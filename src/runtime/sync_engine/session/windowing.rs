@@ -364,7 +364,7 @@ pub fn restrict_outbound_windows_to_last_week(db_path: &str, recorded_by: &str, 
     planner.cycle_anchor_now_ms = None;
 }
 
-fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
+pub(crate) fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
     match kind {
         SyncWindowKind::AuthGraph | SyncWindowKind::KeyGraph => SyncWindow {
             kind,

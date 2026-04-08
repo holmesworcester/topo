@@ -18,7 +18,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use topo::crypto::event_id_from_base64;
+use topo::crypto::{event_id_from_base64, event_id_from_hex, event_id_to_base64};
 use topo::db::open_connection;
 use topo::event_modules::workspace::commands::{
     accept_invite as accept_invite_without_sync, create_user_invite_raw,
@@ -166,38 +166,88 @@ fn wait_for_sync_run_count_at_least(db_path: &str, minimum: i64, timeout: Durati
     }
 }
 
-fn wait_for_sync_runs_to_stabilize(db_paths: &[&str], stable_for: Duration, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    let mut last_counts: Vec<i64> = db_paths
-        .iter()
-        .map(|db_path| sync_run_count_via_cli(db_path))
-        .collect();
-    let mut stable_since = Instant::now();
-
-    loop {
-        let counts: Vec<i64> = db_paths
-            .iter()
-            .map(|db_path| sync_run_count_via_cli(db_path))
-            .collect();
-        if counts == last_counts {
-            if stable_since.elapsed() >= stable_for {
-                return;
+fn live_connection_count_via_cli(db_path: &str) -> usize {
+    let output = topo_cmd(db_path, &["connections"]);
+    assert!(
+        output.status.success(),
+        "connections failed for db={}: stdout={} stderr={}",
+        db_path,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("CONNECTIONS (") {
+                return None;
             }
-        } else {
-            last_counts = counts;
-            stable_since = Instant::now();
-        }
+            let start = trimmed.find('(')? + 1;
+            let end = trimmed[start..].find(')')? + start;
+            trimmed[start..end].parse::<usize>().ok()
+        })
+        .expect("connections output missing count header")
+}
 
+fn wait_for_live_connection_count_at_least(db_path: &str, minimum: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let count = live_connection_count_via_cli(db_path);
+        if count >= minimum {
+            return;
+        }
         assert!(
             Instant::now() < deadline,
-            "sync run counts for {:?} did not stabilize for {:?} within {:?} (last_counts={:?})",
-            db_paths,
-            stable_for,
+            "live connection count for db={} did not reach {} within {:?} (count={})",
+            db_path,
+            minimum,
             timeout,
-            last_counts
+            count
         );
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn measure_projected_message_delivery_latency(
+    sender_db: &str,
+    receiver_db: &str,
+    content: &str,
+    timeout: Duration,
+) -> Duration {
+    let receiver_recorded_by =
+        active_tenant_peer_id(receiver_db).expect("receiver active tenant peer id");
+    let started = Instant::now();
+    let event_id_hex = send_message(sender_db, content);
+    let event_id =
+        event_id_from_hex(event_id_hex.trim()).expect("sent message event id should be hex");
+    let message_id_b64 = event_id_to_base64(&event_id);
+
+    let _ = assert_value_eventually(
+        timeout,
+        Duration::from_millis(10),
+        &format!("message {content:?} projected on receiver"),
+        || {
+            let conn = open_connection(receiver_db).expect("open receiver db");
+            conn.query_row(
+                "SELECT COUNT(*) > 0
+                 FROM messages
+                 WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![&receiver_recorded_by, &message_id_b64],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("query projected message row")
+        },
+        |projected| *projected,
+    );
+
+    started.elapsed()
+}
+
+fn prefers_outbound_known_peer_dials(local_peer_id: &str, remote_peer_id: &str) -> bool {
+    let local = hex::decode(local_peer_id).expect("local peer id should be hex");
+    let remote = hex::decode(remote_peer_id).expect("remote peer id should be hex");
+    local <= remote
 }
 
 struct StartedCliPeer {
@@ -1152,7 +1202,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
 }
 
 #[test]
-fn test_cli_relay_bootstrap_quiesces_after_endpoint_supersession() {
+fn test_cli_relay_bootstrap_keeps_steady_state_polling_after_endpoint_supersession() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -1196,7 +1246,7 @@ fn test_cli_relay_bootstrap_quiesces_after_endpoint_supersession() {
     wait_for_sync_run_count_at_least(&alice_db, 1, Duration::from_secs(60));
     wait_for_sync_run_count_at_least(&bob_db, 1, Duration::from_secs(60));
 
-    let steady_state_eid = send_message(&alice_db, "steady-state before idle");
+    let steady_state_eid = send_message(&alice_db, "steady-state before polling window");
     assert_eventually(
         &bob_db,
         &format!("has_event:{} >= 1", steady_state_eid),
@@ -1208,25 +1258,20 @@ fn test_cli_relay_bootstrap_quiesces_after_endpoint_supersession() {
     let transport_auth = topo_cmd(&bob_db, &["transport-auth"]);
     assert!(
         transport_auth.status.success(),
-        "transport-auth failed before idle window: stdout={} stderr={}",
+        "transport-auth failed before polling window: stdout={} stderr={}",
         String::from_utf8_lossy(&transport_auth.stdout),
         String::from_utf8_lossy(&transport_auth.stderr)
     );
     let transport_auth_stdout = String::from_utf8_lossy(&transport_auth.stdout);
     assert!(
         transport_auth_stdout.contains("[peer_shared]"),
-        "expected steady-state peer_shared auth before idle window, got:\n{}",
+        "expected steady-state peer_shared auth before polling window, got:\n{}",
         transport_auth_stdout
     );
     assert!(
         transport_auth_stdout.contains("[accepted_bootstrap]"),
-        "expected preserved bootstrap fallback before idle window, got:\n{}",
+        "expected preserved bootstrap fallback before polling window, got:\n{}",
         transport_auth_stdout
-    );
-    wait_for_sync_runs_to_stabilize(
-        &[&alice_db, &bob_db],
-        Duration::from_secs(2),
-        Duration::from_secs(30),
     );
 
     let before_alice = sync_run_count_via_cli(&alice_db);
@@ -1237,15 +1282,128 @@ fn test_cli_relay_bootstrap_quiesces_after_endpoint_supersession() {
     let delta_alice = after_alice - before_alice;
     let delta_bob = after_bob - before_bob;
     println!(
-        "idle sync-run delta after relay bootstrap supersession: alice={} bob={}",
+        "steady-state sync-run delta after relay bootstrap supersession: alice={} bob={}",
         delta_alice, delta_bob
     );
 
     assert!(
-        delta_alice <= 2 && delta_bob <= 2,
-        "expected relay-bootstrap peers to quiesce after endpoint supersession, got idle sync-run deltas alice={} bob={}",
+        delta_alice > 0 && delta_bob > 0,
+        "expected relay-bootstrap peers to keep steady-state polling after endpoint supersession, got sync-run deltas alice={} bob={}",
         delta_alice,
         delta_bob
+    );
+
+    stop_daemon(&bob_db, &mut bob_daemon);
+    stop_daemon(&alice_db, &mut alice_daemon);
+}
+
+#[test]
+fn test_cli_live_caught_up_connection_delivers_messages_bidirectionally_under_200ms() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let relay_opts = DaemonOptions {
+        disable_discovery: true,
+        ..Default::default()
+    };
+
+    create_workspace_with_details(&alice_db, "live-latency", "alice", "alice-box");
+    let mut alice_daemon = start_daemon_with_options(&alice_db, &relay_opts);
+    let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
+
+    accept_invite_with_identity(&bob_db, &invite_link, "bob", "bob-box");
+    let mut bob_daemon = start_daemon_with_options(&bob_db, &relay_opts);
+
+    wait_for_active_tenant_ready(&alice_db, Duration::from_secs(60));
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    wait_for_live_connection_count_at_least(&alice_db, 1, Duration::from_secs(30));
+    wait_for_live_connection_count_at_least(&bob_db, 1, Duration::from_secs(30));
+
+    let bootstrap_eid = send_message(&alice_db, "bootstrap-latency-gate");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", bootstrap_eid),
+        60_000,
+    );
+    let bootstrap_reply_eid = send_message(&bob_db, "bootstrap-latency-reply");
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bootstrap_reply_eid),
+        60_000,
+    );
+
+    let alice_peer_id = active_tenant_peer_id(&alice_db).expect("alice active tenant peer id");
+    let bob_peer_id = active_tenant_peer_id(&bob_db).expect("bob active tenant peer id");
+    let (
+        passive_sender_db,
+        passive_receiver_db,
+        passive_direction_label,
+        active_sender_db,
+        active_receiver_db,
+        active_direction_label,
+    ) = if prefers_outbound_known_peer_dials(&alice_peer_id, &bob_peer_id) {
+        (
+            &bob_db,
+            &alice_db,
+            "bob->alice",
+            &alice_db,
+            &bob_db,
+            "alice->bob",
+        )
+    } else {
+        (
+            &alice_db,
+            &bob_db,
+            "alice->bob",
+            &bob_db,
+            &alice_db,
+            "bob->alice",
+        )
+    };
+
+    std::thread::sleep(Duration::from_secs(2));
+    wait_for_live_connection_count_at_least(&alice_db, 1, Duration::from_secs(10));
+    wait_for_live_connection_count_at_least(&bob_db, 1, Duration::from_secs(10));
+
+    let passive_to_active_latency = measure_projected_message_delivery_latency(
+        passive_sender_db,
+        passive_receiver_db,
+        &format!("passive-live-latency-probe-{}", passive_direction_label),
+        Duration::from_secs(5),
+    );
+
+    std::thread::sleep(Duration::from_secs(2));
+    wait_for_live_connection_count_at_least(&alice_db, 1, Duration::from_secs(10));
+    wait_for_live_connection_count_at_least(&bob_db, 1, Duration::from_secs(10));
+
+    let active_to_passive_latency = measure_projected_message_delivery_latency(
+        active_sender_db,
+        active_receiver_db,
+        &format!("active-live-latency-probe-{}", active_direction_label),
+        Duration::from_secs(5),
+    );
+
+    println!(
+        "live caught-up bidirectional message latency: passive={} {}ms active={} {}ms",
+        passive_direction_label,
+        passive_to_active_latency.as_millis(),
+        active_direction_label,
+        active_to_passive_latency.as_millis()
+    );
+
+    assert!(
+        passive_to_active_latency < Duration::from_millis(200),
+        "expected passive-direction live delivery {} under 200ms on a caught-up connection, got {}ms",
+        passive_direction_label,
+        passive_to_active_latency.as_millis()
+    );
+    assert!(
+        active_to_passive_latency < Duration::from_millis(200),
+        "expected active-direction live delivery {} under 200ms on a caught-up connection, got {}ms",
+        active_direction_label,
+        active_to_passive_latency.as_millis()
     );
 
     stop_daemon(&bob_db, &mut bob_daemon);
