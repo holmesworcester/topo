@@ -9,8 +9,6 @@ pub enum SyncWindowKind {
     LastDay = 1,
     LastWeek = 2,
     LastTwelveWeeks = 3,
-    AuthGraph = 4,
-    KeyGraph = 5,
 }
 
 pub fn encode_sync_window_kind(kind: SyncWindowKind) -> u8 {
@@ -23,8 +21,6 @@ pub fn decode_sync_window_kind(kind: u8) -> Result<SyncWindowKind, String> {
         1 => Ok(SyncWindowKind::LastDay),
         2 => Ok(SyncWindowKind::LastWeek),
         3 => Ok(SyncWindowKind::LastTwelveWeeks),
-        4 => Ok(SyncWindowKind::AuthGraph),
-        5 => Ok(SyncWindowKind::KeyGraph),
         other => Err(format!("unsupported sync window kind {}", other)),
     }
 }
@@ -53,17 +49,8 @@ const LOW_MEM_COLD_TIER_ORDER: [SyncWindowKind; 1] = [SyncWindowKind::LastWeek];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SinglePeerPhase {
-    AuthGraph,
-    KeyGraph,
     LastDay,
     Cold,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PriorityPhase {
-    AuthGraph,
-    KeyGraph,
-    LastDay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +64,6 @@ struct PlannerState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TenantPriorityState {
     owner_idx: usize,
-    phase: PriorityPhase,
     cycle_anchor_now_ms: Option<i64>,
 }
 
@@ -115,7 +101,7 @@ fn state_for<'a>(
             cold_next_idx: 0,
             cycle_anchor_now_ms: None,
             restrict_to_low_mem_windows: false,
-            single_peer_phase: SinglePeerPhase::AuthGraph,
+            single_peer_phase: SinglePeerPhase::LastDay,
         })
 }
 
@@ -128,7 +114,6 @@ fn tenant_state_for<'a>(
         .entry(tenant_priority_key(db_path, recorded_by))
         .or_insert(TenantPriorityState {
             owner_idx: 0,
-            phase: PriorityPhase::AuthGraph,
             cycle_anchor_now_ms: None,
         })
 }
@@ -138,14 +123,6 @@ fn cold_tier_order(planner: &PlannerState) -> &'static [SyncWindowKind] {
         &LOW_MEM_COLD_TIER_ORDER
     } else {
         &DEFAULT_COLD_TIER_ORDER
-    }
-}
-
-fn priority_kind(phase: PriorityPhase) -> SyncWindowKind {
-    match phase {
-        PriorityPhase::AuthGraph => SyncWindowKind::AuthGraph,
-        PriorityPhase::KeyGraph => SyncWindowKind::KeyGraph,
-        PriorityPhase::LastDay => SyncWindowKind::LastDay,
     }
 }
 
@@ -179,12 +156,6 @@ pub fn prime_outbound_window_kind(
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
     planner.cycle_anchor_now_ms = None;
     match kind {
-        SyncWindowKind::AuthGraph => {
-            planner.single_peer_phase = SinglePeerPhase::AuthGraph;
-        }
-        SyncWindowKind::KeyGraph => {
-            planner.single_peer_phase = SinglePeerPhase::KeyGraph;
-        }
         SyncWindowKind::LastDay => {
             planner.single_peer_phase = SinglePeerPhase::LastDay;
         }
@@ -212,8 +183,6 @@ fn select_single_peer_window(
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
     let anchor_now_ms = *planner.cycle_anchor_now_ms.get_or_insert(now_ms);
     let kind = match planner.single_peer_phase {
-        SinglePeerPhase::AuthGraph => SyncWindowKind::AuthGraph,
-        SinglePeerPhase::KeyGraph => SyncWindowKind::KeyGraph,
         SinglePeerPhase::LastDay => SyncWindowKind::LastDay,
         SinglePeerPhase::Cold => {
             let tier_order = cold_tier_order(planner);
@@ -269,7 +238,7 @@ pub fn select_outbound_window(
         let owner_peer_id = live_peers.get(owner_idx).cloned().unwrap_or_default();
         let owner_kind = if owner_peer_id == peer_id {
             let _ = tenant_state.cycle_anchor_now_ms.get_or_insert(now_ms);
-            Some(priority_kind(tenant_state.phase))
+            Some(SyncWindowKind::LastDay)
         } else {
             None
         };
@@ -304,12 +273,6 @@ pub fn mark_outbound_window_completed(
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let planner = state_for(&mut state, db_path, recorded_by, peer_id);
         match window.kind {
-            SyncWindowKind::AuthGraph => {
-                planner.single_peer_phase = SinglePeerPhase::KeyGraph;
-            }
-            SyncWindowKind::KeyGraph => {
-                planner.single_peer_phase = SinglePeerPhase::LastDay;
-            }
             SyncWindowKind::LastDay => {
                 planner.single_peer_phase = SinglePeerPhase::Cold;
             }
@@ -318,7 +281,7 @@ pub fn mark_outbound_window_completed(
                 let was_single_peer_cold = planner.single_peer_phase == SinglePeerPhase::Cold;
                 planner.cold_next_idx = (planner.cold_next_idx + 1) % tier_order.len();
                 if was_single_peer_cold {
-                    planner.single_peer_phase = SinglePeerPhase::AuthGraph;
+                    planner.single_peer_phase = SinglePeerPhase::LastDay;
                     planner.cycle_anchor_now_ms = None;
                 } else if planner.cold_next_idx == 0 {
                     planner.cycle_anchor_now_ms = None;
@@ -327,30 +290,13 @@ pub fn mark_outbound_window_completed(
         }
     }
 
-    match window.kind {
-        SyncWindowKind::AuthGraph | SyncWindowKind::KeyGraph | SyncWindowKind::LastDay => {
-            let mut state = tenant_priority_state()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let tenant_state = tenant_state_for(&mut state, db_path, recorded_by);
-            match window.kind {
-                SyncWindowKind::AuthGraph => {
-                    tenant_state.phase = PriorityPhase::KeyGraph;
-                }
-                SyncWindowKind::KeyGraph => {
-                    tenant_state.phase = PriorityPhase::LastDay;
-                }
-                SyncWindowKind::LastDay => {
-                    tenant_state.phase = PriorityPhase::AuthGraph;
-                    tenant_state.owner_idx = tenant_state.owner_idx.saturating_add(1);
-                    tenant_state.cycle_anchor_now_ms = None;
-                }
-                SyncWindowKind::LastWeek
-                | SyncWindowKind::LastTwelveWeeks
-                | SyncWindowKind::Full => {}
-            }
-        }
-        SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks | SyncWindowKind::Full => {}
+    if window.kind == SyncWindowKind::LastDay {
+        let mut state = tenant_priority_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tenant_state = tenant_state_for(&mut state, db_path, recorded_by);
+        tenant_state.owner_idx = tenant_state.owner_idx.saturating_add(1);
+        tenant_state.cycle_anchor_now_ms = None;
     }
 }
 
@@ -366,11 +312,6 @@ pub fn restrict_outbound_windows_to_last_week(db_path: &str, recorded_by: &str, 
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
     match kind {
-        SyncWindowKind::AuthGraph | SyncWindowKind::KeyGraph => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: None,
-            ts_max_exclusive_ms: None,
-        },
         SyncWindowKind::Full => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(ALL_START_MS),
@@ -399,20 +340,11 @@ pub fn is_hot_window(kind: SyncWindowKind) -> bool {
 }
 
 pub fn is_priority_ingest_window(kind: SyncWindowKind) -> bool {
-    matches!(
-        kind,
-        SyncWindowKind::AuthGraph | SyncWindowKind::KeyGraph | SyncWindowKind::LastDay
-    )
+    matches!(kind, SyncWindowKind::LastDay)
 }
 
 pub fn is_low_mem_allowed_window(kind: SyncWindowKind) -> bool {
-    matches!(
-        kind,
-        SyncWindowKind::AuthGraph
-            | SyncWindowKind::KeyGraph
-            | SyncWindowKind::LastDay
-            | SyncWindowKind::LastWeek
-    )
+    matches!(kind, SyncWindowKind::LastDay | SyncWindowKind::LastWeek)
 }
 
 fn normalized_live_peers(peer_id: &str, live_peer_ids: &[String]) -> Vec<String> {
@@ -589,16 +521,16 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                SyncWindowKind::AuthGraph,
-                SyncWindowKind::KeyGraph,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
-                SyncWindowKind::AuthGraph,
-                SyncWindowKind::KeyGraph,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastTwelveWeeks,
-                SyncWindowKind::AuthGraph,
-                SyncWindowKind::KeyGraph,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::Full,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastTwelveWeeks,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::Full,
             ]
@@ -627,12 +559,12 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                SyncWindowKind::AuthGraph,
-                SyncWindowKind::KeyGraph,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
-                SyncWindowKind::AuthGraph,
-                SyncWindowKind::KeyGraph,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
             ]
@@ -661,12 +593,12 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                SyncWindowKind::AuthGraph,
-                SyncWindowKind::KeyGraph,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
-                SyncWindowKind::AuthGraph,
-                SyncWindowKind::KeyGraph,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
             ]
@@ -695,8 +627,6 @@ mod tests {
 
     #[test]
     fn lowmem_allows_only_day_and_week_windows() {
-        assert!(is_low_mem_allowed_window(SyncWindowKind::AuthGraph));
-        assert!(is_low_mem_allowed_window(SyncWindowKind::KeyGraph));
         assert!(is_low_mem_allowed_window(SyncWindowKind::LastDay));
         assert!(is_low_mem_allowed_window(SyncWindowKind::LastWeek));
         assert!(!is_low_mem_allowed_window(SyncWindowKind::LastTwelveWeeks));
@@ -704,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn priority_windows_use_single_owner_and_rotate_across_live_peers() {
+    fn last_day_window_uses_single_owner_and_rotates_across_live_peers() {
         let db_path = "/tmp/window-priority-owner";
         let recorded_by = "tenant-a";
         let peer_a = "peer-a";
@@ -715,23 +645,15 @@ mod tests {
         reset_outbound_window_state(db_path, recorded_by, peer_b);
         reset_outbound_window_state(db_path, recorded_by, peer_c);
 
-        let auth_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let day_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
         let cold_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
-        assert_eq!(auth_a.kind, SyncWindowKind::AuthGraph);
+        assert_eq!(day_a.kind, SyncWindowKind::LastDay);
         assert_eq!(cold_b.kind, SyncWindowKind::LastWeek);
 
-        mark_outbound_window_completed(db_path, recorded_by, peer_a, auth_a);
-        let key_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
-        assert_eq!(key_a.kind, SyncWindowKind::KeyGraph);
-
-        mark_outbound_window_completed(db_path, recorded_by, peer_a, key_a);
-        let day_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
-        assert_eq!(day_a.kind, SyncWindowKind::LastDay);
-
         mark_outbound_window_completed(db_path, recorded_by, peer_a, day_a);
-        let auth_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        let day_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
         let cold_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
-        assert_eq!(auth_b.kind, SyncWindowKind::AuthGraph);
+        assert_eq!(day_b.kind, SyncWindowKind::LastDay);
         assert_eq!(cold_a.kind, SyncWindowKind::LastWeek);
     }
 
@@ -743,16 +665,10 @@ mod tests {
         let live_peers = vec![peer_id.to_string()];
         reset_outbound_window_state(db_path, recorded_by, peer_id);
 
-        let auth = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
-        mark_outbound_window_completed(db_path, recorded_by, peer_id, auth);
-        let key = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 2_000_000);
-        mark_outbound_window_completed(db_path, recorded_by, peer_id, key);
-        let day = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 2_000_000);
+        let day = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
         mark_outbound_window_completed(db_path, recorded_by, peer_id, day);
         let week = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 2_000_000);
 
-        assert_eq!(auth.kind, SyncWindowKind::AuthGraph);
-        assert_eq!(key.kind, SyncWindowKind::KeyGraph);
         assert_eq!(day.kind, SyncWindowKind::LastDay);
         assert_eq!(week.kind, SyncWindowKind::LastWeek);
         assert_eq!(day.ts_min(), Some(1_000_000 - DAY_MS));
