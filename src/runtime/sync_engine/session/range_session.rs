@@ -16,8 +16,8 @@ use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::{
     sync_dep_check_cap, sync_dep_send_byte_cap, sync_dep_send_event_cap,
-    sync_dep_time_budget_full_ms, sync_dep_time_budget_last_day_ms,
-    sync_dep_time_budget_last_twelve_weeks_ms, sync_dep_time_budget_last_week_ms,
+    sync_dep_time_budget_last_day_ms, sync_dep_time_budget_last_twelve_weeks_ms,
+    sync_dep_time_budget_last_week_ms,
 };
 use tracing::warn;
 
@@ -139,9 +139,9 @@ fn dep_time_budget_for_window(kind: SyncWindowKind) -> Duration {
         SyncWindowKind::LastDay => sync_dep_time_budget_last_day_ms(),
         SyncWindowKind::LastWeek => sync_dep_time_budget_last_week_ms(),
         SyncWindowKind::LastTwelveWeeks => sync_dep_time_budget_last_twelve_weeks_ms(),
-        SyncWindowKind::Full => sync_dep_time_budget_full_ms(),
+        SyncWindowKind::Full => 0,
     };
-    Duration::from_millis(millis.max(1))
+    Duration::from_millis(millis)
 }
 
 fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
@@ -982,11 +982,11 @@ mod tests {
     }
 
     #[test]
-    fn full_window_expands_shared_deps_with_time_budget() {
+    fn full_window_does_not_expand_shared_deps() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let recorded_by = "tenant-a";
-        let workspace_id = "workspace-full-expands";
+        let workspace_id = "workspace-full-no-deps";
 
         let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
         let mid = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
@@ -1009,7 +1009,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(ordered, vec![root, mid, leaf]);
+        assert_eq!(ordered, vec![leaf]);
     }
 
     #[test]
@@ -1129,7 +1129,7 @@ mod tests {
             recorded_by,
             workspace_id,
             SyncWindow {
-                kind: SyncWindowKind::Full,
+                kind: SyncWindowKind::LastDay,
                 ts_min_inclusive_ms: Some(0),
                 ts_max_exclusive_ms: Some(10_000),
             },
