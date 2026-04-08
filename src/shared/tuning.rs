@@ -142,12 +142,6 @@ pub fn sync_dep_time_budget_last_twelve_weeks_ms() -> u64 {
         .unwrap_or(if low_mem_mode() { 1_000 } else { 5_000 })
 }
 
-pub fn sync_dep_time_budget_full_ms() -> u64 {
-    read_u64_env("TOPO_SYNC_DEP_TIME_BUDGET_FULL_MS")
-        .or_else(|| read_u64_env("TOPO_SYNC_DEP_TIME_BUDGET_MS"))
-        .unwrap_or(if low_mem_mode() { 2_000 } else { 30_000 })
-}
-
 // -- Sync sessions --
 pub fn session_ingest_cap() -> usize {
     if low_mem_mode() {
