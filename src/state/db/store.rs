@@ -14,29 +14,6 @@ pub const SQL_INSERT_RECORDED_EVENT: &str =
     "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
      VALUES (?1, ?2, ?3, ?4)";
 
-pub const SHARED_PRIORITY_LANE_AUTH: &str = "auth";
-pub const SHARED_PRIORITY_LANE_KEY: &str = "key";
-
-fn classify_shared_priority_lane(semantic_type_code: Option<u8>) -> Option<&'static str> {
-    match semantic_type_code {
-        Some(
-            crate::event_modules::EVENT_TYPE_WORKSPACE
-            | crate::event_modules::EVENT_TYPE_USER_INVITE
-            | crate::event_modules::EVENT_TYPE_DEVICE_INVITE
-            | crate::event_modules::EVENT_TYPE_USER
-            | crate::event_modules::EVENT_TYPE_PEER_SHARED
-            | crate::event_modules::EVENT_TYPE_ADMIN
-            | crate::event_modules::EVENT_TYPE_REMOVAL
-            | crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
-        ) => Some(SHARED_PRIORITY_LANE_AUTH),
-        Some(
-            crate::event_modules::EVENT_TYPE_KEY_SHARED
-            | crate::event_modules::EVENT_TYPE_KEY_ROTATION,
-        ) => Some(SHARED_PRIORITY_LANE_KEY),
-        _ => None,
-    }
-}
-
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
         "
@@ -94,14 +71,6 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             id BLOB NOT NULL,
             PRIMARY KEY (workspace_id, ts, id)
         ) WITHOUT ROWID;
-
-        CREATE TABLE IF NOT EXISTS shared_priority_event_index (
-            workspace_id TEXT NOT NULL,
-            lane TEXT NOT NULL,
-            ts INTEGER NOT NULL,
-            id BLOB NOT NULL,
-            PRIMARY KEY (workspace_id, lane, ts, id)
-        ) WITHOUT ROWID;
         ",
     )?;
     Ok(())
@@ -145,22 +114,13 @@ pub fn insert_shared_event_index_entry_if_shared(
     created_at_ms: i64,
     event_id: &EventId,
     workspace_id: &str,
-    blob: &[u8],
+    _blob: &[u8],
 ) -> SqliteResult<()> {
     if share_scope == ShareScope::Shared {
         conn.execute(
             SQL_INSERT_SHARED_EVENT_INDEX_ENTRY,
             params![workspace_id, created_at_ms, event_id.as_slice()],
         )?;
-        if let Some(lane) =
-            classify_shared_priority_lane(crate::event_modules::outer_semantic_type_code(blob))
-        {
-            conn.execute(
-                "INSERT OR IGNORE INTO shared_priority_event_index (workspace_id, lane, ts, id)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![workspace_id, lane, created_at_ms, event_id.as_slice()],
-            )?;
-        }
     }
     Ok(())
 }
