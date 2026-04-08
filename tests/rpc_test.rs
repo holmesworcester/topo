@@ -2157,6 +2157,8 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "Tenants",
         "UseTenant",
         "ActiveTenant",
+        "GetTopoLogConfig",
+        "SetTopoLogLevel",
         "CreateWorkspace",
         "Peers",
         "View",

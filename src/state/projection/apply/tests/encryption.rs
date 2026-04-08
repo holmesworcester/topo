@@ -383,6 +383,7 @@ fn test_encrypted_inner_type_mismatch_rejects() {
 
 #[test]
 fn test_encrypted_nested_rejects() {
+    use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
     use crate::event_modules::layout::common::{ENCRYPTED_AUTH_TAG_BYTES, ENCRYPTED_HEADER_BYTES};
 
     let conn = setup();
@@ -409,10 +410,11 @@ fn test_encrypted_nested_rejects() {
     buf[0] = EVENT_TYPE_ENCRYPTED;
     buf[1..9].copy_from_slice(&now_ms().to_le_bytes());
     buf[9..41].copy_from_slice(&sk_eid);
-    buf[41] = EVENT_TYPE_ENCRYPTED; // inner_type_code = 5 (nested)
-    buf[42..54].copy_from_slice(&nonce);
-    buf[54..54 + raw_ct.len()].copy_from_slice(&raw_ct);
-    buf[54 + raw_ct.len()..].copy_from_slice(&auth_tag);
+    buf[41..73].copy_from_slice(&NO_OWNER_EVENT_ID);
+    buf[73] = EVENT_TYPE_ENCRYPTED; // inner_type_code = 5 (nested)
+    buf[74..86].copy_from_slice(&nonce);
+    buf[86..86 + raw_ct.len()].copy_from_slice(&raw_ct);
+    buf[86 + raw_ct.len()..].copy_from_slice(&auth_tag);
 
     let outer_eid = insert_event_raw(&conn, recorded_by, &buf);
     let result = project_one(&conn, recorded_by, &outer_eid).unwrap();
