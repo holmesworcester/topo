@@ -322,6 +322,8 @@ pub struct DaemonOptions {
     pub bind_ip: Option<String>,
     /// Specific port to bind to. None = random (127.0.0.1:0).
     pub bind_port: Option<u16>,
+    /// Restrict sync planning to LastDay only.
+    pub last_day_only_sync: bool,
     /// Allow retrying on an ephemeral port if the requested bind port is busy.
     pub allow_ephemeral_bind_fallback: bool,
     /// Disable placeholder autodial via environment variable.
@@ -345,6 +347,7 @@ impl Default for DaemonOptions {
         Self {
             bind_ip: None,
             bind_port: None,
+            last_day_only_sync: false,
             allow_ephemeral_bind_fallback: true,
             disable_placeholder_autodial: false,
             disable_discovery: false,
@@ -535,6 +538,9 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
             .arg("start")
             .arg("--bind")
             .arg(&bind_addr);
+        if opts.last_day_only_sync {
+            cmd.arg("--last-day-only-sync");
+        }
         cmd.env_clear();
         for key in [
             "HOME",

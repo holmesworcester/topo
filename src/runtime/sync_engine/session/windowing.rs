@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::tuning::low_mem_mode;
+use crate::tuning::{low_mem_mode, sync_last_day_only_mode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowKind {
@@ -224,6 +224,9 @@ pub fn select_outbound_window(
     live_peer_ids: &[String],
     now_ms: i64,
 ) -> SyncWindow {
+    if sync_last_day_only_mode() {
+        return window_for_kind(SyncWindowKind::LastDay, now_ms);
+    }
     let live_peers = normalized_live_peers(peer_id, live_peer_ids);
     if live_peers.len() <= 1 {
         return select_single_peer_window(db_path, recorded_by, peer_id, now_ms);
@@ -267,6 +270,9 @@ pub fn mark_outbound_window_completed(
     peer_id: &str,
     window: SyncWindow,
 ) {
+    if sync_last_day_only_mode() {
+        return;
+    }
     {
         let mut state = planner_state()
             .lock()
@@ -481,13 +487,28 @@ mod tests {
 
     struct EnvGuard {
         prev_low_mem_ios: Option<String>,
+        prev_last_day_only: Option<String>,
     }
 
     impl EnvGuard {
         fn enable_low_mem_ios() -> Self {
             let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
+            let prev_last_day_only = std::env::var("TOPO_SYNC_LAST_DAY_ONLY").ok();
             std::env::set_var("LOW_MEM_IOS", "1");
-            Self { prev_low_mem_ios }
+            Self {
+                prev_low_mem_ios,
+                prev_last_day_only,
+            }
+        }
+
+        fn enable_last_day_only_sync() -> Self {
+            let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
+            let prev_last_day_only = std::env::var("TOPO_SYNC_LAST_DAY_ONLY").ok();
+            std::env::set_var("TOPO_SYNC_LAST_DAY_ONLY", "1");
+            Self {
+                prev_low_mem_ios,
+                prev_last_day_only,
+            }
         }
     }
 
@@ -497,7 +518,33 @@ mod tests {
                 Some(v) => std::env::set_var("LOW_MEM_IOS", v),
                 None => std::env::remove_var("LOW_MEM_IOS"),
             }
+            match &self.prev_last_day_only {
+                Some(v) => std::env::set_var("TOPO_SYNC_LAST_DAY_ONLY", v),
+                None => std::env::remove_var("TOPO_SYNC_LAST_DAY_ONLY"),
+            }
         }
+    }
+
+    #[test]
+    fn last_day_only_mode_sticks_to_hot_window() {
+        let _env = EnvGuard::enable_last_day_only_sync();
+        let db_path = "/tmp/window-last-day-only";
+        let recorded_by = "tenant-a";
+        let peer_id = "peer-a";
+        let live_peers = vec![peer_id.to_string(), "peer-b".to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_id);
+
+        let kinds: Vec<SyncWindowKind> = (0..4)
+            .map(|_| {
+                let window =
+                    select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
+                let kind = window.kind;
+                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
+                kind
+            })
+            .collect();
+
+        assert_eq!(kinds, vec![SyncWindowKind::LastDay; 4]);
     }
 
     #[test]

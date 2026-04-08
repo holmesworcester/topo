@@ -8,6 +8,10 @@ pub fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS")
 }
 
+pub fn sync_last_day_only_mode() -> bool {
+    read_bool_env("TOPO_SYNC_LAST_DAY_ONLY")
+}
+
 /// Enables periodic low-memory runtime queue/vector instrumentation logs.
 pub fn low_mem_memtrace() -> bool {
     read_bool_env("LOW_MEM_MEMTRACE")
