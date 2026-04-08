@@ -45,7 +45,7 @@ fn create_user_invite_link_for_test_peer(creator: &Peer, bootstrap_addr: &str) -
              ORDER BY event_id ASC
              LIMIT 1",
             rusqlite::params![&creator.identity],
-            |row| row.get::<_, String>(0),
+            |row| topo::db::sql_types::get_text(row, 0),
         )
         .ok()
         .and_then(|b64| event_id_from_base64(&b64))
@@ -2129,7 +2129,7 @@ fn test_cli_live_daemon_accept_second_workspace_switches_active_tenant() {
                      WHERE username = ?1
                      LIMIT 1",
                     rusqlite::params!["yuki-zeta"],
-                    |row| row.get::<_, String>(0),
+                    |row| topo::db::sql_types::get_text(row, 0),
                 )
                 .ok();
             if let Some(peer_id) = found {
@@ -2250,7 +2250,7 @@ fn test_cli_live_daemon_create_second_workspace_switches_active_tenant() {
                      WHERE username = ?1
                      LIMIT 1",
                     rusqlite::params!["zeta"],
-                    |row| row.get::<_, String>(0),
+                    |row| topo::db::sql_types::get_text(row, 0),
                 )
                 .ok();
             if let Some(peer_id) = found {
@@ -3482,7 +3482,7 @@ fn test_cli_delete_message_purges_message_and_reaction_from_event_commands() {
              ORDER BY created_at DESC, message_id DESC
              LIMIT 1",
             rusqlite::params![&recorded_by],
-            |row| row.get(0),
+            |row| topo::db::sql_types::get_text(row, 0),
         )
         .expect("message event id");
     let reaction_eid: String = conn
@@ -3493,7 +3493,7 @@ fn test_cli_delete_message_purges_message_and_reaction_from_event_commands() {
              ORDER BY created_at DESC, event_id DESC
              LIMIT 1",
             rusqlite::params![&recorded_by],
-            |row| row.get(0),
+            |row| topo::db::sql_types::get_text(row, 0),
         )
         .expect("reaction event id");
 
@@ -3566,7 +3566,7 @@ fn test_cli_delete_message_purges_message_and_reaction_from_event_commands() {
              FROM deleted_messages
              WHERE recorded_by = ?1 AND message_id = ?2",
             rusqlite::params![&recorded_by, &msg_eid],
-            |row| row.get(0),
+            |row| topo::db::sql_types::get_text(row, 0),
         )
         .expect("deletion event id");
     assert_eq!(message_rows, 0, "message row should be purged");
@@ -3689,7 +3689,7 @@ fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
                  ORDER BY created_at DESC, message_id DESC
                  LIMIT 1",
                 rusqlite::params![&recorded_by],
-                |row| row.get::<_, String>(0),
+                |row| topo::db::sql_types::get_text(row, 0),
             )
             .expect("message event id");
         let file_eid = conn
@@ -3700,7 +3700,7 @@ fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
                  ORDER BY created_at DESC, event_id DESC
                  LIMIT 1",
                 rusqlite::params![&recorded_by],
-                |row| row.get::<_, String>(0),
+                |row| topo::db::sql_types::get_text(row, 0),
             )
             .expect("file event id");
         (msg_eid, file_eid)
@@ -3720,7 +3720,7 @@ fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
                      ORDER BY s.slice_number ASC
                      LIMIT 1",
                     rusqlite::params![&recorded_by, &file_eid],
-                    |row| row.get::<_, String>(0),
+                    |row| topo::db::sql_types::get_text(row, 0),
                 )
                 .ok();
             if let Some(row) = row {
@@ -3813,7 +3813,7 @@ fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
              FROM deleted_messages
              WHERE recorded_by = ?1 AND message_id = ?2",
             rusqlite::params![&recorded_by, &msg_eid],
-            |row| row.get(0),
+            |row| topo::db::sql_types::get_text(row, 0),
         )
         .expect("deletion event id");
     assert_eq!(message_rows, 0, "message row should be purged");

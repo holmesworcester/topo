@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
+use super::sql_types::get_text;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
@@ -76,7 +77,7 @@ pub fn list_shared_event_deps_limited(
          LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![workspace_id, event_id_b64, limit as i64], |row| {
-        row.get::<_, String>(0)
+        get_text(row, 0)
     })?;
     let mut dep_ids = Vec::new();
     for row in rows {

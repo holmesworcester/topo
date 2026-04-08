@@ -265,14 +265,14 @@ fn test_concurrent_multi_parent_frontier_hash_converges_despite_parent_order() {
         .query_row(
             "SELECT frontier_hash FROM removals WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &merge_left_right_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     let stored_right_left: String = conn
         .query_row(
             "SELECT frontier_hash FROM removals WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &merge_right_left_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
 
@@ -370,7 +370,7 @@ fn test_key_rotation_multi_parent_frontier_blocks_until_all_frontier_deps_arrive
         .query_row(
             "SELECT frontier_hash FROM key_rotations WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &rotation_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     assert_eq!(

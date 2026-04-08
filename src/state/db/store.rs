@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
+use super::sql_types::{get_blob, get_text};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::{self as events, ParsedEvent, ShareScope};
 
@@ -138,7 +139,7 @@ pub fn lookup_workspace_id(conn: &Connection, peer_id: &str) -> Option<String> {
          ORDER BY created_at ASC, event_id ASC
          LIMIT 1",
         params![peer_id],
-        |row| row.get::<_, String>(0),
+        |row| get_text(row, 0),
     )
     .optional()
     .expect("lookup_workspace_id: unexpected DB error querying invites_accepted")
@@ -151,7 +152,7 @@ fn recorded_owner_event_id(conn: &Connection, event_id_b64: &str) -> SqliteResul
              FROM events
              WHERE event_id = ?1",
             params![event_id_b64],
-            |row| row.get(0),
+            |row| get_blob(row, 0),
         )
         .optional()?;
     let Some(blob) = blob else {
@@ -258,7 +259,7 @@ impl<'a> Store<'a> {
         let result = self.conn.query_row(
             "SELECT blob FROM events WHERE event_id = ?1",
             params![id_str],
-            |row| row.get(0),
+            |row| get_blob(row, 0),
         );
 
         match result {
@@ -276,7 +277,7 @@ impl<'a> Store<'a> {
         let result = self.conn.query_row(
             "SELECT blob FROM events WHERE event_id = ?1 AND share_scope = 'shared'",
             params![id_str],
-            |row| row.get(0),
+            |row| get_blob(row, 0),
         );
 
         match result {
@@ -303,8 +304,8 @@ impl<'a> Store<'a> {
         let mut map = HashMap::with_capacity(ids.len());
         let mut rows = stmt.query(rusqlite::params_from_iter(id_strs.iter()))?;
         while let Some(row) = rows.next()? {
-            let id_str: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
+            let id_str = get_text(row, 0)?;
+            let blob = get_blob(row, 1)?;
             if let Some(event_id) = event_id_from_base64(&id_str) {
                 map.insert(event_id, blob);
             }
@@ -332,7 +333,7 @@ impl<'a> Store<'a> {
         let mut map = HashMap::with_capacity(ids.len());
         let mut rows = stmt.query(rusqlite::params_from_iter(id_strs.iter()))?;
         while let Some(row) = rows.next()? {
-            let id_str: String = row.get(0)?;
+            let id_str = get_text(row, 0)?;
             let created_at: i64 = row.get(1)?;
             if let Some(event_id) = event_id_from_base64(&id_str) {
                 map.insert(event_id, created_at);
@@ -353,7 +354,7 @@ impl<'a> Store<'a> {
                  WHERE event_id = ?1
                    AND share_scope = 'shared'",
                 params![id_str],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((get_blob(row, 0)?, row.get(1)?)),
             )
             .optional()?;
         let Some((blob, created_at_ms)) = row else {

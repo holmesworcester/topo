@@ -497,7 +497,7 @@ pub fn create_encrypted_event_synchronous_with_owner(
         .query_row(
             "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &key_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .map_err(|e| CreateEventError::DbError(format!("key lookup: {}", e)))?;
 
@@ -1242,7 +1242,7 @@ mod tests {
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![event_id_to_base64(&event_id)],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .unwrap();
         let wrapper = crate::event_modules::parse_event(&wrapper_blob).unwrap();

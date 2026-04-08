@@ -190,7 +190,12 @@ mod tests {
                 "SELECT transport_peer_id, source
                  FROM local_transport_targets WHERE tenant_id = ?1",
                 rusqlite::params![recorded_by],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        crate::db::sql_types::get_text(row, 0)?,
+                        crate::db::sql_types::get_text(row, 1)?,
+                    ))
+                },
             )
             .optional()
             .unwrap();
@@ -234,7 +239,12 @@ mod tests {
                 "SELECT transport_peer_id, source
                  FROM local_transport_targets WHERE tenant_id = ?1",
                 rusqlite::params![recorded_by],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        crate::db::sql_types::get_text(row, 0)?,
+                        crate::db::sql_types::get_text(row, 1)?,
+                    ))
+                },
             )
             .optional()
             .unwrap();

@@ -146,7 +146,7 @@ fn test_invite_accepted_requires_tenant_not_workspace() {
         .query_row(
             "SELECT workspace_id FROM invites_accepted WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     assert_eq!(

@@ -69,7 +69,7 @@ fn encrypted_wrapper_key_event_id(
         .query_row(
             "SELECT blob FROM events WHERE event_id = ?1",
             rusqlite::params![event_id_to_base64(wrapper_event_id)],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .expect("load encrypted wrapper blob");
     match parse_event(&blob).expect("parse encrypted wrapper") {
@@ -125,7 +125,7 @@ fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
              ORDER BY e.created_at ASC, u.event_id ASC
              LIMIT 1",
             rusqlite::params![&peer_id],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .expect("load creator user event");
     let user_created_at_ms: i64 = conn
@@ -152,7 +152,7 @@ fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
         .query_row(
             "SELECT author_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at DESC, message_id DESC LIMIT 1",
             rusqlite::params![&peer_id],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .expect("load newest message author");
     let newest_message_created_at_ms: i64 = conn
@@ -198,7 +198,7 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
         .query_row(
             "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
             rusqlite::params![&recorded_by],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .ok()
         .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
@@ -273,7 +273,7 @@ fn create_device_link_materializes_pending_bootstrap_trust_via_projection() {
         .query_row(
             "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
             rusqlite::params![&recorded_by],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .ok()
         .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
@@ -408,7 +408,7 @@ fn join_workspace_replays_existing_same_workspace_shared_events_for_new_tenant()
         .query_row(
             "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
             rusqlite::params![&creator_peer_id],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .ok()
         .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
@@ -450,7 +450,7 @@ fn join_workspace_replays_existing_same_workspace_shared_events_for_new_tenant()
             .prepare("SELECT username FROM users WHERE recorded_by = ?1 ORDER BY username")
             .expect("prepare users query");
         stmt.query_map(rusqlite::params![&bob_peer_id], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })
         .expect("query users")
         .collect::<Result<Vec<_>, _>>()
@@ -500,7 +500,7 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
         .query_row(
             "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
             rusqlite::params![&creator_peer_id],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .ok()
         .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
@@ -622,7 +622,7 @@ fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
         .query_row(
             "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
             rusqlite::params![&recorded_by],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .ok()
         .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
@@ -692,7 +692,7 @@ fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
              ORDER BY rowid DESC
              LIMIT 1",
             rusqlite::params![&recorded_by, event_id_to_base64(&frontier_key)],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .expect("query post-removal key frontier");
     assert_eq!(

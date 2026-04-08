@@ -330,7 +330,7 @@ pub fn import_peer_state(
              ORDER BY sei.ts ASC, sei.id ASC",
         )?;
         for row in shared_index_stmt.query_map(rusqlite::params![workspace_id], |row| {
-            row.get::<_, Vec<u8>>(0)
+            crate::db::sql_types::get_blob(row, 0)
         })? {
             let id = row?;
             if id.len() != 32 {
@@ -345,7 +345,12 @@ pub fn import_peer_state(
                      FROM events
                      WHERE event_id = ?1",
                     rusqlite::params![&event_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            crate::db::sql_types::get_blob(row, 1)?,
+                        ))
+                    },
                 )
                 .ok()
             else {

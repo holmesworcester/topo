@@ -259,10 +259,7 @@ fn wait_for_message_count_exact(db: &str, expected: i64, timeout: Duration) -> i
     }
 }
 
-fn wait_for_newest_message_visible(
-    db: &str,
-    timeout: Duration,
-) -> (NewestMessageTiming, i64, i64) {
+fn wait_for_newest_message_visible(db: &str, timeout: Duration) -> (NewestMessageTiming, i64, i64) {
     let start = Instant::now();
     loop {
         let timing = newest_message_timing_sql(db);
@@ -609,7 +606,10 @@ fn perf_last_day_only_sync_renders_newest_message_with_old_deps() {
     );
     eprintln!("\n{summary}");
     write_summary(
-        &format!("daemon_tiered_window_perf_test.last_day_only_{}", total_messages),
+        &format!(
+            "daemon_tiered_window_perf_test.last_day_only_{}",
+            total_messages
+        ),
         &summary,
     );
 

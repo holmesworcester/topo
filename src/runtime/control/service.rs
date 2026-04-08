@@ -83,7 +83,7 @@ pub fn open_db_load(
         let mut stmt =
             conn.prepare("SELECT DISTINCT recorded_by FROM invites_accepted ORDER BY recorded_by")?;
         let peers = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| crate::db::sql_types::get_text(row, 0))?
             .collect::<Result<Vec<_>, _>>()?;
         peers
     };
@@ -219,7 +219,10 @@ fn load_key_secrets(
         db.prepare("SELECT event_id, key_bytes FROM key_secrets WHERE recorded_by = ?1")
     {
         if let Ok(rows) = stmt.query_map(rusqlite::params![recorded_by], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_blob(row, 1)?,
+            ))
         }) {
             for row in rows.flatten() {
                 key_secrets.insert(row.0, row.1);
@@ -372,9 +375,9 @@ pub fn svc_event_list(
          ORDER BY re.id",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        let id: String = row.get(0)?;
-        let etype: String = row.get(1)?;
-        let blob: Vec<u8> = row.get(2)?;
+        let id = crate::db::sql_types::get_text(row, 0)?;
+        let etype = crate::db::sql_types::get_text(row, 1)?;
+        let blob = crate::db::sql_types::get_blob(row, 2)?;
         let created_at: i64 = row.get(3)?;
         Ok((id, etype, blob, created_at as u64))
     })?;
@@ -406,9 +409,9 @@ pub fn svc_event_list_head(
          WHERE re.peer_id = ?1",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        let id: String = row.get(0)?;
-        let etype: String = row.get(1)?;
-        let blob: Vec<u8> = row.get(2)?;
+        let id = crate::db::sql_types::get_text(row, 0)?;
+        let etype = crate::db::sql_types::get_text(row, 1)?;
+        let blob = crate::db::sql_types::get_blob(row, 2)?;
         let created_at: i64 = row.get(3)?;
         Ok((id, etype, blob, created_at as u64))
     })?;
@@ -459,9 +462,9 @@ pub fn svc_event_list_by_ids(
         params_vec.iter().map(|b| b.as_ref()).collect();
 
     let rows = stmt.query_map(&*param_refs, |row| {
-        let id: String = row.get(0)?;
-        let etype: String = row.get(1)?;
-        let blob: Vec<u8> = row.get(2)?;
+        let id = crate::db::sql_types::get_text(row, 0)?;
+        let etype = crate::db::sql_types::get_text(row, 1)?;
+        let blob = crate::db::sql_types::get_blob(row, 2)?;
         let created_at: i64 = row.get(3)?;
         Ok((id, etype, blob, created_at as u64))
     })?;
@@ -493,9 +496,9 @@ pub fn svc_event_show(
          ORDER BY re.id",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by, like_pattern], |row| {
-        let id: String = row.get(0)?;
-        let etype: String = row.get(1)?;
-        let blob: Vec<u8> = row.get(2)?;
+        let id = crate::db::sql_types::get_text(row, 0)?;
+        let etype = crate::db::sql_types::get_text(row, 1)?;
+        let blob = crate::db::sql_types::get_blob(row, 2)?;
         let created_at: i64 = row.get(3)?;
         Ok((id, etype, blob, created_at as u64))
     })?;
@@ -532,9 +535,9 @@ pub fn svc_event_deps(
              ORDER BY re.id LIMIT 1",
         )?
         .query_row(rusqlite::params![recorded_by, like_pattern], |row| {
-            let id: String = row.get(0)?;
-            let etype: String = row.get(1)?;
-            let blob: Vec<u8> = row.get(2)?;
+            let id = crate::db::sql_types::get_text(row, 0)?;
+            let etype = crate::db::sql_types::get_text(row, 1)?;
+            let blob = crate::db::sql_types::get_blob(row, 2)?;
             let created_at: i64 = row.get(3)?;
             Ok((id, etype, blob, created_at as u64))
         })
@@ -578,9 +581,9 @@ pub fn svc_event_deps(
                  LIMIT 1",
             )?
             .query_row(rusqlite::params![recorded_by, dep_id], |row| {
-                let id: String = row.get(0)?;
-                let etype: String = row.get(1)?;
-                let blob: Vec<u8> = row.get(2)?;
+                let id = crate::db::sql_types::get_text(row, 0)?;
+                let etype = crate::db::sql_types::get_text(row, 1)?;
+                let blob = crate::db::sql_types::get_blob(row, 2)?;
                 let created_at: i64 = row.get(3)?;
                 Ok((id, etype, blob, created_at as u64))
             })

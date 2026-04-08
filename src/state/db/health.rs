@@ -1,5 +1,7 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
+use super::sql_types::get_text;
+
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
         "
@@ -88,7 +90,7 @@ pub fn list_live_endpoint_targets(
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        let via_peer_id: String = row.get(0)?;
+        let via_peer_id = get_text(row, 0)?;
         if !seen.insert(via_peer_id.clone()) {
             continue;
         }
@@ -98,7 +100,7 @@ pub fn list_live_endpoint_targets(
         }
         out.push(EndpointTarget {
             via_peer_id,
-            origin_ip: row.get(1)?,
+            origin_ip: get_text(row, 1)?,
             origin_port: origin_port as u16,
         });
     }

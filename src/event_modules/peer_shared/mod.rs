@@ -20,7 +20,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Resu
     let mut stmt = conn.prepare(&pragma)?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
+        let name = crate::db::sql_types::get_text(row, 1)?;
         if name == column {
             return Ok(true);
         }

@@ -147,7 +147,7 @@ pub fn import_peer_db_state(source_db_path: &str) -> BridgeResult<ImportedPeerDb
             let blob: Vec<u8> = source.query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![event_id],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )?;
             event_blobs.insert(event_id.clone(), blob);
         }
@@ -190,7 +190,7 @@ fn collect_importable_tenant_ids(
          SELECT recorded_by AS id FROM invites_accepted
          ORDER BY id ASC",
     )?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |row| crate::db::sql_types::get_text(row, 0))?;
     rows.collect::<Result<Vec<_>, _>>()
 }
 
@@ -205,7 +205,7 @@ fn collect_recorded_event_ids(
          ORDER BY id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        row.get::<_, String>(0)
+        crate::db::sql_types::get_text(row, 0)
     })?;
     rows.collect::<Result<Vec<_>, _>>()
 }
@@ -221,7 +221,7 @@ fn load_daemon_endpoint_id(
              FROM daemon_transport_identity
              WHERE singleton_id = 1",
             [],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?;
     if daemon_identity.is_some() {
@@ -235,7 +235,7 @@ fn load_daemon_endpoint_id(
              ORDER BY created_at ASC, event_id ASC
              LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?;
     if endpoint_secret.is_some() {
@@ -249,7 +249,7 @@ fn load_daemon_endpoint_id(
              ORDER BY created_at ASC, event_id ASC
              LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()
 }
@@ -286,13 +286,13 @@ fn copy_recorded_event_store_for_scope(
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
             row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Vec<u8>>(5)?,
-            row.get::<_, String>(6)?,
+            crate::db::sql_types::get_text(row, 3)?,
+            crate::db::sql_types::get_text(row, 4)?,
+            crate::db::sql_types::get_blob(row, 5)?,
+            crate::db::sql_types::get_text(row, 6)?,
             row.get::<_, i64>(7)?,
             row.get::<_, i64>(8)?,
         ))
@@ -351,9 +351,9 @@ fn copy_shared_event_index(
     )?;
     let rows = stmt.query_map(rusqlite::params![workspace_id], |row| {
         Ok((
-            row.get::<_, String>(0)?,
+            crate::db::sql_types::get_text(row, 0)?,
             row.get::<_, i64>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
+            crate::db::sql_types::get_blob(row, 2)?,
         ))
     })?;
     for row in rows {
@@ -372,9 +372,9 @@ fn copy_shared_event_index(
                 rusqlite::params![&event_id],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
+                        crate::db::sql_types::get_text(row, 0)?,
+                        crate::db::sql_types::get_blob(row, 1)?,
+                        crate::db::sql_types::get_text(row, 2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
                     ))
@@ -419,10 +419,10 @@ fn copy_invite_secrets(
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_text(row, 2)?,
+            crate::db::sql_types::get_blob(row, 3)?,
             row.get::<_, i64>(4)?,
         ))
     })?;
@@ -455,10 +455,10 @@ fn copy_endpoint_shared_rows(
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_text(row, 2)?,
+            crate::db::sql_types::get_blob(row, 3)?,
             row.get::<_, i64>(4)?,
         ))
     })?;
@@ -487,10 +487,10 @@ fn copy_key_secrets(
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_blob(row, 1)?,
             row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
+            crate::db::sql_types::get_text(row, 3)?,
         ))
     })?;
     for row in rows {
@@ -518,10 +518,10 @@ fn copy_peer_secrets(
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Vec<u8>>(3)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_text(row, 2)?,
+            crate::db::sql_types::get_blob(row, 3)?,
             row.get::<_, i64>(4)?,
         ))
     })?;
@@ -562,11 +562,11 @@ fn copy_bootstrap_context(
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Vec<u8>>(4)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_text(row, 2)?,
+            crate::db::sql_types::get_text(row, 3)?,
+            crate::db::sql_types::get_blob(row, 4)?,
             row.get::<_, i64>(5)?,
         ))
     })?;
@@ -615,9 +615,9 @@ fn copy_peer_endpoint_observations(
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_text(row, 2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
@@ -653,9 +653,9 @@ fn copy_daemon_transport_identity(
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let peer_id: String = row.get(0)?;
-        let cert_der: Vec<u8> = row.get(1)?;
-        let key_der: Vec<u8> = row.get(2)?;
+        let peer_id = crate::db::sql_types::get_text(row, 0)?;
+        let cert_der = crate::db::sql_types::get_blob(row, 1)?;
+        let key_der = crate::db::sql_types::get_blob(row, 2)?;
         let created_at: i64 = row.get(3)?;
         dest.execute(
             "INSERT OR REPLACE INTO daemon_transport_identity
@@ -680,10 +680,10 @@ fn copy_local_client_ops(
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-            row.get::<_, String>(3)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_blob(row, 2)?,
+            crate::db::sql_types::get_text(row, 3)?,
             row.get::<_, i64>(4)?,
         ))
     })?;

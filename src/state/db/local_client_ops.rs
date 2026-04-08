@@ -1,5 +1,7 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
+use super::sql_types::{get_blob, get_text};
+
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
         "
@@ -46,7 +48,7 @@ pub fn lookup_by_event_id(
     )?;
     let mut rows = stmt.query(params![recorded_by, event_id])?;
     if let Some(row) = rows.next()? {
-        Ok(Some(row.get(0)?))
+        Ok(Some(get_text(row, 0)?))
     } else {
         Ok(None)
     }
@@ -63,8 +65,8 @@ pub fn all_mappings(
     let mut map = std::collections::HashMap::new();
     let mut rows = stmt.query(params![recorded_by])?;
     while let Some(row) = rows.next()? {
-        let eid_bytes: Vec<u8> = row.get(0)?;
-        let client_op_id: String = row.get(1)?;
+        let eid_bytes = get_blob(row, 0)?;
+        let client_op_id = get_text(row, 1)?;
         use base64::Engine;
         let eid_b64 = base64::engine::general_purpose::STANDARD.encode(&eid_bytes);
         map.insert(eid_b64, client_op_id);

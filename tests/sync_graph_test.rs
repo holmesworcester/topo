@@ -67,7 +67,7 @@ fn projected_message_ids(peer: &Peer) -> BTreeSet<String> {
         )
         .expect("prepare projected message query");
     stmt.query_map(rusqlite::params![&peer.identity], |row| {
-        row.get::<_, String>(0)
+        topo::db::sql_types::get_text(row, 0)
     })
     .expect("query projected message rows")
     .collect::<Result<BTreeSet<_>, _>>()
@@ -174,7 +174,10 @@ fn collect_per_event_delivery_latencies(origin: &Peer, sink: &Peer) -> Vec<i64> 
         .expect("prepare origin query");
     let rows: Vec<(String, i64)> = stmt
         .query_map(rusqlite::params![&origin.identity], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                topo::db::sql_types::get_text(row, 0)?,
+                row.get::<_, i64>(1)?,
+            ))
         })
         .expect("query origin events")
         .filter_map(|r| r.ok())

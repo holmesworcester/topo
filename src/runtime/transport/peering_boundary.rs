@@ -477,7 +477,7 @@ pub fn tenant_trusts_daemon_peer(
     let peer_ids = stmt
         .query_map(
             rusqlite::params![tenant_id, hex::encode(daemon_fp)],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )?
         .collect::<Result<Vec<_>, _>>()?;
 

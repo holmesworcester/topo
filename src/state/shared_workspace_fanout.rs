@@ -54,9 +54,9 @@ pub(crate) fn take_pending_fanouts(
         conn.prepare("SELECT origin_peer_id, workspace_id, event_id FROM pending_shared_fanouts")?;
     let rows: Vec<SharedEventFanout> = stmt
         .query_map([], |row| {
-            let origin: String = row.get(0)?;
-            let ws: String = row.get(1)?;
-            let blob: Vec<u8> = row.get(2)?;
+            let origin = crate::db::sql_types::get_text(row, 0)?;
+            let ws = crate::db::sql_types::get_text(row, 1)?;
+            let blob = crate::db::sql_types::get_blob(row, 2)?;
             Ok((origin, ws, blob))
         })?
         .filter_map(|r| {
@@ -157,7 +157,7 @@ fn sibling_tenants_in_workspace(
          ORDER BY recorded_by",
     )?;
     let rows = stmt.query_map(rusqlite::params![workspace_id, origin_peer_id], |row| {
-        row.get::<_, String>(0)
+        crate::db::sql_types::get_text(row, 0)
     })?;
     rows.collect::<Result<Vec<_>, _>>()
 }
@@ -231,7 +231,7 @@ fn is_removal_event(conn: &Connection, event_id: &EventId) -> bool {
     conn.query_row(
         "SELECT event_type FROM events WHERE event_id = ?1",
         rusqlite::params![&event_id_b64],
-        |row| row.get::<_, String>(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )
     .map(|t| t == "user_removed" || t == "peer_removed")
     .unwrap_or(false)
@@ -310,7 +310,7 @@ fn is_removal_targeting_sibling(
         .query_row(
             "SELECT blob FROM events WHERE event_id = ?1",
             rusqlite::params![&event_id_b64],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .ok()
         .and_then(|blob| {
@@ -349,7 +349,12 @@ fn workspace_id_for_stored_shared_event(
     let (event_type, share_scope): (String, String) = conn.query_row(
         "SELECT event_type, share_scope FROM events WHERE event_id = ?1",
         rusqlite::params![&event_id_b64],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| {
+            Ok((
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_text(row, 1)?,
+            ))
+        },
     )?;
     if share_scope != ShareScope::Shared.as_str() {
         return Ok(None);

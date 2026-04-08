@@ -2,6 +2,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
+use super::sql_types::get_text;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventDisplayMode {
     Tree,
@@ -44,7 +46,7 @@ pub fn load_mode(conn: &Connection) -> SqliteResult<EventDisplayMode> {
         .query_row(
             "SELECT mode FROM event_display_config WHERE id = 1",
             [],
-            |row| row.get(0),
+            |row| get_text(row, 0),
         )
         .optional()?;
     Ok(mode_str

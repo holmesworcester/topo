@@ -162,12 +162,12 @@ fn recent_key_rotations_for_peer(
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by, limit as i64], |row| {
         Ok((
-            row.get::<_, String>(0)?,
+            crate::db::sql_types::get_text(row, 0)?,
             row.get::<_, u8>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
+            crate::db::sql_types::get_text(row, 2)?,
+            crate::db::sql_types::get_text(row, 3)?,
+            crate::db::sql_types::get_text(row, 4)?,
+            crate::db::sql_types::get_text(row, 5)?,
             row.get::<_, i64>(6)?,
         ))
     })?;
@@ -213,7 +213,7 @@ fn current_removal_frontier_for_peer(
          ORDER BY r.event_id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        row.get::<_, String>(0)
+        crate::db::sql_types::get_text(row, 0)
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -286,7 +286,7 @@ fn latest_content_key_for_frontier(
                 event_id_to_base64(&slots[2]),
                 event_id_to_base64(&slots[3]),
             ],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?;
     existing
@@ -328,7 +328,7 @@ fn ensure_rotation_for_key_frontier_at(
                 event_id_to_base64(&slots[2]),
                 event_id_to_base64(&slots[3]),
             ],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .ok()
     {
@@ -490,9 +490,9 @@ fn collect_active_invite_targets_from_table(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![recorded_by, cutoff_ms], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, String>(2)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_blob(row, 1)?,
+            crate::db::sql_types::get_text(row, 2)?,
             row.get::<_, i64>(3)?,
         ))
     })?;

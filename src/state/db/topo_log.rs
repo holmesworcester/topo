@@ -2,6 +2,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
+use super::sql_types::get_text;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopoLogLevel {
     Error,
@@ -50,7 +52,7 @@ pub fn load_level(conn: &Connection) -> SqliteResult<TopoLogLevel> {
         .query_row(
             "SELECT level FROM topo_log_config WHERE id = 1",
             [],
-            |row| row.get(0),
+            |row| get_text(row, 0),
         )
         .optional()?;
     Ok(level_str

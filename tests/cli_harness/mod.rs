@@ -1811,7 +1811,7 @@ fn assert_eventually_debug_context(db: &str) -> String {
                  ORDER BY created_at DESC, event_id DESC
                  LIMIT 1",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| topo::db::sql_types::get_text(row, 0),
             )
             .ok()
         } else {
@@ -1883,8 +1883,8 @@ fn assert_eventually_debug_context(db: &str) -> String {
                     .query_map(rusqlite::params![peer_id], |row| {
                         Ok(format!(
                             "{}@{}:{}",
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
+                            topo::db::sql_types::get_text(row, 0)?,
+                            topo::db::sql_types::get_text(row, 1)?,
                             row.get::<_, i64>(2)?,
                         ))
                     })
@@ -1906,8 +1906,8 @@ fn assert_eventually_debug_context(db: &str) -> String {
                     .ok()?;
                 let rows = stmt
                     .query_map(rusqlite::params![peer_id], |row| {
-                        let event_id: String = row.get(0)?;
-                        let blocker_id: String = row.get(1)?;
+                        let event_id = topo::db::sql_types::get_text(row, 0)?;
+                        let blocker_id = topo::db::sql_types::get_text(row, 1)?;
                         Ok((event_id, blocker_id))
                     })
                     .ok()?;
@@ -1918,14 +1918,14 @@ fn assert_eventually_debug_context(db: &str) -> String {
                                 .query_row(
                                     "SELECT event_type FROM events WHERE event_id = ?1",
                                     rusqlite::params![&event_id],
-                                    |row| row.get::<_, String>(0),
+                                    |row| topo::db::sql_types::get_text(row, 0),
                                 )
                                 .unwrap_or_else(|_| "<missing>".to_string());
                             let blocker_type = conn
                                 .query_row(
                                     "SELECT event_type FROM events WHERE event_id = ?1",
                                     rusqlite::params![&blocker_id],
-                                    |row| row.get::<_, String>(0),
+                                    |row| topo::db::sql_types::get_text(row, 0),
                                 )
                                 .unwrap_or_else(|_| "<missing>".to_string());
                             let blocker_recorded = conn

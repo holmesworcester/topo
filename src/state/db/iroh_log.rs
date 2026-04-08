@@ -2,6 +2,8 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
+use super::sql_types::get_text;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrohLogMode {
     Show,
@@ -39,7 +41,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
 pub fn load_mode(conn: &Connection) -> SqliteResult<IrohLogMode> {
     let mode_str: Option<String> = conn
         .query_row("SELECT mode FROM iroh_log_config WHERE id = 1", [], |row| {
-            row.get(0)
+            get_text(row, 0)
         })
         .optional()?;
     Ok(mode_str

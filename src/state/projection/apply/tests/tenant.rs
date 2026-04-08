@@ -209,7 +209,7 @@ fn test_rejection_recorded_durably() {
         .query_row(
             "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &msg_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     assert!(rej_reason.contains("invalid signature"));

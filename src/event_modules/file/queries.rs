@@ -156,7 +156,7 @@ fn collect_verified_file_progress(
     let mut progress = VerifiedFileProgress::default();
     while let Some(row) = rows.next()? {
         let slice_number: i64 = row.get(0)?;
-        let slice_event_id_b64: String = row.get(1)?;
+        let slice_event_id_b64 = crate::db::sql_types::get_text(row, 1)?;
         let earliest_sync_start_ms: Option<i64> = row.get(2)?;
         let last_slice_recorded_at_ms: Option<i64> = row.get(3)?;
         if slice_number < 0 || slice_number >= total_slices {
@@ -213,15 +213,15 @@ pub fn list_for_message(
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, message_id_b64], |row| {
             Ok(FileDescriptorRow {
-                event_id: row.get(0)?,
+                event_id: crate::db::sql_types::get_text(row, 0)?,
                 message_id: message_id_b64.to_string(),
-                file_id: row.get(1)?,
-                filename: row.get(2)?,
-                mime_type: row.get(3)?,
+                file_id: crate::db::sql_types::get_text(row, 1)?,
+                filename: crate::db::sql_types::get_text(row, 2)?,
+                mime_type: crate::db::sql_types::get_text(row, 3)?,
                 blob_bytes: row.get(4)?,
                 total_slices: row.get(5)?,
                 slice_bytes: row.get(6)?,
-                key_event_id: row.get(7)?,
+                key_event_id: crate::db::sql_types::get_text(row, 7)?,
                 created_at: 0,
             })
         })?
@@ -356,7 +356,7 @@ fn resolve_file_selector_to_b64(
                  ORDER BY created_at ASC, event_id ASC
                  LIMIT 1 OFFSET ?2",
                 rusqlite::params![recorded_by, num - 1],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .ok();
         return match file_event_id_b64 {
@@ -442,7 +442,7 @@ fn load_file_slice_payload(
                      WHERE recorded_by = ?1 AND event_id = ?2
                      LIMIT 1",
                     rusqlite::params![recorded_by, &key_event_id_b64],
-                    |row| row.get(0),
+                    |row| crate::db::sql_types::get_blob(row, 0),
                 )?;
                 if key_bytes.len() != 32 {
                     return Err(format!(
@@ -494,7 +494,7 @@ fn load_file_slice_payload(
     let blob: Vec<u8> = db.query_row(
         "SELECT blob FROM events WHERE event_id = ?1",
         rusqlite::params![slice_event_id_b64],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_blob(row, 0),
     )?;
     let parsed =
         parse_event(&blob).map_err(|e| format!("parse event {}: {}", slice_event_id_b64, e))?;
@@ -547,7 +547,7 @@ fn write_matching_file_slices<W: Write>(
     let mut bytes_written = 0u64;
     while let Some(row) = rows.next()? {
         let slice_number: i64 = row.get(0)?;
-        let slice_event_id_b64: String = row.get(1)?;
+        let slice_event_id_b64 = crate::db::sql_types::get_text(row, 1)?;
         if slice_number < 0 || slice_number >= total_slices {
             continue;
         }
@@ -615,16 +615,16 @@ pub fn save_file_by_selector(
         "SELECT file_id, blob_bytes, total_slices, filename, key_event_id, root_hash, slice_bytes
          FROM files
          WHERE recorded_by = ?1 AND event_id = ?2
-         LIMIT 1",
+        LIMIT 1",
         rusqlite::params![recorded_by, &file_event_id_b64],
         |row| {
             Ok((
-                row.get(0)?,
+                crate::db::sql_types::get_text(row, 0)?,
                 row.get(1)?,
                 row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
+                crate::db::sql_types::get_text(row, 3)?,
+                crate::db::sql_types::get_text(row, 4)?,
+                crate::db::sql_types::get_blob(row, 5)?,
                 row.get(6)?,
             ))
         },

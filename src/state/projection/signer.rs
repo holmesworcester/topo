@@ -38,7 +38,7 @@ pub fn resolve_signer_key(
          INNER JOIN valid_events v ON e.event_id = v.event_id
          WHERE v.peer_id = ?1 AND e.event_id = ?2",
         rusqlite::params![recorded_by, &eid_b64],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_blob(row, 0),
     ) {
         Ok(b) => b,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(SignerResolution::NotFound),

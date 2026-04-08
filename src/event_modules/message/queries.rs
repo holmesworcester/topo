@@ -44,15 +44,15 @@ pub fn list_rows(
     let mut stmt = db.prepare(&query)?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            let msg_id_b64: String = row.get(0)?;
+            let msg_id_b64 = crate::db::sql_types::get_text(row, 0)?;
             let msg_id_hex = b64_to_hex(&msg_id_b64);
             Ok(MessageRow {
                 message_id_b64: msg_id_b64,
                 message_id_hex: msg_id_hex,
-                author_id: row.get(1)?,
-                content: row.get(2)?,
+                author_id: crate::db::sql_types::get_text(row, 1)?,
+                content: crate::db::sql_types::get_text(row, 2)?,
                 created_at: row.get(3)?,
-                author_name: row.get(4)?,
+                author_name: crate::db::sql_types::get_text(row, 4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -75,7 +75,9 @@ pub fn resolve_number(db: &Connection, recorded_by: &str, num: usize) -> Result<
         "SELECT message_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at ASC, rowid ASC LIMIT 1 OFFSET ?2"
     ).map_err(|e| e.to_string())?;
     let msg_id_b64: Option<String> = stmt
-        .query_row(rusqlite::params![recorded_by, num - 1], |row| row.get(0))
+        .query_row(rusqlite::params![recorded_by, num - 1], |row| {
+            crate::db::sql_types::get_text(row, 0)
+        })
         .ok();
     match msg_id_b64 {
         Some(b64) => event_id_from_base64(&b64)
@@ -172,7 +174,7 @@ pub fn list_deleted_ids(
     let mut stmt = db.prepare("SELECT message_id FROM deleted_messages WHERE recorded_by = ?1")?;
     let ids = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ids)

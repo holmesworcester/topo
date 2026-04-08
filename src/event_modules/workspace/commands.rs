@@ -95,7 +95,7 @@ pub(crate) fn replay_existing_workspace_shared_events_for_tenant(
     let mut seen: HashSet<EventId> = HashSet::new();
     let mut event_ids: Vec<EventId> = Vec::new();
     for row in ve_stmt.query_map(rusqlite::params![&workspace_id_b64, recorded_by], |row| {
-        row.get::<_, String>(0)
+        crate::db::sql_types::get_text(row, 0)
     })? {
         if let Some(eid) = row.ok().and_then(|b64| event_id_from_base64(&b64)) {
             if seen.insert(eid) {
@@ -115,7 +115,7 @@ pub(crate) fn replay_existing_workspace_shared_events_for_tenant(
          ORDER BY ni.ts ASC, ni.id ASC",
     )?;
     for row in ni_stmt.query_map(rusqlite::params![&workspace_id_b64], |row| {
-        row.get::<_, Vec<u8>>(0)
+        crate::db::sql_types::get_blob(row, 0)
     })? {
         let blob = match row {
             Ok(b) => b,
@@ -175,7 +175,7 @@ pub(crate) fn replay_existing_workspace_shared_events_for_tenant(
                      WHERE event_id = ?1
                      LIMIT 1",
                     rusqlite::params![&event_id_b64],
-                    |row| row.get::<_, String>(0),
+                    |row| crate::db::sql_types::get_text(row, 0),
                 )
                 .optional()?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
@@ -380,7 +380,7 @@ pub fn create_workspace_with_options(
                  ORDER BY created_at ASC, event_id ASC
                  LIMIT 1",
                 rusqlite::params![recorded_by],
-                |row| row.get::<_, String>(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .ok()
             .and_then(|b64| crate::crypto::event_id_from_base64(&b64))

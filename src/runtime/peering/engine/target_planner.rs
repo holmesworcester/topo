@@ -305,8 +305,8 @@ pub(crate) fn load_known_peer_targets(
     for tenant_id in tenant_ids {
         let rows = stmt.query_map(rusqlite::params![tenant_id, now_ms], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_opt_text(row, 1)?,
                 row.get::<_, Option<i64>>(2)?,
             ))
         })?;

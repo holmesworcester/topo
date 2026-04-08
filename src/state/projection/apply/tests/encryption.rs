@@ -17,7 +17,7 @@ fn test_project_key_secret_valid() {
         .query_row(
             "SELECT key_bytes FROM key_secrets WHERE event_id = ?1 AND recorded_by = ?2",
             rusqlite::params![&eid_b64, recorded_by],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .unwrap();
     assert_eq!(stored_key, key_bytes.as_slice());
@@ -548,7 +548,7 @@ fn test_encrypted_rejection_recorded_durably() {
         .query_row(
             "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &enc_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     assert!(reason.contains("decryption failed"));

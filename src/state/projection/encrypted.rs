@@ -29,7 +29,7 @@ pub fn project_encrypted(
     let key_bytes: Vec<u8> = match conn.query_row(
         "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
         rusqlite::params![recorded_by, event_id_to_base64(&enc.key_event_id)],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_blob(row, 0),
     ) {
         Ok(k) => k,
         Err(rusqlite::Error::QueryReturnedNoRows) => {

@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
 use super::queue::{current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry};
+use super::sql_types::get_blob32;
 use crate::crypto::EventId;
 
 /// Deferred need-id queue for low-memory pull backpressure.
@@ -69,12 +70,10 @@ impl<'a> NeedQueue<'a> {
             let mut rows = stmt.query(params![peer_id, limit_i64])?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
-                let blob: Vec<u8> = row.get(0)?;
-                if blob.len() != 32 {
-                    continue;
-                }
-                let mut id = [0u8; 32];
-                id.copy_from_slice(&blob);
+                let id = match get_blob32(row, 0) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
                 out.push(id);
             }
             Ok(out)

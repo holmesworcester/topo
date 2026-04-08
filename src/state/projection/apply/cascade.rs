@@ -46,7 +46,7 @@ pub(crate) fn cascade_unblocked_global(
         let mut rows = stmt.query(rusqlite::params![blocker_b64])?;
         let mut peers = Vec::new();
         while let Some(row) = rows.next()? {
-            peers.push(row.get::<_, String>(0)?);
+            peers.push(crate::db::sql_types::get_text(row, 0)?);
         }
         peers
     };
@@ -78,7 +78,7 @@ pub(crate) fn cascade_file_id_if_file(
         .query_row(
             "SELECT file_id FROM files WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, event_id_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?;
     if let Some(file_id) = file_id {
@@ -109,7 +109,7 @@ fn cascade_unblocked_inner(
             let mut rows = stmt.query(rusqlite::params![recorded_by, &blocker])?;
             let mut result = Vec::new();
             while let Some(row) = rows.next()? {
-                result.push(row.get::<_, String>(0)?);
+                result.push(crate::db::sql_types::get_text(row, 0)?);
             }
             result
         };

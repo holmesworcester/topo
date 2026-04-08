@@ -341,7 +341,7 @@ fn load_associated_shared_key_event_ids(
                 crate::crypto::event_id_to_base64(&key_event_id),
                 limit as i64
             ],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .map_err(|e| format!("query associated key_shared rows: {e}"))?;
     let mut dep_ids = Vec::new();

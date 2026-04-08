@@ -45,7 +45,7 @@ fn load_local_peer_signer_from_recorded_event(
          ORDER BY re.recorded_at DESC, re.id DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        row.get::<_, Vec<u8>>(0)
+        crate::db::sql_types::get_blob(row, 0)
     })?;
     for row in rows {
         let blob = row?;
@@ -83,7 +83,12 @@ pub fn load_local_peer_signer(
              ORDER BY created_at DESC, event_id DESC
              LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_blob(row, 1)?,
+                ))
+            },
         )
         .optional()?
     {
@@ -128,7 +133,7 @@ pub fn resolve_user_event_id(
         .query_row(
             "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &signer_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap_or_default();
     if !user_eid_b64.is_empty() {
@@ -142,7 +147,7 @@ pub fn resolve_user_event_id(
         .query_row(
             "SELECT blob FROM events WHERE event_id = ?1 LIMIT 1",
             rusqlite::params![&signer_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
             "no peer_shared entry found for signer — identity chain incomplete".into()
@@ -185,7 +190,7 @@ pub fn list_event_ids(db: &Connection, recorded_by: &str) -> Result<Vec<String>,
     let mut stmt = db.prepare("SELECT event_id FROM peers_shared WHERE recorded_by = ?1")?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -200,7 +205,7 @@ pub fn first_event_id(
     db.query_row(
         "SELECT event_id FROM peers_shared WHERE recorded_by = ?1 LIMIT 1",
         rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )
     .optional()
 }
@@ -221,7 +226,7 @@ pub fn resolve_event_id_by_transport_fingerprint(
            AND transport_fingerprint = ?2
          LIMIT 1",
         rusqlite::params![recorded_by, transport_fingerprint.as_slice()],
-        |row| row.get::<_, String>(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )
     .optional()
 }
@@ -245,10 +250,10 @@ pub fn list_tenants(db: &Connection, recorded_by: &str) -> Result<Vec<TenantRow>
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
             Ok(TenantRow {
-                event_id: row.get(0)?,
-                device_name: row.get(1)?,
-                user_event_id: row.get(2)?,
-                username: row.get(3)?,
+                event_id: crate::db::sql_types::get_text(row, 0)?,
+                device_name: crate::db::sql_types::get_text(row, 1)?,
+                user_event_id: crate::db::sql_types::get_text(row, 2)?,
+                username: crate::db::sql_types::get_text(row, 3)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -352,13 +357,13 @@ pub fn list_peers(db: &Connection, recorded_by: &str) -> Result<Vec<PeerItem>, r
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, now_ms], |row| {
             Ok(PeerItem {
-                peer_id: row.get(0)?,
-                device_name: row.get(1)?,
-                username: row.get(2)?,
-                user_event_id: row.get(3)?,
+                peer_id: crate::db::sql_types::get_text(row, 0)?,
+                device_name: crate::db::sql_types::get_text(row, 1)?,
+                username: crate::db::sql_types::get_text(row, 2)?,
+                user_event_id: crate::db::sql_types::get_text(row, 3)?,
                 local: row.get(4)?,
-                endpoint_id: row.get(5)?,
-                endpoint: row.get(6)?,
+                endpoint_id: crate::db::sql_types::get_opt_text(row, 5)?,
+                endpoint: crate::db::sql_types::get_opt_text(row, 6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -392,7 +397,12 @@ pub fn identity(db: &Connection, recorded_by: &str) -> Result<IdentityResponse, 
              WHERE ps.recorded_by = ?1
              LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_opt_text(row, 1)?,
+                ))
+            },
         )
         .optional()?;
 
