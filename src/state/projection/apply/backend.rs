@@ -1,14 +1,113 @@
 use crate::crypto::EventId;
 use crate::db::queue::current_timestamp_ms;
+use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::ParsedEvent;
 use crate::projection::contract::{EmitCommand, WriteOp};
 use crate::projection::queries::ProjectionQueries;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::stages::record_rejection;
 use super::write_exec::{execute_emit_commands, execute_write_ops};
+
+fn is_zero_event_id(event_id: &EventId) -> bool {
+    event_id.iter().all(|byte| *byte == 0)
+}
+
+fn dedupe_dep_ids(mut dep_ids: Vec<EventId>) -> Vec<EventId> {
+    dep_ids.retain(|dep_id| !is_zero_event_id(dep_id));
+    dep_ids.sort_unstable();
+    dep_ids.dedup();
+    dep_ids
+}
+
+fn collect_wrapper_dep_ids(outer_event: &ParsedEvent) -> Vec<EventId> {
+    match outer_event {
+        ParsedEvent::Signed(signed) => {
+            let mut dep_ids = vec![signed.signer_event_id];
+            if let Ok(ParsedEvent::Encrypted(encrypted)) =
+                crate::event_modules::parse_event(&signed.payload)
+            {
+                dep_ids.push(encrypted.key_event_id);
+            }
+            dep_ids
+        }
+        ParsedEvent::Encrypted(encrypted) => vec![encrypted.key_event_id],
+        _ => Vec::new(),
+    }
+}
+
+fn filter_syncable_shared_dep_ids(
+    conn: &Connection,
+    dep_ids: Vec<EventId>,
+) -> ProjectionApplyResult<Vec<EventId>> {
+    let dep_ids = dedupe_dep_ids(dep_ids);
+    if dep_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut syncable = Vec::new();
+    for dep_id in dep_ids {
+        let dep_id_b64 = crate::crypto::event_id_to_base64(&dep_id);
+        let is_shared: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM events
+                     WHERE event_id = ?1
+                       AND share_scope = 'shared'
+                 )",
+                rusqlite::params![dep_id_b64],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if is_shared {
+            syncable.push(dep_id);
+        }
+    }
+    Ok(syncable)
+}
+
+fn persist_shared_dep_edges(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    sub_event: &ParsedEvent,
+) -> ProjectionApplyResult<()> {
+    let Some(workspace_id) = lookup_workspace_id(conn, recorded_by) else {
+        return Ok(());
+    };
+    let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) else {
+        return Ok(());
+    };
+    let outer_blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT blob
+             FROM events
+             WHERE event_id = ?1
+               AND share_scope = 'shared'",
+            rusqlite::params![event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(outer_blob) = outer_blob else {
+        return Ok(());
+    };
+    let outer_event = crate::event_modules::parse_event(&outer_blob)?;
+
+    let mut dep_ids = collect_wrapper_dep_ids(&outer_event);
+    dep_ids.extend(
+        sub_event
+            .dep_field_values()
+            .into_iter()
+            .map(|(_, dep_id)| dep_id),
+    );
+    let dep_ids = filter_syncable_shared_dep_ids(conn, dep_ids)?;
+    crate::db::dep_index::replace_shared_event_deps(conn, &workspace_id, &event_id, &dep_ids)?;
+    Ok(())
+}
 
 pub(crate) type ProjectionApplyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -179,6 +278,7 @@ impl ProjectionBackend for Connection {
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![recorded_by, event_id_b64, semantic_type_code],
             )?;
+            persist_shared_dep_edges(self, recorded_by, event_id_b64, sub_event)?;
 
             crate::state::subscriptions::on_projected_event(
                 self,

@@ -209,7 +209,8 @@ where
     );
 
     let store = Store::new(&db);
-    let (events_sent, bytes_sent) = send_have_events(&store, &mut data_send, &have_ids).await?;
+    let (events_sent, bytes_sent) =
+        send_have_events(&db, &store, &mut data_send, &have_ids, recorded_by, &ws_id).await?;
     drop(data_send);
 
     let received = match receive_task.await {

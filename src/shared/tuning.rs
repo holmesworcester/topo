@@ -83,6 +83,28 @@ pub fn response_send_quantum_bytes() -> usize {
     }
 }
 
+pub fn sync_dep_send_event_cap() -> usize {
+    if let Some(v) = read_usize_env("TOPO_SYNC_DEP_SEND_EVENT_CAP") {
+        return v;
+    }
+    if low_mem_mode() {
+        128
+    } else {
+        2048
+    }
+}
+
+pub fn sync_dep_send_byte_cap() -> usize {
+    if let Some(v) = read_usize_env("TOPO_SYNC_DEP_SEND_BYTE_CAP") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        512 * 1024
+    } else {
+        4 * 1024 * 1024
+    }
+}
+
 // -- Sync sessions --
 pub fn session_ingest_cap() -> usize {
     if low_mem_mode() {

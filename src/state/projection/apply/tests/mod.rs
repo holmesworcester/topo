@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod cascade;
 mod core_projection;
+mod dep_sync;
 mod deletion;
 mod encryption;
 mod file_slice;

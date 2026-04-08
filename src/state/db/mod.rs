@@ -1,4 +1,5 @@
 pub mod daemon_identity;
+pub mod dep_index;
 pub mod event_display;
 pub mod health;
 pub mod local_client_ops;
@@ -104,6 +105,7 @@ use crate::tuning::low_mem_mode;
 pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     store::ensure_schema(conn)?;
     daemon_identity::ensure_schema(conn)?;
+    dep_index::ensure_schema(conn)?;
     event_display::ensure_schema(conn)?;
     project_queue::ensure_schema(conn)?;
     health::ensure_schema(conn)?;
