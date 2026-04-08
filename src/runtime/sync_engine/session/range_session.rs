@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use negentropy::{Id, NegentropyStorageVector};
 use rusqlite::Connection;
@@ -12,9 +12,13 @@ use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
-use crate::tuning::{sync_dep_check_cap, sync_dep_send_byte_cap, sync_dep_send_event_cap};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
+use crate::tuning::{
+    sync_dep_check_cap, sync_dep_send_byte_cap, sync_dep_send_event_cap,
+    sync_dep_time_budget_full_ms, sync_dep_time_budget_last_day_ms,
+    sync_dep_time_budget_last_twelve_weeks_ms, sync_dep_time_budget_last_week_ms,
+};
 use tracing::warn;
 
 const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
@@ -30,20 +34,26 @@ struct SharedDepSendBudget {
     remaining_dep_events: usize,
     remaining_dep_bytes: usize,
     remaining_dep_checks: usize,
+    started_at: Instant,
+    time_budget: Duration,
     dep_event_budget_hit: bool,
     dep_byte_budget_hit: bool,
     dep_check_budget_hit: bool,
+    dep_time_budget_hit: bool,
 }
 
 impl SharedDepSendBudget {
-    fn new() -> Self {
+    fn new(kind: SyncWindowKind) -> Self {
         Self {
             remaining_dep_events: sync_dep_send_event_cap(),
             remaining_dep_bytes: sync_dep_send_byte_cap(),
             remaining_dep_checks: sync_dep_check_cap(),
+            started_at: Instant::now(),
+            time_budget: dep_time_budget_for_window(kind),
             dep_event_budget_hit: false,
             dep_byte_budget_hit: false,
             dep_check_budget_hit: false,
+            dep_time_budget_hit: false,
         }
     }
 
@@ -78,8 +88,23 @@ impl SharedDepSendBudget {
         self.dep_check_budget_hit = true;
     }
 
+    fn time_budget_exhausted(&mut self) -> bool {
+        if self.started_at.elapsed() >= self.time_budget {
+            self.dep_time_budget_hit = true;
+            return true;
+        }
+        false
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+
     fn any_budget_hit(&self) -> bool {
-        self.dep_event_budget_hit || self.dep_byte_budget_hit || self.dep_check_budget_hit
+        self.dep_event_budget_hit
+            || self.dep_byte_budget_hit
+            || self.dep_check_budget_hit
+            || self.dep_time_budget_hit
     }
 
     #[cfg(test)]
@@ -87,14 +112,18 @@ impl SharedDepSendBudget {
         remaining_dep_events: usize,
         remaining_dep_bytes: usize,
         remaining_dep_checks: usize,
+        time_budget: Duration,
     ) -> Self {
         Self {
             remaining_dep_events,
             remaining_dep_bytes,
             remaining_dep_checks,
+            started_at: Instant::now(),
+            time_budget,
             dep_event_budget_hit: false,
             dep_byte_budget_hit: false,
             dep_check_budget_hit: false,
+            dep_time_budget_hit: false,
         }
     }
 }
@@ -105,18 +134,22 @@ enum SharedSendOrderPolicy {
     NewestFirst,
 }
 
-fn should_expand_shared_deps(kind: SyncWindowKind) -> bool {
-    matches!(
-        kind,
-        SyncWindowKind::LastDay | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks
-    )
+fn dep_time_budget_for_window(kind: SyncWindowKind) -> Duration {
+    let millis = match kind {
+        SyncWindowKind::LastDay => sync_dep_time_budget_last_day_ms(),
+        SyncWindowKind::LastWeek => sync_dep_time_budget_last_week_ms(),
+        SyncWindowKind::LastTwelveWeeks => sync_dep_time_budget_last_twelve_weeks_ms(),
+        SyncWindowKind::Full => sync_dep_time_budget_full_ms(),
+    };
+    Duration::from_millis(millis.max(1))
 }
 
 fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
     match kind {
         SyncWindowKind::LastDay => SharedSendOrderPolicy::NewestFirst,
-        SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks =>
-            SharedSendOrderPolicy::PreserveInput,
+        SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
+            SharedSendOrderPolicy::PreserveInput
+        }
     }
 }
 
@@ -334,6 +367,10 @@ fn load_ordered_shared_dep_ids(
     if let Some(dep_ids) = dep_cache.get(event_id) {
         return Ok(dep_ids.clone());
     }
+    if budget.time_budget_exhausted() {
+        dep_cache.insert(*event_id, Vec::new());
+        return Ok(Vec::new());
+    }
 
     let dep_limit = budget.remaining_dep_checks();
     if dep_limit == 0 {
@@ -342,13 +379,8 @@ fn load_ordered_shared_dep_ids(
         return Ok(Vec::new());
     }
 
-    let mut dep_ids = load_associated_shared_key_event_ids(
-        conn,
-        recorded_by,
-        store,
-        event_id,
-        dep_limit,
-    )?;
+    let mut dep_ids =
+        load_associated_shared_key_event_ids(conn, recorded_by, store, event_id, dep_limit)?;
     let direct_limit = dep_limit.saturating_sub(dep_ids.len());
     dep_ids.extend(
         crate::db::dep_index::list_shared_event_deps_limited(
@@ -417,6 +449,9 @@ fn visit_send_closure(
         summary_cache,
         budget,
     )? {
+        if budget.time_budget_exhausted() {
+            break;
+        }
         if emitted.contains(&dep_id) || visiting.contains(&dep_id) {
             continue;
         }
@@ -465,7 +500,7 @@ fn expand_requested_ids_with_shared_deps(
         workspace_id,
         range,
         requested_ids,
-        SharedDepSendBudget::new(),
+        SharedDepSendBudget::new(range.kind),
     )
 }
 
@@ -483,9 +518,6 @@ fn expand_requested_ids_with_shared_deps_and_budget(
     }
 
     let ordered_roots = prioritize_send_order(store, range, requested_ids)?;
-    if !should_expand_shared_deps(range.kind) {
-        return Ok(ordered_roots);
-    }
     let root_ids: HashSet<EventId> = ordered_roots.iter().copied().collect();
     let mut ordered = Vec::new();
     let mut emitted = HashSet::new();
@@ -494,6 +526,12 @@ fn expand_requested_ids_with_shared_deps_and_budget(
     let mut summary_cache = HashMap::new();
 
     for event_id in ordered_roots {
+        if budget.time_budget_exhausted() {
+            if emitted.insert(event_id) {
+                ordered.push(event_id);
+            }
+            continue;
+        }
         if budget.remaining_dep_checks() == 0 {
             budget.note_dep_check_budget_hit();
             if emitted.insert(event_id) {
@@ -520,9 +558,11 @@ fn expand_requested_ids_with_shared_deps_and_budget(
         warn!(
             ?range.kind,
             requested_roots = requested_ids.len(),
+            dep_elapsed_ms = budget.elapsed_ms(),
             dep_check_budget_hit = budget.dep_check_budget_hit,
             dep_event_budget_hit = budget.dep_event_budget_hit,
             dep_byte_budget_hit = budget.dep_byte_budget_hit,
+            dep_time_budget_hit = budget.dep_time_budget_hit,
             "shared dep expansion hit budget"
         );
     }
@@ -548,8 +588,14 @@ where
     let mut events_sent = 0u64;
     let mut bytes_sent = 0u64;
     let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
-    let event_ids =
-        expand_requested_ids_with_shared_deps(conn, store, recorded_by, workspace_id, range, &event_ids)?;
+    let event_ids = expand_requested_ids_with_shared_deps(
+        conn,
+        store,
+        recorded_by,
+        workspace_id,
+        range,
+        &event_ids,
+    )?;
     for chunk in event_ids.chunks(64) {
         let ordered = load_shared_send_batch(store, chunk)?;
         let mut payload = Vec::new();
@@ -656,18 +702,17 @@ mod tests {
 
     use super::*;
     use crate::contracts::event_pipeline_contract::IngestItem;
-    use crate::db::dep_index::replace_shared_event_deps;
     use crate::crypto::hash_event;
-    use crate::db::{open_connection, open_in_memory};
+    use crate::db::dep_index::replace_shared_event_deps;
     use crate::db::schema::create_tables;
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
+    use crate::db::{open_connection, open_in_memory};
+    use crate::event_modules::removal::frontier_hash_from_refs;
     use crate::event_modules::{
-        encode_event, endpoint_shared, encrypted::NO_OWNER_EVENT_ID, registry::ShareScope,
-        BenchDepEvent, EncryptedEvent, KeySharedEvent, MessageEvent, ParsedEvent,
-        PeerSharedEvent,
+        encode_event, encrypted::NO_OWNER_EVENT_ID, endpoint_shared, registry::ShareScope,
+        BenchDepEvent, EncryptedEvent, KeySharedEvent, MessageEvent, ParsedEvent, PeerSharedEvent,
     };
     use crate::projection::encrypted::encrypt_event_blob;
-    use crate::event_modules::removal::frontier_hash_from_refs;
     use crate::state::pipeline::ingest_now;
 
     fn insert_shared_bench_dep(
@@ -937,11 +982,11 @@ mod tests {
     }
 
     #[test]
-    fn full_window_does_not_expand_shared_deps() {
+    fn full_window_expands_shared_deps_with_time_budget() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let recorded_by = "tenant-a";
-        let workspace_id = "workspace-full-no-deps";
+        let workspace_id = "workspace-full-expands";
 
         let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
         let mid = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
@@ -964,7 +1009,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(ordered, vec![leaf]);
+        assert_eq!(ordered, vec![root, mid, leaf]);
     }
 
     #[test]
@@ -1025,7 +1070,7 @@ mod tests {
                 ts_max_exclusive_ms: None,
             },
             &[leaf],
-            SharedDepSendBudget::new_for_tests(2, 1024 * 1024, 32),
+            SharedDepSendBudget::new_for_tests(2, 1024 * 1024, 32, Duration::from_secs(60)),
         )
         .unwrap();
 
@@ -1057,11 +1102,43 @@ mod tests {
                 ts_max_exclusive_ms: Some(10_000),
             },
             &[leaf],
-            SharedDepSendBudget::new_for_tests(32, 1024 * 1024, 1),
+            SharedDepSendBudget::new_for_tests(32, 1024 * 1024, 1, Duration::from_secs(60)),
         )
         .unwrap();
 
         assert_eq!(ordered, vec![mid, leaf]);
+    }
+
+    #[test]
+    fn expand_requested_ids_respects_dep_time_budget() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let recorded_by = "tenant-a";
+        let workspace_id = "workspace-dep-time-budget";
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let mid = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, 3, vec![mid], 3);
+        replace_shared_event_deps(&conn, workspace_id, &mid, &[root]).unwrap();
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[mid]).unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = expand_requested_ids_with_shared_deps_and_budget(
+            &conn,
+            &store,
+            recorded_by,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::Full,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: Some(10_000),
+            },
+            &[leaf],
+            SharedDepSendBudget::new_for_tests(32, 1024 * 1024, 32, Duration::ZERO),
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![leaf]);
     }
 
     #[test]
@@ -1237,7 +1314,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(persisted, all_ids.len());
-        assert_eq!(valid_event_count(&dest_conn, "tenant-a"), all_ids.len() as i64);
+        assert_eq!(
+            valid_event_count(&dest_conn, "tenant-a"),
+            all_ids.len() as i64
+        );
         assert!(is_valid(&dest_conn, "tenant-a", &leaf));
     }
 
@@ -1314,7 +1394,12 @@ mod tests {
                 chain_workspace_id,
                 range,
                 &[chain_leaf],
-                SharedDepSendBudget::new_for_tests(send_cap, usize::MAX, cap),
+                SharedDepSendBudget::new_for_tests(
+                    send_cap,
+                    usize::MAX,
+                    cap,
+                    Duration::from_secs(60),
+                ),
             )
             .unwrap();
             let chain_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1335,7 +1420,12 @@ mod tests {
                 star_workspace_id,
                 range,
                 &[star_root],
-                SharedDepSendBudget::new_for_tests(send_cap, usize::MAX, cap),
+                SharedDepSendBudget::new_for_tests(
+                    send_cap,
+                    usize::MAX,
+                    cap,
+                    Duration::from_secs(60),
+                ),
             )
             .unwrap();
             let star_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
