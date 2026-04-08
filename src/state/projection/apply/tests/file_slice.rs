@@ -305,9 +305,10 @@ fn test_attachment_blocks_on_missing_key() {
 }
 
 #[test]
-fn test_attachment_blocks_on_both_missing() {
+fn test_attachment_blocks_on_missing_message_after_outer_key_available() {
     let conn = setup();
     let recorded_by = "peer1";
+    let _outer_key_eid = ensure_test_content_key(&conn, recorded_by);
 
     let fake_msg_id = [88u8; 32];
     let fake_key_id = [77u8; 32];
@@ -316,14 +317,12 @@ fn test_attachment_blocks_on_both_missing() {
     let result = project_one(&conn, recorded_by, &att_eid).unwrap();
     match result {
         ProjectionDecision::Block { ref missing } => {
-            // Should block on at least the 2 fake deps (message_id + key_event_id)
+            // Once the outer encrypted wrapper key is available, projection
+            // should advance past the wrapper and still block on the missing
+            // file message dependency.
             assert!(
                 missing.contains(&fake_msg_id),
                 "should block on missing message_id"
-            );
-            assert!(
-                missing.contains(&fake_key_id),
-                "should block on missing key_event_id"
             );
         }
         _ => panic!("expected Block, got {:?}", result),

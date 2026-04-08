@@ -665,7 +665,12 @@ fn test_peer_shared_rejects_wrong_signer_family_at_projection() {
         device_name: "device".to_string(),
     });
     let blob = sign_blob(&user_key, &admin_eid, &event);
-    assert_projection_rejection_with_reason(&conn, recorded_by, &blob, "semantic type code 18");
+    assert_projection_rejection_with_reason(
+        &conn,
+        recorded_by,
+        &blob,
+        "peer_shared signer must be device_invite, got semantic type 18",
+    );
 }
 
 #[test]
