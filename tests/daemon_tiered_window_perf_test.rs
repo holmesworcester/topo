@@ -240,6 +240,45 @@ fn wait_for_message_count(db: &str, expected: i64, timeout: Duration) -> i64 {
     }
 }
 
+fn wait_for_message_count_exact(db: &str, expected: i64, timeout: Duration) -> i64 {
+    let start = Instant::now();
+    loop {
+        let count = message_count_sql(db);
+        if count == expected {
+            return current_timestamp_ms();
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "exact message_count timed out after {:?} for db={}: expected={} actual={}",
+            timeout,
+            db,
+            expected,
+            count
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_newest_message_visible(
+    db: &str,
+    timeout: Duration,
+) -> (NewestMessageTiming, i64, i64) {
+    let start = Instant::now();
+    loop {
+        let timing = newest_message_timing_sql(db);
+        if timing.projected_at_ms.is_some() {
+            return (timing, current_timestamp_ms(), message_count_sql(db));
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "newest message visibility timed out after {:?} for db={}",
+            timeout,
+            db
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn write_summary(summary_key: &str, summary: &str) {
     let summary_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-results");
     std::fs::create_dir_all(&summary_dir).expect("create target/perf-results");
@@ -436,4 +475,146 @@ fn perf_tiered_window_50k_parallel() {
 #[ignore]
 fn perf_tiered_window_100k_parallel() {
     run_tiered_window_bench(Some(100_000));
+}
+
+#[test]
+#[ignore]
+fn perf_last_day_only_sync_renders_newest_message_with_old_deps() {
+    let total_messages = env_i64("TOPO_LAST_DAY_ONLY_TOTAL_MESSAGES", 10_000);
+    let newest_visible_budget_secs = env_i64("TOPO_LAST_DAY_ONLY_VISIBLE_MAX_SECS", 10) as f64;
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let daemon_env = vec![
+        ("TOPO_EVENT_TIMELINE".to_string(), "1".to_string()),
+        (
+            "TOPO_EVENT_TIMELINE_GROUPS".to_string(),
+            "persist,projection".to_string(),
+        ),
+    ];
+
+    create_workspace_with_seeded_history(
+        &alice_db,
+        "workspace",
+        "alice",
+        "desktop",
+        total_messages as usize,
+        Some("3y"),
+    );
+    let mut alice_daemon = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            last_day_only_sync: true,
+            extra_env: daemon_env.clone(),
+            ..Default::default()
+        },
+    );
+    ensure_active_peer(&alice_db, Duration::from_secs(10));
+
+    let measurement_now_ms = current_timestamp_ms();
+    let authoring_dep_timing = authoring_dep_timing_sql(&alice_db);
+    let day_cutoff = measurement_now_ms - DAY_MS;
+    let expected_day = message_count_since_sql(&alice_db, day_cutoff);
+    assert!(
+        authoring_dep_timing.user_created_at_ms < day_cutoff,
+        "creator user event should be outside the hot last-day window: user_created_at_ms={} day_cutoff={}",
+        authoring_dep_timing.user_created_at_ms,
+        day_cutoff
+    );
+    assert!(
+        authoring_dep_timing.peer_shared_created_at_ms < day_cutoff,
+        "creator peer_shared event should be outside the hot last-day window: peer_shared_created_at_ms={} day_cutoff={}",
+        authoring_dep_timing.peer_shared_created_at_ms,
+        day_cutoff
+    );
+    assert!(
+        expected_day > 0 && expected_day < total_messages,
+        "expected a non-empty hot range smaller than the full history: expected_day={} total_messages={}",
+        expected_day,
+        total_messages
+    );
+
+    let invite_link = create_invite_with_spki(
+        &alice_db,
+        &daemon_listen_addr(&alice_db),
+        Some(&daemon_identity_fingerprint(&alice_db)),
+    );
+    let mut bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            last_day_only_sync: true,
+            extra_env: daemon_env,
+            ..Default::default()
+        },
+    );
+
+    let bench_start = Instant::now();
+    accept_invite_with_identity_on_running_daemon(
+        &bob_db,
+        &invite_link,
+        "bob",
+        "laptop",
+        Duration::from_secs(30),
+    );
+
+    let (newest_timing, newest_visible_wall_ms, bob_total_at_newest) =
+        wait_for_newest_message_visible(&bob_db, Duration::from_secs(120));
+    let newest_visible_secs = bench_start.elapsed().as_secs_f64();
+    assert!(
+        newest_visible_secs <= newest_visible_budget_secs,
+        "newest message should become visible quickly in last-day-only mode: visible_secs={:.2} budget_secs={:.2} bob_total_at_newest={}",
+        newest_visible_secs,
+        newest_visible_budget_secs,
+        bob_total_at_newest
+    );
+    assert!(
+        bob_total_at_newest < total_messages,
+        "newest message should become visible before full history projection: bob_total_at_newest={} total_messages={}",
+        bob_total_at_newest,
+        total_messages
+    );
+
+    let hot_complete_ms =
+        wait_for_message_count_exact(&bob_db, expected_day, Duration::from_secs(120));
+    thread::sleep(Duration::from_secs(1));
+    let bob_total_after_hot = message_count_sql(&bob_db);
+    let bob_day_after_hot = message_count_since_sql(&bob_db, day_cutoff);
+    assert_eq!(
+        bob_total_after_hot, expected_day,
+        "last-day-only mode should not project cold messages"
+    );
+    assert_eq!(
+        bob_day_after_hot, expected_day,
+        "all hot-range messages should be projected once dep sync completes"
+    );
+    assert!(
+        newest_timing.projected_at_ms.is_some(),
+        "newest message should be visible once wait_for_newest_message_visible returns"
+    );
+
+    let summary = format!(
+        "=== last-day-only dep sync ===\n  Messages preloaded on inviter: {total_messages}\n  Hot range messages: {expected_day}\n  Aged auth deps: user={} peer_shared={}\n  Newest message: created_at={} visible in {:.2}s\n  Bob projected at newest visibility: {}\n  Bob projected after hot completion: {} in {:.2}s\n",
+        authoring_dep_timing.user_created_at_ms,
+        authoring_dep_timing.peer_shared_created_at_ms,
+        newest_timing.created_at_ms.unwrap_or_default(),
+        newest_visible_secs,
+        bob_total_at_newest,
+        bob_total_after_hot,
+        elapsed_secs(
+            newest_visible_wall_ms.min(hot_complete_ms),
+            Some(hot_complete_ms),
+        ),
+    );
+    eprintln!("\n{summary}");
+    write_summary(
+        &format!("daemon_tiered_window_perf_test.last_day_only_{}", total_messages),
+        &summary,
+    );
+
+    stop_daemon(&bob_db, &mut bob_daemon);
+    wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
+    stop_daemon(&alice_db, &mut alice_daemon);
+    wait_for_daemon_stopped(&alice_db, Duration::from_secs(10));
 }

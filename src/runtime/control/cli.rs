@@ -25,6 +25,9 @@ pub(crate) enum Commands {
         /// Listen address for QUIC sync
         #[arg(short, long, default_value = "0.0.0.0:4433")]
         bind: SocketAddr,
+        /// Restrict sync planning to the hot LastDay window only.
+        #[arg(long)]
+        last_day_only_sync: bool,
     },
 
     /// Stop a running daemon

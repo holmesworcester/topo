@@ -153,7 +153,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Daemon lifecycle
         // ---------------------------------------------------------------
-        Commands::Start { bind } => {
+        Commands::Start {
+            bind,
+            last_day_only_sync,
+        } => {
+            if last_day_only_sync {
+                std::env::set_var("TOPO_SYNC_LAST_DAY_ONLY", "1");
+            }
             let socket_path = socket_override
                 .as_ref()
                 .map(std::path::PathBuf::from)
