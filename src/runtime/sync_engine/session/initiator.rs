@@ -17,7 +17,8 @@ use crate::sync::session::receive_log::{
 use crate::sync::session::windowing::{
     decode_sync_window_kind, encode_initial_neg_open, is_low_mem_allowed_window,
     is_priority_ingest_window, mark_outbound_window_completed,
-    restrict_outbound_windows_to_last_week, select_outbound_window, SyncWindowKind,
+    restrict_outbound_windows_to_last_week, select_outbound_window, window_for_kind,
+    SyncWindowKind,
 };
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -75,6 +76,7 @@ pub async fn run_sync_initiator<C, S, R>(
     recorded_by: &str,
     ingress_source_tag: &str,
     rx_capture: Option<SyncRunRxCapture>,
+    outbound_window_override: Option<SyncWindowKind>,
     mut command_rx: Option<
         tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
     >,
@@ -97,14 +99,13 @@ where
 
     let db = open_connection(db_path)?;
     let ws_id = resolve_sync_admission(&db, recorded_by)?;
-    let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
-    let range = select_outbound_window(
-        db_path,
-        recorded_by,
-        peer_id,
-        &live_peer_ids,
-        crate::db::queue::current_timestamp_ms(),
-    );
+    let now_ms = crate::db::queue::current_timestamp_ms();
+    let range = if let Some(kind) = outbound_window_override {
+        window_for_kind(kind, now_ms)
+    } else {
+        let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
+        select_outbound_window(db_path, recorded_by, peer_id, &live_peer_ids, now_ms)
+    };
     let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
     let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
     let initial_msg = encode_initial_neg_open(range, neg.initiate()?);
@@ -213,7 +214,9 @@ where
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
-    let _ = mark_outbound_window_completed(db_path, recorded_by, peer_id, range);
+    if outbound_window_override.is_none() {
+        let _ = mark_outbound_window_completed(db_path, recorded_by, peer_id, range);
+    }
 
     Ok(SyncStats {
         events_sent,

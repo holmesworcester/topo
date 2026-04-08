@@ -17,6 +17,7 @@ use crate::contracts::peering_contract::{
 use crate::protocol::Frame;
 use crate::protocol::{encode_frame, parse_frame};
 use crate::sync::session::logging::{LogDir, LogLane, SessionRunLogger, SyncRunCapture};
+use crate::sync::session::windowing::SyncWindowKind;
 use crate::sync::session::{run_sync_initiator, run_sync_responder};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -154,6 +155,7 @@ pub struct SyncConnectionHandler {
     timeout_secs: u64,
     direction: SessionDirection,
     sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
+    outbound_window_override: Option<SyncWindowKind>,
 }
 
 impl SyncConnectionHandler {
@@ -163,6 +165,7 @@ impl SyncConnectionHandler {
             timeout_secs,
             direction: SessionDirection::Outbound,
             sync_control: None,
+            outbound_window_override: None,
         }
     }
 
@@ -172,6 +175,7 @@ impl SyncConnectionHandler {
             timeout_secs,
             direction: SessionDirection::Inbound,
             sync_control: None,
+            outbound_window_override: None,
         }
     }
 
@@ -182,6 +186,20 @@ impl SyncConnectionHandler {
     ) -> Self {
         self.sync_control = sync_control;
         self
+    }
+
+    pub fn with_outbound_window_override(
+        mut self,
+        outbound_window_override: Option<SyncWindowKind>,
+    ) -> Self {
+        self.outbound_window_override = outbound_window_override;
+        self
+    }
+
+    pub fn sync_control(
+        &self,
+    ) -> &Option<Arc<crate::runtime::sync_control::SyncControlRegistry>> {
+        &self.sync_control
     }
 
     pub async fn on_session_with_stats(
@@ -268,6 +286,7 @@ impl SyncConnectionHandler {
                     &tenant_id,
                     &ingress_source_tag,
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
+                    self.outbound_window_override,
                     manual_cmd_rx.take(),
                 );
                 tokio::pin!(run);
