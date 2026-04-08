@@ -652,6 +652,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::contracts::event_pipeline_contract::IngestItem;
     use crate::db::dep_index::replace_shared_event_deps;
@@ -1237,5 +1239,114 @@ mod tests {
         assert_eq!(persisted, all_ids.len());
         assert_eq!(valid_event_count(&dest_conn, "tenant-a"), all_ids.len() as i64);
         assert!(is_valid(&dest_conn, "tenant-a", &leaf));
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_dep_expansion_caps_plateau_on_chain_and_star() {
+        let caps = [64usize, 128, 256, 512, 1024, 2048, 4096, 8192];
+        let send_cap = 2048usize;
+        let dep_count = 4096usize;
+        let recorded_by = "tenant-a";
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastTwelveWeeks,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: Some(10_000_000),
+        };
+
+        let chain_conn = open_in_memory().unwrap();
+        create_tables(&chain_conn).unwrap();
+        let chain_workspace_id = "workspace-perf-chain";
+        let mut prior = None;
+        let mut chain_ids = Vec::new();
+        for idx in 0..dep_count {
+            let deps = prior.into_iter().collect::<Vec<_>>();
+            let event_id = insert_shared_bench_dep(
+                &chain_conn,
+                chain_workspace_id,
+                (idx as i64) + 1,
+                deps.clone(),
+                (idx % 251) as u8,
+            );
+            if let Some(dep_id) = deps.first() {
+                replace_shared_event_deps(&chain_conn, chain_workspace_id, &event_id, &[*dep_id])
+                    .unwrap();
+            }
+            chain_ids.push(event_id);
+            prior = Some(event_id);
+        }
+        let chain_leaf = *chain_ids.last().unwrap();
+        let chain_store = Store::new(&chain_conn);
+
+        let star_conn = open_in_memory().unwrap();
+        create_tables(&star_conn).unwrap();
+        let star_workspace_id = "workspace-perf-star";
+        let mut star_deps = Vec::new();
+        for idx in 0..dep_count {
+            let dep_id = insert_shared_bench_dep(
+                &star_conn,
+                star_workspace_id,
+                (idx as i64) + 1,
+                Vec::new(),
+                (idx % 251) as u8,
+            );
+            star_deps.push(dep_id);
+        }
+        let star_root = insert_shared_bench_dep(
+            &star_conn,
+            star_workspace_id,
+            (dep_count as i64) + 1,
+            Vec::new(),
+            0xFE,
+        );
+        replace_shared_event_deps(&star_conn, star_workspace_id, &star_root, &star_deps).unwrap();
+        let star_store = Store::new(&star_conn);
+
+        eprintln!(
+            "\n=== dep expansion cap plateau ===\nshape,cap,ordered_len,expected_len,elapsed_ms"
+        );
+        for cap in caps {
+            let start = Instant::now();
+            let chain_ordered = expand_requested_ids_with_shared_deps_and_budget(
+                &chain_conn,
+                &chain_store,
+                recorded_by,
+                chain_workspace_id,
+                range,
+                &[chain_leaf],
+                SharedDepSendBudget::new_for_tests(send_cap, usize::MAX, cap),
+            )
+            .unwrap();
+            let chain_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let expected_chain_len = 1 + dep_count.saturating_sub(1).min(send_cap).min(cap);
+            assert_eq!(chain_ordered.len(), expected_chain_len);
+            eprintln!(
+                "chain,{cap},{},{},{}",
+                chain_ordered.len(),
+                expected_chain_len,
+                chain_elapsed_ms
+            );
+
+            let start = Instant::now();
+            let star_ordered = expand_requested_ids_with_shared_deps_and_budget(
+                &star_conn,
+                &star_store,
+                recorded_by,
+                star_workspace_id,
+                range,
+                &[star_root],
+                SharedDepSendBudget::new_for_tests(send_cap, usize::MAX, cap),
+            )
+            .unwrap();
+            let star_elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let expected_star_len = 1 + dep_count.min(send_cap).min(cap);
+            assert_eq!(star_ordered.len(), expected_star_len);
+            eprintln!(
+                "star,{cap},{},{},{}",
+                star_ordered.len(),
+                expected_star_len,
+                star_elapsed_ms
+            );
+        }
     }
 }
