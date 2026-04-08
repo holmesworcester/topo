@@ -855,7 +855,7 @@ fn run_cold_join_hot_head_diagnostic(source_count: usize, wait_for_full_catchup:
     hold_network_test_lock_for_binary();
     std::env::set_var("TOPO_GENERATE_MESSAGE_SPREAD_MS", "94608000000");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
-    std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
+    std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "receive,persist,projection");
 
     let seeded_history_messages = env_usize("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES", 32);
     let hot_messages_per_peer = env_usize("TOPO_MULTI_SOURCE_HOT_MESSAGES_PER_PEER", 3);
@@ -1280,7 +1280,7 @@ fn mesh_four_peers_discover_and_connect() {
     hold_network_test_lock_for_binary();
     std::env::set_var("TOPO_GENERATE_MESSAGE_SPREAD_MS", "94608000000");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
-    std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
+    std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "receive,persist,projection");
 
     let seeded_history_messages = env_usize("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES", 0);
     let tmpdir = bench_tmpdir("mesh-four-cli-");
