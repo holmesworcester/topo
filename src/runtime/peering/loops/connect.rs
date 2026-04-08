@@ -43,6 +43,9 @@ const LAST_DAY_BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const LAST_WEEK_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 const LAST_TWELVE_WEEKS_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 const FULL_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const ACTIVE_CATCHUP_BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+const ACTIVE_CATCHUP_EVENT_THRESHOLD: u64 = 64;
+const ACTIVE_CATCHUP_BYTE_THRESHOLD: u64 = 64 * 1024;
 const FAILED_SESSION_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +165,11 @@ fn background_sync_interval(kind: SyncWindowKind) -> Duration {
     }
 }
 
+fn is_active_catchup_round(stats: &crate::runtime::SyncStats) -> bool {
+    stats.events_sent.saturating_add(stats.events_received) >= ACTIVE_CATCHUP_EVENT_THRESHOLD
+        || stats.bytes_sent.saturating_add(stats.bytes_received) >= ACTIVE_CATCHUP_BYTE_THRESHOLD
+}
+
 pub struct ConnectLoopConfig {
     pub db_path: String,
     pub recorded_by: String,
@@ -228,8 +236,8 @@ async fn connect_loop_inner(
     let mut consecutive_stale_dial_failures: u32 = 0;
     let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
     let mut next_auth_plan_override: Option<OutboundSessionAuthPlan> = None;
-    let mut next_hot_sync_at = tokio::time::Instant::now();
-    let mut background_worker_connection_id: Option<usize> = None;
+    let mut last_outbound_window_scope = None;
+    let mut live_session_peer_registration = None;
 
     let remote_target = describe_remote_target(remote, relay_url, expected_remote_daemon_peer_id);
 
@@ -343,20 +351,8 @@ async fn connect_loop_inner(
         };
 
         let connection_id = daemon_connection.connection().stable_id();
-        if background_worker_connection_id != Some(connection_id) {
-            spawn_background_sync_worker(
-                daemon_connection.clone(),
-                db_path.to_string(),
-                recorded_by.to_string(),
-                remote_target.clone(),
-                remote_session_peer_id.to_string(),
-                expected_remote_daemon_peer_id.to_string(),
-                auth_plan.clone(),
-                shutdown.child_token(),
-                sync_control.clone(),
-            );
-            background_worker_connection_id = Some(connection_id);
-        }
+        let mut next_hot_sync_at = tokio::time::Instant::now();
+        let mut next_background_sync_at = tokio::time::Instant::now();
 
         loop {
             if shutdown.is_cancelled() {
@@ -364,18 +360,16 @@ async fn connect_loop_inner(
             }
 
             let now = tokio::time::Instant::now();
-            if now < next_hot_sync_at {
+            let next_due_at = next_hot_sync_at.min(next_background_sync_at);
+            if now < next_due_at {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    _ = tokio::time::sleep_until(next_hot_sync_at) => {}
+                    _ = tokio::time::sleep_until(next_due_at) => {}
                 }
                 continue;
             }
 
-            let initiator_handler =
-                SyncConnectionHandler::outbound(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS)
-                    .with_sync_control(sync_control.clone())
-                    .with_outbound_window_override(Some(SyncWindowKind::LastDay));
+            let run_background_sync = now >= next_background_sync_at;
 
             let mut session = match daemon_connection
                 .open_outbound_session(SessionClass::Range)
@@ -497,6 +491,47 @@ async fn connect_loop_inner(
                     break;
                 }
             };
+
+            let should_refresh_live_peer_registration = live_session_peer_registration
+                .as_ref()
+                .map(|(registered_peer_id, _lease)| registered_peer_id != &peer_id)
+                .unwrap_or(true);
+            if should_refresh_live_peer_registration {
+                live_session_peer_registration = Some((
+                    peer_id.clone(),
+                    claim_live_session_peer(db_path, recorded_by, &peer_id),
+                ));
+            }
+
+            let should_reset_outbound_window = last_outbound_window_scope
+                .as_ref()
+                .map(|(last_connection_id, last_peer_id)| {
+                    *last_connection_id != connection_id || last_peer_id != &peer_id
+                })
+                .unwrap_or(true);
+            if should_reset_outbound_window {
+                reset_outbound_window_state(db_path, recorded_by, &peer_id);
+                last_outbound_window_scope = Some((connection_id, peer_id.clone()));
+            }
+
+            let background_window = if run_background_sync {
+                let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
+                Some(select_outbound_window(
+                    db_path,
+                    recorded_by,
+                    &peer_id,
+                    &live_peer_ids,
+                    current_timestamp_ms(),
+                ))
+            } else {
+                None
+            };
+            let initiator_handler =
+                SyncConnectionHandler::outbound(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS)
+                    .with_sync_control(sync_control.clone())
+                    .with_outbound_window_override(
+                        background_window.is_none().then_some(SyncWindowKind::LastDay),
+                    );
             record_authenticated_outbound_session(
                 db_path,
                 recorded_by,
@@ -518,11 +553,23 @@ async fn connect_loop_inner(
             .await;
 
             let completed_at = tokio::time::Instant::now();
-            next_hot_sync_at = completed_at + HOT_HEAD_SYNC_INTERVAL;
-            if session_stats.is_none() {
-                next_hot_sync_at = completed_at + FAILED_SESSION_RETRY_DELAY;
+            if let Some(background_window) = background_window {
+                next_background_sync_at = match session_stats {
+                    Some(stats) if is_active_catchup_round(&stats) => {
+                        completed_at + ACTIVE_CATCHUP_BACKGROUND_SYNC_INTERVAL
+                    }
+                    Some(_) => completed_at + background_sync_interval(background_window.kind),
+                    None => completed_at + FAILED_SESSION_RETRY_DELAY,
+                };
+            } else {
+                next_hot_sync_at = completed_at + HOT_HEAD_SYNC_INTERVAL;
+                if session_stats.is_none() {
+                    next_hot_sync_at = completed_at + FAILED_SESSION_RETRY_DELAY;
+                }
             }
         }
+
+        live_session_peer_registration = None;
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -531,255 +578,6 @@ async fn connect_loop_inner(
     }
 
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_background_sync_worker(
-    daemon_connection: DaemonConnection,
-    db_path: String,
-    recorded_by: String,
-    remote_target: String,
-    remote_session_peer_id: String,
-    expected_remote_daemon_peer_id: String,
-    auth_plan: OutboundSessionAuthPlan,
-    shutdown: CancellationToken,
-    sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
-) {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("background sync worker runtime");
-        let local = tokio::task::LocalSet::new();
-        runtime.block_on(local.run_until(async move {
-            run_background_sync_loop(
-                daemon_connection,
-                &db_path,
-                &recorded_by,
-                &remote_target,
-                &remote_session_peer_id,
-                &expected_remote_daemon_peer_id,
-                &auth_plan,
-                shutdown,
-                sync_control,
-            )
-            .await;
-        }));
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_background_sync_loop(
-    daemon_connection: DaemonConnection,
-    db_path: &str,
-    recorded_by: &str,
-    remote_target: &str,
-    remote_session_peer_id: &str,
-    expected_remote_daemon_peer_id: &str,
-    auth_plan: &OutboundSessionAuthPlan,
-    shutdown: CancellationToken,
-    sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
-) {
-    let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
-    let mut next_auth_plan_override: Option<OutboundSessionAuthPlan> = None;
-    let mut next_background_sync_at = tokio::time::Instant::now();
-    let mut last_outbound_window_scope = None;
-    let mut live_session_peer_registration = None;
-    let connection_id = daemon_connection.connection().stable_id();
-
-    loop {
-        if shutdown.is_cancelled() || daemon_connection.connection().close_reason().is_some() {
-            break;
-        }
-
-        let now = tokio::time::Instant::now();
-        if now < next_background_sync_at {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep_until(next_background_sync_at) => {}
-            }
-            continue;
-        }
-
-        let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
-        let background_window = select_outbound_window(
-            db_path,
-            recorded_by,
-            remote_session_peer_id,
-            &live_peer_ids,
-            current_timestamp_ms(),
-        );
-        let initiator_handler =
-            SyncConnectionHandler::outbound(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS)
-                .with_sync_control(sync_control.clone());
-
-        let mut session = match daemon_connection
-            .open_outbound_session(SessionClass::Range)
-            .await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                if let Some(reason) = extract_build_mismatch_reason(&err.to_string()) {
-                    note_build_mismatch(daemon_connection.remote_daemon_peer_id(), reason);
-                }
-                let plan = decide_session_open_failure_plan(
-                    should_evict_closed_daemon_connection(&daemon_connection, &err.to_string()),
-                );
-                if matches!(plan, SessionOpenFailurePlan::EvictAndBreak) {
-                    daemon_connection
-                        .connection()
-                        .close(0u32.into(), b"background session open lost connection");
-                    evict_live_daemon_connection(
-                        db_path,
-                        daemon_connection.remote_daemon_peer_id(),
-                        connection_id,
-                    );
-                    break;
-                }
-                next_background_sync_at = tokio::time::Instant::now() + FAILED_SESSION_RETRY_DELAY;
-                continue;
-            }
-        };
-
-        let db = open_connection(db_path).ok();
-        let effective_auth_plan = next_auth_plan_override.take().unwrap_or_else(|| {
-            db.as_ref()
-                .and_then(|conn| {
-                    resolve_outbound_session_auth_plan(
-                        conn,
-                        Some(&daemon_connection),
-                        recorded_by,
-                        remote_session_peer_id,
-                        daemon_connection.remote_daemon_peer_id(),
-                        auth_plan,
-                    )
-                    .ok()
-                })
-                .unwrap_or_else(|| auth_plan.clone())
-        });
-        let bootstrap_retry_invite = match &effective_auth_plan {
-            OutboundSessionAuthPlan::PeerShared { .. }
-                if !daemon_connection.admits_session_route(recorded_by, remote_session_peer_id) =>
-            {
-                db.as_ref()
-                    .and_then(|conn| {
-                        resolve_bootstrap_fallback_invite_for_daemon(
-                            conn,
-                            recorded_by,
-                            daemon_connection.remote_daemon_peer_id(),
-                        )
-                        .ok()
-                    })
-                    .flatten()
-            }
-            _ => None,
-        };
-
-        let auth_result = match send_outbound_session_auth(
-            session.io.as_mut(),
-            db_path,
-            recorded_by,
-            Some(&daemon_connection),
-            daemon_connection.remote_daemon_peer_id(),
-            Some(expected_remote_daemon_peer_id),
-            &effective_auth_plan,
-        )
-        .await
-        {
-            Ok(auth_result) => {
-                next_auth_plan_override = None;
-                auth_result
-            }
-            Err(e) => {
-                let plan = decide_session_auth_failure_plan(
-                    should_evict_closed_daemon_connection(&daemon_connection, &e.to_string()),
-                    bootstrap_retry_invite,
-                );
-                next_auth_plan_override = plan.next_auth_plan_override.clone();
-                if plan.evict_live_connection {
-                    daemon_connection
-                        .connection()
-                        .close(0u32.into(), b"background session auth lost connection");
-                    evict_live_daemon_connection(
-                        db_path,
-                        daemon_connection.remote_daemon_peer_id(),
-                        connection_id,
-                    );
-                    break;
-                }
-                let message = format!(
-                    "{} [auth_plan={}, expected_daemon={}, actual_daemon={}]",
-                    describe_session_auth_failure(remote_target, remote_session_peer_id, &*e),
-                    describe_outbound_session_auth_plan(&effective_auth_plan),
-                    super::short_peer_id(expected_remote_daemon_peer_id),
-                    super::short_peer_id(daemon_connection.remote_daemon_peer_id()),
-                );
-                if warning_gate.should_emit(message.clone())
-                    && should_emit_globally(format!("connect:{message}"))
-                {
-                    warn!("{}", message);
-                }
-                next_background_sync_at = tokio::time::Instant::now() + FAILED_SESSION_RETRY_DELAY;
-                continue;
-            }
-        };
-
-        let peer_id = auth_result.session_peer_id.clone();
-        let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
-            Some(peer_fp) => peer_fp,
-            None => {
-                warn!(
-                    "Invalid authenticated session peer id {} on daemon {}",
-                    super::short_peer_id(&peer_id),
-                    super::short_peer_id(daemon_connection.remote_daemon_peer_id())
-                );
-                next_background_sync_at = tokio::time::Instant::now() + FAILED_SESSION_RETRY_DELAY;
-                continue;
-            }
-        };
-
-        let should_refresh_live_peer_registration = live_session_peer_registration
-            .as_ref()
-            .map(|(registered_peer_id, _lease)| registered_peer_id != &peer_id)
-            .unwrap_or(true);
-        if should_refresh_live_peer_registration {
-            live_session_peer_registration = Some((
-                peer_id.clone(),
-                claim_live_session_peer(db_path, recorded_by, &peer_id),
-            ));
-        }
-
-        let should_reset_outbound_window = last_outbound_window_scope
-            .as_ref()
-            .map(|(last_connection_id, last_peer_id)| {
-                *last_connection_id != connection_id || last_peer_id != &peer_id
-            })
-            .unwrap_or(true);
-        if should_reset_outbound_window {
-            reset_outbound_window_state(db_path, recorded_by, &peer_id);
-            last_outbound_window_scope = Some((connection_id, peer_id.clone()));
-        }
-
-        record_authenticated_outbound_session(db_path, recorded_by, &auth_result, session.remote_addr);
-        let session_remote_label = session.remote_label.clone();
-        let session_stats = super::run_session(
-            &initiator_handler,
-            session.session_id,
-            session.io,
-            recorded_by,
-            peer_fp,
-            session_remote_label,
-            SessionDirection::Outbound,
-            db_path,
-        )
-        .await;
-
-        let completed_at = tokio::time::Instant::now();
-        next_background_sync_at = completed_at + background_sync_interval(background_window.kind);
-        if session_stats.is_none() {
-            next_background_sync_at = completed_at + FAILED_SESSION_RETRY_DELAY;
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1217,5 +1015,33 @@ mod tests {
             background_sync_interval(SyncWindowKind::Full),
             FULL_SYNC_INTERVAL
         );
+    }
+
+    #[test]
+    fn active_catchup_round_requires_material_progress() {
+        assert!(!is_active_catchup_round(&crate::runtime::SyncStats {
+            events_sent: 4,
+            events_received: 8,
+            neg_rounds: 1,
+            bytes_sent: 743,
+            bytes_received: 1_422,
+            duration_ms: 10,
+        }));
+        assert!(is_active_catchup_round(&crate::runtime::SyncStats {
+            events_sent: 80,
+            events_received: 0,
+            neg_rounds: 1,
+            bytes_sent: 10_000,
+            bytes_received: 0,
+            duration_ms: 10,
+        }));
+        assert!(is_active_catchup_round(&crate::runtime::SyncStats {
+            events_sent: 1,
+            events_received: 1,
+            neg_rounds: 1,
+            bytes_sent: 70_000,
+            bytes_received: 0,
+            duration_ms: 10,
+        }));
     }
 }
