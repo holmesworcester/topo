@@ -111,6 +111,36 @@ enum OutboundSessionAuthDecision {
     UpgradeToPeerSharedAfterBootstrapLapse,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundRouteAuthContext {
+    route_authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InboundRouteAuthDecision {
+    RejectUnauthorized,
+    Accept,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundBootstrapAuthContext {
+    tenant_resolution: BootstrapSessionTenantDecision,
+    tenant_resolution_error: Option<String>,
+    cached_tenant_id: Option<String>,
+    expiry_valid: bool,
+    daemon_binding_valid: bool,
+    claimed_peer_matches_key: bool,
+    invite_signature_valid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InboundBootstrapAuthDecision {
+    RejectInvalidAuth,
+    AcceptResolvedTenant { tenant_id: String },
+    AcceptCachedTenant { tenant_id: String },
+    RejectTenantResolution,
+}
+
 fn decide_bootstrap_session_tenant(
     context: &BootstrapSessionTenantContext,
 ) -> BootstrapSessionTenantDecision {
@@ -203,6 +233,44 @@ fn plan_for_outbound_session_auth_decision(
         | OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
             OutboundSessionAuthPlan::PeerShared {
                 target_peer_id: context.remote_session_peer_id.clone(),
+            }
+        }
+    }
+}
+
+fn decide_inbound_route_auth(context: &InboundRouteAuthContext) -> InboundRouteAuthDecision {
+    if context.route_authorized {
+        InboundRouteAuthDecision::Accept
+    } else {
+        InboundRouteAuthDecision::RejectUnauthorized
+    }
+}
+
+fn decide_inbound_bootstrap_auth(
+    context: &InboundBootstrapAuthContext,
+) -> InboundBootstrapAuthDecision {
+    if !context.expiry_valid
+        || !context.daemon_binding_valid
+        || !context.claimed_peer_matches_key
+        || !context.invite_signature_valid
+    {
+        return InboundBootstrapAuthDecision::RejectInvalidAuth;
+    }
+
+    match &context.tenant_resolution {
+        BootstrapSessionTenantDecision::Accept { tenant_id } => {
+            InboundBootstrapAuthDecision::AcceptResolvedTenant {
+                tenant_id: tenant_id.clone(),
+            }
+        }
+        BootstrapSessionTenantDecision::RejectMissing
+        | BootstrapSessionTenantDecision::RejectAmbiguous => {
+            if let Some(tenant_id) = &context.cached_tenant_id {
+                InboundBootstrapAuthDecision::AcceptCachedTenant {
+                    tenant_id: tenant_id.clone(),
+                }
+            } else {
+                InboundBootstrapAuthDecision::RejectTenantResolution
             }
         }
     }
@@ -596,13 +664,15 @@ async fn read_inbound_session_auth_inner(
         Frame::OpenSessionRoute { route } => {
             let tenant_id = hex::encode(route.target_tenant_id);
             let remote_peer_id = hex::encode(route.source_peer_id);
-            if !peer_route_is_authorized_for_daemon(
+            let route_authorized = peer_route_is_authorized_for_daemon(
                 &db,
                 daemon_connection,
                 &tenant_id,
                 &remote_peer_id,
                 actual_remote_daemon_peer_id,
-            )? {
+            )?;
+            let decision = decide_inbound_route_auth(&InboundRouteAuthContext { route_authorized });
+            if matches!(decision, InboundRouteAuthDecision::RejectUnauthorized) {
                 return Err(format!(
                     "session route not admitted for tenant {} peer {} on daemon {}",
                     tenant_id, remote_peer_id, actual_remote_daemon_peer_id
@@ -620,39 +690,74 @@ async fn read_inbound_session_auth_inner(
             })
         }
         Frame::OpenSessionAuthInvite { auth } => {
-            validate_expiry(auth.expires_at_ms)?;
-            ensure_daemon_binding(
+            let expiry_valid = validate_expiry(auth.expires_at_ms).is_ok();
+            let daemon_binding_valid = ensure_daemon_binding(
                 &auth.remote_daemon_peer_id,
                 &auth.local_daemon_peer_id,
                 &local_daemon_peer_id_raw,
                 &actual_remote_daemon_peer_id_raw,
-            )?;
+            )
+            .is_ok();
             let derived_source_peer_id =
                 spki_fingerprint_from_ed25519_pubkey(&auth.source_peer_public_key);
-            if auth.source_peer_id != derived_source_peer_id {
-                return Err(
-                    "bootstrap session auth peer_id does not match claimed public key".into(),
-                );
-            }
+            let claimed_peer_matches_key = auth.source_peer_id == derived_source_peer_id;
             let invite_event_id_b64 = event_id_to_base64(&auth.target_invite_event_id);
             let remote_peer_id = hex::encode(auth.source_peer_id);
-            let tenant_id = match resolve_bootstrap_session_tenant(
+            let (tenant_resolution, tenant_resolution_error) = match resolve_bootstrap_session_tenant(
                 &db,
                 &invite_event_id_b64,
                 &actual_remote_daemon_peer_id_raw,
             ) {
-                Ok(tenant_id) => tenant_id,
-                Err(err) => daemon_connection
-                    .and_then(|conn| {
-                        conn.accepted_bootstrap_tenant(&invite_event_id_b64, &remote_peer_id)
-                    })
-                    .ok_or(err)?,
+                Ok(tenant_id) => (BootstrapSessionTenantDecision::Accept { tenant_id }, None),
+                Err(err) => (
+                    BootstrapSessionTenantDecision::RejectMissing,
+                    Some(err.to_string()),
+                ),
             };
             let invite_public_key = load_invite_public_key(&db, &invite_event_id_b64)?;
             let signing_bytes = encode_invite_signing_bytes(&auth);
-            if !verify_ed25519_signature(&invite_public_key, &signing_bytes, &auth.signature) {
-                return Err("session auth invite signature verification failed".into());
-            }
+            let invite_signature_valid =
+                verify_ed25519_signature(&invite_public_key, &signing_bytes, &auth.signature);
+            let cached_tenant_id = daemon_connection.and_then(|conn| {
+                conn.accepted_bootstrap_tenant(&invite_event_id_b64, &remote_peer_id)
+            });
+            let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthContext {
+                tenant_resolution,
+                tenant_resolution_error: tenant_resolution_error.clone(),
+                cached_tenant_id,
+                expiry_valid,
+                daemon_binding_valid,
+                claimed_peer_matches_key,
+                invite_signature_valid,
+            });
+            let tenant_id = match decision {
+                InboundBootstrapAuthDecision::AcceptResolvedTenant { tenant_id }
+                | InboundBootstrapAuthDecision::AcceptCachedTenant { tenant_id } => tenant_id,
+                InboundBootstrapAuthDecision::RejectInvalidAuth => {
+                    if !expiry_valid {
+                        return Err("session auth expired".into());
+                    }
+                    if !daemon_binding_valid {
+                        return Err("session auth daemon binding mismatch".into());
+                    }
+                    if !claimed_peer_matches_key {
+                        return Err(
+                            "bootstrap session auth peer_id does not match claimed public key"
+                                .into(),
+                        );
+                    }
+                    return Err("session auth invite signature verification failed".into());
+                }
+                InboundBootstrapAuthDecision::RejectTenantResolution => {
+                    let reason = tenant_resolution_error.unwrap_or_else(|| {
+                        format!(
+                            "no accepted bootstrap tenant for invite {} on daemon {}",
+                            invite_event_id_b64, actual_remote_daemon_peer_id
+                        )
+                    });
+                    return Err(reason.into());
+                }
+            };
             if let Some(conn) = daemon_connection {
                 conn.remember_accepted_bootstrap_auth(
                     &invite_event_id_b64,
@@ -1246,6 +1351,49 @@ mod tests {
             decision,
             BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate
         );
+    }
+
+    #[test]
+    fn inbound_route_auth_decision_rejects_unauthorized_routes() {
+        assert_eq!(
+            decide_inbound_route_auth(&InboundRouteAuthContext {
+                route_authorized: false,
+            }),
+            InboundRouteAuthDecision::RejectUnauthorized
+        );
+    }
+
+    #[test]
+    fn inbound_bootstrap_auth_decision_accepts_cached_tenant_after_resolution_loss() {
+        let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthContext {
+            tenant_resolution: BootstrapSessionTenantDecision::RejectMissing,
+            tenant_resolution_error: None,
+            cached_tenant_id: Some("tenant-a".to_string()),
+            expiry_valid: true,
+            daemon_binding_valid: true,
+            claimed_peer_matches_key: true,
+            invite_signature_valid: true,
+        });
+        assert_eq!(
+            decision,
+            InboundBootstrapAuthDecision::AcceptCachedTenant {
+                tenant_id: "tenant-a".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn inbound_bootstrap_auth_decision_rejects_invalid_auth_before_cache_use() {
+        let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthContext {
+            tenant_resolution: BootstrapSessionTenantDecision::RejectMissing,
+            tenant_resolution_error: None,
+            cached_tenant_id: Some("tenant-a".to_string()),
+            expiry_valid: false,
+            daemon_binding_valid: true,
+            claimed_peer_matches_key: true,
+            invite_signature_valid: true,
+        });
+        assert_eq!(decision, InboundBootstrapAuthDecision::RejectInvalidAuth);
     }
 
     #[test]

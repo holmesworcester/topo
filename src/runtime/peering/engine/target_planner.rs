@@ -23,7 +23,7 @@ use crate::runtime::repeated_warning::should_emit_globally;
 use crate::transport::resolve_bootstrap_inviter_peer_id;
 
 /// Dispatch decision for an outbound target.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DispatchAction {
     Skip,
     Connect,
@@ -74,23 +74,32 @@ impl PeerDispatcher {
         addr: Option<SocketAddr>,
         relay_url: Option<&str>,
     ) -> (DispatchAction, Option<tokio::sync::watch::Receiver<()>>) {
-        if let Some((prev_addr, prev_relay_url, _)) = self.known.get(key) {
-            if *prev_addr == addr && prev_relay_url.as_deref() == relay_url {
-                return (DispatchAction::Skip, None);
-            }
+        let action = self.peek_action(key, addr, relay_url);
+        if matches!(action, DispatchAction::Skip) {
+            return (DispatchAction::Skip, None);
         }
-
-        let action = if self.known.contains_key(key) {
-            DispatchAction::Reconnect
-        } else {
-            DispatchAction::Connect
-        };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
         self.known.insert(
             key.to_string(),
             (addr, relay_url.map(str::to_string), cancel_tx),
         );
         (action, Some(cancel_rx))
+    }
+
+    pub(crate) fn peek_action(
+        &self,
+        key: &str,
+        addr: Option<SocketAddr>,
+        relay_url: Option<&str>,
+    ) -> DispatchAction {
+        if let Some((prev_addr, prev_relay_url, _)) = self.known.get(key) {
+            if *prev_addr == addr && prev_relay_url.as_deref() == relay_url {
+                return DispatchAction::Skip;
+            }
+            return DispatchAction::Reconnect;
+        }
+
+        DispatchAction::Connect
     }
 
     pub(crate) fn forget(&mut self, key: &str) {
@@ -370,6 +379,17 @@ pub(crate) fn dispatch_bootstrap_target(
     matches!(action, DispatchAction::Connect | DispatchAction::Reconnect)
 }
 
+pub(crate) fn bootstrap_dispatch_action(
+    dispatcher: &PeerDispatcher,
+    tenant_id: &str,
+    transport_peer_id: &str,
+    remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
+) -> DispatchAction {
+    let key = bootstrap_dispatch_key(tenant_id, transport_peer_id, remote, relay_url);
+    dispatcher.peek_action(&key, remote, relay_url)
+}
+
 pub(crate) fn dispatch_known_peer_target(
     dispatcher: &mut PeerDispatcher,
     tenant_id: &str,
@@ -379,6 +399,16 @@ pub(crate) fn dispatch_known_peer_target(
     let key = known_peer_dispatch_key(tenant_id, transport_peer_id);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote, None);
     matches!(action, DispatchAction::Connect | DispatchAction::Reconnect)
+}
+
+pub(crate) fn known_peer_dispatch_action(
+    dispatcher: &PeerDispatcher,
+    tenant_id: &str,
+    transport_peer_id: &str,
+    remote: Option<SocketAddr>,
+) -> DispatchAction {
+    let key = known_peer_dispatch_key(tenant_id, transport_peer_id);
+    dispatcher.peek_action(&key, remote, None)
 }
 
 #[cfg(test)]

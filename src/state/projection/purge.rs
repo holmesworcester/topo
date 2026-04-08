@@ -13,6 +13,15 @@ struct PurgeManifest {
     file_ids: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HardPurgePlan {
+    RejectMissingTombstone,
+    ExecuteManifest {
+        event_ids: BTreeSet<String>,
+        file_ids: BTreeSet<String>,
+    },
+}
+
 impl PurgeManifest {
     fn add_event_id(&mut self, event_id: impl Into<String>) -> bool {
         self.event_ids.insert(event_id.into())
@@ -20,6 +29,17 @@ impl PurgeManifest {
 
     fn add_file_id(&mut self, file_id: impl Into<String>) -> bool {
         self.file_ids.insert(file_id.into())
+    }
+}
+
+fn decide_hard_purge_plan(tombstoned: bool, manifest: &PurgeManifest) -> HardPurgePlan {
+    if !tombstoned {
+        HardPurgePlan::RejectMissingTombstone
+    } else {
+        HardPurgePlan::ExecuteManifest {
+            event_ids: manifest.event_ids.clone(),
+            file_ids: manifest.file_ids.clone(),
+        }
     }
 }
 
@@ -559,6 +579,16 @@ pub(crate) fn hard_purge_deleted_message_graph(
     }
 
     let manifest = build_manifest(conn, recorded_by, root_message_event_id)?;
+    match decide_hard_purge_plan(tombstoned, &manifest) {
+        HardPurgePlan::RejectMissingTombstone => {
+            return Err(format!(
+                "hard purge requires tombstone for message {}",
+                root_message_event_id
+            )
+            .into())
+        }
+        HardPurgePlan::ExecuteManifest { .. } => {}
+    }
     test_checkpoint("after_manifest_build")?;
     delete_tenant_scoped_rows(conn, recorded_by, &manifest)?;
     test_checkpoint("after_tenant_scoped_delete")?;
@@ -572,4 +602,33 @@ pub(crate) fn hard_purge_deleted_message_graph(
         &orphaned_event_ids,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_purge_plan_rejects_missing_tombstone() {
+        let mut manifest = PurgeManifest::default();
+        manifest.add_event_id("message".to_string());
+        assert_eq!(
+            decide_hard_purge_plan(false, &manifest),
+            HardPurgePlan::RejectMissingTombstone
+        );
+    }
+
+    #[test]
+    fn hard_purge_plan_executes_exact_manifest() {
+        let mut manifest = PurgeManifest::default();
+        manifest.add_event_id("message".to_string());
+        manifest.add_file_id("file".to_string());
+        assert_eq!(
+            decide_hard_purge_plan(true, &manifest),
+            HardPurgePlan::ExecuteManifest {
+                event_ids: BTreeSet::from(["message".to_string()]),
+                file_ids: BTreeSet::from(["file".to_string()]),
+            }
+        );
+    }
 }

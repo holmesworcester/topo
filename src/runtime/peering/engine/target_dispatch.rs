@@ -19,8 +19,9 @@ use super::bootstrap_auth::{
     should_initiate_connect_for_source_with_db, BootstrapSessionFallback,
 };
 use super::target_planner::{
-    bootstrap_dispatch_key, bootstrap_dispatch_key_prefix, dispatch_bootstrap_target,
-    dispatch_known_peer_target, known_peer_dispatch_key, PeerDispatcher,
+    bootstrap_dispatch_action, bootstrap_dispatch_key, bootstrap_dispatch_key_prefix,
+    dispatch_bootstrap_target, dispatch_known_peer_target, known_peer_dispatch_action,
+    known_peer_dispatch_key, DispatchAction, PeerDispatcher,
 };
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
@@ -57,6 +58,49 @@ pub(super) struct ActiveConnectWorker {
     pub(super) source: TargetIngressSource,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TargetIngressSourceKind {
+    Bootstrap,
+    KnownPeer,
+}
+
+impl TargetIngressSource {
+    fn kind(&self) -> TargetIngressSourceKind {
+        match self {
+            TargetIngressSource::Bootstrap { .. } => TargetIngressSourceKind::Bootstrap,
+            TargetIngressSource::KnownPeer { .. } => TargetIngressSourceKind::KnownPeer,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TargetDispatchContext {
+    pub(super) incoming_source: TargetIngressSourceKind,
+    pub(super) should_initiate_connect: bool,
+    pub(super) bootstrap_phase: bool,
+    pub(super) has_active_higher_precedence_worker: bool,
+    pub(super) dispatch_action: DispatchAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TargetDispatchSkipReason {
+    NonPreferredSource,
+    LowerPrecedenceThanActiveWorker,
+    DispatcherNoop,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TargetDispatchSpawnPlan {
+    pub(super) cancel_existing_dispatch_key: bool,
+    pub(super) cancel_bootstrap_prefix: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TargetDispatchPlan {
+    Skip(TargetDispatchSkipReason),
+    Spawn(TargetDispatchSpawnPlan),
+}
+
 fn source_precedence(source: &TargetIngressSource) -> u8 {
     match source {
         TargetIngressSource::Bootstrap { .. } => 0,
@@ -71,15 +115,35 @@ pub(super) fn should_ignore_target_event(
     source_precedence(existing) > source_precedence(incoming)
 }
 
-pub(super) fn should_keep_existing_bootstrap_worker(
-    db_path: &str,
-    tenant_id: &str,
-    existing: &TargetIngressSource,
-    incoming: &TargetIngressSource,
-) -> bool {
-    is_tenant_in_bootstrap_phase(db_path, tenant_id)
-        && matches!(existing, TargetIngressSource::Bootstrap { .. })
-        && matches!(incoming, TargetIngressSource::KnownPeer { .. })
+pub(super) fn decide_target_dispatch_plan(context: &TargetDispatchContext) -> TargetDispatchPlan {
+    if !context.should_initiate_connect {
+        return TargetDispatchPlan::Skip(TargetDispatchSkipReason::NonPreferredSource);
+    }
+
+    if matches!(context.incoming_source, TargetIngressSourceKind::Bootstrap)
+        && context.has_active_higher_precedence_worker
+        && !context.bootstrap_phase
+    {
+        return TargetDispatchPlan::Skip(TargetDispatchSkipReason::LowerPrecedenceThanActiveWorker);
+    }
+
+    match context.dispatch_action {
+        DispatchAction::Skip => TargetDispatchPlan::Skip(TargetDispatchSkipReason::DispatcherNoop),
+        DispatchAction::Connect => TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
+            cancel_existing_dispatch_key: false,
+            cancel_bootstrap_prefix: matches!(
+                context.incoming_source,
+                TargetIngressSourceKind::KnownPeer
+            ) && !context.bootstrap_phase,
+        }),
+        DispatchAction::Reconnect => TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
+            cancel_existing_dispatch_key: true,
+            cancel_bootstrap_prefix: matches!(
+                context.incoming_source,
+                TargetIngressSourceKind::KnownPeer
+            ) && !context.bootstrap_phase,
+        }),
+    }
 }
 
 fn preferred_outbound_only_peer_id(source: &TargetIngressSource) -> Option<&str> {
@@ -134,6 +198,24 @@ fn known_peer_key_for_event(event: &TargetIngressEvent) -> String {
         }
         TargetIngressSource::KnownPeer { peer_id } => {
             known_peer_dispatch_key(&event.tenant_id, peer_id)
+        }
+    }
+}
+
+fn dispatch_action_for_event(
+    dispatcher: &PeerDispatcher,
+    event: &TargetIngressEvent,
+) -> DispatchAction {
+    match &event.source {
+        TargetIngressSource::Bootstrap { daemon_peer_id, .. } => bootstrap_dispatch_action(
+            dispatcher,
+            &event.tenant_id,
+            daemon_peer_id,
+            event.remote,
+            event.relay_url.as_deref(),
+        ),
+        TargetIngressSource::KnownPeer { peer_id } => {
+            known_peer_dispatch_action(dispatcher, &event.tenant_id, peer_id, event.remote)
         }
     }
 }
@@ -246,7 +328,28 @@ pub(super) async fn run_target_dispatcher(
             }
         };
 
-        if !should_initiate_connect_for_source_with_db(&db_path, &event.tenant_id, &event.source) {
+        let bootstrap_phase = is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id);
+        let should_initiate_connect =
+            should_initiate_connect_for_source_with_db(&db_path, &event.tenant_id, &event.source);
+        let has_active_higher_precedence_worker =
+            matches!(event.source, TargetIngressSource::Bootstrap { .. })
+                && active_workers
+                    .get(&known_peer_key_for_event(&event))
+                    .map(|existing| should_ignore_target_event(&existing.source, &event.source))
+                    .unwrap_or(false);
+        let dispatch_action = dispatch_action_for_event(&dispatcher, &event);
+        let dispatch_plan = decide_target_dispatch_plan(&TargetDispatchContext {
+            incoming_source: event.source.kind(),
+            should_initiate_connect,
+            bootstrap_phase,
+            has_active_higher_precedence_worker,
+            dispatch_action,
+        });
+
+        if matches!(
+            dispatch_plan,
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::NonPreferredSource)
+        ) {
             if let Some(peer_id) = preferred_outbound_only_peer_id(&event.source) {
                 info!(
                     "Skipping non-preferred {:?} dial key={} tenant={} peer={}",
@@ -259,39 +362,23 @@ pub(super) async fn run_target_dispatcher(
             continue;
         }
 
-        if matches!(event.source, TargetIngressSource::Bootstrap { .. }) {
-            let known_peer_key = known_peer_key_for_event(&event);
-            if let Some(existing) = active_workers.get(&known_peer_key) {
-                if should_ignore_target_event(&existing.source, &event.source) {
-                    if is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id) {
-                        info!(
-                            "Allowing bootstrap worker despite existing {:?} worker key={} tenant={}",
-                            existing.source,
-                            known_peer_key,
-                            short_peer_id(&event.tenant_id)
-                        );
-                    } else {
-                        continue;
-                    }
-                }
-            }
+        if matches!(event.source, TargetIngressSource::Bootstrap { .. })
+            && has_active_higher_precedence_worker
+            && bootstrap_phase
+        {
+            info!(
+                "Allowing bootstrap worker despite active known-peer worker key={} tenant={}",
+                known_peer_key_for_event(&event),
+                short_peer_id(&event.tenant_id)
+            );
         }
 
-        if let Some(existing) = active_workers.get(&dispatch_key) {
-            if should_keep_existing_bootstrap_worker(
-                &db_path,
-                &event.tenant_id,
-                &existing.source,
-                &event.source,
-            ) {
-                continue;
-            }
-            if should_ignore_target_event(&existing.source, &event.source) {
-                continue;
-            }
-        }
+        let spawn_plan = match dispatch_plan {
+            TargetDispatchPlan::Skip(_) => continue,
+            TargetDispatchPlan::Spawn(plan) => plan,
+        };
 
-        let should_spawn = match &event.source {
+        let did_dispatch = match &event.source {
             TargetIngressSource::Bootstrap { daemon_peer_id, .. } => dispatch_bootstrap_target(
                 &mut dispatcher,
                 &event.tenant_id,
@@ -303,13 +390,15 @@ pub(super) async fn run_target_dispatcher(
                 dispatch_known_peer_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
             }
         };
-        if !should_spawn {
+        if !did_dispatch {
             continue;
         }
 
-        if let Some(existing) = active_workers.remove(&dispatch_key) {
-            existing.cancel.cancel();
-            join_connect_worker(existing).await;
+        if spawn_plan.cancel_existing_dispatch_key {
+            if let Some(existing) = active_workers.remove(&dispatch_key) {
+                existing.cancel.cancel();
+                join_connect_worker(existing).await;
+            }
         }
 
         let bootstrap_session_fallback = match &event.source {
@@ -383,9 +472,7 @@ pub(super) async fn run_target_dispatcher(
             }
         }
 
-        if matches!(event.source, TargetIngressSource::KnownPeer { .. })
-            && !is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id)
-        {
+        if spawn_plan.cancel_bootstrap_prefix {
             let prefix =
                 bootstrap_dispatch_key_prefix(&event.tenant_id, &expected_remote_daemon_peer_id);
             cancel_bootstrap_workers_for_prefix(&mut active_workers, &mut dispatcher, &prefix)
@@ -536,6 +623,82 @@ async fn run_connect_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bootstrap_context(
+        bootstrap_phase: bool,
+        has_active_higher_precedence_worker: bool,
+        dispatch_action: DispatchAction,
+    ) -> TargetDispatchContext {
+        TargetDispatchContext {
+            incoming_source: TargetIngressSourceKind::Bootstrap,
+            should_initiate_connect: true,
+            bootstrap_phase,
+            has_active_higher_precedence_worker,
+            dispatch_action,
+        }
+    }
+
+    #[test]
+    fn target_dispatch_plan_skips_non_preferred_sources() {
+        let context = TargetDispatchContext {
+            incoming_source: TargetIngressSourceKind::KnownPeer,
+            should_initiate_connect: false,
+            bootstrap_phase: false,
+            has_active_higher_precedence_worker: false,
+            dispatch_action: DispatchAction::Connect,
+        };
+
+        assert_eq!(
+            decide_target_dispatch_plan(&context),
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::NonPreferredSource)
+        );
+    }
+
+    #[test]
+    fn bootstrap_is_suppressed_by_active_known_peer_outside_bootstrap_phase() {
+        assert_eq!(
+            decide_target_dispatch_plan(&bootstrap_context(false, true, DispatchAction::Connect)),
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::LowerPrecedenceThanActiveWorker)
+        );
+    }
+
+    #[test]
+    fn bootstrap_phase_allows_bootstrap_worker_despite_known_peer_worker() {
+        assert_eq!(
+            decide_target_dispatch_plan(&bootstrap_context(true, true, DispatchAction::Connect)),
+            TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
+                cancel_existing_dispatch_key: false,
+                cancel_bootstrap_prefix: false,
+            })
+        );
+    }
+
+    #[test]
+    fn dispatcher_noop_skips_spawning() {
+        assert_eq!(
+            decide_target_dispatch_plan(&bootstrap_context(false, false, DispatchAction::Skip)),
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::DispatcherNoop)
+        );
+    }
+
+    #[test]
+    fn known_peer_spawn_outside_bootstrap_phase_cancels_bootstrap_prefix() {
+        let context = TargetDispatchContext {
+            incoming_source: TargetIngressSourceKind::KnownPeer,
+            should_initiate_connect: true,
+            bootstrap_phase: false,
+            has_active_higher_precedence_worker: false,
+            dispatch_action: DispatchAction::Reconnect,
+        };
+
+        assert_eq!(
+            decide_target_dispatch_plan(&context),
+            TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
+                cancel_existing_dispatch_key: true,
+                cancel_bootstrap_prefix: true,
+            })
+        );
+    }
 
     #[test]
     fn bootstrap_source_uses_invite_bootstrap_auth() {

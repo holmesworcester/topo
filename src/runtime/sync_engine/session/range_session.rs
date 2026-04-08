@@ -21,14 +21,37 @@ pub struct RangeReceiveResult {
     pub path: Option<PathBuf>,
 }
 
-fn shared_priority_lane(kind: SyncWindowKind) -> Option<&'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedIndexLoadPlan {
+    PriorityLane(&'static str),
+    TimeWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedSendOrderPolicy {
+    PreserveInput,
+    OldestFirst,
+    NewestFirst,
+}
+
+fn decide_shared_index_load_plan(kind: SyncWindowKind) -> SharedIndexLoadPlan {
     match kind {
-        SyncWindowKind::AuthGraph => Some(SHARED_PRIORITY_LANE_AUTH),
-        SyncWindowKind::KeyGraph => Some(SHARED_PRIORITY_LANE_KEY),
+        SyncWindowKind::AuthGraph => SharedIndexLoadPlan::PriorityLane(SHARED_PRIORITY_LANE_AUTH),
+        SyncWindowKind::KeyGraph => SharedIndexLoadPlan::PriorityLane(SHARED_PRIORITY_LANE_KEY),
         SyncWindowKind::Full
         | SyncWindowKind::LastDay
         | SyncWindowKind::LastWeek
-        | SyncWindowKind::LastTwelveWeeks => None,
+        | SyncWindowKind::LastTwelveWeeks => SharedIndexLoadPlan::TimeWindow,
+    }
+}
+
+fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
+    match kind {
+        SyncWindowKind::AuthGraph => SharedSendOrderPolicy::OldestFirst,
+        SyncWindowKind::KeyGraph | SyncWindowKind::LastDay => SharedSendOrderPolicy::NewestFirst,
+        SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
+            SharedSendOrderPolicy::PreserveInput
+        }
     }
 }
 
@@ -39,70 +62,73 @@ fn load_shared_index_entries(
 ) -> Result<Vec<(i64, EventId)>, String> {
     let mut entries = Vec::new();
 
-    if let Some(lane) = shared_priority_lane(range.kind) {
-        let mut stmt = conn
-            .prepare(
-                "SELECT ts, id
-                 FROM shared_priority_event_index
-                 WHERE workspace_id = ?1
-                   AND lane = ?2
-                 ORDER BY ts, id",
-            )
-            .map_err(|e| format!("prepare shared priority index query: {e}"))?;
-        let mut rows = stmt
-            .query(rusqlite::params![workspace_id, lane])
-            .map_err(|e| format!("query shared priority index rows: {e}"))?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("iterate shared priority index rows: {e}"))?
-        {
-            let ts: i64 = row
-                .get(0)
-                .map_err(|e| format!("read shared priority index ts: {e}"))?;
-            let id_blob: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("read shared priority index id: {e}"))?;
-            if id_blob.len() != 32 {
-                continue;
+    match decide_shared_index_load_plan(range.kind) {
+        SharedIndexLoadPlan::PriorityLane(lane) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ts, id
+                     FROM shared_priority_event_index
+                     WHERE workspace_id = ?1
+                       AND lane = ?2
+                     ORDER BY ts, id",
+                )
+                .map_err(|e| format!("prepare shared priority index query: {e}"))?;
+            let mut rows = stmt
+                .query(rusqlite::params![workspace_id, lane])
+                .map_err(|e| format!("query shared priority index rows: {e}"))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| format!("iterate shared priority index rows: {e}"))?
+            {
+                let ts: i64 = row
+                    .get(0)
+                    .map_err(|e| format!("read shared priority index ts: {e}"))?;
+                let id_blob: Vec<u8> = row
+                    .get(1)
+                    .map_err(|e| format!("read shared priority index id: {e}"))?;
+                if id_blob.len() != 32 {
+                    continue;
+                }
+                let mut event_id = [0u8; 32];
+                event_id.copy_from_slice(&id_blob);
+                entries.push((ts, event_id));
             }
-            let mut event_id = [0u8; 32];
-            event_id.copy_from_slice(&id_blob);
-            entries.push((ts, event_id));
         }
-    } else {
-        let mut stmt = conn
-            .prepare(
-                "SELECT ts, id
-                 FROM shared_event_index
-                 WHERE workspace_id = ?1
-                   AND (?2 IS NULL OR ts >= ?2)
-                   AND (?3 IS NULL OR ts < ?3)
-                 ORDER BY ts, id",
-            )
-            .map_err(|e| format!("prepare shared index query: {e}"))?;
-        let mut rows = stmt
-            .query(rusqlite::params![
-                workspace_id,
-                range.ts_min(),
-                range.ts_max_exclusive()
-            ])
-            .map_err(|e| format!("query shared index rows: {e}"))?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("iterate shared index rows: {e}"))?
-        {
-            let ts: i64 = row
-                .get(0)
-                .map_err(|e| format!("read shared index ts: {e}"))?;
-            let id_blob: Vec<u8> = row
-                .get(1)
-                .map_err(|e| format!("read shared index id: {e}"))?;
-            if id_blob.len() != 32 {
-                continue;
+        SharedIndexLoadPlan::TimeWindow => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ts, id
+                     FROM shared_event_index
+                     WHERE workspace_id = ?1
+                       AND (?2 IS NULL OR ts >= ?2)
+                       AND (?3 IS NULL OR ts < ?3)
+                     ORDER BY ts, id",
+                )
+                .map_err(|e| format!("prepare shared index query: {e}"))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    workspace_id,
+                    range.ts_min(),
+                    range.ts_max_exclusive()
+                ])
+                .map_err(|e| format!("query shared index rows: {e}"))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| format!("iterate shared index rows: {e}"))?
+            {
+                let ts: i64 = row
+                    .get(0)
+                    .map_err(|e| format!("read shared index ts: {e}"))?;
+                let id_blob: Vec<u8> = row
+                    .get(1)
+                    .map_err(|e| format!("read shared index id: {e}"))?;
+                if id_blob.len() != 32 {
+                    continue;
+                }
+                let mut event_id = [0u8; 32];
+                event_id.copy_from_slice(&id_blob);
+                entries.push((ts, event_id));
             }
-            let mut event_id = [0u8; 32];
-            event_id.copy_from_slice(&id_blob);
-            entries.push((ts, event_id));
         }
     }
     Ok(entries)
@@ -153,10 +179,8 @@ fn prioritize_send_order(
     range: SyncWindow,
     ids: &[EventId],
 ) -> Result<Vec<EventId>, String> {
-    if !matches!(
-        range.kind,
-        SyncWindowKind::AuthGraph | SyncWindowKind::KeyGraph | SyncWindowKind::LastDay
-    ) {
+    let order_policy = decide_shared_send_order_policy(range.kind);
+    if matches!(order_policy, SharedSendOrderPolicy::PreserveInput) {
         return Ok(ids.to_vec());
     }
 
@@ -171,14 +195,14 @@ fn prioritize_send_order(
     ordered.sort_by(|left, right| {
         let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
         let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
-        match range.kind {
-            SyncWindowKind::AuthGraph => left_ts.cmp(&right_ts).then_with(|| left.cmp(right)),
-            SyncWindowKind::KeyGraph | SyncWindowKind::LastDay => {
+        match order_policy {
+            SharedSendOrderPolicy::OldestFirst => {
+                left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
+            }
+            SharedSendOrderPolicy::NewestFirst => {
                 right_ts.cmp(&left_ts).then_with(|| right.cmp(left))
             }
-            SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
-                left.cmp(right)
-            }
+            SharedSendOrderPolicy::PreserveInput => left.cmp(right),
         }
     });
     Ok(ordered)
@@ -409,6 +433,15 @@ mod tests {
 
     #[test]
     fn priority_index_entries_split_auth_and_key_preflight_lanes() {
+        assert_eq!(
+            decide_shared_index_load_plan(SyncWindowKind::AuthGraph),
+            SharedIndexLoadPlan::PriorityLane(SHARED_PRIORITY_LANE_AUTH)
+        );
+        assert_eq!(
+            decide_shared_index_load_plan(SyncWindowKind::KeyGraph),
+            SharedIndexLoadPlan::PriorityLane(SHARED_PRIORITY_LANE_KEY)
+        );
+
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "workspace-auth-key";
@@ -560,6 +593,19 @@ mod tests {
 
     #[test]
     fn prioritize_send_order_matches_lane_policy() {
+        assert_eq!(
+            decide_shared_send_order_policy(SyncWindowKind::AuthGraph),
+            SharedSendOrderPolicy::OldestFirst
+        );
+        assert_eq!(
+            decide_shared_send_order_policy(SyncWindowKind::KeyGraph),
+            SharedSendOrderPolicy::NewestFirst
+        );
+        assert_eq!(
+            decide_shared_send_order_policy(SyncWindowKind::Full),
+            SharedSendOrderPolicy::PreserveInput
+        );
+
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 

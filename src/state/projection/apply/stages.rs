@@ -14,6 +14,21 @@ use super::dispatch::dispatch_pure_projector;
 
 const MAX_PROJECTION_ENVELOPE_DEPTH: usize = 4;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextLoadDispositionPlan {
+    Continue,
+    RecordBlockAndReturn { missing: Vec<EventId> },
+    Reject { reason: String },
+    EmitHardPurgeAndReturn { message_event_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectionDecisionEffectPlan {
+    ApplyWriteOpsAndEmitCommands,
+    EmitCommandsOnly { missing: Vec<EventId> },
+    NoEffects,
+}
+
 fn check_transport_privacy(
     parsed: &ParsedEvent,
     is_encrypted_transport: bool,
@@ -149,6 +164,37 @@ fn load_context_with_prereqs<B: ProjectionBackend>(
     (meta.context_loader)(backend, frame, recorded_by, event_id_b64, parsed)
 }
 
+fn decide_context_load_disposition(result: &ContextLoadResult) -> ContextLoadDispositionPlan {
+    match result {
+        ContextLoadResult::Ready(_) => ContextLoadDispositionPlan::Continue,
+        ContextLoadResult::Block { missing } => ContextLoadDispositionPlan::RecordBlockAndReturn {
+            missing: missing.clone(),
+        },
+        ContextLoadResult::Reject { reason } => ContextLoadDispositionPlan::Reject {
+            reason: reason.clone(),
+        },
+        ContextLoadResult::Purge { message_event_id } => {
+            ContextLoadDispositionPlan::EmitHardPurgeAndReturn {
+                message_event_id: message_event_id.clone(),
+            }
+        }
+    }
+}
+
+fn decide_projection_decision_effect_plan(
+    decision: &ProjectionDecision,
+) -> ProjectionDecisionEffectPlan {
+    match decision {
+        ProjectionDecision::Valid => ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands,
+        ProjectionDecision::Block { missing } => ProjectionDecisionEffectPlan::EmitCommandsOnly {
+            missing: missing.clone(),
+        },
+        ProjectionDecision::Reject { .. } | ProjectionDecision::AlreadyProcessed => {
+            ProjectionDecisionEffectPlan::NoEffects
+        }
+    }
+}
+
 /// Shared projection helper: verify signer (if required), build context snapshot,
 /// dispatch to pure projector, execute write_ops, return decision.
 ///
@@ -248,26 +294,30 @@ fn apply_projection_frame<B: ProjectionBackend>(
     // Generic prerequisite reads now live at the context-load boundary:
     // declared deps, dep semantic types, and module-local context all return
     // through the same tri-state result.
-    let mut ctx =
-        match load_context_with_prereqs(backend, &frame, recorded_by, event_id_b64, parsed)? {
+    let context_result =
+        load_context_with_prereqs(backend, &frame, recorded_by, event_id_b64, parsed)?;
+    let mut ctx = match decide_context_load_disposition(&context_result) {
+        ContextLoadDispositionPlan::Continue => match context_result {
             ContextLoadResult::Ready(ctx) => ctx,
-            ContextLoadResult::Block { missing } => {
-                if !missing.is_empty() {
-                    backend.record_block(recorded_by, event_id_b64, &missing)?;
-                }
-                return Ok((ProjectionDecision::Block { missing }, None));
+            _ => unreachable!("continue plan requires ready context"),
+        },
+        ContextLoadDispositionPlan::RecordBlockAndReturn { missing } => {
+            if !missing.is_empty() {
+                backend.record_block(recorded_by, event_id_b64, &missing)?;
             }
-            ContextLoadResult::Reject { reason } => {
-                return Ok((ProjectionDecision::Reject { reason }, None));
-            }
-            ContextLoadResult::Purge { message_event_id } => {
-                backend.execute_emit_commands(
-                    recorded_by,
-                    &[EmitCommand::HardPurgeMessageGraph { message_event_id }],
-                )?;
-                return Ok((ProjectionDecision::Valid, None));
-            }
-        };
+            return Ok((ProjectionDecision::Block { missing }, None));
+        }
+        ContextLoadDispositionPlan::Reject { reason } => {
+            return Ok((ProjectionDecision::Reject { reason }, None));
+        }
+        ContextLoadDispositionPlan::EmitHardPurgeAndReturn { message_event_id } => {
+            backend.execute_emit_commands(
+                recorded_by,
+                &[EmitCommand::HardPurgeMessageGraph { message_event_id }],
+            )?;
+            return Ok((ProjectionDecision::Valid, None));
+        }
+    };
     ctx.current_transport_key_event_id = frame.current_transport_key_event_id.clone();
     ctx.current_owner_event_id = frame.current_owner_event_id.clone();
     ctx.current_signer = frame.current_signer.clone();
@@ -479,18 +529,18 @@ fn apply_projection_frame<B: ProjectionBackend>(
     // - Valid: apply write_ops and emitted commands.
     // - Block: apply emitted commands only (for block-side effects).
     // - Reject / AlreadyProcessed: no side effects.
-    match result.decision {
-        ProjectionDecision::Valid => {
+    match decide_projection_decision_effect_plan(&result.decision) {
+        ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands => {
             backend.execute_write_ops(&result.write_ops)?;
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
-        ProjectionDecision::Block { ref missing } => {
+        ProjectionDecisionEffectPlan::EmitCommandsOnly { missing } => {
             if !missing.is_empty() {
-                backend.record_block(recorded_by, event_id_b64, missing)?;
+                backend.record_block(recorded_by, event_id_b64, &missing)?;
             }
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
-        ProjectionDecision::Reject { .. } | ProjectionDecision::AlreadyProcessed => {}
+        ProjectionDecisionEffectPlan::NoEffects => {}
     }
 
     Ok((result.decision, None))
@@ -498,6 +548,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::db::{open_connection, schema::create_tables};
 
     #[test]
@@ -524,5 +575,24 @@ mod tests {
 
         assert!(blocked_events_exists);
         assert!(blocked_event_deps_exists);
+    }
+
+    #[test]
+    fn context_load_disposition_maps_block_to_block_recording_plan() {
+        let missing = vec![[0x11; 32]];
+        assert_eq!(
+            decide_context_load_disposition(&ContextLoadResult::block(missing.clone())),
+            ContextLoadDispositionPlan::RecordBlockAndReturn { missing }
+        );
+    }
+
+    #[test]
+    fn projection_decision_effect_plan_disables_effects_for_rejects() {
+        assert_eq!(
+            decide_projection_decision_effect_plan(&ProjectionDecision::Reject {
+                reason: "nope".to_string(),
+            }),
+            ProjectionDecisionEffectPlan::NoEffects
+        );
     }
 }
