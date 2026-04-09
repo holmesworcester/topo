@@ -160,6 +160,12 @@ const DAEMON_START_RETRY_BASE_MS: u64 = 200;
 
 pub fn bin() -> String {
     hold_network_test_binary_lock();
+    static DISABLE_RELAY_FOR_TESTS: OnceLock<()> = OnceLock::new();
+    DISABLE_RELAY_FOR_TESTS.get_or_init(|| {
+        unsafe {
+            std::env::set_var("TOPO_DISABLE_RELAY", "1");
+        }
+    });
     env!("CARGO_BIN_EXE_topo").to_string()
 }
 
@@ -324,6 +330,8 @@ pub struct DaemonOptions {
     pub disable_placeholder_autodial: bool,
     /// Disable mDNS discovery via environment variable.
     pub disable_discovery: bool,
+    /// Disable iroh relay usage via environment variable.
+    pub disable_relay: bool,
     /// Inherit stdout/stderr for debugging (instead of suppressing).
     pub inherit_stdio: bool,
     /// Redirect stdout to a file path (takes precedence over inherit_stdio).
@@ -343,6 +351,7 @@ impl Default for DaemonOptions {
             allow_ephemeral_bind_fallback: true,
             disable_placeholder_autodial: false,
             disable_discovery: false,
+            disable_relay: true,
             inherit_stdio: false,
             stdout_file: None,
             stderr_file: None,
@@ -424,6 +433,7 @@ pub fn start_daemon(db: &str) -> HarnessDaemon {
         db,
         &DaemonOptions {
             disable_discovery: true,
+            disable_relay: true,
             ..Default::default()
         },
     )
@@ -436,6 +446,7 @@ pub fn start_daemon_on_port(db: &str, port: u16) -> HarnessDaemon {
         &DaemonOptions {
             bind_port: Some(port),
             disable_discovery: true,
+            disable_relay: true,
             ..Default::default()
         },
     )
@@ -450,6 +461,7 @@ pub fn start_discovery_daemon(db: &str) -> HarnessDaemon {
             // binding the QUIC socket to loopback avoids environment-specific
             // wildcard-bind failures without changing the sync path under test.
             bind_ip: Some("127.0.0.1".to_string()),
+            disable_relay: true,
             extra_env: vec![("TOPO_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
             ..Default::default()
         },
@@ -463,6 +475,7 @@ pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> HarnessDaemon {
         &DaemonOptions {
             bind_ip: Some("127.0.0.1".to_string()),
             bind_port: Some(port),
+            disable_relay: true,
             extra_env: vec![("TOPO_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
             ..Default::default()
         },
@@ -554,6 +567,11 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
             cmd.env("TOPO_DISABLE_DISCOVERY", "1");
         } else {
             cmd.env_remove("TOPO_DISABLE_DISCOVERY");
+        }
+        if opts.disable_relay {
+            cmd.env("TOPO_DISABLE_RELAY", "1");
+        } else {
+            cmd.env_remove("TOPO_DISABLE_RELAY");
         }
         for (key, value) in &opts.extra_env {
             cmd.env(key, value);
@@ -1298,9 +1316,13 @@ pub fn rotate_key(db: &str) -> (String, u64) {
     (rotation_event_id, proactive_shares)
 }
 
-/// Create an invite via daemon RPC using Iroh relay/bootstrap lookup only.
-pub fn create_invite(db: &str, _bootstrap_addr: &str) -> String {
-    topo_create_invite_retry(db, _bootstrap_addr)
+/// Create an invite via daemon RPC, preferring an explicit direct bootstrap address.
+pub fn create_invite(db: &str, bootstrap_addr: &str) -> String {
+    if bootstrap_addr.trim().is_empty() {
+        topo_create_invite_retry(db, bootstrap_addr)
+    } else {
+        create_invite_with_public_addr(db, bootstrap_addr)
+    }
 }
 
 /// Create an invite via daemon RPC with an explicit direct bootstrap address.
@@ -1337,9 +1359,13 @@ pub fn create_invite_with_spki(
         .to_string()
 }
 
-/// Create a device-link via daemon RPC using Iroh relay/bootstrap lookup only.
-pub fn create_device_link(db: &str, _bootstrap_addr: &str) -> String {
-    topo_create_device_link_retry(db, _bootstrap_addr)
+/// Create a device-link via daemon RPC, preferring an explicit direct bootstrap address.
+pub fn create_device_link(db: &str, bootstrap_addr: &str) -> String {
+    if bootstrap_addr.trim().is_empty() {
+        topo_create_device_link_retry(db, bootstrap_addr)
+    } else {
+        create_device_link_with_public_addr(db, bootstrap_addr)
+    }
 }
 
 /// Create a device-link via daemon RPC with an explicit direct bootstrap address.
@@ -2508,14 +2534,22 @@ pub fn topo_send_retry(db: &str, content: &str) -> String {
         .to_string()
 }
 
-/// Create an invite via RPC with retry using Iroh endpoint/relay bootstrap only.
-pub fn topo_create_invite_retry(db: &str, _bootstrap_addr: &str) -> String {
+/// Create an invite via RPC with retry, preferring an explicit direct bootstrap address.
+pub fn topo_create_invite_retry(db: &str, bootstrap_addr: &str) -> String {
     assert_value_eventually(
         Duration::from_secs(30),
         Duration::from_millis(500),
-        "invite link with Iroh relay bootstrap",
+        "invite link",
         || {
-            let out = topo_rpc_retry(db, &["invite"], Duration::from_secs(3));
+            let out = if bootstrap_addr.trim().is_empty() {
+                topo_rpc_retry(db, &["invite"], Duration::from_secs(3))
+            } else {
+                topo_rpc_retry(
+                    db,
+                    &["invite", "--public-addr", bootstrap_addr],
+                    Duration::from_secs(3),
+                )
+            };
             assert!(
                 out.status.success(),
                 "topo invite failed: stdout={} stderr={}",
@@ -2529,18 +2563,26 @@ pub fn topo_create_invite_retry(db: &str, _bootstrap_addr: &str) -> String {
                 .expect("invite output missing topo:// link")
                 .to_string()
         },
-        |invite_link| invite_link.contains("/RELAY_URL."),
+        |invite_link| invite_link.starts_with("topo://"),
     )
 }
 
-/// Create a device-link via RPC with retry using Iroh endpoint/relay bootstrap only.
-pub fn topo_create_device_link_retry(db: &str, _bootstrap_addr: &str) -> String {
+/// Create a device-link via RPC with retry, preferring an explicit direct bootstrap address.
+pub fn topo_create_device_link_retry(db: &str, bootstrap_addr: &str) -> String {
     assert_value_eventually(
         Duration::from_secs(30),
         Duration::from_millis(500),
-        "device link with Iroh relay bootstrap",
+        "device link",
         || {
-            let out = topo_rpc_retry(db, &["link"], Duration::from_secs(3));
+            let out = if bootstrap_addr.trim().is_empty() {
+                topo_rpc_retry(db, &["link"], Duration::from_secs(3))
+            } else {
+                topo_rpc_retry(
+                    db,
+                    &["link", "--public-addr", bootstrap_addr],
+                    Duration::from_secs(3),
+                )
+            };
             assert!(
                 out.status.success(),
                 "topo link failed: stdout={} stderr={}",
@@ -2554,7 +2596,7 @@ pub fn topo_create_device_link_retry(db: &str, _bootstrap_addr: &str) -> String 
                 .expect("link output missing topo://link/ link")
                 .to_string()
         },
-        |invite_link| invite_link.contains("/RELAY_URL."),
+        |invite_link| invite_link.starts_with("topo://link/"),
     )
 }
 

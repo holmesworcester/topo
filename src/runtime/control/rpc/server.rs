@@ -441,6 +441,9 @@ fn runtime_relay_url(state: &DaemonState) -> Option<String> {
 }
 
 fn runtime_relay_url_for_bootstrap(state: &DaemonState) -> Option<String> {
+    if env_flag("TOPO_DISABLE_RELAY") {
+        return None;
+    }
     state.notify_runtime_recheck();
     let deadline = Instant::now() + INVITE_RELAY_WAIT_TIMEOUT;
     loop {
