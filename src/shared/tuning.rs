@@ -30,10 +30,6 @@ fn read_usize_env(name: &str) -> Option<usize> {
         .and_then(|v| v.parse::<usize>().ok())
 }
 
-fn read_u64_env(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok())
-}
-
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn read_i32_env(name: &str) -> Option<i32> {
     std::env::var(name).ok().and_then(|v| v.parse::<i32>().ok())
@@ -89,57 +85,6 @@ pub fn response_send_quantum_bytes() -> usize {
     } else {
         1024 * 1024
     }
-}
-
-pub fn sync_dep_send_event_cap() -> usize {
-    if let Some(v) = read_usize_env("TOPO_SYNC_DEP_SEND_EVENT_CAP") {
-        return v;
-    }
-    if low_mem_mode() {
-        128
-    } else {
-        2048
-    }
-}
-
-pub fn sync_dep_send_byte_cap() -> usize {
-    if let Some(v) = read_usize_env("TOPO_SYNC_DEP_SEND_BYTE_CAP") {
-        return v.max(1);
-    }
-    if low_mem_mode() {
-        512 * 1024
-    } else {
-        4 * 1024 * 1024
-    }
-}
-
-pub fn sync_dep_check_cap() -> usize {
-    if let Some(v) = read_usize_env("TOPO_SYNC_DEP_CHECK_CAP") {
-        return v;
-    }
-    if low_mem_mode() {
-        100_000
-    } else {
-        1_000_000
-    }
-}
-
-pub fn sync_dep_time_budget_last_day_ms() -> u64 {
-    read_u64_env("TOPO_SYNC_DEP_TIME_BUDGET_LAST_DAY_MS")
-        .or_else(|| read_u64_env("TOPO_SYNC_DEP_TIME_BUDGET_MS"))
-        .unwrap_or(if low_mem_mode() { 250 } else { 1_000 })
-}
-
-pub fn sync_dep_time_budget_last_week_ms() -> u64 {
-    read_u64_env("TOPO_SYNC_DEP_TIME_BUDGET_LAST_WEEK_MS")
-        .or_else(|| read_u64_env("TOPO_SYNC_DEP_TIME_BUDGET_MS"))
-        .unwrap_or(if low_mem_mode() { 500 } else { 2_000 })
-}
-
-pub fn sync_dep_time_budget_last_twelve_weeks_ms() -> u64 {
-    read_u64_env("TOPO_SYNC_DEP_TIME_BUDGET_LAST_TWELVE_WEEKS_MS")
-        .or_else(|| read_u64_env("TOPO_SYNC_DEP_TIME_BUDGET_MS"))
-        .unwrap_or(if low_mem_mode() { 1_000 } else { 5_000 })
 }
 
 // -- Sync sessions --
