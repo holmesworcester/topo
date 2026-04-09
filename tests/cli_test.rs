@@ -2015,6 +2015,112 @@ fn test_cli_todo_multi_use_invite_reuse_three_peer_probe_propagation() {
 }
 
 #[test]
+#[ignore = "diagnostic catchup probe; run explicitly when debugging two-peer bootstrap/rejoin sync"]
+fn test_cli_two_peer_rejoin_catches_offline_delta_and_preserves_live_messages() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 90_000;
+    let catchup_timeout_ms = 300_000;
+    let workspace_name = "two-peer-rejoin-diagnostic";
+
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&alice_db, workspace_name, "alice", "alice-root");
+    let mut alice = StartedCliPeer {
+        db: alice_db,
+        username: "alice".to_string(),
+        device_name: "alice-root".to_string(),
+        _daemon: start_discovery_daemon(
+            tmpdir
+                .path()
+                .join("alice.db")
+                .to_str()
+                .expect("alice db path"),
+        ),
+    };
+
+    let bob_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
+    let mut bob =
+        start_joined_discovery_cli_peer(&tmpdir, "bob.db", &bob_invite, "bob", "bob-box");
+    let _alice_peer_event_for_bob = wait_for_workspace_peer_id_with_sync_rounds(
+        &bob.db,
+        "alice",
+        &[&alice.db, &bob.db],
+        Duration::from_millis(timeout_ms),
+    );
+    let _bob_peer_event_for_alice = wait_for_workspace_peer_id_with_sync_rounds(
+        &alice.db,
+        "bob",
+        &[&alice.db, &bob.db],
+        Duration::from_millis(timeout_ms),
+    );
+    assert_identity_eventually_materialized(&bob.db, timeout_ms);
+
+    let alice_to_bob_steady_content = "two-peer-rejoin-diagnostic/alice-to-bob-steady";
+    let bob_to_alice_steady_content = "two-peer-rejoin-diagnostic/bob-to-alice-steady";
+    let _alice_to_bob_steady = send_message(&alice.db, alice_to_bob_steady_content);
+    let _bob_to_alice_steady = send_message(&bob.db, bob_to_alice_steady_content);
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db],
+        alice_to_bob_steady_content,
+        Duration::from_millis(timeout_ms),
+    );
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db],
+        bob_to_alice_steady_content,
+        Duration::from_millis(timeout_ms),
+    );
+
+    stop_daemon(&bob.db, &mut bob._daemon);
+    wait_for_daemon_stopped(&bob.db, Duration::from_secs(10));
+    assert_eq!(
+        message_count_sql(&bob.db),
+        2,
+        "offline peer should stop at the pre-offline steady-state message count"
+    );
+
+    generate_messages(&alice.db, 1_000);
+    let alice_tail = send_message(&alice.db, "two-peer-rejoin-diagnostic/alice-offline-tail");
+    let expected_total_messages = 1_003;
+
+    bob._daemon = start_discovery_daemon(&bob.db);
+    wait_for_active_tenant_ready(&bob.db, Duration::from_secs(120));
+    wait_for_active_tenant_transport_converged(&bob.db, Duration::from_secs(120));
+    let _ = wait_for_workspace_peer_id_with_sync_rounds(
+        &bob.db,
+        "alice",
+        &[&alice.db, &bob.db],
+        Duration::from_millis(timeout_ms),
+    );
+    assert_eventually(
+        &bob.db,
+        &format!("message_count >= {expected_total_messages}"),
+        catchup_timeout_ms,
+    );
+    assert_eventually(
+        &bob.db,
+        &format!("has_event:{} >= 1", alice_tail),
+        catchup_timeout_ms,
+    );
+
+    let alice_post_rejoin_content = "two-peer-rejoin-diagnostic/alice-post-rejoin";
+    let bob_post_rejoin_content = "two-peer-rejoin-diagnostic/bob-post-rejoin";
+    let _alice_post_rejoin = send_message(&alice.db, alice_post_rejoin_content);
+    let _bob_post_rejoin = send_message(&bob.db, bob_post_rejoin_content);
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db],
+        alice_post_rejoin_content,
+        Duration::from_millis(timeout_ms),
+    );
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db],
+        bob_post_rejoin_content,
+        Duration::from_millis(timeout_ms),
+    );
+
+    stop_daemon(&bob.db, &mut bob._daemon);
+    stop_daemon(&alice.db, &mut alice._daemon);
+}
+
+#[test]
 #[ignore = "TODO(route-admission): sequential fresh invites still fail to materialize a full three-peer mesh under automated CLI coverage"]
 fn test_cli_three_peer_rejoin_catches_offline_one_k_delta_after_sequential_invites() {
     let tmpdir = tempfile::tempdir().unwrap();
