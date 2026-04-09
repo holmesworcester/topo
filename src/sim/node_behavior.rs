@@ -1815,6 +1815,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
         &self,
         recorded_by: &str,
         event_id_b64: &str,
+        _outer_event: &ParsedEvent,
         sub_event: &ParsedEvent,
     ) -> ProjectionApplyResult<()> {
         if self.state.borrow().recorded_by != recorded_by {

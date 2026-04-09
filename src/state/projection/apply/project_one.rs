@@ -93,7 +93,7 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
     }
 
     let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
-    backend.finalize_valid_projection(recorded_by, &event_id_b64, sub_event)?;
+    backend.finalize_valid_projection(recorded_by, &event_id_b64, &parsed, sub_event)?;
 
     Ok((ProjectionDecision::Valid, Some(parsed)))
 }

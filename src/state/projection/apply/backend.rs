@@ -47,57 +47,62 @@ fn filter_syncable_shared_dep_ids(
         return Ok(Vec::new());
     }
 
-    let mut syncable = Vec::new();
-    for dep_id in dep_ids {
-        let dep_id_b64 = crate::crypto::event_id_to_base64(&dep_id);
-        let is_shared: bool = conn
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1
-                     FROM events
-                     WHERE event_id = ?1
-                       AND share_scope = 'shared'
-                 )",
-                rusqlite::params![dep_id_b64],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if is_shared {
-            syncable.push(dep_id);
-        }
+    let dep_rows: Vec<(EventId, String)> = dep_ids
+        .into_iter()
+        .map(|dep_id| (dep_id, crate::crypto::event_id_to_base64(&dep_id)))
+        .collect();
+    let placeholders = dep_rows.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT event_id
+         FROM events
+         WHERE share_scope = 'shared'
+           AND event_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(dep_rows.iter().map(|(_, dep_id_b64)| dep_id_b64)),
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut shared_ids = std::collections::HashSet::with_capacity(dep_rows.len());
+    for row in rows {
+        shared_ids.insert(row?);
     }
-    Ok(syncable)
+
+    Ok(dep_rows
+        .into_iter()
+        .filter_map(|(dep_id, dep_id_b64)| shared_ids.contains(&dep_id_b64).then_some(dep_id))
+        .collect())
 }
 
 fn persist_shared_dep_edges(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
+    outer_event: &ParsedEvent,
     sub_event: &ParsedEvent,
 ) -> ProjectionApplyResult<()> {
+    let is_shared: bool = conn
+        .query_row(
+            "SELECT share_scope = 'shared'
+             FROM events
+             WHERE event_id = ?1",
+            rusqlite::params![event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !is_shared {
+        return Ok(());
+    }
+
     let Some(workspace_id) = lookup_workspace_id(conn, recorded_by) else {
         return Ok(());
     };
     let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) else {
         return Ok(());
     };
-    let outer_blob: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT blob
-             FROM events
-             WHERE event_id = ?1
-               AND share_scope = 'shared'",
-            rusqlite::params![event_id_b64],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(outer_blob) = outer_blob else {
-        return Ok(());
-    };
-    let outer_event = crate::event_modules::parse_event(&outer_blob)?;
 
-    let mut dep_ids = collect_wrapper_dep_ids(&outer_event);
+    let mut dep_ids = collect_wrapper_dep_ids(outer_event);
     dep_ids.extend(
         sub_event
             .dep_field_values()
@@ -154,6 +159,7 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
         &self,
         recorded_by: &str,
         event_id_b64: &str,
+        outer_event: &ParsedEvent,
         sub_event: &ParsedEvent,
     ) -> ProjectionApplyResult<()>;
 }
@@ -255,6 +261,7 @@ impl ProjectionBackend for Connection {
         &self,
         recorded_by: &str,
         event_id_b64: &str,
+        outer_event: &ParsedEvent,
         sub_event: &ParsedEvent,
     ) -> ProjectionApplyResult<()> {
         // Some projectors hard-purge the current event inside the same
@@ -278,7 +285,7 @@ impl ProjectionBackend for Connection {
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![recorded_by, event_id_b64, semantic_type_code],
             )?;
-            persist_shared_dep_edges(self, recorded_by, event_id_b64, sub_event)?;
+            persist_shared_dep_edges(self, recorded_by, event_id_b64, outer_event, sub_event)?;
 
             crate::state::subscriptions::on_projected_event(
                 self,
@@ -434,6 +441,7 @@ mod tests {
             &self,
             _recorded_by: &str,
             event_id_b64: &str,
+            _outer_event: &ParsedEvent,
             _sub_event: &ParsedEvent,
         ) -> ProjectionApplyResult<()> {
             self.valid_marked
