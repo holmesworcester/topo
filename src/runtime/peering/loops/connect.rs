@@ -752,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn session_retry_plan_quiescent_sessions_back_off() {
+    fn session_retry_plan_quiescent_sessions_do_not_back_off() {
         let stats = SyncStats {
             events_sent: 0,
             events_received: 0,
@@ -763,7 +763,7 @@ mod tests {
         };
         assert_eq!(
             decide_session_retry_plan(Some(&stats)),
-            SessionRetryPlan::Delay(QUIESCENT_SESSION_RETRY_DELAY)
+            SessionRetryPlan::NoDelay
         );
     }
 }
