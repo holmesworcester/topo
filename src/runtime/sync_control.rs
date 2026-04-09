@@ -2,10 +2,8 @@
 
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Notify;
 
 /// Result of a manually-triggered negentropy round.
 #[derive(Debug, Clone, Serialize)]
@@ -49,73 +47,6 @@ struct SessionEntry {
 pub struct SyncControlRegistry {
     sessions: Mutex<HashMap<u64, SessionEntry>>,
     next_id: Mutex<u64>,
-}
-
-struct FrontierAdvanceSlot {
-    version: Arc<AtomicU64>,
-    notify: Arc<Notify>,
-}
-
-#[derive(Clone)]
-pub struct FrontierAdvanceSubscription {
-    version: Arc<AtomicU64>,
-    notify: Arc<Notify>,
-    observed_version: u64,
-}
-
-impl FrontierAdvanceSubscription {
-    pub fn take_changed(&mut self) -> bool {
-        let current = self.version.load(Ordering::Acquire);
-        if current == self.observed_version {
-            return false;
-        }
-        self.observed_version = current;
-        true
-    }
-
-    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.notify.notified()
-    }
-}
-
-fn frontier_key(db_path: &str, tenant_id: &str) -> String {
-    format!("{db_path}|{tenant_id}")
-}
-
-fn frontier_advance_slots() -> &'static Mutex<HashMap<String, FrontierAdvanceSlot>> {
-    static SLOTS: std::sync::OnceLock<Mutex<HashMap<String, FrontierAdvanceSlot>>> =
-        std::sync::OnceLock::new();
-    SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn frontier_advance_slot(db_path: &str, tenant_id: &str) -> (Arc<AtomicU64>, Arc<Notify>) {
-    let key = frontier_key(db_path, tenant_id);
-    let mut slots = frontier_advance_slots()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let slot = slots.entry(key).or_insert_with(|| FrontierAdvanceSlot {
-        version: Arc::new(AtomicU64::new(0)),
-        notify: Arc::new(Notify::new()),
-    });
-    (slot.version.clone(), slot.notify.clone())
-}
-
-pub fn frontier_advance_subscription(
-    db_path: &str,
-    tenant_id: &str,
-) -> FrontierAdvanceSubscription {
-    let (version, notify) = frontier_advance_slot(db_path, tenant_id);
-    FrontierAdvanceSubscription {
-        observed_version: version.load(Ordering::Acquire),
-        version,
-        notify,
-    }
-}
-
-pub fn note_frontier_advanced(db_path: &str, tenant_id: &str) {
-    let (version, notify) = frontier_advance_slot(db_path, tenant_id);
-    version.fetch_add(1, Ordering::AcqRel);
-    notify.notify_waiters();
 }
 
 impl SyncControlRegistry {
@@ -318,15 +249,5 @@ mod tests {
         let result = registry.trigger_round_for_peer("tenant1", "abcd");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no live session"));
-    }
-
-    #[test]
-    fn frontier_advance_subscription_detects_new_work() {
-        let mut subscription = frontier_advance_subscription("db-a", "tenant-a");
-        assert!(!subscription.take_changed());
-
-        note_frontier_advanced("db-a", "tenant-a");
-        assert!(subscription.take_changed());
-        assert!(!subscription.take_changed());
     }
 }

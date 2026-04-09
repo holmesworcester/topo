@@ -13,7 +13,6 @@ use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
-use crate::runtime::sync_control::frontier_advance_subscription;
 use crate::sync::session::windowing::{
     reset_outbound_window_state, select_outbound_window, SyncWindowKind,
 };
@@ -37,8 +36,6 @@ pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 const HOT_HEAD_SYNC_INTERVAL: Duration = Duration::from_millis(75);
-const AUTH_GRAPH_SYNC_INTERVAL: Duration = Duration::from_secs(1);
-const KEY_GRAPH_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const LAST_DAY_BACKGROUND_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const LAST_WEEK_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 const LAST_TWELVE_WEEKS_SYNC_INTERVAL: Duration = Duration::from_secs(10);
@@ -153,8 +150,6 @@ fn decide_session_auth_failure_plan(
 
 fn background_sync_interval(kind: SyncWindowKind) -> Duration {
     match kind {
-        SyncWindowKind::AuthGraph => AUTH_GRAPH_SYNC_INTERVAL,
-        SyncWindowKind::KeyGraph => KEY_GRAPH_SYNC_INTERVAL,
         SyncWindowKind::LastDay => LAST_DAY_BACKGROUND_SYNC_INTERVAL,
         SyncWindowKind::LastWeek => LAST_WEEK_SYNC_INTERVAL,
         SyncWindowKind::LastTwelveWeeks => LAST_TWELVE_WEEKS_SYNC_INTERVAL,
@@ -780,217 +775,6 @@ async fn run_background_sync_loop(
             next_background_sync_at = completed_at + FAILED_SESSION_RETRY_DELAY;
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_frontier_hot_sync_worker(
-    daemon_connection: DaemonConnection,
-    db_path: String,
-    recorded_by: String,
-    remote_target: String,
-    remote_session_peer_id: String,
-    expected_remote_daemon_peer_id: String,
-    shutdown: CancellationToken,
-    sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
-) {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("frontier hot sync worker runtime");
-        let local = tokio::task::LocalSet::new();
-        runtime.block_on(local.run_until(async move {
-            let mut frontier = frontier_advance_subscription(&db_path, &recorded_by);
-            let mut next_auth_plan_override: Option<OutboundSessionAuthPlan> = None;
-            let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
-            let connection_id = daemon_connection.connection().stable_id();
-            let auth_plan = OutboundSessionAuthPlan::PeerShared {
-                target_peer_id: remote_session_peer_id.clone(),
-            };
-            let mut pending_hot_sync = false;
-            let mut next_retry_at = tokio::time::Instant::now();
-
-            loop {
-                if shutdown.is_cancelled() || daemon_connection.connection().close_reason().is_some() {
-                    break;
-                }
-
-                if frontier.take_changed() {
-                    pending_hot_sync = true;
-                    next_retry_at = tokio::time::Instant::now();
-                }
-
-                if !pending_hot_sync {
-                    let frontier_notified = frontier.notified();
-                    tokio::pin!(frontier_notified);
-                    tokio::select! {
-                        _ = shutdown.cancelled() => break,
-                        _ = &mut frontier_notified => {}
-                    }
-                    continue;
-                }
-
-                let now = tokio::time::Instant::now();
-                if now < next_retry_at {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => break,
-                        _ = tokio::time::sleep_until(next_retry_at) => {}
-                    }
-                    continue;
-                }
-
-                let initiator_handler =
-                    SyncConnectionHandler::outbound(db_path.clone(), SYNC_SESSION_TIMEOUT_SECS)
-                        .with_sync_control(sync_control.clone())
-                        .with_outbound_window_override(Some(SyncWindowKind::LastDay));
-
-                let mut session = match daemon_connection
-                    .open_outbound_session(SessionClass::Range)
-                    .await
-                {
-                    Ok(session) => session,
-                    Err(err) => {
-                        if let Some(reason) = extract_build_mismatch_reason(&err.to_string()) {
-                            note_build_mismatch(daemon_connection.remote_daemon_peer_id(), reason);
-                        }
-                        let plan = decide_session_open_failure_plan(
-                            should_evict_closed_daemon_connection(&daemon_connection, &err.to_string()),
-                        );
-                        if matches!(plan, SessionOpenFailurePlan::EvictAndBreak) {
-                            daemon_connection
-                                .connection()
-                                .close(0u32.into(), b"frontier hot session open lost connection");
-                            evict_live_daemon_connection(
-                                &db_path,
-                                daemon_connection.remote_daemon_peer_id(),
-                                connection_id,
-                            );
-                            break;
-                        }
-                        next_retry_at = tokio::time::Instant::now() + FAILED_SESSION_RETRY_DELAY;
-                        continue;
-                    }
-                };
-
-                let db = open_connection(&db_path).ok();
-                let effective_auth_plan = next_auth_plan_override.take().unwrap_or_else(|| {
-                    db.as_ref()
-                        .and_then(|conn| {
-                            resolve_outbound_session_auth_plan(
-                                conn,
-                                Some(&daemon_connection),
-                                &recorded_by,
-                                &remote_session_peer_id,
-                                daemon_connection.remote_daemon_peer_id(),
-                                &auth_plan,
-                            )
-                            .ok()
-                        })
-                        .unwrap_or_else(|| auth_plan.clone())
-                });
-                let bootstrap_retry_invite = match &effective_auth_plan {
-                    OutboundSessionAuthPlan::PeerShared { .. }
-                        if !daemon_connection
-                            .admits_session_route(&recorded_by, &remote_session_peer_id) =>
-                    {
-                        db.as_ref()
-                            .and_then(|conn| {
-                                resolve_bootstrap_fallback_invite_for_daemon(
-                                    conn,
-                                    &recorded_by,
-                                    daemon_connection.remote_daemon_peer_id(),
-                                )
-                                .ok()
-                            })
-                            .flatten()
-                    }
-                    _ => None,
-                };
-
-                let auth_result = match send_outbound_session_auth(
-                    session.io.as_mut(),
-                    &db_path,
-                    &recorded_by,
-                    Some(&daemon_connection),
-                    daemon_connection.remote_daemon_peer_id(),
-                    Some(&expected_remote_daemon_peer_id),
-                    &effective_auth_plan,
-                )
-                .await
-                {
-                    Ok(auth_result) => {
-                        next_auth_plan_override = None;
-                        auth_result
-                    }
-                    Err(e) => {
-                        let plan = decide_session_auth_failure_plan(
-                            should_evict_closed_daemon_connection(&daemon_connection, &e.to_string()),
-                            bootstrap_retry_invite,
-                        );
-                        next_auth_plan_override = plan.next_auth_plan_override.clone();
-                        if plan.evict_live_connection {
-                            daemon_connection
-                                .connection()
-                                .close(0u32.into(), b"frontier hot session auth lost connection");
-                            evict_live_daemon_connection(
-                                &db_path,
-                                daemon_connection.remote_daemon_peer_id(),
-                                connection_id,
-                            );
-                            break;
-                        }
-                        let message = format!(
-                            "{} [auth_plan={}, expected_daemon={}, actual_daemon={}]",
-                            describe_session_auth_failure(&remote_target, &remote_session_peer_id, &*e),
-                            describe_outbound_session_auth_plan(&effective_auth_plan),
-                            super::short_peer_id(&expected_remote_daemon_peer_id),
-                            super::short_peer_id(daemon_connection.remote_daemon_peer_id()),
-                        );
-                        if warning_gate.should_emit(message.clone())
-                            && should_emit_globally(format!("connect:{message}"))
-                        {
-                            warn!("{}", message);
-                        }
-                        next_retry_at = tokio::time::Instant::now() + FAILED_SESSION_RETRY_DELAY;
-                        continue;
-                    }
-                };
-
-                let peer_fp = match peer_fingerprint_from_hex(&auth_result.session_peer_id) {
-                    Some(peer_fp) => peer_fp,
-                    None => {
-                        next_retry_at = tokio::time::Instant::now() + FAILED_SESSION_RETRY_DELAY;
-                        continue;
-                    }
-                };
-
-                record_authenticated_outbound_session(
-                    &db_path,
-                    &recorded_by,
-                    &auth_result,
-                    session.remote_addr,
-                );
-                let session_remote_label = session.remote_label.clone();
-                let session_stats = super::run_session(
-                    &initiator_handler,
-                    session.session_id,
-                    session.io,
-                    &recorded_by,
-                    peer_fp,
-                    session_remote_label,
-                    SessionDirection::Outbound,
-                    &db_path,
-                )
-                .await;
-
-                if session_stats.is_some() {
-                    pending_hot_sync = false;
-                } else {
-                    next_retry_at = tokio::time::Instant::now() + FAILED_SESSION_RETRY_DELAY;
-                }
-            }
-        }));
-    });
 }
 
 pub(super) fn spawn_daemon_connection_worker(

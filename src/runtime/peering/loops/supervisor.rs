@@ -24,7 +24,6 @@ use crate::transport::{
 };
 
 use super::{
-    connect::spawn_frontier_hot_sync_worker,
     current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session, short_peer_id,
     ENDPOINT_TTL_MS,
 };
@@ -126,8 +125,6 @@ pub(super) async fn supervise_inbound_daemon_connection(
     let connection = daemon_connection.connection();
     let remote_daemon_peer_id = daemon_connection.remote_daemon_peer_id().to_string();
     let mut connection_admitted = false;
-    let mut frontier_hot_sync_identity: Option<(String, String)> = None;
-
     loop {
         if shutdown.is_cancelled() {
             connection.close(0u32.into(), b"runtime shutdown");
@@ -257,29 +254,6 @@ pub(super) async fn supervise_inbound_daemon_connection(
                 err
             );
             continue;
-        }
-
-        let should_spawn_frontier_hot_sync = frontier_hot_sync_identity
-            .as_ref()
-            .map(|(tenant_id, peer_id)| {
-                tenant_id != &auth_context.tenant_id || peer_id != &auth_context.remote_peer_id
-            })
-            .unwrap_or(true);
-        if should_spawn_frontier_hot_sync && session.remote_addr.is_some() {
-            spawn_frontier_hot_sync_worker(
-                daemon_connection.clone(),
-                db_path.to_string(),
-                auth_context.tenant_id.clone(),
-                format!("daemon {}", short_peer_id(&remote_daemon_peer_id)),
-                auth_context.remote_peer_id.clone(),
-                remote_daemon_peer_id.clone(),
-                shutdown.child_token(),
-                handler.sync_control().clone(),
-            );
-            frontier_hot_sync_identity = Some((
-                auth_context.tenant_id.clone(),
-                auth_context.remote_peer_id.clone(),
-            ));
         }
 
         let peer_fp = match peer_fingerprint_from_hex(&auth_context.remote_peer_id) {

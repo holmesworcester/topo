@@ -120,10 +120,6 @@ impl DaemonState {
         self.runtime_recheck.notify_waiters();
     }
 
-    pub fn notify_frontier_advanced(&self, tenant_id: &str) {
-        crate::runtime::sync_control::note_frontier_advanced(&self.db_path, tenant_id);
-    }
-
     fn runtime_endpoint(&self) -> Option<TransportEndpoint> {
         self.runtime_net
             .read()
@@ -721,7 +717,6 @@ fn dispatch(
                         }
                     }
                     state.notify_runtime_recheck();
-                    state.notify_frontier_advanced(&resp.peer_id);
                     rpc_resp
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -743,7 +738,6 @@ fn dispatch(
                         "message",
                     );
                     state.notify_runtime_recheck();
-                    state.notify_frontier_advanced(&peer_id);
                     let eid = data.event_id.clone();
                     let mut resp = RpcResponse::success(data);
                     inject_created_events(&mut resp, db_path, &peer_id, &[&eid]);
@@ -776,7 +770,6 @@ fn dispatch(
                             "file",
                         );
                         state.notify_runtime_recheck();
-                        state.notify_frontier_advanced(&peer_id);
                         let eid = data.event_id.clone();
                         let mut resp = RpcResponse::success(data);
                         inject_created_events(&mut resp, db_path, &peer_id, &[&eid]);
@@ -811,7 +804,6 @@ fn dispatch(
                 match message::generate_files_for_peer(db_path, &peer_id, count, size_mib) {
                     Ok(data) => {
                         state.notify_runtime_recheck();
-                        state.notify_frontier_advanced(&peer_id);
                         RpcResponse::success(data)
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
@@ -834,7 +826,6 @@ fn dispatch(
                         "reaction",
                     );
                     state.notify_runtime_recheck();
-                    state.notify_frontier_advanced(&peer_id);
                     let eid = data.event_id.clone();
                     let mut resp = RpcResponse::success(data);
                     inject_created_events(&mut resp, db_path, &peer_id, &[&eid]);
@@ -848,7 +839,6 @@ fn dispatch(
             Ok(peer_id) => match message::delete_message_for_peer(db_path, &peer_id, &target) {
                 Ok(data) => {
                     state.notify_runtime_recheck();
-                    state.notify_frontier_advanced(&peer_id);
                     RpcResponse::success(data)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -987,7 +977,6 @@ fn dispatch(
             Ok(peer_id) => match workspace::commands::rotate_key_for_peer(db_path, &peer_id) {
                 Ok(data) => {
                     state.notify_runtime_recheck();
-                    state.notify_frontier_advanced(&peer_id);
                     RpcResponse::success(data)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -1125,7 +1114,6 @@ fn dispatch(
                 match result {
                     Ok(data) => {
                         let invite_eid_b64 = data.invite_event_id.clone();
-                        state.notify_frontier_advanced(&peer_id);
                         let mut resp = if let Some(link) = serde_json::to_value(&data)
                             .ok()
                             .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
@@ -1183,7 +1171,6 @@ fn dispatch(
                     ) {
                         Ok(data) => {
                             let invite_eid_b64 = data.invite_event_id.clone();
-                            state.notify_frontier_advanced(&peer_id);
                             let mut resp = if let Some(link) = serde_json::to_value(&data)
                                 .ok()
                                 .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
@@ -1224,7 +1211,6 @@ fn dispatch(
                     let pid = data.peer_id.clone();
                     *state.active_peer.write().unwrap() = Some(pid.clone());
                     state.notify_runtime_recheck();
-                    state.notify_frontier_advanced(&pid);
                     let mut resp = RpcResponse::success(data);
                     if let Ok((recorded_by, db)) = service::open_db_for_peer(db_path, &pid) {
                         if let Ok(list_resp) = service::svc_event_list(&db, &recorded_by) {
@@ -1258,7 +1244,6 @@ fn dispatch(
                 let pid = data.peer_id.clone();
                 *state.active_peer.write().unwrap() = Some(pid.clone());
                 state.notify_runtime_recheck();
-                state.notify_frontier_advanced(&pid);
                 let mut resp = RpcResponse::success(data);
                 if let Ok((recorded_by, db)) = service::open_db_for_peer(db_path, &pid) {
                     if let Ok(list_resp) = service::svc_event_list(&db, &recorded_by) {

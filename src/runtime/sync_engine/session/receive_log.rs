@@ -11,7 +11,6 @@ use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::hash_event;
 use crate::db::queue::current_timestamp_ms;
 use crate::protocol::{parse_frame, Frame, ParseError};
-use crate::runtime::sync_control::note_frontier_advanced;
 use crate::state::pipeline::ingest_now;
 
 const RECEIVE_LOG_PREFIX: &str = "recvlog";
@@ -277,10 +276,6 @@ pub fn ingest_receive_log(db_path: &str, path: &Path) -> Result<usize, String> {
     if !batch.is_empty() {
         ingested += ingest_now(db_path, batch)?;
     }
-    if ingested > 0 {
-        note_frontier_advanced(db_path, &header.recorded_by);
-    }
-
     fs::remove_file(path).map_err(|e| format!("delete receive log {}: {e}", path.display()))?;
     let _ = fs::remove_file(legacy_receive_log_meta_path(path));
     Ok(ingested)
