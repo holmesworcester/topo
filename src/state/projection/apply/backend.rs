@@ -70,6 +70,49 @@ fn filter_syncable_shared_dep_ids(
     Ok(syncable)
 }
 
+fn collect_associated_key_shared_dep_ids(
+    conn: &Connection,
+    recorded_by: &str,
+    outer_event: &ParsedEvent,
+) -> ProjectionApplyResult<Vec<EventId>> {
+    let key_event_id = match outer_event {
+        ParsedEvent::Encrypted(encrypted) => Some(encrypted.key_event_id),
+        ParsedEvent::Signed(signed) => match crate::event_modules::parse_event(&signed.payload)? {
+            ParsedEvent::Encrypted(encrypted) => Some(encrypted.key_event_id),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(key_event_id) = key_event_id else {
+        return Ok(Vec::new());
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT ks.event_id
+         FROM key_shared ks
+         JOIN events e ON e.event_id = ks.event_id
+         WHERE ks.recorded_by = ?1
+           AND ks.key_event_id = ?2
+           AND e.share_scope = 'shared'
+         ORDER BY e.created_at, ks.event_id",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            recorded_by,
+            crate::crypto::event_id_to_base64(&key_event_id)
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut dep_ids = Vec::new();
+    for row in rows {
+        let event_id_b64 = row?;
+        if let Some(dep_id) = crate::crypto::event_id_from_base64(&event_id_b64) {
+            dep_ids.push(dep_id);
+        }
+    }
+    Ok(dep_ids)
+}
+
 fn persist_shared_dep_edges(
     conn: &Connection,
     recorded_by: &str,
@@ -98,6 +141,11 @@ fn persist_shared_dep_edges(
     let outer_event = crate::event_modules::parse_event(&outer_blob)?;
 
     let mut dep_ids = collect_wrapper_dep_ids(&outer_event);
+    dep_ids.extend(collect_associated_key_shared_dep_ids(
+        conn,
+        recorded_by,
+        &outer_event,
+    )?);
     dep_ids.extend(
         sub_event
             .dep_field_values()
@@ -269,6 +317,17 @@ impl ProjectionBackend for Connection {
                 rusqlite::params![recorded_by, event_id_b64, semantic_type_code],
             )?;
             persist_shared_dep_edges(self, recorded_by, event_id_b64, sub_event)?;
+            if let Some(workspace_id) = lookup_workspace_id(self, recorded_by) {
+                if let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) {
+                    crate::db::hot_day_deps::track_valid_shared_event_deps(
+                        self,
+                        &workspace_id,
+                        &event_id,
+                        sub_event.created_at_ms() as i64,
+                        current_timestamp_ms(),
+                    )?;
+                }
+            }
 
             crate::state::subscriptions::on_projected_event(
                 self,
