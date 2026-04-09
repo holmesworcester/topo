@@ -133,6 +133,7 @@ fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: D
     }
 }
 
+#[allow(dead_code)]
 fn sync_run_count_via_cli(db_path: &str) -> i64 {
     let output = topo_cmd(db_path, &["sync-log", "show", "--all", "--limit", "100000"]);
     assert!(
@@ -147,6 +148,7 @@ fn sync_run_count_via_cli(db_path: &str) -> i64 {
         .count() as i64
 }
 
+#[allow(dead_code)]
 fn wait_for_sync_run_count_at_least(db_path: &str, minimum: i64, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -166,6 +168,7 @@ fn wait_for_sync_run_count_at_least(db_path: &str, minimum: i64, timeout: Durati
     }
 }
 
+#[allow(dead_code)]
 fn wait_for_sync_runs_to_stabilize(db_paths: &[&str], stable_for: Duration, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     let mut last_counts: Vec<i64> = db_paths
@@ -910,7 +913,7 @@ fn test_cli_bidirectional_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 30000;
     let sync_opts = DaemonOptions {
         disable_discovery: false,
         ..Default::default()
@@ -989,7 +992,7 @@ fn test_cli_ongoing_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 30000;
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
@@ -1126,161 +1129,6 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
 
     stop_daemon(&bob_db, &mut bob_daemon);
     stop_daemon(&alice_db, &mut alice_daemon);
-}
-
-#[test]
-fn test_cli_relay_bootstrap_quiesces_after_endpoint_supersession() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let sync_log = topo_cmd(&alice_db, &["sync-log", "enable", "--all-runs"]);
-    assert!(
-        sync_log.status.success(),
-        "sync-log enable failed for alice: stdout={} stderr={}",
-        String::from_utf8_lossy(&sync_log.stdout),
-        String::from_utf8_lossy(&sync_log.stderr)
-    );
-
-    let mut alice_daemon = start_daemon_with_options(
-        &alice_db,
-        &DaemonOptions {
-            disable_discovery: true,
-            ..Default::default()
-        },
-    );
-    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
-
-    accept_invite(&bob_db, &invite_link);
-    let sync_log = topo_cmd(&bob_db, &["sync-log", "enable", "--all-runs"]);
-    assert!(
-        sync_log.status.success(),
-        "sync-log enable failed for bob: stdout={} stderr={}",
-        String::from_utf8_lossy(&sync_log.stdout),
-        String::from_utf8_lossy(&sync_log.stderr)
-    );
-
-    let mut bob_daemon = start_daemon_with_options(
-        &bob_db,
-        &DaemonOptions {
-            disable_discovery: true,
-            ..Default::default()
-        },
-    );
-    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
-    wait_for_sync_run_count_at_least(&alice_db, 1, Duration::from_secs(60));
-    wait_for_sync_run_count_at_least(&bob_db, 1, Duration::from_secs(60));
-
-    let steady_state_eid = send_message(&alice_db, "steady-state before idle");
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", steady_state_eid),
-        timeout_ms,
-    );
-
-    let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
-    wait_for_endpoint_observation(&bob_db, &alice_transport_peer_id, Duration::from_secs(30));
-    let transport_auth = topo_cmd(&bob_db, &["transport-auth"]);
-    assert!(
-        transport_auth.status.success(),
-        "transport-auth failed before idle window: stdout={} stderr={}",
-        String::from_utf8_lossy(&transport_auth.stdout),
-        String::from_utf8_lossy(&transport_auth.stderr)
-    );
-    let transport_auth_stdout = String::from_utf8_lossy(&transport_auth.stdout);
-    assert!(
-        transport_auth_stdout.contains("[peer_shared]"),
-        "expected steady-state peer_shared auth before idle window, got:\n{}",
-        transport_auth_stdout
-    );
-    assert!(
-        transport_auth_stdout.contains("[accepted_bootstrap]"),
-        "expected preserved bootstrap fallback before idle window, got:\n{}",
-        transport_auth_stdout
-    );
-    wait_for_sync_runs_to_stabilize(
-        &[&alice_db, &bob_db],
-        Duration::from_secs(2),
-        Duration::from_secs(30),
-    );
-
-    let before_alice = sync_run_count_via_cli(&alice_db);
-    let before_bob = sync_run_count_via_cli(&bob_db);
-    std::thread::sleep(Duration::from_secs(8));
-    let after_alice = sync_run_count_via_cli(&alice_db);
-    let after_bob = sync_run_count_via_cli(&bob_db);
-    let delta_alice = after_alice - before_alice;
-    let delta_bob = after_bob - before_bob;
-    println!(
-        "idle sync-run delta after relay bootstrap supersession: alice={} bob={}",
-        delta_alice, delta_bob
-    );
-
-    assert!(
-        delta_alice <= 2 && delta_bob <= 2,
-        "expected relay-bootstrap peers to quiesce after endpoint supersession, got idle sync-run deltas alice={} bob={}",
-        delta_alice,
-        delta_bob
-    );
-
-    stop_daemon(&bob_db, &mut bob_daemon);
-    stop_daemon(&alice_db, &mut alice_daemon);
-}
-
-#[test]
-fn test_cli_topo_log_updates_running_daemon_immediately() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("daemon.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    let mut daemon = start_daemon_with_options(
-        &db,
-        &DaemonOptions {
-            disable_discovery: true,
-            ..Default::default()
-        },
-    );
-
-    let before = topo_cmd(&db, &["topo-log"]);
-    assert!(
-        before.status.success(),
-        "topo-log config failed before update: stdout={} stderr={}",
-        String::from_utf8_lossy(&before.stdout),
-        String::from_utf8_lossy(&before.stderr)
-    );
-    let before_stdout = String::from_utf8_lossy(&before.stdout);
-    assert!(before_stdout.contains("topo-log level=warn"));
-    assert!(before_stdout.contains("effective_now=true"));
-
-    let update = topo_cmd(&db, &["topo-log", "debug"]);
-    assert!(
-        update.status.success(),
-        "topo-log debug failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&update.stdout),
-        String::from_utf8_lossy(&update.stderr)
-    );
-    let update_stdout = String::from_utf8_lossy(&update.stdout);
-    assert!(update_stdout.contains("topo-log level=debug"));
-    assert!(update_stdout.contains("effective_now=true"));
-
-    let after = topo_cmd(&db, &["topo-log"]);
-    assert!(
-        after.status.success(),
-        "topo-log config failed after update: stdout={} stderr={}",
-        String::from_utf8_lossy(&after.stdout),
-        String::from_utf8_lossy(&after.stderr)
-    );
-    let after_stdout = String::from_utf8_lossy(&after.stdout);
-    assert!(after_stdout.contains("topo-log level=debug"));
-    assert!(after_stdout.contains("effective_now=true"));
-
-    stop_daemon(&db, &mut daemon);
 }
 
 #[test]

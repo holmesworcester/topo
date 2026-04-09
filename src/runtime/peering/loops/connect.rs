@@ -33,8 +33,6 @@ use super::{
 pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
-const QUIESCENT_SESSION_RETRY_DELAY: Duration = Duration::from_secs(15);
-
 fn describe_outbound_session_auth_plan(plan: &OutboundSessionAuthPlan) -> String {
     match plan {
         OutboundSessionAuthPlan::PeerShared { target_peer_id } => {
@@ -409,9 +407,6 @@ async fn connect_loop_inner(
             .await;
 
             let session_retry_delay = match session_stats {
-                Some(stats) if stats.events_sent == 0 && stats.events_received == 0 => {
-                    QUIESCENT_SESSION_RETRY_DELAY
-                }
                 Some(_) => Duration::ZERO,
                 None => Duration::from_millis(250),
             };
