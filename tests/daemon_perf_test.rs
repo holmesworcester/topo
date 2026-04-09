@@ -523,7 +523,7 @@ fn perf_continuous_10k() {
 #[test]
 fn perf_preloaded_10k() {
     const N: i64 = 10_000;
-    let timeout_secs = env_i64("TOPO_PERF_PRELOADED_TIMEOUT_SECS", 300) as u64;
+    let timeout_secs = env_i64("TOPO_PERF_PRELOADED_TIMEOUT_SECS", 5) as u64;
 
     let bench = SharedWorkspaceBench::new();
     // Warm the connection first so bootstrap identity sync is done
