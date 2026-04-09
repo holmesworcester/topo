@@ -18,7 +18,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use topo::crypto::event_id_from_base64;
+use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::db::open_connection;
 use topo::event_modules::workspace::commands::{
     accept_invite as accept_invite_without_sync, create_user_invite_raw,
@@ -359,6 +359,31 @@ fn tenant_peer_id_for_username(db_path: &str, username: &str) -> Option<String> 
         .map(|tenant| tenant.peer_id)
 }
 
+fn workspace_peer_id_for_username(db_path: &str, username: &str) -> Option<String> {
+    let conn = open_connection(db_path).expect("open db");
+    let active_peer_id = active_tenant_peer_id(db_path)?;
+    topo::event_modules::peer_shared::queries::list_peers(&conn, &active_peer_id)
+        .ok()?
+        .into_iter()
+        .find(|peer| peer.username == username)
+        .map(|peer| peer.peer_id)
+}
+
+fn active_tenant_has_event(db_path: &str, event_id: &str) -> bool {
+    let conn = open_connection(db_path).expect("open db");
+    let Some(active_peer_id) = active_tenant_peer_id(db_path) else {
+        return false;
+    };
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![active_peer_id, event_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    count > 0
+}
+
 fn wait_for_username_peer_id(db_path: &str, username: &str, timeout_ms: u64) -> String {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
@@ -551,6 +576,32 @@ fn start_joined_cli_peer(
     }
 }
 
+fn start_joined_discovery_cli_peer(
+    tmpdir: &tempfile::TempDir,
+    db_name: &str,
+    invite_link: &str,
+    username: &str,
+    device_name: &str,
+) -> StartedCliPeer {
+    let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
+    let daemon = start_discovery_daemon(&db);
+    accept_invite_with_identity_on_running_daemon(
+        &db,
+        invite_link,
+        username,
+        device_name,
+        Duration::from_secs(10),
+    );
+    wait_for_active_tenant_ready(&db, Duration::from_secs(120));
+    wait_for_active_tenant_transport_converged(&db, Duration::from_secs(120));
+    StartedCliPeer {
+        db,
+        username: username.to_string(),
+        device_name: device_name.to_string(),
+        _daemon: daemon,
+    }
+}
+
 fn start_linked_cli_peer(
     tmpdir: &tempfile::TempDir,
     db_name: &str,
@@ -573,6 +624,122 @@ fn start_linked_cli_peer(
         username: username.to_string(),
         device_name: device_name.to_string(),
         _daemon: daemon,
+    }
+}
+
+fn run_sync_round_all(dbs: &[&str]) {
+    for db in dbs {
+        let _ = topo_cmd(db, &["sync", "round", "all"]);
+    }
+}
+
+fn wait_for_workspace_peer_id_with_sync_rounds(
+    observer_db: &str,
+    username: &str,
+    sync_dbs: &[&str],
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(peer_id) = workspace_peer_id_for_username(observer_db, username) {
+            return peer_id;
+        }
+
+        run_sync_round_all(sync_dbs);
+        if Instant::now() >= deadline {
+            let users = topo_cmd(observer_db, &["users"]);
+            let peers = topo_cmd(observer_db, &["peers"]);
+            let transport_auth = topo_cmd(observer_db, &["transport-auth"]);
+            let status = topo_cmd(observer_db, &["status"]);
+            panic!(
+                "workspace peer {} did not materialize within {:?} in {}\nusers:\n{}\npeers:\n{}\ntransport-auth:\n{}\nstatus:\n{}",
+                username,
+                timeout,
+                observer_db,
+                String::from_utf8_lossy(&users.stdout),
+                String::from_utf8_lossy(&peers.stdout),
+                String::from_utf8_lossy(&transport_auth.stdout),
+                String::from_utf8_lossy(&status.stdout)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn wait_for_peer_or_invite_awareness_with_sync_rounds(
+    observer_db: &str,
+    username: &str,
+    invite_event_id: &str,
+    sync_dbs: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(peer_id) = workspace_peer_id_for_username(observer_db, username) {
+            return Some(peer_id);
+        }
+        if active_tenant_has_event(observer_db, invite_event_id) {
+            return None;
+        }
+
+        run_sync_round_all(sync_dbs);
+        if Instant::now() >= deadline {
+            let users = topo_cmd(observer_db, &["users"]);
+            let peers = topo_cmd(observer_db, &["peers"]);
+            let transport_auth = topo_cmd(observer_db, &["transport-auth"]);
+            let status = topo_cmd(observer_db, &["status"]);
+            panic!(
+                "neither peer {} nor invite event {} materialized within {:?} in {}\nusers:\n{}\npeers:\n{}\ntransport-auth:\n{}\nstatus:\n{}",
+                username,
+                invite_event_id,
+                timeout,
+                observer_db,
+                String::from_utf8_lossy(&users.stdout),
+                String::from_utf8_lossy(&peers.stdout),
+                String::from_utf8_lossy(&transport_auth.stdout),
+                String::from_utf8_lossy(&status.stdout)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn assert_message_visible_on_all_with_sync_rounds(
+    dbs: &[&str],
+    message_content: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let mut all_ready = true;
+        for db in dbs {
+            let messages = topo_cmd(db, &["messages"]);
+            if !String::from_utf8_lossy(&messages.stdout).contains(message_content) {
+                all_ready = false;
+            }
+        }
+        if all_ready {
+            return;
+        }
+
+        run_sync_round_all(dbs);
+        if Instant::now() >= deadline {
+            for db in dbs {
+                let messages = topo_cmd(db, &["messages"]);
+                let status = topo_cmd(db, &["status"]);
+                panic!(
+                    "message {:?} did not materialize within {:?} in {}\nmessages:\n{}\nstatus:\n{}",
+                    message_content,
+                    timeout,
+                    db,
+                    String::from_utf8_lossy(&messages.stdout),
+                    String::from_utf8_lossy(&status.stdout)
+                );
+            }
+            unreachable!("panic above should abort");
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -1742,6 +1909,319 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
 /// Base case: Alice alone is healthy. Step case: if N peers are converged,
 /// reusing the same invite for the N+1th peer should preserve healthy CLI
 /// state for everyone.
+#[test]
+#[ignore = "TODO(invite-reuse): same invite reused by multiple joiners can stall third-peer propagation"]
+fn test_cli_todo_multi_use_invite_reuse_three_peer_probe_propagation() {
+    const ATTEMPTS: usize = 5;
+    let timeout_ms = 10_000;
+
+    for attempt in 0..ATTEMPTS {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workspace_name = format!("reuse-fast-three-peer-{attempt}");
+
+        let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+        create_workspace_with_details(&alice_db, &workspace_name, "alice", "alice-root");
+        let alice = StartedCliPeer {
+            db: alice_db,
+            username: "alice".to_string(),
+            device_name: "alice-root".to_string(),
+            _daemon: start_daemon(
+                tmpdir
+                    .path()
+                    .join("alice.db")
+                    .to_str()
+                    .expect("alice db path"),
+            ),
+        };
+        let reused_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
+
+        let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+        let carol_db = tmpdir.path().join("carol.db").to_str().unwrap().to_string();
+        let bob = StartedCliPeer {
+            db: bob_db.clone(),
+            username: "bob".to_string(),
+            device_name: "bob-box".to_string(),
+            _daemon: start_daemon(&bob_db),
+        };
+        let carol = StartedCliPeer {
+            db: carol_db.clone(),
+            username: "carol".to_string(),
+            device_name: "carol-box".to_string(),
+            _daemon: start_daemon(&carol_db),
+        };
+
+        std::thread::scope(|scope| {
+            let invite_for_bob = reused_invite.clone();
+            let bob_db = bob.db.clone();
+            scope.spawn(move || {
+                accept_invite_with_identity_on_running_daemon(
+                    &bob_db,
+                    &invite_for_bob,
+                    "bob",
+                    "bob-box",
+                    Duration::from_secs(10),
+                );
+                wait_for_active_tenant_ready(&bob_db, Duration::from_secs(120));
+            });
+
+            let invite_for_carol = reused_invite.clone();
+            let carol_db = carol.db.clone();
+            scope.spawn(move || {
+                accept_invite_with_identity_on_running_daemon(
+                    &carol_db,
+                    &invite_for_carol,
+                    "carol",
+                    "carol-box",
+                    Duration::from_secs(10),
+                );
+                wait_for_active_tenant_ready(&carol_db, Duration::from_secs(120));
+            });
+        });
+
+        wait_for_username_peer_id(&bob.db, "bob", 30_000);
+        wait_for_username_peer_id(&carol.db, "carol", 30_000);
+        assert_identity_eventually_materialized(&bob.db, 30_000);
+        assert_identity_eventually_materialized(&carol.db, 30_000);
+
+        send_message(
+            &alice.db,
+            &format!("reuse-fast-three-peer/{attempt}/alice-probe"),
+        );
+        send_message(
+            &bob.db,
+            &format!("reuse-fast-three-peer/{attempt}/bob-probe"),
+        );
+        send_message(
+            &carol.db,
+            &format!("reuse-fast-three-peer/{attempt}/carol-probe"),
+        );
+
+        for (label, db) in [("alice", &alice.db), ("bob", &bob.db), ("carol", &carol.db)] {
+            let output = topo_assert_eventually(db, "message_count >= 3", timeout_ms);
+            assert!(
+                output.status.success(),
+                "attempt {} {} did not reach 3 messages in {}ms\nstdout={}\nmessages=\n{}\npeers=\n{}\nstatus=\n{}\nconnections=\n{}",
+                attempt,
+                label,
+                timeout_ms,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&topo_cmd(db, &["messages", "--limit", "10"]).stdout),
+                String::from_utf8_lossy(&topo_cmd(db, &["peers"]).stdout),
+                String::from_utf8_lossy(&topo_cmd(db, &["status"]).stdout),
+                String::from_utf8_lossy(&topo_cmd(db, &["connections"]).stdout),
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "TODO(route-admission): sequential fresh invites still fail to materialize a full three-peer mesh under automated CLI coverage"]
+fn test_cli_three_peer_rejoin_catches_offline_one_k_delta_after_sequential_invites() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 90_000;
+    let catchup_timeout_ms = 600_000;
+    let workspace_name = "three-peer-rejoin-sequential";
+
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&alice_db, workspace_name, "alice", "alice-root");
+    let mut alice = StartedCliPeer {
+        db: alice_db,
+        username: "alice".to_string(),
+        device_name: "alice-root".to_string(),
+        _daemon: start_discovery_daemon(
+            tmpdir
+                .path()
+                .join("alice.db")
+                .to_str()
+                .expect("alice db path"),
+        ),
+    };
+
+    let bob_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
+    let bob_invite_event_id = event_id_to_base64(
+        &parse_invite_link(&bob_invite)
+            .expect("parse bob invite")
+            .invite_event_id,
+    );
+    let mut bob =
+        start_joined_discovery_cli_peer(&tmpdir, "bob.db", &bob_invite, "bob", "bob-box");
+    let _alice_peer_event_for_bob = wait_for_workspace_peer_id_with_sync_rounds(
+        &bob.db,
+        "alice",
+        &[&alice.db, &bob.db],
+        Duration::from_millis(timeout_ms),
+    );
+    let _bob_peer_event_for_alice = wait_for_workspace_peer_id_with_sync_rounds(
+        &alice.db,
+        "bob",
+        &[&alice.db, &bob.db],
+        Duration::from_millis(timeout_ms),
+    );
+    assert_identity_eventually_materialized(&bob.db, timeout_ms);
+
+    let alice_to_bob_steady_content = "three-peer-rejoin-sequential/alice-to-bob-steady";
+    let bob_to_alice_steady_content = "three-peer-rejoin-sequential/bob-to-alice-steady";
+    let _alice_to_bob_steady = send_message(&alice.db, alice_to_bob_steady_content);
+    let _bob_to_alice_steady = send_message(&bob.db, bob_to_alice_steady_content);
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db],
+        alice_to_bob_steady_content,
+        Duration::from_millis(timeout_ms),
+    );
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db],
+        bob_to_alice_steady_content,
+        Duration::from_millis(timeout_ms),
+    );
+
+    let carol_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
+    let carol_invite_event_id = event_id_to_base64(
+        &parse_invite_link(&carol_invite)
+            .expect("parse carol invite")
+            .invite_event_id,
+    );
+    let mut carol =
+        start_joined_discovery_cli_peer(&tmpdir, "carol.db", &carol_invite, "carol", "carol-box");
+    let _carol_peer_event_for_alice = wait_for_workspace_peer_id_with_sync_rounds(
+        &alice.db,
+        "carol",
+        &[&alice.db, &bob.db, &carol.db],
+        Duration::from_millis(timeout_ms),
+    );
+    let _alice_peer_event_for_carol = wait_for_workspace_peer_id_with_sync_rounds(
+        &carol.db,
+        "alice",
+        &[&alice.db, &bob.db, &carol.db],
+        Duration::from_millis(timeout_ms),
+    );
+    let _carol_peer_or_invite_for_bob = wait_for_peer_or_invite_awareness_with_sync_rounds(
+        &bob.db,
+        "carol",
+        &carol_invite_event_id,
+        &[&alice.db, &bob.db, &carol.db],
+        Duration::from_millis(timeout_ms),
+    );
+    let _bob_peer_or_invite_for_carol = wait_for_peer_or_invite_awareness_with_sync_rounds(
+        &carol.db,
+        "bob",
+        &bob_invite_event_id,
+        &[&alice.db, &bob.db, &carol.db],
+        Duration::from_millis(timeout_ms),
+    );
+    assert_identity_eventually_materialized(&carol.db, timeout_ms);
+
+    let alice_probe_content = "three-peer-rejoin-sequential/alice-probe";
+    let bob_probe_content = "three-peer-rejoin-sequential/bob-probe";
+    let carol_probe_content = "three-peer-rejoin-sequential/carol-probe";
+    let _alice_probe = send_message(&alice.db, alice_probe_content);
+    let _bob_probe = send_message(&bob.db, bob_probe_content);
+    let _carol_probe = send_message(&carol.db, carol_probe_content);
+    for content in [
+        alice_to_bob_steady_content,
+        bob_to_alice_steady_content,
+        alice_probe_content,
+        bob_probe_content,
+        carol_probe_content,
+    ] {
+        assert_message_visible_on_all_with_sync_rounds(
+            &[&alice.db, &bob.db, &carol.db],
+            content,
+            Duration::from_millis(timeout_ms),
+        );
+    }
+
+    stop_daemon(&carol.db, &mut carol._daemon);
+    wait_for_daemon_stopped(&carol.db, Duration::from_secs(10));
+    assert_eq!(
+        message_count_sql(&carol.db),
+        5,
+        "offline peer should stop at the pre-offline message count"
+    );
+
+    generate_messages(&alice.db, 5_000);
+    generate_messages(&bob.db, 5_000);
+    let alice_tail = send_message(&alice.db, "three-peer-rejoin-sequential/alice-offline-tail");
+    let bob_tail = send_message(&bob.db, "three-peer-rejoin-sequential/bob-offline-tail");
+    let expected_total_messages = 10_007;
+
+    for db in [&alice.db, &bob.db] {
+        assert_eventually(
+            db,
+            &format!("message_count >= {expected_total_messages}"),
+            catchup_timeout_ms,
+        );
+        assert_eventually(
+            db,
+            &format!("has_event:{} >= 1", alice_tail),
+            catchup_timeout_ms,
+        );
+        assert_eventually(
+            db,
+            &format!("has_event:{} >= 1", bob_tail),
+            catchup_timeout_ms,
+        );
+    }
+
+    carol._daemon = start_discovery_daemon(&carol.db);
+    wait_for_active_tenant_ready(&carol.db, Duration::from_secs(120));
+    wait_for_active_tenant_transport_converged(&carol.db, Duration::from_secs(120));
+    let _ = wait_for_workspace_peer_id_with_sync_rounds(
+        &carol.db,
+        "alice",
+        &[&alice.db, &bob.db, &carol.db],
+        Duration::from_millis(timeout_ms),
+    );
+    let _ = wait_for_peer_or_invite_awareness_with_sync_rounds(
+        &carol.db,
+        "bob",
+        &bob_invite_event_id,
+        &[&alice.db, &bob.db, &carol.db],
+        Duration::from_millis(timeout_ms),
+    );
+    assert_eventually(
+        &carol.db,
+        &format!("message_count >= {expected_total_messages}"),
+        catchup_timeout_ms,
+    );
+    assert_eventually(
+        &carol.db,
+        &format!("has_event:{} >= 1", alice_tail),
+        catchup_timeout_ms,
+    );
+    assert_eventually(
+        &carol.db,
+        &format!("has_event:{} >= 1", bob_tail),
+        catchup_timeout_ms,
+    );
+
+    let alice_post_rejoin_content = "three-peer-rejoin-sequential/alice-post-rejoin";
+    let bob_post_rejoin_content = "three-peer-rejoin-sequential/bob-post-rejoin";
+    let carol_after_catchup_content = "three-peer-rejoin-sequential/carol-after-catchup";
+    let _alice_post_rejoin = send_message(&alice.db, alice_post_rejoin_content);
+    let _bob_post_rejoin = send_message(&bob.db, bob_post_rejoin_content);
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db, &carol.db],
+        alice_post_rejoin_content,
+        Duration::from_millis(timeout_ms),
+    );
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db, &carol.db],
+        bob_post_rejoin_content,
+        Duration::from_millis(timeout_ms),
+    );
+
+    let _resumed_eid = send_message(&carol.db, carol_after_catchup_content);
+    assert_message_visible_on_all_with_sync_rounds(
+        &[&alice.db, &bob.db],
+        carol_after_catchup_content,
+        Duration::from_millis(timeout_ms),
+    );
+
+    stop_daemon(&carol.db, &mut carol._daemon);
+    stop_daemon(&bob.db, &mut bob._daemon);
+    stop_daemon(&alice.db, &mut alice._daemon);
+}
+
 #[test]
 fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
     let tmpdir = tempfile::tempdir().unwrap();
