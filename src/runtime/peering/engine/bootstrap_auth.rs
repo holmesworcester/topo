@@ -8,8 +8,11 @@
 use crate::db::open_connection;
 use crate::db::transport_creds::{resolve_tenant_transport_target, CRED_SOURCE_BOOTSTRAP};
 use crate::db::transport_trust::list_active_bootstrap_session_fallback_candidates;
+use crate::peering::loops::live_session_peer_ids;
 
 use super::target_dispatch::{should_initiate_connect_for_source, TargetIngressSource};
+
+pub(crate) const GREEDY_KNOWN_PEER_TARGET_FLOOR: usize = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BootstrapSessionFallback {
@@ -125,6 +128,10 @@ pub(super) fn resolve_active_bootstrap_session_fallback(
     }
 }
 
+fn should_greedily_initiate_known_peer_connect(db_path: &str, tenant_id: &str) -> bool {
+    live_session_peer_ids(db_path, tenant_id).len() < GREEDY_KNOWN_PEER_TARGET_FLOOR
+}
+
 pub(crate) fn should_initiate_connect_for_source_with_db(
     db_path: &str,
     tenant_id: &str,
@@ -134,6 +141,7 @@ pub(crate) fn should_initiate_connect_for_source_with_db(
         TargetIngressSource::Bootstrap { .. } => true,
         TargetIngressSource::KnownPeer { .. } => {
             resolve_active_bootstrap_session_fallback(db_path, tenant_id, false).is_some()
+                || should_greedily_initiate_known_peer_connect(db_path, tenant_id)
                 || should_initiate_connect_for_source(tenant_id, source)
         }
     }
@@ -146,6 +154,7 @@ mod tests {
     use crate::db::schema::create_tables;
     use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_BOOTSTRAP};
     use crate::db::transport_trust::record_invite_bootstrap_trust;
+    use crate::peering::loops::claim_live_session_peer;
 
     #[test]
     fn bootstrap_source_always_initiates_connect() {
@@ -210,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn known_peer_without_bootstrap_fallback_keeps_preferred_side_gate() {
+    fn underconnected_known_peer_ignores_preferred_side_gate() {
         let lower = "0000000000000000000000000000000000000000000000000000000000000001";
         let higher = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let tmpdir = tempfile::tempdir().unwrap();
@@ -219,6 +228,29 @@ mod tests {
         create_tables(&conn).unwrap();
         drop(conn);
 
+        assert!(should_initiate_connect_for_source_with_db(
+            db_path.to_str().unwrap(),
+            higher,
+            &TargetIngressSource::KnownPeer {
+                peer_id: lower.to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn saturated_known_peer_keeps_preferred_side_gate() {
+        let lower = "0000000000000000000000000000000000000000000000000000000000000001";
+        let higher = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("saturated-known-peer.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+        drop(conn);
+
+        let leases: Vec<_> = (0..GREEDY_KNOWN_PEER_TARGET_FLOOR)
+            .map(|idx| claim_live_session_peer(db_path.to_str().unwrap(), higher, &format!("{idx:064x}")))
+            .collect();
+
         assert!(!should_initiate_connect_for_source_with_db(
             db_path.to_str().unwrap(),
             higher,
@@ -226,6 +258,8 @@ mod tests {
                 peer_id: lower.to_string(),
             }
         ));
+
+        drop(leases);
     }
 
     #[test]

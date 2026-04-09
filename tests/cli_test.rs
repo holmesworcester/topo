@@ -743,6 +743,42 @@ fn assert_message_visible_on_all_with_sync_rounds(
     }
 }
 
+fn assert_eventually_with_sync_rounds(
+    observer_db: &str,
+    predicate: &str,
+    sync_dbs: &[&str],
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = Command::new(bin())
+            .arg("--db")
+            .arg(observer_db)
+            .arg("assert-now")
+            .arg(predicate)
+            .output()
+            .expect("failed to run assert-now");
+        if output.status.success() {
+            return;
+        }
+
+        run_sync_round_all(sync_dbs);
+        if Instant::now() >= deadline {
+            let status = topo_cmd(observer_db, &["status"]);
+            let messages = topo_cmd(observer_db, &["messages"]);
+            panic!(
+                "predicate {:?} did not materialize within {:?} in {}\nstatus:\n{}\nmessages:\n{}",
+                predicate,
+                timeout,
+                observer_db,
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&messages.stdout)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 fn send_message_as_username(db_path: &str, username: &str, content: &str) -> String {
     use_tenant_for_username(db_path, username);
     send_message(db_path, content)
@@ -2090,15 +2126,17 @@ fn test_cli_two_peer_rejoin_catches_offline_delta_and_preserves_live_messages() 
         &[&alice.db, &bob.db],
         Duration::from_millis(timeout_ms),
     );
-    assert_eventually(
+    assert_eventually_with_sync_rounds(
         &bob.db,
         &format!("message_count >= {expected_total_messages}"),
-        catchup_timeout_ms,
+        &[&alice.db, &bob.db],
+        Duration::from_millis(catchup_timeout_ms),
     );
-    assert_eventually(
+    assert_eventually_with_sync_rounds(
         &bob.db,
         &format!("has_event:{} >= 1", alice_tail),
-        catchup_timeout_ms,
+        &[&alice.db, &bob.db],
+        Duration::from_millis(catchup_timeout_ms),
     );
 
     let alice_post_rejoin_content = "two-peer-rejoin-diagnostic/alice-post-rejoin";
