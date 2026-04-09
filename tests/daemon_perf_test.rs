@@ -138,6 +138,13 @@ fn perf_debug_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
 fn perf_lowmem_env(label: &str) -> Vec<(String, String)> {
     let scoped = match label {
         "alice" => perf_debug_env("PERF_ALICE_LOWMEM"),
@@ -516,6 +523,7 @@ fn perf_continuous_10k() {
 #[test]
 fn perf_preloaded_10k() {
     const N: i64 = 10_000;
+    let timeout_secs = env_i64("TOPO_PERF_PRELOADED_TIMEOUT_SECS", 300) as u64;
 
     let bench = SharedWorkspaceBench::new();
     // Warm the connection first so bootstrap identity sync is done
@@ -534,7 +542,11 @@ fn perf_preloaded_10k() {
         return;
     }
     let start = Instant::now();
-    wait_for_message_count(&bench.bob_db, baseline + N, Duration::from_secs(300));
+    wait_for_message_count(
+        &bench.bob_db,
+        baseline + N,
+        Duration::from_secs(timeout_secs),
+    );
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
