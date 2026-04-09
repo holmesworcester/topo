@@ -319,7 +319,7 @@ impl ProjectionBackend for Connection {
             persist_shared_dep_edges(self, recorded_by, event_id_b64, sub_event)?;
             if let Some(workspace_id) = lookup_workspace_id(self, recorded_by) {
                 if let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) {
-                    crate::db::hot_day_deps::track_valid_shared_event_deps(
+                    crate::db::hot_week_deps::track_valid_shared_event_deps(
                         self,
                         &workspace_id,
                         &event_id,

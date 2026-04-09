@@ -25,23 +25,25 @@ fn projecting_signed_encrypted_message_indexes_shared_dep_edges() {
 
     assert_eq!(dep_ids, expected);
 
-    let day_start_ms: i64 = conn
+    let week_start_ms: i64 = conn
         .query_row(
-            "SELECT day_start_ms
-             FROM hot_day_dep_index
+            "SELECT week_start_ms
+             FROM hot_week_dep_index
              WHERE workspace_id = ?1
              LIMIT 1",
             rusqlite::params![&workspace_id],
             |row| row.get(0),
         )
         .unwrap();
-    let hot_day_dep_ids =
-        crate::db::hot_day_deps::list_hot_day_dep_ids(&conn, &workspace_id, &[day_start_ms])
+    let hot_week_dep_ids =
+        crate::db::hot_week_deps::list_hot_week_dep_entries(&conn, &workspace_id, &[week_start_ms])
             .unwrap();
     for dep_id in expected {
         assert!(
-            hot_day_dep_ids.contains(&dep_id),
-            "hot day dep index should include direct dep {}",
+            hot_week_dep_ids
+                .iter()
+                .any(|(_, event_id)| *event_id == dep_id),
+            "hot week dep index should include direct dep {}",
             crate::crypto::event_id_to_base64(&dep_id)
         );
     }

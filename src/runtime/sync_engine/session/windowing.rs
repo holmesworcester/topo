@@ -326,7 +326,7 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
         SyncWindowKind::LastDay => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(now_ms - DAY_MS),
-            ts_max_exclusive_ms: None,
+            ts_max_exclusive_ms: Some(now_ms),
         },
         SyncWindowKind::LastWeek => SyncWindow {
             kind,
@@ -660,7 +660,7 @@ mod tests {
         let full = window_for_kind(SyncWindowKind::Full, 1_000_000);
 
         assert_eq!(day.ts_min(), Some(1_000_000 - DAY_MS));
-        assert_eq!(day.ts_max_exclusive(), None);
+        assert_eq!(day.ts_max_exclusive(), Some(1_000_000));
 
         assert_eq!(week.ts_min(), Some(1_000_000 - WEEK_MS));
         assert_eq!(week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));

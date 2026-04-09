@@ -7,40 +7,48 @@ use crate::db::dep_index::list_shared_event_deps;
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-const HOT_DAY_DEP_RETAIN_DAYS: i64 = 7;
+const WEEK_MS: i64 = 7 * DAY_MS;
+const HOT_WEEK_DEP_RETAIN_WEEKS: i64 = 13;
 
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS hot_day_dep_index (
+        CREATE TABLE IF NOT EXISTS hot_week_dep_index (
             workspace_id TEXT NOT NULL,
-            day_start_ms INTEGER NOT NULL,
+            week_start_ms INTEGER NOT NULL,
             dep_created_at_ms INTEGER NOT NULL,
             event_id TEXT NOT NULL,
-            PRIMARY KEY (workspace_id, day_start_ms, event_id)
+            PRIMARY KEY (workspace_id, week_start_ms, event_id)
         ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_hot_day_dep_index_lookup
-            ON hot_day_dep_index(workspace_id, day_start_ms, dep_created_at_ms, event_id);
-        CREATE INDEX IF NOT EXISTS idx_hot_day_dep_index_prune
-            ON hot_day_dep_index(day_start_ms);
+        CREATE INDEX IF NOT EXISTS idx_hot_week_dep_index_lookup
+            ON hot_week_dep_index(workspace_id, week_start_ms, dep_created_at_ms, event_id);
+        CREATE INDEX IF NOT EXISTS idx_hot_week_dep_index_prune
+            ON hot_week_dep_index(week_start_ms);
         ",
     )?;
     Ok(())
 }
 
-pub fn utc_day_start_ms(ts_ms: i64) -> i64 {
+fn utc_day_start_ms(ts_ms: i64) -> i64 {
     ts_ms.div_euclid(DAY_MS) * DAY_MS
 }
 
-fn oldest_retained_day_start_ms(now_ms: i64) -> i64 {
-    utc_day_start_ms(now_ms) - ((HOT_DAY_DEP_RETAIN_DAYS - 1) * DAY_MS)
+pub fn utc_week_start_ms(ts_ms: i64) -> i64 {
+    let day_start_ms = utc_day_start_ms(ts_ms);
+    let days_since_epoch = day_start_ms.div_euclid(DAY_MS);
+    let weekday_monday_zero = (days_since_epoch + 3).rem_euclid(7);
+    day_start_ms - (weekday_monday_zero * DAY_MS)
 }
 
-fn prune_expired_hot_day_rows(conn: &Connection, now_ms: i64) -> SqliteResult<()> {
+fn oldest_retained_week_start_ms(now_ms: i64) -> i64 {
+    utc_week_start_ms(now_ms) - ((HOT_WEEK_DEP_RETAIN_WEEKS - 1) * WEEK_MS)
+}
+
+fn prune_expired_hot_week_rows(conn: &Connection, now_ms: i64) -> SqliteResult<()> {
     conn.execute(
-        "DELETE FROM hot_day_dep_index
-         WHERE day_start_ms < ?1",
-        params![oldest_retained_day_start_ms(now_ms)],
+        "DELETE FROM hot_week_dep_index
+         WHERE week_start_ms < ?1",
+        params![oldest_retained_week_start_ms(now_ms)],
     )?;
     Ok(())
 }
@@ -64,10 +72,10 @@ pub fn track_valid_shared_event_deps(
     root_created_at_ms: i64,
     now_ms: i64,
 ) -> SqliteResult<()> {
-    prune_expired_hot_day_rows(conn, now_ms)?;
+    prune_expired_hot_week_rows(conn, now_ms)?;
 
-    let day_start_ms = utc_day_start_ms(root_created_at_ms);
-    if day_start_ms < oldest_retained_day_start_ms(now_ms) {
+    let week_start_ms = utc_week_start_ms(root_created_at_ms);
+    if week_start_ms < oldest_retained_week_start_ms(now_ms) {
         return Ok(());
     }
 
@@ -82,12 +90,12 @@ pub fn track_valid_shared_event_deps(
             continue;
         };
         let inserted = conn.execute(
-            "INSERT OR IGNORE INTO hot_day_dep_index
-             (workspace_id, day_start_ms, dep_created_at_ms, event_id)
+            "INSERT OR IGNORE INTO hot_week_dep_index
+             (workspace_id, week_start_ms, dep_created_at_ms, event_id)
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 workspace_id,
-                day_start_ms,
+                week_start_ms,
                 dep_created_at_ms,
                 event_id_to_base64(&event_id)
             ],
@@ -101,7 +109,7 @@ pub fn track_valid_shared_event_deps(
     Ok(())
 }
 
-pub fn day_starts_for_window(window: SyncWindow, now_ms: i64) -> Vec<i64> {
+pub fn week_starts_for_window(window: SyncWindow, now_ms: i64) -> Vec<i64> {
     let Some(start_ms) = window.ts_min() else {
         return Vec::new();
     };
@@ -110,26 +118,29 @@ pub fn day_starts_for_window(window: SyncWindow, now_ms: i64) -> Vec<i64> {
         return Vec::new();
     }
 
-    let mut day_starts = Vec::new();
-    let mut day_start = utc_day_start_ms(start_ms);
-    let last_day_start = utc_day_start_ms(end_exclusive_ms - 1);
-    while day_start <= last_day_start {
-        day_starts.push(day_start);
-        day_start += DAY_MS;
+    let mut week_starts = Vec::new();
+    let mut week_start = utc_week_start_ms(start_ms);
+    let last_week_start = utc_week_start_ms(end_exclusive_ms - 1);
+    while week_start <= last_week_start {
+        week_starts.push(week_start);
+        week_start += WEEK_MS;
     }
-    day_starts
+    week_starts
 }
 
-pub fn should_attach_hot_day_deps(kind: SyncWindowKind) -> bool {
-    matches!(kind, SyncWindowKind::LastDay | SyncWindowKind::LastWeek)
+pub fn should_include_week_deps(kind: SyncWindowKind) -> bool {
+    matches!(
+        kind,
+        SyncWindowKind::LastDay | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks
+    )
 }
 
-pub fn list_hot_day_dep_ids(
+pub fn list_hot_week_dep_entries(
     conn: &Connection,
     workspace_id: &str,
-    day_starts_ms: &[i64],
-) -> SqliteResult<Vec<EventId>> {
-    if day_starts_ms.is_empty() {
+    week_starts_ms: &[i64],
+) -> SqliteResult<Vec<(i64, EventId)>> {
+    if week_starts_ms.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -137,14 +148,14 @@ pub fn list_hot_day_dep_ids(
     let mut entries = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT dep_created_at_ms, event_id
-         FROM hot_day_dep_index
+         FROM hot_week_dep_index
          WHERE workspace_id = ?1
-           AND day_start_ms = ?2
+           AND week_start_ms = ?2
          ORDER BY dep_created_at_ms, event_id",
     )?;
 
-    for day_start_ms in day_starts_ms {
-        let rows = stmt.query_map(params![workspace_id, day_start_ms], |row| {
+    for week_start_ms in week_starts_ms {
+        let rows = stmt.query_map(params![workspace_id, week_start_ms], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -159,7 +170,7 @@ pub fn list_hot_day_dep_ids(
     }
 
     entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    Ok(entries.into_iter().map(|(_, event_id)| event_id).collect())
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -208,11 +219,11 @@ mod tests {
     }
 
     #[test]
-    fn track_valid_shared_event_deps_populates_transitive_day_closure_once() {
+    fn track_valid_shared_event_deps_populates_transitive_week_closure_once() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "ws";
-        let now_ms = 30 * DAY_MS;
+        let now_ms = 30 * WEEK_MS;
         let hot_created_at_ms = now_ms - 1_000;
 
         let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
@@ -226,27 +237,33 @@ mod tests {
         track_valid_shared_event_deps(&conn, workspace_id, &leaf, hot_created_at_ms, now_ms)
             .unwrap();
 
-        let dep_ids =
-            list_hot_day_dep_ids(&conn, workspace_id, &[utc_day_start_ms(hot_created_at_ms)])
+        let dep_entries =
+            list_hot_week_dep_entries(&conn, workspace_id, &[utc_week_start_ms(hot_created_at_ms)])
                 .unwrap();
-        assert_eq!(dep_ids, vec![root, mid]);
+        assert_eq!(
+            dep_entries
+                .into_iter()
+                .map(|(_, event_id)| event_id)
+                .collect::<Vec<_>>(),
+            vec![root, mid]
+        );
     }
 
     #[test]
-    fn track_valid_shared_event_deps_prunes_days_older_than_seven() {
+    fn track_valid_shared_event_deps_prunes_weeks_older_than_thirteen() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "ws";
-        let now_ms = 30 * DAY_MS;
-        let very_old_day = utc_day_start_ms(now_ms) - (8 * DAY_MS);
+        let now_ms = 30 * WEEK_MS;
+        let very_old_week = utc_week_start_ms(now_ms) - (13 * WEEK_MS);
         let hot_created_at_ms = now_ms - 1_000;
-        let hot_day = utc_day_start_ms(hot_created_at_ms);
+        let hot_week = utc_week_start_ms(hot_created_at_ms);
 
         conn.execute(
-            "INSERT INTO hot_day_dep_index
-             (workspace_id, day_start_ms, dep_created_at_ms, event_id)
+            "INSERT INTO hot_week_dep_index
+             (workspace_id, week_start_ms, dep_created_at_ms, event_id)
              VALUES (?1, ?2, 1, ?3)",
-            params![workspace_id, very_old_day, event_id_to_base64(&[0x11; 32])],
+            params![workspace_id, very_old_week, event_id_to_base64(&[0x11; 32])],
         )
         .unwrap();
 
@@ -258,8 +275,8 @@ mod tests {
 
         let old_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM hot_day_dep_index WHERE day_start_ms = ?1",
-                params![very_old_day],
+                "SELECT COUNT(*) FROM hot_week_dep_index WHERE week_start_ms = ?1",
+                params![very_old_week],
                 |row| row.get(0),
             )
             .unwrap();
@@ -267,8 +284,8 @@ mod tests {
 
         let hot_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM hot_day_dep_index WHERE day_start_ms = ?1",
-                params![hot_day],
+                "SELECT COUNT(*) FROM hot_week_dep_index WHERE week_start_ms = ?1",
+                params![hot_week],
                 |row| row.get(0),
             )
             .unwrap();
@@ -276,23 +293,31 @@ mod tests {
     }
 
     #[test]
-    fn day_starts_for_window_covers_hot_window_boundaries() {
+    fn week_starts_for_window_covers_hot_window_boundaries() {
         let now_ms = 10 * DAY_MS + (6 * 60 * 60 * 1000);
         let last_day = SyncWindow {
             kind: SyncWindowKind::LastDay,
             ts_min_inclusive_ms: Some(now_ms - DAY_MS),
-            ts_max_exclusive_ms: None,
+            ts_max_exclusive_ms: Some(now_ms),
         };
         let last_week = SyncWindow {
             kind: SyncWindowKind::LastWeek,
             ts_min_inclusive_ms: Some(now_ms - (7 * DAY_MS)),
             ts_max_exclusive_ms: Some(now_ms - DAY_MS),
         };
+        let last_twelve_weeks = SyncWindow {
+            kind: SyncWindowKind::LastTwelveWeeks,
+            ts_min_inclusive_ms: Some(now_ms - (12 * WEEK_MS)),
+            ts_max_exclusive_ms: Some(now_ms - WEEK_MS),
+        };
 
-        let last_day_days = day_starts_for_window(last_day, now_ms);
-        assert_eq!(last_day_days.len(), 2);
+        let last_day_weeks = week_starts_for_window(last_day, now_ms);
+        assert_eq!(last_day_weeks.len(), 2);
 
-        let last_week_days = day_starts_for_window(last_week, now_ms);
-        assert_eq!(last_week_days.len(), 7);
+        let last_week_weeks = week_starts_for_window(last_week, now_ms);
+        assert_eq!(last_week_weeks.len(), 2);
+
+        let last_twelve_week_weeks = week_starts_for_window(last_twelve_weeks, now_ms);
+        assert_eq!(last_twelve_week_weeks.len(), 12);
     }
 }

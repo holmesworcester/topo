@@ -6,10 +6,9 @@ use negentropy::{Id, NegentropyStorageVector};
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
-use crate::db::hot_day_deps::{
-    day_starts_for_window, list_hot_day_dep_ids, should_attach_hot_day_deps,
+use crate::db::hot_week_deps::{
+    list_hot_week_dep_entries, should_include_week_deps, week_starts_for_window,
 };
-use crate::db::queue::current_timestamp_ms;
 use crate::db::store::Store;
 use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
@@ -85,13 +84,46 @@ fn load_shared_index_entries(
     Ok(entries)
 }
 
+fn load_shared_sync_entries(
+    conn: &Connection,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> Result<Vec<(i64, EventId)>, String> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+
+    for (created_at_ms, event_id) in load_shared_index_entries(conn, workspace_id, range)? {
+        if seen.insert(event_id) {
+            entries.push((created_at_ms, event_id));
+        }
+    }
+
+    if should_include_week_deps(range.kind) {
+        let now_ms = range
+            .ts_max_exclusive()
+            .unwrap_or_else(crate::db::queue::current_timestamp_ms);
+        let week_starts = week_starts_for_window(range, now_ms);
+        for (created_at_ms, event_id) in
+            list_hot_week_dep_entries(conn, workspace_id, &week_starts)
+                .map_err(|e| format!("load hot week dep entries: {e}"))?
+        {
+            if seen.insert(event_id) {
+                entries.push((created_at_ms, event_id));
+            }
+        }
+    }
+
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(entries)
+}
+
 pub fn load_shared_event_index_slice(
     conn: &Connection,
     workspace_id: &str,
     range: SyncWindow,
 ) -> Result<NegentropyStorageVector, String> {
     let mut storage = NegentropyStorageVector::new();
-    for (ts, event_id) in load_shared_index_entries(conn, workspace_id, range)? {
+    for (ts, event_id) in load_shared_sync_entries(conn, workspace_id, range)? {
         storage
             .insert(ts.max(0) as u64, Id::from_byte_array(event_id))
             .map_err(|e| format!("insert negentropy vector item: {e}"))?;
@@ -230,20 +262,7 @@ fn visit_selected_send_order(
     Ok(())
 }
 
-fn load_hot_day_dep_ids_for_send(
-    conn: &Connection,
-    workspace_id: &str,
-    range: SyncWindow,
-) -> Result<Vec<EventId>, String> {
-    if !should_attach_hot_day_deps(range.kind) {
-        return Ok(Vec::new());
-    }
-    let day_starts = day_starts_for_window(range, current_timestamp_ms());
-    list_hot_day_dep_ids(conn, workspace_id, &day_starts)
-        .map_err(|e| format!("load hot day dep ids: {e}"))
-}
-
-fn expand_requested_ids_with_hot_day_deps(
+fn order_requested_ids_for_send(
     conn: &Connection,
     store: &Store<'_>,
     workspace_id: &str,
@@ -255,35 +274,18 @@ fn expand_requested_ids_with_hot_day_deps(
     }
 
     let ordered_roots = prioritize_send_order(store, range, requested_ids)?;
-    let root_ids: HashSet<EventId> = ordered_roots.iter().copied().collect();
-    let extra_dep_ids = load_hot_day_dep_ids_for_send(conn, workspace_id, range)?;
-
-    let mut selected_ids = root_ids.clone();
-    for dep_id in extra_dep_ids {
-        selected_ids.insert(dep_id);
-    }
-
-    let selected_vec = selected_ids.iter().copied().collect::<Vec<_>>();
+    let selected_ids: HashSet<EventId> = requested_ids.iter().copied().collect();
+    let selected_vec = requested_ids.to_vec();
     let created_at_by_id = store
         .get_shared_created_at_batch(&selected_vec)
         .map_err(|e| format!("load selected created_at batch: {e}"))?;
-    let mut dep_only_ids = selected_ids
-        .iter()
-        .filter(|event_id| !root_ids.contains(*event_id))
-        .copied()
-        .collect::<Vec<_>>();
-    dep_only_ids.sort_by(|left, right| {
-        let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
-        let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
-        left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
-    });
 
     let mut ordered = Vec::new();
     let mut emitted = HashSet::new();
     let mut visiting = HashSet::new();
     let mut dep_cache = HashMap::new();
 
-    for event_id in ordered_roots.into_iter().chain(dep_only_ids.into_iter()) {
+    for event_id in ordered_roots {
         visit_selected_send_order(
             conn,
             workspace_id,
@@ -319,8 +321,7 @@ where
     let mut events_sent = 0u64;
     let mut bytes_sent = 0u64;
     let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
-    let event_ids =
-        expand_requested_ids_with_hot_day_deps(conn, store, workspace_id, range, &event_ids)?;
+    let event_ids = order_requested_ids_for_send(conn, store, workspace_id, range, &event_ids)?;
     for chunk in event_ids.chunks(64) {
         let ordered = load_shared_send_batch(store, chunk)?;
         let mut payload = Vec::new();
@@ -426,6 +427,7 @@ mod tests {
     use super::*;
     use crate::contracts::event_pipeline_contract::IngestItem;
     use crate::crypto::hash_event;
+    use crate::db::queue::current_timestamp_ms;
     use crate::db::dep_index::replace_shared_event_deps;
     use crate::db::schema::create_tables;
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
@@ -672,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_requested_ids_includes_hot_day_deps_before_root() {
+    fn load_shared_sync_entries_includes_hot_week_deps_for_last_day() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "workspace-bench-chain";
@@ -684,7 +686,7 @@ mod tests {
         let leaf = insert_shared_bench_dep(&conn, workspace_id, hot_created_at_ms, vec![mid], 3);
         replace_shared_event_deps(&conn, workspace_id, &mid, &[root]).unwrap();
         replace_shared_event_deps(&conn, workspace_id, &leaf, &[mid]).unwrap();
-        crate::db::hot_day_deps::track_valid_shared_event_deps(
+        crate::db::hot_week_deps::track_valid_shared_event_deps(
             &conn,
             workspace_id,
             &leaf,
@@ -693,17 +695,33 @@ mod tests {
         )
         .unwrap();
 
+        let entries = load_shared_sync_entries(
+            &conn,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(now_ms - (24 * 60 * 60 * 1000)),
+                ts_max_exclusive_ms: Some(now_ms),
+            },
+        )
+        .unwrap();
+        let selected_ids = entries
+            .into_iter()
+            .map(|(_, event_id)| event_id)
+            .collect::<Vec<_>>();
+        assert_eq!(selected_ids, vec![root, mid, leaf]);
+
         let store = Store::new(&conn);
-        let ordered = expand_requested_ids_with_hot_day_deps(
+        let ordered = order_requested_ids_for_send(
             &conn,
             &store,
             workspace_id,
             SyncWindow {
                 kind: SyncWindowKind::LastDay,
                 ts_min_inclusive_ms: Some(now_ms - (24 * 60 * 60 * 1000)),
-                ts_max_exclusive_ms: None,
+                ts_max_exclusive_ms: Some(now_ms),
             },
-            &[leaf],
+            &selected_ids,
         )
         .unwrap();
 
@@ -711,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn full_window_does_not_attach_hot_day_deps() {
+    fn full_window_sync_entries_do_not_include_week_deps() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "workspace-full-no-deps";
@@ -720,7 +738,7 @@ mod tests {
         let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
         let leaf = insert_shared_bench_dep(&conn, workspace_id, now_ms - 1_000, vec![root], 2);
         replace_shared_event_deps(&conn, workspace_id, &leaf, &[root]).unwrap();
-        crate::db::hot_day_deps::track_valid_shared_event_deps(
+        crate::db::hot_week_deps::track_valid_shared_event_deps(
             &conn,
             workspace_id,
             &leaf,
@@ -729,25 +747,78 @@ mod tests {
         )
         .unwrap();
 
-        let store = Store::new(&conn);
-        let ordered = expand_requested_ids_with_hot_day_deps(
+        let entries = load_shared_sync_entries(
             &conn,
-            &store,
             workspace_id,
             SyncWindow {
                 kind: SyncWindowKind::Full,
                 ts_min_inclusive_ms: Some(0),
                 ts_max_exclusive_ms: Some(now_ms - (12 * 7 * 24 * 60 * 60 * 1000)),
             },
-            &[leaf],
         )
         .unwrap();
 
-        assert_eq!(ordered, vec![leaf]);
+        let selected_ids = entries
+            .into_iter()
+            .map(|(_, event_id)| event_id)
+            .collect::<Vec<_>>();
+        assert_eq!(selected_ids, vec![root]);
     }
 
     #[test]
-    fn hot_day_dep_send_projects_full_chain_in_one_round() {
+    fn order_requested_ids_sends_week_deps_before_root() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "workspace-bench-order";
+        let now_ms = current_timestamp_ms();
+        let hot_created_at_ms = now_ms - 1_000;
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let mid = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, hot_created_at_ms, vec![mid], 3);
+        replace_shared_event_deps(&conn, workspace_id, &mid, &[root]).unwrap();
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[mid]).unwrap();
+        crate::db::hot_week_deps::track_valid_shared_event_deps(
+            &conn,
+            workspace_id,
+            &leaf,
+            hot_created_at_ms,
+            now_ms,
+        )
+        .unwrap();
+
+        let selected_ids = load_shared_sync_entries(
+            &conn,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(now_ms - (24 * 60 * 60 * 1000)),
+                ts_max_exclusive_ms: Some(now_ms),
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(_, event_id)| event_id)
+        .collect::<Vec<_>>();
+        let store = Store::new(&conn);
+        let ordered = order_requested_ids_for_send(
+            &conn,
+            &store,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(now_ms - (24 * 60 * 60 * 1000)),
+                ts_max_exclusive_ms: Some(now_ms),
+            },
+            &selected_ids,
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![root, mid, leaf]);
+    }
+
+    #[test]
+    fn week_dep_sync_entries_project_full_chain_in_one_round() {
         let dir = tempfile::tempdir().unwrap();
         let source_db_path = dir.path().join("source.db");
         let dest_db_path = dir.path().join("dest.db");
@@ -779,7 +850,7 @@ mod tests {
             prior = Some(event_id);
         }
         let leaf = *all_ids.last().unwrap();
-        crate::db::hot_day_deps::track_valid_shared_event_deps(
+        crate::db::hot_week_deps::track_valid_shared_event_deps(
             &source_conn,
             workspace_id,
             &leaf,
@@ -788,17 +859,30 @@ mod tests {
         )
         .unwrap();
 
+        let selected_ids = load_shared_sync_entries(
+            &source_conn,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(now_ms - (24 * 60 * 60 * 1000)),
+                ts_max_exclusive_ms: Some(now_ms),
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(_, event_id)| event_id)
+        .collect::<Vec<_>>();
         let store = Store::new(&source_conn);
-        let ordered_ids = expand_requested_ids_with_hot_day_deps(
+        let ordered_ids = order_requested_ids_for_send(
             &source_conn,
             &store,
             workspace_id,
             SyncWindow {
                 kind: SyncWindowKind::LastDay,
                 ts_min_inclusive_ms: Some(now_ms - (24 * 60 * 60 * 1000)),
-                ts_max_exclusive_ms: None,
+                ts_max_exclusive_ms: Some(now_ms),
             },
-            &[leaf],
+            &selected_ids,
         )
         .unwrap();
         assert_eq!(ordered_ids.len(), all_ids.len());
