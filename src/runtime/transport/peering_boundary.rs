@@ -378,7 +378,9 @@ pub async fn create_runtime_endpoint_for_tenants(
         .secret_key(secret_key)
         .alpns(vec![TOPO_ALPN.to_vec()]);
 
-    if low_mem_mode() {
+    if env_flag("TOPO_DISABLE_RELAY") {
+        builder = builder.relay_mode(iroh::endpoint::RelayMode::Disabled);
+    } else if low_mem_mode() {
         // In low-memory mode (iOS NSE, 24 MiB budget), keep a single relay
         // server for NAT traversal (adds ~1.3 MiB) but disable portmapper
         // and mDNS to stay under budget.  A single relay is essential for

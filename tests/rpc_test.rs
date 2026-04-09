@@ -1080,7 +1080,11 @@ fn create_workspace_on_idle_daemon_uses_resolved_fallback_port_in_auto_invite() 
         topo::event_modules::workspace::invite_link::parse_invite_link(&invite_link).unwrap();
     assert!(
         parsed.bootstrap_addrs.is_empty(),
-        "auto-invite should default to relay/lookup bootstrap, not embedded direct addresses"
+        "auto-invite should not embed direct bootstrap addresses by default"
+    );
+    assert!(
+        parsed.relay_url.is_none(),
+        "tests should not rely on iroh relay bootstrap info"
     );
 
     let active_status = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
@@ -1149,8 +1153,8 @@ fn create_invite_without_public_addr_omits_direct_bootstrap_addresses() {
         "default invite command should not embed direct bootstrap addresses"
     );
     assert!(
-        parsed.relay_url.is_some(),
-        "default invite command should wait for iroh relay bootstrap info"
+        parsed.relay_url.is_none(),
+        "tests should not rely on iroh relay bootstrap info"
     );
 
     let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
@@ -1208,8 +1212,8 @@ fn create_device_link_without_public_addr_omits_direct_bootstrap_addresses() {
         "default link command should not embed direct bootstrap addresses"
     );
     assert!(
-        parsed.relay_url.is_some(),
-        "default link command should wait for iroh relay bootstrap info"
+        parsed.relay_url.is_none(),
+        "tests should not rely on iroh relay bootstrap info"
     );
 
     let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));

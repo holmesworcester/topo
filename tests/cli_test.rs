@@ -844,19 +844,19 @@ fn test_cli_bidirectional_sync() {
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-    let relay_opts = DaemonOptions {
+    let sync_opts = DaemonOptions {
         disable_discovery: false,
         ..Default::default()
     };
 
     create_workspace_with_username(&alice_db, "alice");
-    let _alice = start_daemon_with_options(&alice_db, &relay_opts);
+    let _alice = start_daemon_with_options(&alice_db, &sync_opts);
 
     let bootstrap_eid = send_message(&alice_db, "bootstrap-before-invite");
     let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
 
     accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon_with_options(&bob_db, &relay_opts);
+    let _bob = start_daemon_with_options(&bob_db, &sync_opts);
 
     // The invitee should catch up enough to record Alice's pre-invite event id.
     assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
@@ -894,16 +894,13 @@ fn test_cli_bidirectional_sync() {
 }
 
 #[test]
-fn test_cli_bidirectional_sync_with_empty_bootstrap_addrs_uses_relay_bootstrap() {
+fn test_cli_invite_with_empty_bootstrap_addrs_has_no_relay_fallback() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
 
     create_workspace(&alice_db);
     let _alice = start_daemon(&alice_db);
 
-    let bootstrap_eid = send_message(&alice_db, "bootstrap-before-empty-address-invite");
     let original_invite = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
     let invite_link = rewrite_bootstrap_addrs(&original_invite, &[])
         .expect("rewrite invite with no bootstrap addrs");
@@ -913,28 +910,8 @@ fn test_cli_bidirectional_sync_with_empty_bootstrap_addrs_uses_relay_bootstrap()
         "invite should not carry explicit bootstrap addresses"
     );
     assert!(
-        parsed.relay_url.is_some(),
-        "invite should carry a relay bootstrap hint when direct addresses are removed"
-    );
-
-    accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon(&bob_db);
-
-    assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
-    assert_identity_eventually_materialized(&bob_db, timeout_ms);
-
-    let alice_live_eid = send_message(&alice_db, "alice-live-no-bootstrap-addr");
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", alice_live_eid),
-        timeout_ms,
-    );
-
-    let bob_live_eid = send_message(&bob_db, "bob-live-no-bootstrap-addr");
-    assert_eventually(
-        &alice_db,
-        &format!("has_event:{} >= 1", bob_live_eid),
-        timeout_ms,
+        parsed.relay_url.is_none(),
+        "invite should not carry a relay bootstrap hint when tests disable relays"
     );
 }
 
