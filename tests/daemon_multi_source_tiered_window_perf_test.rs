@@ -47,6 +47,14 @@ struct BenchOutcome {
     active_sources: usize,
 }
 
+#[derive(Debug)]
+struct ReplicatedRejoinOutcome {
+    useful_unique_events: i64,
+    active_sources: usize,
+    source_event_frames: Vec<i64>,
+    source_recorded_events: Vec<i64>,
+}
+
 fn current_timestamp_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -548,6 +556,15 @@ fn generate_messages_distributed(nodes: &[&Node], total_messages: i64) {
     }
 }
 
+fn generate_messages_replicated(nodes: &[Node], total_messages: i64) {
+    assert!(!nodes.is_empty(), "nodes must not be empty");
+    assert!(total_messages >= 0, "total_messages must be non-negative");
+    if total_messages == 0 {
+        return;
+    }
+    generate_messages(&nodes[0].db, total_messages as usize);
+}
+
 fn write_summary_with_sources(
     summary_key: &str,
     title: &str,
@@ -1025,6 +1042,118 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
     }
 }
 
+fn run_replicated_rejoin_bench(
+    source_count: usize,
+    connectivity: ConnectivityMode,
+) -> ReplicatedRejoinOutcome {
+    assert!(source_count >= 2, "source_count must be >= 2");
+    hold_network_test_lock_for_binary();
+    std::env::set_var("TOPO_GENERATE_MESSAGE_SPREAD_MS", HOUR_MS.to_string());
+    std::env::set_var("TOPO_EVENT_TIMELINE", "1");
+    std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
+    std::env::set_var("TOPO_ENABLE_LIVE_SUPPRESSION", "1");
+
+    let total_messages = env_i64("TOPO_MULTI_SOURCE_COMPARE_TOTAL_MESSAGES", 1_000);
+    let tmpdir = bench_tmpdir("msrr-");
+    let mut peer_labels = vec!["hub".to_string()];
+    for idx in 1..source_count {
+        peer_labels.push(format!("source-{idx:02}"));
+    }
+    peer_labels.push("rejoiner".to_string());
+
+    let (mut nodes, _invite_link) = create_online_community(&tmpdir, &peer_labels, connectivity);
+    let rejoiner = nodes.pop().expect("rejoiner node missing");
+    assert_eq!(rejoiner.label, "rejoiner");
+    let sources = nodes;
+    let source_dbs: Vec<String> = sources.iter().map(|source| source.db.clone()).collect();
+    let all_dbs: Vec<String> = sources
+        .iter()
+        .map(|source| source.db.clone())
+        .chain(std::iter::once(rejoiner.db.clone()))
+        .collect();
+
+    let warmup_messages = emit_warmup_messages(&sources) + 1;
+    let _ = send_message(&rejoiner.db, "warmup-rejoiner");
+    wait_for_message_count_all(&all_dbs, warmup_messages, Duration::from_secs(120));
+
+    let mut rejoiner_daemon = rejoiner._daemon;
+    stop_daemon(&rejoiner.db, &mut rejoiner_daemon);
+    wait_for_daemon_stopped(&rejoiner.db, Duration::from_secs(10));
+
+    generate_messages_replicated(&sources, total_messages);
+    let expected_source_total = total_messages + warmup_messages;
+    wait_for_message_count_all(
+        &source_dbs,
+        expected_source_total,
+        Duration::from_secs(1200),
+    );
+
+    let useful_unique_events_before = unique_sync_received_event_count_sql(&rejoiner.db);
+    let rejoiner_received_frames_before = received_events_by_peer_for_db(&rejoiner.db);
+    let rejoiner_recorded_sources_before = received_recorded_events_by_source_for_db(&rejoiner.db);
+
+    let inherited_env = inherited_tier_env();
+    rejoiner_daemon = start_peer(&rejoiner.db, inherited_env, connectivity);
+    ensure_active_peer(&rejoiner.db, Duration::from_secs(10));
+    wait_for_active_tenant_ready(&rejoiner.db, Duration::from_secs(120));
+    let _ = wait_for_message_count(
+        &rejoiner.db,
+        expected_source_total,
+        Duration::from_secs(1800),
+    );
+    wait_for_downloader_receives_stable(
+        &rejoiner.db,
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+    );
+
+    let rejoiner_received_frames_after = received_events_by_peer_for_db(&rejoiner.db);
+    let rejoiner_received_frame_deltas = diff_count_map(
+        &rejoiner_received_frames_after,
+        &rejoiner_received_frames_before,
+    );
+    let source_event_frames: Vec<i64> = sources
+        .iter()
+        .map(|source| {
+            rejoiner_received_frame_deltas
+                .get(&source.transport_peer_id)
+                .copied()
+                .unwrap_or(0)
+        })
+        .collect();
+    let rejoiner_recorded_sources_after = received_recorded_events_by_source_for_db(&rejoiner.db);
+    let rejoiner_recorded_source_deltas = diff_count_map(
+        &rejoiner_recorded_sources_after,
+        &rejoiner_recorded_sources_before,
+    );
+    let source_recorded_events =
+        count_source_tag_events(&rejoiner_recorded_source_deltas, &sources);
+    let useful_unique_events = unique_sync_received_event_count_sql(&rejoiner.db)
+        .saturating_sub(useful_unique_events_before);
+    let active_sources = source_event_frames
+        .iter()
+        .filter(|count| **count > 0)
+        .count();
+
+    eprintln!(
+        "\nreplicated rejoin {}: useful_unique={} active_sources={} recv_by_source={:?} durable_by_source={:?}",
+        connectivity.title(),
+        useful_unique_events,
+        active_sources,
+        source_event_frames,
+        source_recorded_events,
+    );
+    stop_daemon(&rejoiner.db, &mut rejoiner_daemon);
+    wait_for_daemon_stopped(&rejoiner.db, Duration::from_secs(10));
+
+    ReplicatedRejoinOutcome {
+        useful_unique_events,
+        active_sources,
+        source_event_frames,
+        source_recorded_events,
+    }
+}
+
 #[test]
 #[ignore]
 fn perf_multi_source_cold_join_4x_10k() {
@@ -1071,6 +1200,42 @@ fn perf_multi_source_rejoin_4x_10k_discovery() {
 #[ignore]
 fn perf_multi_source_rejoin_8x_10k_discovery() {
     let _ = run_rejoin_bench(8, ConnectivityMode::DiscoveryLoopback);
+}
+
+#[test]
+#[ignore = "diagnostic on local master: replicated rejoin still converges through one source in this scenario"]
+fn replicated_rejoin_2x_1k_live_suppression_uses_multiple_sources_after_preconvergence() {
+    std::env::set_var("TOPO_MULTI_SOURCE_COMPARE_TOTAL_MESSAGES", "1000");
+    let outcome = run_replicated_rejoin_bench(2, ConnectivityMode::DiscoveryLoopback);
+    assert!(
+        outcome.active_sources >= 2,
+        "expected both known replicated sources to contribute after rejoin, got active_sources={} recv_frames={:?} durable_attributed={:?}",
+        outcome.active_sources,
+        outcome.source_event_frames,
+        outcome.source_recorded_events,
+    );
+    assert!(
+        outcome.useful_unique_events > 0,
+        "expected the rejoiner to ingest replicated events"
+    );
+}
+
+#[test]
+#[ignore = "diagnostic on local master: replicated rejoin still converges through one source in this scenario"]
+fn replicated_rejoin_2x_10k_live_suppression_uses_multiple_sources_after_preconvergence() {
+    std::env::set_var("TOPO_MULTI_SOURCE_COMPARE_TOTAL_MESSAGES", "10000");
+    let outcome = run_replicated_rejoin_bench(2, ConnectivityMode::DiscoveryLoopback);
+    assert!(
+        outcome.active_sources >= 2,
+        "expected both known replicated sources to contribute after rejoin, got active_sources={} recv_frames={:?} durable_attributed={:?}",
+        outcome.active_sources,
+        outcome.source_event_frames,
+        outcome.source_recorded_events,
+    );
+    assert!(
+        outcome.useful_unique_events > 0,
+        "expected the rejoiner to ingest replicated events"
+    );
 }
 
 #[test]
