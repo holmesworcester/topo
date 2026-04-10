@@ -1,4 +1,4 @@
-//! Formal verification of the ContextLoadResult tri-state and
+//! Formal verification of the ContextLoadResult outcomes and
 //! context loading phase properties.
 //!
 //! Context loading is the phase between dependency checking and projector
@@ -6,6 +6,7 @@
 //!   - Ready(ctx): proceed to pure projector with populated context
 //!   - Block{missing}: event blocks on missing context (not deps)
 //!   - Reject{reason}: event is rejected before projector runs
+//!   - Purge{message_event_id}: emit hard-purge command and return without projector
 //!
 //! This models the new ContextLoadResult introduced to allow context loaders
 //! to short-circuit projection without running the pure projector.
@@ -18,11 +19,12 @@ verus! {
 pub spec const ONE: nat = 1;
 pub spec const TWO: nat = 2;
 
-/// The tri-state result of context loading.
+/// The result of context loading.
 pub enum ContextLoadResult {
     Ready,
     Block { missing_count: nat },
     Reject,
+    Purge,
 }
 
 /// Model of the apply_projection flow with ContextLoadResult:
@@ -44,6 +46,8 @@ pub open spec fn apply_with_context_loading(
                 ProjectionDecision::Block { missing_count },
             ContextLoadResult::Reject =>
                 ProjectionDecision::Reject,
+            ContextLoadResult::Purge =>
+                ProjectionDecision::Valid,
             ContextLoadResult::Ready =>
                 projector_decision,
         }
@@ -77,6 +81,33 @@ proof fn proof_context_reject_prevents_projector()
             );
             matches!(d, ProjectionDecision::Reject)
         }),
+{
+}
+
+/// Proof: context Purge prevents projector from running and returns Valid
+/// after the hard-purge command has been emitted by the executor.
+proof fn proof_context_purge_prevents_projector(projector_decision: ProjectionDecision)
+    ensures
+        matches!(
+            apply_with_context_loading(
+                true,
+                false,
+                ContextLoadResult::Purge,
+                projector_decision,
+            ),
+            ProjectionDecision::Valid
+        ),
+{
+}
+
+/// Proof: context Purge is noninterfering with the projector decision.
+proof fn proof_context_purge_ignores_projector_decision(
+    a: ProjectionDecision,
+    b: ProjectionDecision,
+)
+    ensures
+        apply_with_context_loading(true, false, ContextLoadResult::Purge, a)
+            == apply_with_context_loading(true, false, ContextLoadResult::Purge, b),
 {
 }
 
@@ -116,6 +147,8 @@ proof fn proof_full_pipeline_check_order()
         matches!(apply_with_context_loading(true, true, ContextLoadResult::Block { missing_count: TWO }, ProjectionDecision::Valid), ProjectionDecision::Block { .. }),
         // Context reject: projector doesn't matter
         matches!(apply_with_context_loading(true, true, ContextLoadResult::Reject, ProjectionDecision::Valid), ProjectionDecision::Reject),
+        // Context purge: projector doesn't matter
+        matches!(apply_with_context_loading(true, true, ContextLoadResult::Purge, ProjectionDecision::Reject), ProjectionDecision::Valid),
         // All pass: projector decision flows through
         matches!(apply_with_context_loading(true, true, ContextLoadResult::Ready, ProjectionDecision::Valid), ProjectionDecision::Valid),
 {
