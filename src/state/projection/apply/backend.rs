@@ -362,9 +362,14 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use crate::crypto::{event_id_to_base64, hash_event};
-    use crate::event_modules::{encode_event, ParsedEvent, TenantEvent};
+    use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
+    use crate::event_modules::file_slice::FILE_SLICE_WIRE_SIZE;
+    use crate::event_modules::{
+        encode_event, EncryptedEvent, ParsedEvent, TenantEvent, EVENT_TYPE_FILE_SLICE,
+    };
     use crate::projection::contract::{EmitCommand, ProjectorDecisionContext, WriteOp};
     use crate::projection::decision::ProjectionDecision;
+    use crate::projection::apply::stages::apply_projection_with_backend;
     use crate::projection::queries::{DepLoadResult, ProjectionQueryResult};
 
     use super::*;
@@ -372,6 +377,7 @@ mod tests {
 
     struct FakeProjectionBackend {
         blobs: HashMap<String, Vec<u8>>,
+        dep_result: RefCell<DepLoadResult>,
         rejections: RefCell<Vec<(String, String, String)>>,
         blocked_event_deps: RefCell<HashMap<String, BTreeSet<String>>>,
         blocked_events: RefCell<HashMap<String, i64>>,
@@ -379,14 +385,24 @@ mod tests {
         valid_marked: RefCell<Vec<String>>,
         write_batches: RefCell<usize>,
         emit_batches: RefCell<usize>,
+        emitted_commands: RefCell<Vec<EmitCommand>>,
     }
 
     impl FakeProjectionBackend {
         fn with_blob(event_id_b64: String, blob: Vec<u8>) -> Self {
+            Self::with_blob_and_dep_result(event_id_b64, blob, DepLoadResult::missing())
+        }
+
+        fn with_blob_and_dep_result(
+            event_id_b64: String,
+            blob: Vec<u8>,
+            dep_result: DepLoadResult,
+        ) -> Self {
             let mut blobs = HashMap::new();
             blobs.insert(event_id_b64, blob);
             Self {
                 blobs,
+                dep_result: RefCell::new(dep_result),
                 rejections: RefCell::new(Vec::new()),
                 blocked_event_deps: RefCell::new(HashMap::new()),
                 blocked_events: RefCell::new(HashMap::new()),
@@ -394,6 +410,7 @@ mod tests {
                 valid_marked: RefCell::new(Vec::new()),
                 write_batches: RefCell::new(0),
                 emit_batches: RefCell::new(0),
+                emitted_commands: RefCell::new(Vec::new()),
             }
         }
     }
@@ -466,9 +483,12 @@ mod tests {
         fn execute_emit_commands(
             &self,
             _recorded_by: &str,
-            _commands: &[EmitCommand],
+            commands: &[EmitCommand],
         ) -> ProjectionApplyResult<()> {
             *self.emit_batches.borrow_mut() += 1;
+            self.emitted_commands
+                .borrow_mut()
+                .extend_from_slice(commands);
             Ok(())
         }
 
@@ -500,7 +520,7 @@ mod tests {
             _field_name: &str,
             _dep_id: &EventId,
         ) -> ProjectionQueryResult<DepLoadResult> {
-            Ok(DepLoadResult::missing())
+            Ok(self.dep_result.borrow().clone())
         }
 
         fn load_key_secret_bytes(
@@ -672,6 +692,20 @@ mod tests {
         assert_eq!(backend.load_blob(&event_id_b64).unwrap(), Some(blob));
     }
 
+    fn make_encrypted_wrapper_with_key_dep(key_event_id: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
+        let parsed = ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: 7,
+            key_event_id,
+            owner_event_id: NO_OWNER_EVENT_ID,
+            inner_type_code: EVENT_TYPE_FILE_SLICE,
+            nonce: [0xAA; 12],
+            ciphertext: vec![0xBB; FILE_SLICE_WIRE_SIZE],
+            auth_tag: [0xCC; 16],
+        });
+        let blob = encode_event(&parsed).unwrap();
+        (parsed, blob)
+    }
+
     #[test]
     fn project_one_step_can_run_against_generic_backend_for_valid_event() {
         let parsed = ParsedEvent::Tenant(TenantEvent {
@@ -714,5 +748,122 @@ mod tests {
         assert!(parsed_out.is_none());
         assert_eq!(backend.rejections.borrow().len(), 1);
         assert_eq!(backend.rejections.borrow()[0].1, event_id_b64);
+    }
+
+    #[test]
+    fn project_one_step_records_block_without_projection_side_effects_when_context_load_blocks() {
+        let key_event_id = [0x51; 32];
+        let (parsed, blob) = make_encrypted_wrapper_with_key_dep(key_event_id);
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let backend = FakeProjectionBackend::with_blob_and_dep_result(
+            event_id_b64.clone(),
+            blob,
+            DepLoadResult::missing(),
+        );
+
+        let (decision, parsed_out) =
+            project_one_step_with_backend(&backend, "peer-a", &event_id).unwrap();
+
+        assert_eq!(
+            decision,
+            ProjectionDecision::Block {
+                missing: vec![key_event_id]
+            }
+        );
+        assert_eq!(parsed_out, Some(parsed));
+        assert_eq!(
+            backend
+                .blocked_event_deps
+                .borrow()
+                .get(&event_id_b64)
+                .cloned()
+                .unwrap_or_default(),
+            BTreeSet::from([event_id_to_base64(&key_event_id)])
+        );
+        assert_eq!(
+            backend.blocked_events.borrow().get(&event_id_b64).copied(),
+            Some(1)
+        );
+        assert_eq!(backend.guard_blocked.borrow().as_slice(), &[event_id_b64]);
+        assert!(backend.rejections.borrow().is_empty());
+        assert!(backend.valid_marked.borrow().is_empty());
+        assert_eq!(*backend.write_batches.borrow(), 0);
+        assert_eq!(*backend.emit_batches.borrow(), 0);
+        assert!(backend.emitted_commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn project_one_step_records_rejection_without_projection_side_effects_when_context_load_rejects(
+    ) {
+        let key_event_id = [0x61; 32];
+        let (parsed, blob) = make_encrypted_wrapper_with_key_dep(key_event_id);
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let backend = FakeProjectionBackend::with_blob_and_dep_result(
+            event_id_b64.clone(),
+            blob,
+            DepLoadResult::Reject {
+                reason: "dependency rejected".to_string(),
+            },
+        );
+
+        let (decision, parsed_out) =
+            project_one_step_with_backend(&backend, "peer-a", &event_id).unwrap();
+
+        assert_eq!(
+            decision,
+            ProjectionDecision::Reject {
+                reason: "dependency rejected".to_string()
+            }
+        );
+        assert_eq!(parsed_out, Some(parsed));
+        assert_eq!(backend.rejections.borrow().len(), 1);
+        assert_eq!(
+            backend.rejections.borrow()[0],
+            (
+                "peer-a".to_string(),
+                event_id_b64.clone(),
+                "dependency rejected".to_string()
+            )
+        );
+        assert!(backend.blocked_event_deps.borrow().is_empty());
+        assert!(backend.guard_blocked.borrow().is_empty());
+        assert!(backend.valid_marked.borrow().is_empty());
+        assert_eq!(*backend.write_batches.borrow(), 0);
+        assert_eq!(*backend.emit_batches.borrow(), 0);
+        assert!(backend.emitted_commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn apply_projection_emits_hard_purge_without_write_ops_when_context_load_purges() {
+        let key_event_id = [0x71; 32];
+        let (parsed, blob) = make_encrypted_wrapper_with_key_dep(key_event_id);
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let backend = FakeProjectionBackend::with_blob_and_dep_result(
+            event_id_b64.clone(),
+            blob.clone(),
+            DepLoadResult::purge("deleted-message"),
+        );
+
+        let (decision, inner) =
+            apply_projection_with_backend(&backend, "peer-a", &event_id_b64, &blob, &parsed)
+                .unwrap();
+
+        assert_eq!(decision, ProjectionDecision::Valid);
+        assert!(inner.is_none());
+        assert_eq!(*backend.write_batches.borrow(), 0);
+        assert_eq!(*backend.emit_batches.borrow(), 1);
+        assert_eq!(
+            backend.emitted_commands.borrow().as_slice(),
+            &[EmitCommand::HardPurgeMessageGraph {
+                message_event_id: "deleted-message".to_string()
+            }]
+        );
+        assert!(backend.blocked_event_deps.borrow().is_empty());
+        assert!(backend.guard_blocked.borrow().is_empty());
+        assert!(backend.rejections.borrow().is_empty());
+        assert!(backend.valid_marked.borrow().is_empty());
     }
 }

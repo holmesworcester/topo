@@ -380,7 +380,9 @@ mod tests {
         schema::create_tables,
         store::{SQL_INSERT_EVENT, SQL_INSERT_RECORDED_EVENT, SQL_INSERT_SHARED_EVENT_INDEX_ENTRY},
     };
-    use crate::event_modules::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_FILE_SLICE};
+    use crate::event_modules::{
+        self, EncryptedEvent, MessageEvent, ParsedEvent, EVENT_TYPE_FILE_SLICE,
+    };
 
     fn run_persist_phase_for_test(
         db: &rusqlite::Connection,
@@ -542,6 +544,134 @@ mod tests {
             resolve_persist_workspace_target(&plan.fanout_workspace, "event-a"),
             None
         );
+    }
+
+    #[test]
+    fn run_persist_phase_indexes_and_fanouts_shared_message_with_cached_workspace_binding() {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
+        let workspace_id = event_id_to_base64(&[9u8; 32]);
+        let blob = event_modules::encode_event(&ParsedEvent::Message(MessageEvent {
+            created_at_ms: 777,
+            workspace_id: [3u8; 32],
+            author_id: [4u8; 32],
+            content: "cached workspace binding".to_string(),
+        }))
+        .unwrap();
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let mut workspace_cache = HashMap::from([("peer-alpha".to_string(), workspace_id.clone())]);
+        let batch = vec![(
+            event_id,
+            blob,
+            "peer-alpha".to_string(),
+            "sync".to_string(),
+            0,
+            0,
+        )];
+
+        let output = run_persist_phase_for_test(&db, &batch, &mut workspace_cache);
+
+        assert_eq!(output.persisted_event_ids, vec![event_id]);
+        assert_eq!(output.shared_event_fanouts.len(), 1);
+        assert_eq!(output.shared_event_fanouts[0].origin_peer_id, "peer-alpha");
+        assert_eq!(output.shared_event_fanouts[0].workspace_id, workspace_id);
+        assert!(output.tenants_seen.contains("peer-alpha"));
+
+        let indexed_workspace_id: String = db
+            .query_row(
+                "SELECT workspace_id FROM shared_event_index WHERE id = ?1",
+                rusqlite::params![event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_workspace_id, output.shared_event_fanouts[0].workspace_id);
+
+        let pending_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM pending_shared_fanouts
+                 WHERE origin_peer_id = ?1 AND workspace_id = ?2 AND event_id = ?3",
+                rusqlite::params![
+                    "peer-alpha",
+                    &output.shared_event_fanouts[0].workspace_id,
+                    event_id.as_slice()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 1);
+
+        let queue_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params!["peer-alpha", &event_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queue_count, 1);
+    }
+
+    #[test]
+    fn run_persist_phase_suppresses_shared_index_and_fanout_without_workspace_binding_for_shared_message(
+    ) {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
+        let blob = event_modules::encode_event(&ParsedEvent::Message(MessageEvent {
+            created_at_ms: 888,
+            workspace_id: [5u8; 32],
+            author_id: [6u8; 32],
+            content: "missing workspace binding".to_string(),
+        }))
+        .unwrap();
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let mut workspace_cache = HashMap::new();
+        let batch = vec![(
+            event_id,
+            blob,
+            "peer-alpha".to_string(),
+            "sync".to_string(),
+            0,
+            0,
+        )];
+
+        let output = run_persist_phase_for_test(&db, &batch, &mut workspace_cache);
+
+        assert_eq!(output.persisted_event_ids, vec![event_id]);
+        assert!(output.shared_event_fanouts.is_empty());
+        assert!(output.tenants_seen.contains("peer-alpha"));
+
+        let shared_index_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM shared_event_index WHERE id = ?1",
+                rusqlite::params![event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_index_count, 0);
+
+        let pending_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM pending_shared_fanouts
+                 WHERE origin_peer_id = ?1 AND event_id = ?2",
+                rusqlite::params!["peer-alpha", event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 0);
+
+        let queue_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params!["peer-alpha", &event_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queue_count, 1);
     }
 
     #[test]
