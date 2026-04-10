@@ -206,7 +206,7 @@ The stricter target for the next auth cleanup is narrower than the current trans
 
 This target is captured in the focused TLA safety model [`EndpointBootstrapRoute.tla`](./tla/EndpointBootstrapRoute.tla). That model checks the exact bootstrap and route safety properties before we remove the current bridge code.
 
-This also covers the hard case where multiple local identities on the same endpoint belong to the same workspace. One daemon-to-daemon QUIC connection can carry multiple tenant/workspace sessions over time, and tenant trust sets may overlap in value, but session admission remains tenant-scoped because each logical session names the exact tenant/workspace scope to bind. Range sync and dependency repair are separate session classes on that shared daemon connection, so recent-history control traffic can stay responsive without paying for a second QUIC congestion controller to the same daemon.
+This also covers the hard case where multiple local identities on the same endpoint belong to the same workspace. One daemon-to-daemon QUIC connection can carry multiple tenant/workspace sessions over time, and tenant trust sets may overlap in value, but session admission remains tenant-scoped because each logical session names the exact tenant/workspace scope to bind. Current sync work is carried by routed range sessions on that shared daemon connection; dependency and auth/key catchup are prioritized by window selection rather than by a separate dependency session class.
 
 ### Why Not Fully Sessionless Signed Control
 
@@ -216,24 +216,20 @@ The attraction is real: connection sharing becomes simpler, and there is less ex
 
 ### Sync And Convergence
 
-Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. A range session loads the local `(ts, event_id)` membership for one selected range from `shared_event_index`, seals it into an in-memory `NegentropyStorageVector`, exchanges `NegOpen` / `NegMsg`, and then both sides stream all missing blobs for that range as raw length-delimited records. The receiver appends those blobs to a `ReceiveLog`, stamps `first_received_at` / `first_stored_at` in the file as each blob is appended, finalizes the spool file, and then lets canonical ingest continue in the background.
+Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. A range session loads the local `(ts, event_id)` membership for one selected range from `shared_event_index`, seals it into an in-memory `NegentropyStorageVector`, exchanges `NegOpen` / `NegMsg`, and then both sides stream all missing blobs for that range as event frames. The receiver hashes each blob, appends the event id and blob to a `ReceiveLog`, stamps `first_received_at` / `first_stored_at` in the file as each blob is appended, finalizes the spool file, and then lets canonical ingest continue in the background.
 
-Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses the Rust [`negentropy` library](https://crates.io/crates/negentropy) over one selected range at a time. The current scheduler intentionally stays simple and round-robins:
+Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses the Rust [`negentropy` library](https://crates.io/crates/negentropy) over one selected range at a time. The current scheduler intentionally stays simple and runs a per-peer cadence through:
 
 1. `last day`
 2. `last week`
 3. `last twelve weeks`
 4. `full history`
 
-When multiple peers are connected, the scheduler uses the same simple rule every round:
+When multiple peers are connected, each peer runs that same cadence independently. The scheduler no longer divides historical ranges by peer rank, ownership, or hash partition. Duplicate reduction is handled by live suppression: as a receiver hashes incoming events, it publishes those event ids to other same-workspace sessions; senders then skip ids that the receiver says it already has or is already receiving.
 
-1. `last day` is duplicated across all live peers to minimize time-to-project for recent history,
-2. `last week`, `last twelve weeks`, and `full history` are partitioned across the current live peer set by sorted peer rank,
-3. the partition is recomputed on every new range session from the live connection set.
+This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, no peer partition, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, later rounds with the remaining peers reconcile the same ranges again and fill holes. While a hot `LastDay` receive is active for a DB, background receive-log ingest stays paused so download/store remains the priority path.
 
-This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, the next round sees a smaller live peer set and the remaining peers automatically widen their assigned historical slices. While a hot `LastDay` receive is active for a DB, background receive-log ingest stays paused so download/store remains the priority path.
-
-Sync is range-owned and durable-first. Bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
+Sync is range-owned with a receive-log durable handoff. Live suppression may advertise a freshly hashed id before canonical ingest because suppression is only an efficiency hint. Bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
 
 For same-workspace sibling tenants sharing one DB, there is one extra local step after canonical persistence: shared events created locally or ingested from the network are fanned out to sibling tenant scopes with the same `workspace_id`, then projected through those tenants' normal queue/drain path. This is not a transport shortcut and it does not bypass projectors; it is local fanout of already-canonical shared blobs so one shared DB converges the same way multiple separate daemons would.
 
@@ -494,15 +490,12 @@ Safety rule:
 
 ## 1.5 Sync session classes and stream separation
 
-One authenticated daemon connection can host two sync session classes:
-
-1. `Range` sessions for bulk catchup,
-2. `Dependency` sessions for targeted blocker repair.
+One authenticated daemon connection hosts routed `Range` sessions for workspace catchup.
 
 Why keep control and data separate inside a session:
-1. large `Event` blobs do not head-of-line block reconciliation or dependency requests,
+1. large `Event` blobs do not head-of-line block reconciliation or suppression/control frames,
 2. control remains readable and bounded while data transfer stays bulk-oriented,
-3. dependency replies can stay latency-first without sharing the same hot path as range bulk transfer.
+3. suppression/control frames can stay bounded while blob transfer remains the only bulk path.
 
 Current shape:
 1. a `Range` session uses one control stream plus one data stream and runs in two strict phases:
@@ -833,25 +826,21 @@ Discovery-only invite acceptance may still persist an empty `bootstrap_addr` mar
 
 This PoC does not implement `PeerRemoved`, `UserRemoved`, or a `ban` command. Safe user/device removal requires coordinated group key agreement plus key rotation so future ciphertext is no longer available to the removed member. When removal is added back, it must revoke any admitted `(tenant_id, remote_peer_id)` routes on live daemon connections and close the daemon connection entirely if no tenant scopes remain; we must not rely on ingest rejection alone. We intentionally defer that work here and keep transport trust/session logic limited to invite/bootstrap trust and steady-state `PeerShared` trust.
 
-### Receive logs and immediate ingest
+### Receive logs and range ingest
 
-The active network ingest model has two boundaries:
+The active network ingest model has one durable receive boundary: range sessions
+write blobs to a per-session `ReceiveLog`, then background replay moves those
+records through canonical ingest and projection.
 
-1. **Range bulk receive** writes blobs to a per-session `ReceiveLog`.
-2. **Dependency replies** call `ingest_now` immediately.
-
-Range bulk path:
-1. append each blob to the `ReceiveLog`,
-2. stamp first-store timing as the append succeeds,
-3. finalize on connection close or idle timeout,
-4. replay the log into canonical ingest,
-5. recover leftover logs on startup and delete them after successful replay.
-
-Dependency path:
-1. receive one or more dependency `Event` replies,
-2. opportunistically drain what is already buffered now,
-3. call `ingest_now`,
-4. let normal `project_queue` / `project_one` logic unblock dependents.
+Range receive path:
+1. hash each incoming blob once before durable append to compute its event id,
+2. publish that event id to the live-suppression cohort when live suppression is enabled,
+3. append the event id and blob to the `ReceiveLog`,
+4. stamp first-store timing as the append succeeds,
+5. record an in-memory pending-receive overlay entry for active range reconciliation,
+6. finalize on connection close or idle timeout,
+7. replay the log into canonical ingest,
+8. recover leftover logs on startup and delete them after successful replay.
 
 This keeps the bulk hot path free of per-event SQLite work while still using
 the same canonical/projector pipeline after the durable handoff point.
@@ -891,7 +880,7 @@ The production peering runtime follows a single conceptual loop:
 2. **Target planner** (`runtime::peering::engine::target_planner`): single-owner module for all dial target planning. Bootstrap trust rows now surface the authenticated bootstrap transport fingerprint, so bootstrap, observed endpoints, and `iroh` mDNS discovery all collapse onto one exact transport-target dispatch key per `(tenant_id, target_transport_fingerprint)`. Relay-backed `iroh` connectivity sits under that planner; there is no separate intro path.
 3. **Supervisor layer**: startup preflight + loop orchestration live in the peering supervisor. Connectivity inputs are hints to `ensure_connected(peer)`, not independent long-lived owners.
 4. **Dial/accept loops**: `connect_loop` (outbound tenant work) and `accept_loop` (raw inbound daemon connections) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. `iroh` dial/accept + daemon identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
-5. **Live daemon slot**: after daemon identity extraction, the runtime claims at most one local live daemon connection slot per `(db_path, remote_daemon_peer_id)`. Duplicates are closed instead of starting overlapping sync ownership. If both directions appear, the deterministic preferred direction is the lexicographically lower daemon id dialing outbound and the higher daemon id retaining inbound; a preferred-direction connection replaces a non-preferred one.
+5. **Live daemon slot**: after daemon identity extraction, the runtime claims at most one local live daemon connection slot per `(db_path, remote_daemon_peer_id)`. Either side may dial; the deterministic preferred direction is only a simultaneous-duplicate tie-breaker. If both directions appear, the lexicographically lower daemon id's outbound connection is preferred and the higher daemon id's inbound connection is preferred; the preferred duplicate replaces a non-preferred live slot.
 6. **Logical session auth and runners**: tenant work reuses the live daemon connection and opens logical range sessions. Steady-state sessions begin with `OpenSessionRoute`; bootstrap or new-workspace sessions use `OpenSessionAuthInvite`, then run through `SyncConnectionHandler`.
 
 Known drawback: because there is no pre-handshake secret gate today, anyone who learns the daemon's `iroh` address or relay-reachable endpoint can touch the unauthenticated `iroh/topo` surface. They still cannot authenticate into a workspace without a valid route or invite proof, but they can force the first-session timeout path and probe for bugs in `iroh` itself or in our own session/bootstrap parsing and admission logic. This is an intentional simplicity tradeoff in the current design, not a claim that the exposed pre-proof surface is zero.
@@ -1294,8 +1283,8 @@ Peer runtime worker shape:
 1. `RangeSession`:
    - choose one explicit range,
    - reconcile that range with negentropy on the control stream,
-   - exchange missing blobs on the data stream as raw length-delimited records,
-   - append received blobs to a `ReceiveLog`,
+   - exchange missing blobs on the data stream as event frames,
+   - hash received blobs once, publish live suppression when enabled, and append blobs plus event ids to a `ReceiveLog`,
    - finish the spool file before local canonical ingest continues in the background.
 2. project worker/drain:
    - claim `project_queue`,
@@ -1318,10 +1307,12 @@ Bulk transfer is range-owned.
 2. the initiator opens a `Range` session and sends the concrete window bounds in the initial `NegOpen`,
 3. both sides load that range from `shared_event_index` into an in-memory `NegentropyStorageVector`,
 4. negentropy computes `have_ids` / `need_ids` for that explicit range,
-5. both sides stream all missing blobs for that range as raw `[u32 len][blob]` records,
-6. the receiver appends those records to a `ReceiveLog`, stamping `first_received_at` and `first_stored_at` in the file,
-7. on close or idle timeout, the log is finalized with `flush + sync_all`, the range session ends, and the log is queued for background canonical ingest,
-8. while a hot `LastDay` receive is active for a DB, bulk receive-log replay stays paused so download/store remains the priority path.
+5. both sides stream all missing blobs for that range as raw event frames on the data stream,
+6. with live suppression enabled, the sender also accepts batched `SuppressIds` frames from the receiver and stops sending ids that are already received or pending elsewhere,
+7. the receiver hashes each blob once before append, records the event id plus blob in the `ReceiveLog`, stamps `first_received_at` and `first_stored_at`, and advertises the id to sibling same-workspace sessions,
+8. senders finish a live-suppression data stream with `RangeDataDone`; receivers continue to finalize on close or idle timeout for compatibility,
+9. on close or idle timeout, the log is finalized with `flush + sync_all`, the range session ends, and the log is queued for background canonical ingest,
+10. while a hot `LastDay` receive is active for a DB, bulk receive-log replay stays paused so download/store remains the priority path.
 
 Dependency repair happens through later prioritized range windows:
 
@@ -1336,13 +1327,13 @@ Dependency repair happens through later prioritized range windows:
 3. duplicate enqueue races are safe via `INSERT OR IGNORE` plus terminal fast-drop checks.
 4. `ReceiveLog` replay parses valid records to EOF and ignores a truncated tail.
 5. leftover receive logs are ingested on startup; interrupted bulk ranges are not discarded.
-6. dependency-session routing state is bounded in-memory state keyed by `(db_path, tenant_id, peer_id)`.
+6. live suppression and pending-receive overlay state are bounded in-memory state keyed by DB/workspace/session identity.
 
 ## 7.5 Atomicity boundaries
 
 Must be atomic:
 
-1. append one blob to the `ReceiveLog`,
+1. append one event id plus blob to the `ReceiveLog`,
 2. canonical event insert + recorded insert + `project_queue` enqueue,
 3. projection state transition + project dequeue,
 4. unblock update + project requeue.
@@ -1350,23 +1341,24 @@ Must be atomic:
 Can be eventual:
 
 1. range retry after timeout or connection loss,
-2. dependency request retry,
+2. later prioritized range windows filling missing dependencies,
 3. queue cleanup and metrics/logging.
 
 ## 7.6 Multi-source coordination
 
 The active implementation keeps coordination intentionally simple.
 
-1. there is one authenticated QUIC connection per peer,
-2. each peer hosts range sessions only; there is no separate dependency session,
-3. bulk scheduling is range-based, not event-based,
-4. newer ranges are favored by the fixed ladder order,
-5. true arbitrary-range splitting and cross-peer range balancing are future work.
+1. there is at most one authenticated QUIC daemon connection slot per remote daemon,
+2. either side may dial, with deterministic tie-break only when simultaneous duplicates appear,
+3. each peer hosts range sessions only; there is no separate dependency session,
+4. bulk scheduling is range-based, not event-based,
+5. every active peer advances through the fixed range ladder independently,
+6. live suppression, not peer partitioning, reduces duplicate sends across overlapping same-workspace sessions.
 
 This means the current branch optimizes for:
 
 1. minimum time to first durable store for recent data,
-2. minimum latency to unblock projection for missing deps,
+2. eventual recovery from missing deps through prioritized range catchup,
 3. a small, readable scheduler rather than a global per-event allocator.
 
 ### Connection idempotency
@@ -1381,8 +1373,9 @@ hints, but the runtime remains peer-idempotent after authentication:
 3. locally there is at most one live QUIC daemon connection owner per
    `(db_path, remote_daemon_peer_id)`, while tenant/workspace work reuses that
    connection by opening logical sessions inside it,
-4. a preferred-direction connection replaces a non-preferred duplicate, while
-   equal-or-worse duplicates are closed immediately.
+4. either side may dial; if simultaneous duplicates appear, the deterministic
+   preferred direction replaces a non-preferred live slot while equal-or-worse
+   duplicates are closed immediately.
 
 This keeps bootstrap as an ongoing process instead of a brittle state machine
 while preventing the dual-session/double-send failure mode caused by redundant
@@ -1394,17 +1387,21 @@ The active branch chooses simpler boundaries over a global per-event planner:
 
 1. **Range-owned bulk transfer.** One range session owns one explicit range and
    one `ReceiveLog`.
-2. **Immediate dependency repair.** Blockers go to a separate dependency
-   session and reply ingestion does not wait behind bulk files.
+2. **Prioritized range repair.** Blockers are recorded locally and repaired by
+   later range windows; there is no separate dependency session.
 3. **Daemon-connection-scoped ownership.** Sessions belong to one authenticated
    daemon connection lifetime, and duplicate raw connections are still collapsed
    by the live daemon-connection slot rule.
-4. **Simple scheduler first.** The current scheduler round-robins the fixed
-   range ladder before growing into arbitrary coordinator-chosen ranges.
+4. **Per-peer cadence.** The current scheduler advances each peer through the
+   fixed range ladder independently, with no peer-rank or hash partition.
 5. **Use stock negentropy directly.** The active path builds an in-memory
    vector from `shared_event_index` for the selected range instead of routing bulk sync
    through a bespoke request-credit scheduler.
-6. **Prefer session-local rebuilds over a persisted Negentropy index.** The
+6. **Suppression-based multi-source coordination.** When live suppression is
+   enabled, received event ids are advertised to same-workspace sessions and
+   senders skip suppressed ids. Suppression is an efficiency hint; later range
+   rounds recover any falsely suppressed or dropped ids.
+7. **Prefer session-local rebuilds over a persisted Negentropy index.** The
    protocol can support a cached auxiliary structure, but current implementation
    experience favors rebuilding the Negentropy hash graph for each range session
    from `shared_event_index`. That path has been simpler and more stable than
@@ -1422,8 +1419,8 @@ Baseline implementation:
    - `LastTwelveWeeks`
    - `Full`
 4. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
-5. Range data transfer streams raw length-delimited blob records (`[u32 len][blob]`) after reconciliation for that range.
-6. Multi-source coordination does not replace negentropy; future smarter range balancing will still consume range-local membership discovered by negentropy.
+5. Range data transfer streams event blobs after reconciliation for that range; live suppression mode also sends `SuppressIds` and `RangeDataDone` frames on the data stream.
+6. Multi-source coordination does not replace negentropy; live suppression only reduces duplicate sends after range-local membership has been discovered by negentropy.
 7. The current range path uses only the in-memory vector-backed storage built directly from `shared_event_index`; the older SQLite-backed storage path has been removed.
 
 ### 7.7.1 Fingerprint security note

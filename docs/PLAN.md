@@ -279,7 +279,7 @@ Every CLI instance is a real peer-to-peer device. All user-facing commands go th
 2. **Multiple tenants per device**: a single device can host many tenants, each participating in arbitrary (potentially overlapping) workspaces.
 3. **Zeroconf discovery**: daemon-scoped `iroh` mDNS discovers peer daemons on the same local machine or LAN.
 4. **Single-port QUIC endpoint**: one shared `iroh` endpoint serves all tenants with one daemon-scoped identity replayed from `endpoint_secret`. The daemon creates that local endpoint root before any workspace exists so the transport principal is stable across replay and restart. Inbound daemon connections are quarantined until the first routed/bootstrap control frame proves one exact tenant/workspace scope; if that proof does not arrive quickly, the connection is dropped.
-   - the raw daemon connection is shared across tenants; range sync and dependency repair run as separate logical sessions on that one connection.
+   - the raw daemon connection is shared across tenants; routed range sessions carry current sync work on that one connection, and dependency/auth/key catchup is prioritized by range selection rather than a separate dependency session.
    - same-workspace sibling tenants should reuse the same daemon connection, not compete with extra QUIC congestion controllers to the same remote daemon.
    - the direct-connect timing and hole-punch job belongs to `iroh`. The current branch accepts n0 relays for rendezvous instead of keeping a bespoke `topo intro` / `IntroOffer` subsystem.
    - known drawback: anyone who knows the daemon's `iroh` address or relay-reachable endpoint can hit the pre-proof `iroh/topo` surface and exercise timeout/parser/admission paths. Membership proof is still required before any workspace-scoped sync is allowed.
@@ -297,7 +297,7 @@ Pros:
 - easier to reason about stateless control handlers in isolation.
 
 Cons:
-- negentropy and dependency repair still need round correlation, replay windows, and response matching, so the design is not truly stateless in practice,
+- negentropy still needs round correlation, replay windows, and response matching, so the design is not truly stateless in practice,
 - asymmetric verification would move onto the hot path for every control message instead of once per logical session,
 - larger signed envelopes would be paid repeatedly for the same peer/workspace conversation,
 - prioritized lanes become harder because admission and replay protection have to be re-solved per message rather than once per session.
@@ -403,13 +403,15 @@ Policy for future transport work:
 
 ### Sync connection lifetime
 
-Sync keeps one long-lived request/response lane set per authenticated connection.
+Sync keeps one authenticated daemon connection per remote daemon and opens routed
+range sessions inside it.
 
 1. discovery remains round-scoped (`NegOpen` / `NegMsg`),
-2. in tiered mode, outbound rounds cycle `last hour -> last day -> last week -> last month -> full`, then repeat; discovered events keep both a window-derived lane and `created_at_ms`,
-3. the data stream carries only `Event` blobs for the active range,
-4. auth/removal-frontier and key ranges are scheduled ahead of hot message ranges,
-5. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
+2. outbound rounds cycle `last day -> last week -> last twelve weeks -> full`, then repeat per peer,
+3. the data stream carries `Event` blobs for the active range,
+4. live suppression mode also carries batched `SuppressIds` and `RangeDataDone` frames on the data stream,
+5. auth/removal-frontier and key ranges are scheduled ahead of hot message ranges,
+6. duplicate raw daemon connections are resolved by a deterministic tie-breaker only after both sides have authenticated.
 
 ### Range-fingerprint security note
 
@@ -1008,9 +1010,9 @@ Separate queue tables stay simpler operationally.
 
 Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1`, `2`, and `4`.
 
-1. `ingest receiver path` (current runtime): QUIC frame -> ingest channel -> transactional canonical insert -> record by tenant -> enqueue project.
+1. `range receive path` (current runtime): QUIC frame -> hash event id -> append event id and blob to `ReceiveLog` -> background canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
-3. `request/response worker`: sources advertise request credit, sinks choose wanted IDs, and sources serve those requested blobs from bounded in-memory connection-scoped response buffers.
+3. `range session worker`: stock negentropy over one selected window discovers missing ids, streams event blobs, and exchanges live-suppression frames when enabled.
 4. `cleanup worker`: reclaim expired project leases and TTL-purge old endpoint observations.
 
 Queue DRY requirement:
@@ -1019,11 +1021,13 @@ Queue DRY requirement:
 
 ## 8.4 Sync transfer shape
 
-Sync event transfer is pull-only:
-1. discovery writes `wanted + wanted_sources`,
-2. sinks fill peer credit by selecting wanted IDs,
-3. sources queue only explicitly requested IDs in bounded in-memory response buffers,
-4. sources fetch canonical blobs at send time.
+Sync event transfer is range-owned:
+1. each session selects one explicit range from the tier ladder,
+2. both sides load that range from `shared_event_index` into an in-memory negentropy vector,
+3. negentropy computes missing event ids for that range,
+4. each side streams its missing event blobs directly on the session data stream,
+5. live suppression mode lets receivers quickly advertise event ids they have already received or are receiving from sibling sessions,
+6. there are no durable `wanted` / `wanted_sources` tables, no `ResponseCredit`, and no per-event pull coordinator in the current plan.
 
 ## 8.5 Project queue dedupe + purge
 
@@ -1143,7 +1147,7 @@ Start simple, then tune.
 When investigating sync performance degradation at high cardinality (e.g. 500k+ events):
 
 1. **Baseline capture**: run serial perf suite (`scripts/run_perf_serial.sh core`) and the target tail benchmark in isolation with `--test-threads=1`. Record wall time, msgs/s, peak RSS, and environment details (filesystem type, hardware).
-2. **Tail profiling**: add per-batch timing instrumentation to `batch_writer` (persist_ms, commit+effects_ms, epoch_10k_ms via `WRITER_PROFILE` log lines). Identify whether tail slowdown is writer-side (persist/drain) or protocol-side (negentropy reconciliation stalls causing data starvation).
+2. **Tail profiling**: add per-batch timing instrumentation to the receive-log writer and canonical ingest replay path (persist_ms, commit+effects_ms, epoch_10k_ms via profiling log lines). Identify whether tail slowdown is writer-side (durable append/replay/drain) or protocol-side (negentropy reconciliation stalls causing data starvation).
 3. **Root-cause ranking**: rank bottlenecks by measured contribution. Common patterns:
    - Negentropy round latency scaling super-linearly with item count (protocol-level, deep fix).
    - Autocommit overhead in projection drain (transaction batching fix).
@@ -1259,97 +1263,69 @@ Projection authorization also rejects when:
 
 ### 10.6 Multi-source download
 
-Multi-source download allows a sink to pull events from N sources concurrently.
+Multi-source download allows a sink to reconcile overlapping event ranges with
+multiple sources concurrently. The current plan is suppression-based rather
+than planner-based: every peer runs the same per-peer range cadence, and
+receivers advertise event ids they have already received or are receiving so
+other sources can stop sending duplicates.
 
-Current daemon implementation note: live suppression uses deterministic shuffled
-send order plus a small per-batch settle delay only when the live peer-connection
-registry indicates multiple remote source peers. The 1:1 path skips that settle
-delay because there is no second source to suppress, and if one source can send
-the whole range before suppression matters, that is a good outcome.
+Current runtime shape:
 
-A naive approach — running N independent negentropy sessions, each with its own
-`batch_writer` and letting each session decide for itself which `need_ids` it
-will serve — fails at scale: N writers contend on SQLite WAL locks, overlapping
-need_ids cause redundant downloads, and transport fill depends on whichever
-session most recently finished reconciliation.
+1. **Per-peer range cadence.** Each active peer independently cycles through
+   `last day -> last week -> last twelve weeks -> full history`. Peer count,
+   priority-owner flags, sorted peer rank, and hash partitions do not decide who
+   owns a range.
+2. **Stock negentropy per selected range.** Each range session loads
+   `shared_event_index` into an in-memory `NegentropyStorageVector`, exchanges
+   `NegOpen` / `NegMsg`, and streams missing event blobs for that explicit range.
+3. **Receive-side event ids.** The receiver hashes each incoming blob once before
+   durable append, writes the event id with the blob into the `ReceiveLog`, and
+   records a pending-receive overlay entry for active range reconciliation.
+4. **Live suppression cohort.** When `TOPO_ENABLE_LIVE_SUPPRESSION=1`, range
+   sessions in the same `(db_path, recorded_by, workspace_id)` cohort share a
+   bounded recent event-id list. New sessions replay the recent list, and active
+   sessions publish new event ids immediately.
+5. **Broad suppression broadcast.** Suppression is sent to all connected
+   same-workspace sessions in the cohort, not filtered by range overlap. This is
+   intentionally broad because false suppression is cheaper than missing a
+   suppression opportunity; later range rounds recover holes.
+6. **Large bounded lists.** The default live suppression cap is large
+   (`TOPO_LIVE_SUPPRESSION_EVENT_ID_CAP`, default 512k ids; lower in low-memory
+   mode). Batch size is controlled by `TOPO_LIVE_SUPPRESSION_SEND_BATCH_SIZE`.
+7. **Deterministic scatter.** Send order is a deterministic shuffle over the
+   full ordered id list using `blake3(seed || event_id)`, seeded by the local
+   peer/recorder id. This avoids every identical source sending the same early
+   ids first.
+8. **Settle only when useful.** `TOPO_LIVE_SUPPRESSION_BATCH_SETTLE_MS` defaults
+   to a small delay between batches, but the runtime skips it for a 1:1 cohort.
+   It is only useful when another distinct source peer can act on suppression.
+9. **Connection idempotency after auth.** Either side may dial. After daemon
+   identity extraction, at most one live daemon connection slot survives per
+   remote daemon; the deterministic preferred direction is only a simultaneous
+   duplicate tie-breaker.
 
-Required changes from the 1:1 sync model:
+Deliberately removed approaches:
 
-1. **Shared batch_writer.** One writer thread with all sessions feeding a single `mpsc`
-   channel. Eliminates SQLite write contention entirely. Duplicate filtering is handled
-   solely by `INSERT OR IGNORE` — see section 8.8 for why in-memory dedup sets must not
-   be placed before the writer.
-2. **Thread-per-connection.** Each connection spawns a `std::thread` with a dedicated
-   single-threaded tokio runtime. Isolates connection failures and allows sharing the
-   `mpsc::Sender` to the batch_writer across connections.
-3. **Connection idempotency after auth.** Bootstrap trust targets, observed endpoints,
-   and mDNS discovery are all hint sources for `ensure_connected(peer)`, not separate
-   owners. Once the remote daemon fingerprint is known, they share one daemon-scoped
-   dispatch key. Locally the runtime keeps at most one live daemon connection slot per
-   `(db_path, remote_daemon_peer_id)`, and all tenant/workspace work reuses that raw
-   connection by opening logical sessions inside it. Steady-state work uses
-   `OpenSessionRoute`; bootstrap or new-workspace admission pays one invite proof on
-   that same daemon relationship before subsequent routed sessions reuse it. The
-   deterministic preferred direction is the
-   lexicographically lower daemon id dialing outbound; if a preferred-direction duplicate
-   arrives it replaces the non-preferred daemon connection.
-4. **PeerReplicator split per authenticated peer/workspace session slot.** Each slot owns two
-   internal loops:
-   - an **observer loop** (lower-rate) that runs Negentropy on connect/full-sync,
-     `dirty_hot`, cold-timer, backlog-exhaustion, or source-set-change triggers and
-     updates SQL truth (`wanted`, candidate sources),
-   - a **sender/request loop** (higher-rate) that keeps QUIC streams full from that
-     SQL truth by serving pull responses from bounded in-memory queues,
-     advertising source-side request credit, and filling
-     bounded in-memory pull windows through a shared tenant-scoped coordinator.
-5. **Receiver-driven wanted scheduling.** Pull balancing happens at the sink, not
-   inside Negentropy. `wanted(event_id, ...)` records demand, and
-   `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at,
-   priority_lane, priority_ts)` records candidate suppliers discovered by the
-   observer loop.
-6. **Shared pull coordinator.** The sender/request loop continuously refills
-   peer request credit from one tenant-scoped in-memory coordinator:
-   - keep durable demand in SQLite and keep in-flight request suppression only in memory,
-   - plan across all active peers in the tenant instead of selecting per peer in isolation,
-   - cap in-flight requests per peer while allowing aggressive duplicate requests
-     across peers when spare credit exists,
-   - keep the first version simple and fairness-light; richer lane/type priority
-     is a follow-up once the structural split is settled.
-   This keeps QUIC full without embedding balancing policy in Negentropy or paying
-   SQLite churn for every individual request.
-7. **Sync event transfer is pull-only.** Discovery populates `wanted` plus
-   candidate suppliers, the sink fills source-advertised credit with request IDs,
-   and sources serve those requests from bounded in-memory ID queues. The live
-   sync path no longer drains SQL-backed peer egress.
-8. **Incremental leased windows, not tiny claim/send cycles.** Once work is known,
-   the sender should not round-trip to SQLite on every 1-8 events. It keeps bounded
-   in-memory windows of leased row IDs/event IDs, refills below a low-water mark,
-   and batch-acks completions so SQLite is not the wire-pacing mechanism.
-9. **Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so the storage
-   sees a consistent read snapshot while concurrent writes proceed in the batch_writer.
-10. **Windowed reconciliation on the same event universe.** The first outbound round to a peer is `Full`; subsequent rounds are usually `Hot` (`ts >= cutoff`) with periodic `Cold` (`ts < cutoff`) refreshes. The window is carried in the initial `NegOpen` header and does not create a second protocol or separate dependency universe.
-11. **New valid shared events wake the hot observer loop.** A newly valid shared
-    event, whether locally created or newly ingested from the network, marks the
-    relevant peer slots `dirty_hot`. That gives the same fast path on every hop of a
-    chain; no special first-hop local gossip shortcut is required.
+1. durable `wanted` / `wanted_sources` tables,
+2. `ResponseCredit` or a per-event pull coordinator,
+3. peer-rank, priority-owner, or hash-partition ownership of historical ranges,
+4. peer-local SQL event ownership or sticky assignment state,
+5. a separate `PeerReplicator` observer/request split for this phase.
 
-Test families (in `sync_graph_test.rs`):
-- **Family A (chain):** N-peer chain propagation (tail convergence, per-hop latency).
-- **Family B (multi-source):** 1–8 concurrent sources with varying event counts.
-- **Family C (multi-source large-file):** all non-sink sources seeded with identical
-  file-slice sets; sink asserts exact file-slice ID set and substantial per-source
-  ingest share from `recorded_events.source` attribution (>=5% per source).
+Test families:
+- `tests/daemon_multi_source_tiered_window_perf_test.rs` is the daemon-facing benchmark/proof harness. It records projected catchup, active source count, downloader event frames, delivery efficiency, and per-source sync-log receive deltas.
+- The 2-source 1k replicated rejoin test is the stable connectivity smoke: it proves sources are known, connections are live, useful sync happens, and the basic live-suppression path is enabled.
+- Ignored larger daemon tests scale that same harness to more sources and larger replicated histories for manual throughput/efficiency comparisons.
+- `tests/sync_graph_test.rs` remains useful for in-process graph probes, but daemon behavior should be proved through the daemon/RPC/CLI path when the assertion is about real connections or runtime sync.
 
 Invariants this model is meant to preserve:
 - at most one steady-state live daemon connection slot per remote daemon,
 - any number of authenticated logical sessions may share that daemon connection over time,
 - no balancing logic is embedded in Negentropy,
-- the sink can keep active peers busy whenever candidate supply exists,
-- a slow source does not own events by fiat; another candidate can be used as soon
-  as spare credit exists,
+- false suppression is an efficiency risk, not a correctness authority,
 - multi-source fairness is across distinct peers, not multiplied by duplicate connections,
-- low-memory mode bounds blob residency while still allowing larger in-memory ID windows,
-- hot/cold cadence does not split the event universe or completion protocol.
+- low-memory mode bounds blob and id-list residency,
+- tiered cadence does not split the event universe or create a separate completion protocol.
 
 ---
 
