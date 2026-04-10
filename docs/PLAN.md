@@ -414,7 +414,7 @@ Sync keeps one authenticated daemon connection per remote daemon and opens route
 range sessions inside it.
 
 1. discovery remains round-scoped (`NegOpen` / `NegMsg`),
-2. outbound rounds cycle `last day -> last week -> last twelve weeks -> full`, then repeat per peer,
+2. outbound rounds cycle `last day -> last week -> last twelve weeks -> old`, then repeat per peer,
 3. the data stream carries `Event` blobs for the active range,
 4. live suppression mode also carries batched `SuppressIds` and `RangeDataDone` frames on the data stream,
 5. auth/removal-frontier and key ranges are scheduled ahead of hot message ranges,
@@ -1279,12 +1279,14 @@ other sources can stop sending duplicates.
 Current runtime shape:
 
 1. **Per-peer range cadence.** Each active peer independently cycles through
-   `last day -> last week -> last twelve weeks -> full history`. Peer count,
+   `last day -> last week -> last twelve weeks -> old`. Peer count,
    priority-owner flags, sorted peer rank, and hash partitions do not decide who
    owns a range.
 2. **Stock negentropy per selected range.** Each range session loads
-   `shared_event_index` into an in-memory `NegentropyStorageVector`, exchanges
-   `NegOpen` / `NegMsg`, and streams missing event blobs for that explicit range.
+   `shared_event_index` plus range-local dep-sync rows into a sealed in-memory
+   `NegentropyStorageVector`, reuses that cached storage until a touched UTC
+   bucket changes, exchanges `NegOpen` / `NegMsg`, and streams missing event
+   blobs for that explicit range.
 3. **Receive-side event ids.** The receiver hashes each incoming blob once before
    durable append, writes the event id with the blob into the `ReceiveLog`, and
    records a pending-receive overlay entry for active range reconciliation.

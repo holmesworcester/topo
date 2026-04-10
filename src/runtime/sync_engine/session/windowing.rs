@@ -7,7 +7,7 @@ use crate::tuning::{low_mem_mode, sync_last_day_only_mode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncWindowKind {
-    Full = 0,
+    Old = 0,
     LastDay = 1,
     LastWeek = 2,
     LastTwelveWeeks = 3,
@@ -19,7 +19,7 @@ pub fn encode_sync_window_kind(kind: SyncWindowKind) -> u8 {
 
 pub fn decode_sync_window_kind(kind: u8) -> Result<SyncWindowKind, String> {
     match kind {
-        0 => Ok(SyncWindowKind::Full),
+        0 => Ok(SyncWindowKind::Old),
         1 => Ok(SyncWindowKind::LastDay),
         2 => Ok(SyncWindowKind::LastWeek),
         3 => Ok(SyncWindowKind::LastTwelveWeeks),
@@ -41,11 +41,10 @@ const ALL_START_MS: i64 = 0;
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
-const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
 const DEFAULT_COLD_TIER_ORDER: [SyncWindowKind; 3] = [
     SyncWindowKind::LastWeek,
     SyncWindowKind::LastTwelveWeeks,
-    SyncWindowKind::Full,
+    SyncWindowKind::Old,
 ];
 const LOW_MEM_COLD_TIER_ORDER: [SyncWindowKind; 1] = [SyncWindowKind::LastWeek];
 
@@ -58,7 +57,6 @@ enum SinglePeerPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlannerState {
     cold_next_idx: usize,
-    cycle_anchor_now_ms: Option<i64>,
     restrict_to_low_mem_windows: bool,
     single_peer_phase: SinglePeerPhase,
 }
@@ -120,7 +118,6 @@ fn state_for<'a>(
         .entry(planner_key(db_path, recorded_by, peer_id))
         .or_insert(PlannerState {
             cold_next_idx: 0,
-            cycle_anchor_now_ms: None,
             restrict_to_low_mem_windows: false,
             single_peer_phase: SinglePeerPhase::LastDay,
         })
@@ -193,12 +190,11 @@ pub fn prime_outbound_window_kind(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
-    planner.cycle_anchor_now_ms = None;
     match kind {
         SyncWindowKind::LastDay => {
             planner.single_peer_phase = SinglePeerPhase::LastDay;
         }
-        SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks | SyncWindowKind::Full => {
+        SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks | SyncWindowKind::Old => {
             let tier_order = cold_tier_order(planner);
             let idx = tier_order
                 .iter()
@@ -220,7 +216,6 @@ fn select_single_peer_window(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
-    let anchor_now_ms = *planner.cycle_anchor_now_ms.get_or_insert(now_ms);
     let kind = match planner.single_peer_phase {
         SinglePeerPhase::LastDay => SyncWindowKind::LastDay,
         SinglePeerPhase::Cold => {
@@ -229,7 +224,7 @@ fn select_single_peer_window(
             tier_order[idx]
         }
     };
-    window_for_kind(kind, anchor_now_ms)
+    window_for_kind(kind, now_ms)
 }
 
 fn normalized_live_peer_count(peer_id: &str, live_peer_ids: &[String]) -> usize {
@@ -302,16 +297,10 @@ pub fn mark_outbound_window_completed(
             SyncWindowKind::LastDay => {
                 planner.single_peer_phase = SinglePeerPhase::Cold;
             }
-            SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks | SyncWindowKind::Full => {
+            SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks | SyncWindowKind::Old => {
                 let tier_order = cold_tier_order(planner);
-                let was_single_peer_cold = planner.single_peer_phase == SinglePeerPhase::Cold;
                 planner.cold_next_idx = (planner.cold_next_idx + 1) % tier_order.len();
-                if was_single_peer_cold {
-                    planner.single_peer_phase = SinglePeerPhase::LastDay;
-                    planner.cycle_anchor_now_ms = None;
-                } else if planner.cold_next_idx == 0 {
-                    planner.cycle_anchor_now_ms = None;
-                }
+                planner.single_peer_phase = SinglePeerPhase::LastDay;
             }
         }
     }
@@ -324,30 +313,45 @@ pub fn restrict_outbound_windows_to_last_week(db_path: &str, recorded_by: &str, 
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
     planner.restrict_to_low_mem_windows = true;
     planner.cold_next_idx %= LOW_MEM_COLD_TIER_ORDER.len();
-    planner.cycle_anchor_now_ms = None;
+}
+
+fn utc_day_start_ms(ts_ms: i64) -> i64 {
+    ts_ms.div_euclid(DAY_MS) * DAY_MS
+}
+
+fn utc_week_start_ms(ts_ms: i64) -> i64 {
+    let day_start_ms = utc_day_start_ms(ts_ms);
+    let days_since_epoch = day_start_ms.div_euclid(DAY_MS);
+    let weekday_monday_zero = (days_since_epoch + 3).rem_euclid(7);
+    day_start_ms - (weekday_monday_zero * DAY_MS)
 }
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
+    let today_start_ms = utc_day_start_ms(now_ms);
+    let yesterday_start_ms = today_start_ms - DAY_MS;
+    let tomorrow_start_ms = today_start_ms + DAY_MS;
+    let this_week_start_ms = utc_week_start_ms(now_ms);
+    let old_start_ms = this_week_start_ms - (13 * WEEK_MS);
     match kind {
-        SyncWindowKind::Full => SyncWindow {
+        SyncWindowKind::Old => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(ALL_START_MS),
-            ts_max_exclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
+            ts_max_exclusive_ms: Some(old_start_ms),
         },
         SyncWindowKind::LastDay => SyncWindow {
             kind,
-            ts_min_inclusive_ms: Some(now_ms - DAY_MS),
-            ts_max_exclusive_ms: Some(now_ms),
+            ts_min_inclusive_ms: Some(yesterday_start_ms),
+            ts_max_exclusive_ms: Some(tomorrow_start_ms),
         },
         SyncWindowKind::LastWeek => SyncWindow {
             kind,
-            ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
-            ts_max_exclusive_ms: Some(now_ms - DAY_MS),
+            ts_min_inclusive_ms: Some(this_week_start_ms - WEEK_MS),
+            ts_max_exclusive_ms: Some(yesterday_start_ms),
         },
         SyncWindowKind::LastTwelveWeeks => SyncWindow {
             kind,
-            ts_min_inclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
-            ts_max_exclusive_ms: Some(now_ms - WEEK_MS),
+            ts_min_inclusive_ms: Some(old_start_ms),
+            ts_max_exclusive_ms: Some(this_week_start_ms - WEEK_MS),
         },
     }
 }
@@ -395,7 +399,7 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
     if msg.len() < 22 || &msg[..4] != WINDOW_MAGIC {
         return Ok((
             SyncWindow {
-                kind: SyncWindowKind::Full,
+                kind: SyncWindowKind::Old,
                 ts_min_inclusive_ms: None,
                 ts_max_exclusive_ms: None,
             },
@@ -703,13 +707,13 @@ mod tests {
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastTwelveWeeks,
                 SyncWindowKind::LastDay,
-                SyncWindowKind::Full,
+                SyncWindowKind::Old,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastTwelveWeeks,
                 SyncWindowKind::LastDay,
-                SyncWindowKind::Full,
+                SyncWindowKind::Old,
             ]
         );
     }
@@ -749,6 +753,28 @@ mod tests {
     }
 
     #[test]
+    fn lowmem_week_window_uses_fixed_utc_bounds() {
+        let _env = EnvGuard::enable_low_mem_ios();
+        let db_path = "/tmp/window-lowmem-fixed-week";
+        let recorded_by = "tenant-a";
+        let peer_id = "peer-a";
+        let live_peers = vec![peer_id.to_string()];
+        let now_ms = (100 * DAY_MS) + (6 * HOUR_MS);
+        let today_start_ms = utc_day_start_ms(now_ms);
+        let this_week_start_ms = utc_week_start_ms(now_ms);
+
+        reset_outbound_window_state(db_path, recorded_by, peer_id);
+        let day = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, now_ms);
+        assert_eq!(day.kind, SyncWindowKind::LastDay);
+        mark_outbound_window_completed(db_path, recorded_by, peer_id, day);
+
+        let week = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, now_ms);
+        assert_eq!(week.kind, SyncWindowKind::LastWeek);
+        assert_eq!(week.ts_min(), Some(this_week_start_ms - WEEK_MS));
+        assert_eq!(week.ts_max_exclusive(), Some(today_start_ms - DAY_MS));
+    }
+
+    #[test]
     fn peer_restricted_to_lowmem_windows_round_robins_day_and_week_only() {
         let db_path = "/tmp/window-round-robin-remote-lowmem";
         let recorded_by = "tenant-a";
@@ -783,23 +809,35 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_uses_adjacent_non_full_windows() {
-        let day = window_for_kind(SyncWindowKind::LastDay, 1_000_000);
-        let week = window_for_kind(SyncWindowKind::LastWeek, 1_000_000);
-        let twelve_weeks = window_for_kind(SyncWindowKind::LastTwelveWeeks, 1_000_000);
-        let full = window_for_kind(SyncWindowKind::Full, 1_000_000);
+    fn scheduler_uses_fixed_utc_bucket_windows() {
+        let now_ms = (100 * DAY_MS) + (6 * HOUR_MS);
+        let today_start_ms = utc_day_start_ms(now_ms);
+        let this_week_start_ms = utc_week_start_ms(now_ms);
+        let day = window_for_kind(SyncWindowKind::LastDay, now_ms);
+        let week = window_for_kind(SyncWindowKind::LastWeek, now_ms);
+        let twelve_weeks = window_for_kind(SyncWindowKind::LastTwelveWeeks, now_ms);
+        let old = window_for_kind(SyncWindowKind::Old, now_ms);
 
-        assert_eq!(day.ts_min(), Some(1_000_000 - DAY_MS));
-        assert_eq!(day.ts_max_exclusive(), Some(1_000_000));
+        assert_eq!(day.ts_min(), Some(today_start_ms - DAY_MS));
+        assert_eq!(day.ts_max_exclusive(), Some(today_start_ms + DAY_MS));
 
-        assert_eq!(week.ts_min(), Some(1_000_000 - WEEK_MS));
-        assert_eq!(week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
+        assert_eq!(week.ts_min(), Some(this_week_start_ms - WEEK_MS));
+        assert_eq!(week.ts_max_exclusive(), Some(today_start_ms - DAY_MS));
 
-        assert_eq!(twelve_weeks.ts_min(), Some(1_000_000 - TWELVE_WEEK_MS));
-        assert_eq!(twelve_weeks.ts_max_exclusive(), Some(1_000_000 - WEEK_MS));
+        assert_eq!(
+            twelve_weeks.ts_min(),
+            Some(this_week_start_ms - (13 * WEEK_MS))
+        );
+        assert_eq!(
+            twelve_weeks.ts_max_exclusive(),
+            Some(this_week_start_ms - WEEK_MS)
+        );
 
-        assert_eq!(full.ts_min(), Some(ALL_START_MS));
-        assert_eq!(full.ts_max_exclusive(), Some(1_000_000 - TWELVE_WEEK_MS));
+        assert_eq!(old.ts_min(), Some(ALL_START_MS));
+        assert_eq!(
+            old.ts_max_exclusive(),
+            Some(this_week_start_ms - (13 * WEEK_MS))
+        );
     }
 
     #[test]
@@ -807,25 +845,31 @@ mod tests {
         assert!(is_low_mem_allowed_window(SyncWindowKind::LastDay));
         assert!(is_low_mem_allowed_window(SyncWindowKind::LastWeek));
         assert!(!is_low_mem_allowed_window(SyncWindowKind::LastTwelveWeeks));
-        assert!(!is_low_mem_allowed_window(SyncWindowKind::Full));
+        assert!(!is_low_mem_allowed_window(SyncWindowKind::Old));
     }
 
     #[test]
-    fn range_scheduler_uses_stable_cycle_anchor_across_window_steps() {
-        let db_path = "/tmp/window-cycle-anchor";
+    fn range_scheduler_recomputes_windows_from_current_utc_bucket() {
+        let db_path = "/tmp/window-fixed-utc";
         let recorded_by = "tenant-a";
         let peer_id = "peer-a";
         let live_peers = vec![peer_id.to_string()];
         reset_outbound_window_state(db_path, recorded_by, peer_id);
 
-        let day = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
+        let first_now_ms = (100 * DAY_MS) + (6 * HOUR_MS);
+        let second_now_ms = first_now_ms + (14 * DAY_MS);
+        let day = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, first_now_ms);
         mark_outbound_window_completed(db_path, recorded_by, peer_id, day);
-        let week = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 2_000_000);
+        let week =
+            select_outbound_window(db_path, recorded_by, peer_id, &live_peers, second_now_ms);
 
         assert_eq!(day.kind, SyncWindowKind::LastDay);
         assert_eq!(week.kind, SyncWindowKind::LastWeek);
-        assert_eq!(day.ts_min(), Some(1_000_000 - DAY_MS));
-        assert_eq!(week.ts_min(), Some(1_000_000 - WEEK_MS));
+        assert_eq!(day.ts_min(), Some(utc_day_start_ms(first_now_ms) - DAY_MS));
+        assert_eq!(
+            week.ts_min(),
+            Some(utc_week_start_ms(second_now_ms) - WEEK_MS)
+        );
     }
 
     #[test]
@@ -848,8 +892,14 @@ mod tests {
         let still_day_b =
             select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
         assert_eq!(week_a.kind, SyncWindowKind::LastWeek);
-        assert_eq!(week_a.ts_min(), Some(1_000_000 - WEEK_MS));
-        assert_eq!(week_a.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
+        assert_eq!(
+            week_a.ts_min(),
+            Some(utc_week_start_ms(1_000_000) - WEEK_MS)
+        );
+        assert_eq!(
+            week_a.ts_max_exclusive(),
+            Some(utc_day_start_ms(1_000_000) - DAY_MS)
+        );
         assert_eq!(still_day_b.kind, SyncWindowKind::LastDay);
     }
 

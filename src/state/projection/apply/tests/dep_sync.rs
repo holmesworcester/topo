@@ -1,4 +1,5 @@
 use super::*;
+use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 
 #[test]
 fn projecting_signed_encrypted_message_indexes_shared_dep_edges() {
@@ -8,6 +9,8 @@ fn projecting_signed_encrypted_message_indexes_shared_dep_edges() {
 
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
     let author_id = user_for_signer(&signer_eid);
+    conn.execute("DELETE FROM hot_week_dep_index", []).unwrap();
+
     let (_event, blob) = make_message_signed(&signing_key, &signer_eid, "dep sync");
     let message_eid = insert_event_raw(&conn, recorded_by, &blob);
 
@@ -25,9 +28,9 @@ fn projecting_signed_encrypted_message_indexes_shared_dep_edges() {
 
     assert_eq!(dep_ids, expected);
 
-    let week_start_ms: i64 = conn
+    let root_created_at_ms: i64 = conn
         .query_row(
-            "SELECT week_start_ms
+            "SELECT root_created_at_ms
              FROM hot_week_dep_index
              WHERE workspace_id = ?1
              LIMIT 1",
@@ -35,9 +38,16 @@ fn projecting_signed_encrypted_message_indexes_shared_dep_edges() {
             |row| row.get(0),
         )
         .unwrap();
-    let hot_week_dep_ids =
-        crate::db::hot_week_deps::list_hot_week_dep_entries(&conn, &workspace_id, &[week_start_ms])
-            .unwrap();
+    let hot_week_dep_ids = crate::db::hot_week_deps::list_hot_week_dep_entries(
+        &conn,
+        &workspace_id,
+        SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(root_created_at_ms),
+            ts_max_exclusive_ms: Some(root_created_at_ms + 1),
+        },
+    )
+    .unwrap();
     for dep_id in expected {
         assert!(
             hot_week_dep_ids

@@ -223,7 +223,7 @@ Negentropy remains the set-reconciliation engine because it is agnostic to event
 1. `last day`
 2. `last week`
 3. `last twelve weeks`
-4. `full history`
+4. `old`
 
 When multiple peers are connected, each peer runs that same cadence independently. The scheduler no longer divides historical ranges by peer rank, ownership, or hash partition. Duplicate reduction is handled by live suppression: as a receiver hashes incoming events, it publishes those event ids to other same-workspace sessions; senders then skip ids that the receiver says it already has or is already receiving.
 
@@ -1303,7 +1303,7 @@ Bulk transfer is range-owned.
    - `last day`
    - `last week`
    - `last twelve weeks`
-   - `full history`
+   - `old`
 2. the initiator opens a `Range` session and sends the concrete window bounds in the initial `NegOpen`,
 3. both sides load that range from `shared_event_index` into an in-memory `NegentropyStorageVector`,
 4. negentropy computes `have_ids` / `need_ids` for that explicit range,
@@ -1412,12 +1412,12 @@ The active branch chooses simpler boundaries over a global per-event planner:
 
 Baseline implementation:
 1. `shared_event_index` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
-2. `RangeSession` queries `shared_event_index` for one explicit range and loads that slice into an in-memory `NegentropyStorageVector`.
+2. `RangeSession` queries `shared_event_index` plus range-local dependency rows for one explicit fixed UTC range and reuses a cached sealed `NegentropyStorageVector` for that range until a touched UTC bucket changes.
 3. Control-plane reconciliation uses `NegOpen` and `NegMsg`; the first `NegOpen` may carry a `P7SW` window envelope selecting one of:
    - `LastDay`
    - `LastWeek`
    - `LastTwelveWeeks`
-   - `Full`
+   - `Old`
 4. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
 5. Range data transfer streams event blobs after reconciliation for that range; live suppression mode also sends `SuppressIds` and `RangeDataDone` frames on the data stream.
 6. Multi-source coordination does not replace negentropy; live suppression only reduces duplicate sends after range-local membership has been discovered by negentropy.

@@ -110,7 +110,7 @@ where
         crate::db::queue::current_timestamp_ms(),
     );
     let storage = load_shared_event_index_slice(&db, db_path, &ws_id, range)?;
-    let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
+    let mut neg = Negentropy::borrowed(storage.as_ref(), NEGENTROPY_FRAME_SIZE_LIMIT)?;
     let initial_msg = encode_initial_neg_open(range, neg.initiate()?);
 
     control.send(&Frame::NegOpen { msg: initial_msg }).await?;

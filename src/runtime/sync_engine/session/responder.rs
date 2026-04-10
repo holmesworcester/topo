@@ -125,7 +125,7 @@ where
     let db = open_connection(db_path)?;
     let ws_id = resolve_sync_admission(&db, recorded_by)?;
     let storage = load_shared_event_index_slice(&db, db_path, &ws_id, range)?;
-    let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
+    let mut neg = Negentropy::borrowed(storage.as_ref(), NEGENTROPY_FRAME_SIZE_LIMIT)?;
 
     let mut have_ids = Vec::<Id>::new();
     let mut need_ids = Vec::<Id>::new();

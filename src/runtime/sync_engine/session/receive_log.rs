@@ -20,7 +20,7 @@ const RECEIVE_LOG_DATA_SUFFIX: &str = "bin";
 const RECEIVE_LOG_INGEST_BATCH_CAP: usize = 256;
 const RECEIVE_LOG_INGEST_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RECEIVE_LOG_HEADER_MAGIC: &[u8; 4] = b"P7RL";
-const RECEIVE_LOG_HEADER_VERSION: u8 = 3;
+const RECEIVE_LOG_HEADER_VERSION: u8 = 2;
 const RECEIVE_LOG_HEADER_PREFIX_LEN: usize = 9;
 const RECEIVE_LOG_HEADER_MAX_BYTES: usize = 64 * 1024;
 const RECEIVE_LOG_RECORD_PREFIX_LEN: usize = 12;
@@ -856,7 +856,7 @@ mod tests {
             .unwrap();
         let payload = serde_json::to_vec(&header).unwrap();
         file.write_all(RECEIVE_LOG_HEADER_MAGIC).unwrap();
-        file.write_all(&[2]).unwrap();
+        file.write_all(&[1]).unwrap();
         file.write_all(&(payload.len() as u32).to_le_bytes())
             .unwrap();
         file.write_all(&payload).unwrap();
@@ -864,13 +864,13 @@ mod tests {
 
         let error = open_receive_log(&path).unwrap_err();
         assert!(
-            error.contains("unsupported receive log header version 2"),
+            error.contains("unsupported receive log header version 1"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
-    fn receive_log_ingest_uses_stored_event_id_for_v3_records() {
+    fn receive_log_ingest_uses_stored_event_id_from_headered_records() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let conn = open_connection(&db_path).unwrap();
@@ -878,7 +878,7 @@ mod tests {
 
         let log_dir = receive_log_dir(db_path.to_str().unwrap());
         std::fs::create_dir_all(&log_dir).unwrap();
-        let path = log_dir.join("manual-v3.bin");
+        let path = log_dir.join("manual-v2.bin");
         let header = ReceiveLogHeader {
             recorded_by: "tenant-a".to_string(),
             session_id: 27,
@@ -906,14 +906,14 @@ mod tests {
                 .load(&event_id_to_base64(&stored_id))
                 .unwrap()
                 .is_some(),
-            "ingest should trust stored event ids for v3 receive logs"
+            "ingest should trust stored event ids from receive logs"
         );
         assert!(
             timeline
                 .load(&event_id_to_base64(&hashed_id))
                 .unwrap()
                 .is_none(),
-            "v3 ingest should not re-hash blobs when replaying receive logs"
+            "ingest should not re-hash blobs when replaying receive logs"
         );
     }
 

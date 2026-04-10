@@ -40,7 +40,7 @@ async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSi
     let storage = empty_negentropy_storage();
     let mut neg = negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
     // Use a LastDay window header so this works even when LOW_MEM_IOS=1 leaks
-    // from a concurrent test (low-mem responders reject Full/LastTwelveWeeks).
+    // from a concurrent test (low-mem responders reject Old/LastTwelveWeeks).
     let initial_msg = encode_initial_neg_open(
         SyncWindow {
             kind: SyncWindowKind::LastDay,

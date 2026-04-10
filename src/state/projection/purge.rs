@@ -430,6 +430,10 @@ fn delete_global_rows(
             params![event_bytes.as_slice()],
         )?;
         conn.execute(
+            "DELETE FROM hot_week_dep_index WHERE event_id = ?1",
+            params![event_id],
+        )?;
+        conn.execute(
             "DELETE FROM shared_event_index WHERE id = ?1",
             params![event_bytes.as_slice()],
         )?;

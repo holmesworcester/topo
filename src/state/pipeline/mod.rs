@@ -316,7 +316,8 @@ pub fn batch_writer(
     }
 }
 
-pub fn ingest_now(db_path: &str, mut batch: Vec<IngestItem>) -> Result<usize, String> {
+pub fn ingest_now(db_path: &str, batch: Vec<IngestItem>) -> Result<usize, String> {
+    let mut batch = batch;
     if batch.is_empty() {
         return Ok(0);
     }
@@ -378,12 +379,13 @@ pub fn ingest_now(db_path: &str, mut batch: Vec<IngestItem>) -> Result<usize, St
         &mut enqueue_stmt,
     );
     let effects_executor = SqlitePostCommitEffectsExecutor::new(&db);
+    let persisted_count = persist_output.persisted_event_ids.len();
     commit_and_run_post_commit_effects(&db, &persist_output, &effects_executor, drain_batch_size())
         .map_err(|e| {
             let _ = db.execute("ROLLBACK", []);
             format!("commit immediate ingest batch: {e}")
         })?;
-    Ok(persist_output.persisted_event_ids.len())
+    Ok(persisted_count)
 }
 
 pub fn ingest_one(db_path: &str, item: IngestItem) -> Result<(), String> {

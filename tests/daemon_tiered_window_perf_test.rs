@@ -1,5 +1,5 @@
 //! Tiered window catch-up benchmark:
-//! last day -> last week -> last 12 weeks -> full history.
+//! last day -> last week -> last 12 weeks -> old.
 //!
 //! Run with:
 //! `cargo test --release --test daemon_tiered_window_perf_test -- --ignored --nocapture --test-threads=1`
@@ -420,7 +420,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>) {
     let newest_timing = newest_message_timing_sql(&bob_db);
 
     let summary = format!(
-        "=== tiered window catchup ===\n  Window ladder: LastDay -> LastWeek -> Last12Weeks -> Full\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Aged auth deps: user={} peer_shared={}\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:     {} msgs durable in {:.2}s projected in {:.2}s\n  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s\n  All:           {} msgs durable in {:.2}s projected in {:.2}s\n  Newest message: created_at={} durable in {:.2}s visible in {:.2}s\n  Full catchup wall: {:.2}s\n",
+        "=== tiered window catchup ===\n  Window ladder: LastDay -> LastWeek -> Last12Weeks -> Old\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Aged auth deps: user={} peer_shared={}\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:     {} msgs durable in {:.2}s projected in {:.2}s\n  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s\n  All:           {} msgs durable in {:.2}s projected in {:.2}s\n  Newest message: created_at={} durable in {:.2}s visible in {:.2}s\n  Total catchup wall: {:.2}s\n",
         network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
         authoring_dep_timing.user_created_at_ms,
         authoring_dep_timing.peer_shared_created_at_ms,

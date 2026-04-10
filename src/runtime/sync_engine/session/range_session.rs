@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use negentropy::{Id, NegentropyStorageVector};
@@ -9,9 +9,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::debug;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
-use crate::db::hot_week_deps::{
-    list_hot_week_dep_entries, should_include_week_deps, week_starts_for_window,
-};
+use crate::db::hot_week_deps::{list_hot_week_dep_entries, should_include_week_deps};
+use crate::db::negentropy_cache::{sum_day_epochs, sum_week_epochs};
 use crate::db::store::Store;
 use crate::protocol::{neg_id_to_event_id, Frame, MSG_TYPE_EVENT};
 use crate::sync::session::logging::SyncRunRxCapture;
@@ -106,8 +105,6 @@ struct SharedSendEligibilityRawRows {
     requested_by_reconciliation: bool,
     present_in_workspace_index: bool,
     shared_blob_available: bool,
-    used_bootstrap_auth: bool,
-    used_peer_shared_auth: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +134,21 @@ struct SelectedDepOrderDecisionContext {
     dep_currently_visiting: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NegentropyStorageCacheKey {
+    db_path: String,
+    workspace_id: String,
+    window_kind: SyncWindowKind,
+}
+
+#[derive(Debug, Clone)]
+struct NegentropyStorageCacheEntry {
+    epoch: u64,
+    ts_min_inclusive_ms: Option<i64>,
+    ts_max_exclusive_ms: Option<i64>,
+    storage: Arc<NegentropyStorageVector>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedDepOrderPlan {
     EmitDepBeforeRoot,
@@ -146,7 +158,7 @@ enum SelectedDepOrderPlan {
 fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
     match kind {
         SyncWindowKind::LastDay => SharedSendOrderPolicy::NewestFirst,
-        SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
+        SyncWindowKind::Old | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
             SharedSendOrderPolicy::PreserveInput
         }
     }
@@ -169,7 +181,6 @@ fn decide_shared_sync_entry_plan(context: &SharedSyncEntryDecisionContext) -> Sh
 fn normalize_shared_send_eligibility_context(
     raw_rows: SharedSendEligibilityRawRows,
 ) -> SharedSendEligibilityDecisionContext {
-    let _ = (raw_rows.used_bootstrap_auth, raw_rows.used_peer_shared_auth);
     SharedSendEligibilityDecisionContext {
         requested_by_reconciliation: raw_rows.requested_by_reconciliation,
         present_in_workspace_index: raw_rows.present_in_workspace_index,
@@ -274,11 +285,7 @@ fn load_shared_sync_entries(
         },
     ));
     if sync_entry_plan.include_hot_week_deps {
-        let now_ms = range
-            .ts_max_exclusive()
-            .unwrap_or_else(crate::db::queue::current_timestamp_ms);
-        let week_starts = week_starts_for_window(range, now_ms);
-        for (created_at_ms, event_id) in list_hot_week_dep_entries(conn, workspace_id, &week_starts)
+        for (created_at_ms, event_id) in list_hot_week_dep_entries(conn, workspace_id, range)
             .map_err(|e| format!("load hot week dep entries: {e}"))?
         {
             if seen.insert(event_id) {
@@ -289,6 +296,129 @@ fn load_shared_sync_entries(
 
     entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     Ok(entries)
+}
+
+fn negentropy_storage_cache(
+) -> &'static Mutex<HashMap<NegentropyStorageCacheKey, NegentropyStorageCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<NegentropyStorageCacheKey, NegentropyStorageCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn current_range_epoch(
+    conn: &Connection,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> Result<u64, String> {
+    let Some(ts_max_exclusive_ms) = range.ts_max_exclusive() else {
+        return Ok(0);
+    };
+    match range.kind {
+        SyncWindowKind::LastDay | SyncWindowKind::LastWeek => {
+            let Some(ts_min_inclusive_ms) = range.ts_min() else {
+                return Ok(0);
+            };
+            sum_day_epochs(conn, workspace_id, ts_min_inclusive_ms, ts_max_exclusive_ms)
+                .map_err(|e| format!("load negentropy day epochs: {e}"))
+        }
+        SyncWindowKind::LastTwelveWeeks => {
+            sum_week_epochs(conn, workspace_id, range.ts_min(), ts_max_exclusive_ms)
+                .map_err(|e| format!("load negentropy twelve-week epochs: {e}"))
+        }
+        SyncWindowKind::Old => sum_week_epochs(conn, workspace_id, None, ts_max_exclusive_ms)
+            .map_err(|e| format!("load negentropy old epochs: {e}")),
+    }
+}
+
+fn negentropy_storage_cache_key(
+    db_path: &str,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> NegentropyStorageCacheKey {
+    NegentropyStorageCacheKey {
+        db_path: db_path.to_string(),
+        workspace_id: workspace_id.to_string(),
+        window_kind: range.kind,
+    }
+}
+
+fn cached_storage_matches(
+    entry: &NegentropyStorageCacheEntry,
+    range: SyncWindow,
+    epoch: u64,
+) -> bool {
+    entry.epoch == epoch
+        && entry.ts_min_inclusive_ms == range.ts_min()
+        && entry.ts_max_exclusive_ms == range.ts_max_exclusive()
+}
+
+fn build_shared_event_index_storage(
+    conn: &Connection,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> Result<NegentropyStorageVector, String> {
+    let entries = load_shared_sync_entries(conn, workspace_id, range)?;
+    let mut storage = NegentropyStorageVector::with_capacity(entries.len());
+    for (ts, event_id) in entries {
+        storage
+            .insert(ts.max(0) as u64, Id::from_byte_array(event_id))
+            .map_err(|e| format!("insert negentropy vector item: {e}"))?;
+    }
+    storage
+        .seal()
+        .map_err(|e| format!("seal negentropy vector storage: {e}"))?;
+    Ok(storage)
+}
+
+fn load_cached_shared_event_index_slice(
+    conn: &Connection,
+    db_path: &str,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> Result<Arc<NegentropyStorageVector>, String> {
+    let epoch = current_range_epoch(conn, workspace_id, range)?;
+    let key = negentropy_storage_cache_key(db_path, workspace_id, range);
+    {
+        let cache = negentropy_storage_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get(&key) {
+            if cached_storage_matches(entry, range, epoch) {
+                return Ok(entry.storage.clone());
+            }
+        }
+    }
+
+    let storage = Arc::new(build_shared_event_index_storage(conn, workspace_id, range)?);
+    let mut cache = negentropy_storage_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get(&key) {
+        if cached_storage_matches(entry, range, epoch) {
+            return Ok(entry.storage.clone());
+        }
+    }
+    cache.insert(
+        key,
+        NegentropyStorageCacheEntry {
+            epoch,
+            ts_min_inclusive_ms: range.ts_min(),
+            ts_max_exclusive_ms: range.ts_max_exclusive(),
+            storage: storage.clone(),
+        },
+    );
+    Ok(storage)
+}
+
+fn pending_entries_in_range(
+    db_path: &str,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> Vec<PendingReceiveOverlayEntry> {
+    load_pending_receive_overlay_entries(db_path, workspace_id, range.kind)
+        .into_iter()
+        .filter(|pending| sync_window_contains_ts(range, pending.created_at_ms))
+        .collect()
 }
 
 fn sync_window_contains_ts(range: SyncWindow, created_at_ms: i64) -> bool {
@@ -309,6 +439,7 @@ fn sync_window_contains_ts(range: SyncWindow, created_at_ms: i64) -> bool {
     true
 }
 
+#[cfg(test)]
 fn load_shared_sync_entries_with_pending(
     conn: &Connection,
     db_path: &str,
@@ -336,18 +467,41 @@ pub fn load_shared_event_index_slice(
     db_path: &str,
     workspace_id: &str,
     range: SyncWindow,
-) -> Result<NegentropyStorageVector, String> {
-    let mut storage = NegentropyStorageVector::new();
-    for (ts, event_id) in load_shared_sync_entries_with_pending(conn, db_path, workspace_id, range)?
-    {
+) -> Result<Arc<NegentropyStorageVector>, String> {
+    let pending = pending_entries_in_range(db_path, workspace_id, range);
+    let base = load_cached_shared_event_index_slice(conn, db_path, workspace_id, range)?;
+    if pending.is_empty() {
+        return Ok(base);
+    }
+
+    let pending_ids = pending
+        .iter()
+        .map(|entry| entry.event_id)
+        .collect::<Vec<_>>();
+    let existing_ids = load_workspace_index_membership(conn, workspace_id, range, &pending_ids)?;
+    let mut seen_pending = HashSet::new();
+
+    let mut storage = base.as_ref().clone();
+    storage
+        .unseal()
+        .map_err(|e| format!("unseal negentropy vector storage: {e}"))?;
+    for pending_entry in pending {
+        if existing_ids.contains(&pending_entry.event_id)
+            || !seen_pending.insert(pending_entry.event_id)
+        {
+            continue;
+        }
         storage
-            .insert(ts.max(0) as u64, Id::from_byte_array(event_id))
-            .map_err(|e| format!("insert negentropy vector item: {e}"))?;
+            .insert(
+                pending_entry.created_at_ms.max(0) as u64,
+                Id::from_byte_array(pending_entry.event_id),
+            )
+            .map_err(|e| format!("insert pending negentropy vector item: {e}"))?;
     }
     storage
         .seal()
-        .map_err(|e| format!("seal negentropy vector storage: {e}"))?;
-    Ok(storage)
+        .map_err(|e| format!("reseal negentropy vector storage: {e}"))?;
+    Ok(Arc::new(storage))
 }
 
 pub fn load_shared_send_batch(
@@ -429,16 +583,9 @@ fn load_workspace_index_membership(
     }
 
     if should_include_week_deps(range.kind) {
-        let now_ms = range
-            .ts_max_exclusive()
-            .unwrap_or_else(crate::db::queue::current_timestamp_ms);
-        let week_starts = week_starts_for_window(range, now_ms);
-        if !week_starts.is_empty() {
-            let week_placeholders = week_starts
-                .iter()
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(",");
+        if let (Some(ts_min_inclusive_ms), Some(ts_max_exclusive_ms)) =
+            (range.ts_min(), range.ts_max_exclusive())
+        {
             for chunk in ids.chunks(64) {
                 let id_placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let sql = format!(
@@ -446,18 +593,16 @@ fn load_workspace_index_membership(
                      FROM hot_week_dep_index
                      WHERE workspace_id = ?
                        AND event_id IN ({id_placeholders})
-                       AND week_start_ms IN ({week_placeholders})",
+                       AND root_created_at_ms >= ?
+                       AND root_created_at_ms < ?",
                 );
-                let mut params = Vec::<rusqlite::types::Value>::with_capacity(
-                    1 + chunk.len() + week_starts.len(),
-                );
+                let mut params = Vec::<rusqlite::types::Value>::with_capacity(3 + chunk.len());
                 params.push(rusqlite::types::Value::Text(workspace_id.to_string()));
                 for event_id in chunk {
                     params.push(rusqlite::types::Value::Text(event_id_to_base64(event_id)));
                 }
-                for week_start in &week_starts {
-                    params.push(rusqlite::types::Value::Integer(*week_start));
-                }
+                params.push(rusqlite::types::Value::Integer(ts_min_inclusive_ms));
+                params.push(rusqlite::types::Value::Integer(ts_max_exclusive_ms));
 
                 let mut stmt = conn
                     .prepare(&sql)
@@ -502,8 +647,6 @@ fn eligible_shared_send_root_ids(
                 requested_by_reconciliation: true,
                 present_in_workspace_index: workspace_index_members.contains(event_id),
                 shared_blob_available: created_at_by_id.contains_key(event_id),
-                used_bootstrap_auth: false,
-                used_peer_shared_auth: false,
             },
         ));
         if matches!(plan, SharedSendEligibilityPlan::SendRoot) {
@@ -1463,6 +1606,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use negentropy::NegentropyStorageBase;
     use std::sync::{Arc, Mutex};
 
     use crate::contracts::event_pipeline_contract::IngestItem;
@@ -1781,7 +1925,7 @@ mod tests {
             SharedSendOrderPolicy::NewestFirst
         );
         assert_eq!(
-            decide_shared_send_order_policy(SyncWindowKind::Full),
+            decide_shared_send_order_policy(SyncWindowKind::Old),
             SharedSendOrderPolicy::PreserveInput
         );
 
@@ -1845,7 +1989,7 @@ mod tests {
     fn shared_sync_entry_plan_matches_hot_week_dep_policy() {
         assert_eq!(
             decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-                window_kind: SyncWindowKind::Full,
+                window_kind: SyncWindowKind::Old,
             }),
             SharedSyncEntryPlan {
                 include_hot_week_deps: false,
@@ -1890,31 +2034,14 @@ mod tests {
     }
 
     #[test]
-    fn shared_send_eligibility_plan_ignores_session_auth_path() {
-        let bootstrap_context =
-            normalize_shared_send_eligibility_context(SharedSendEligibilityRawRows {
-                requested_by_reconciliation: true,
-                present_in_workspace_index: true,
-                shared_blob_available: true,
-                used_bootstrap_auth: true,
-                used_peer_shared_auth: false,
-            });
-        let peer_shared_context =
-            normalize_shared_send_eligibility_context(SharedSendEligibilityRawRows {
-                requested_by_reconciliation: true,
-                present_in_workspace_index: true,
-                shared_blob_available: true,
-                used_bootstrap_auth: false,
-                used_peer_shared_auth: true,
-            });
-
-        assert_eq!(bootstrap_context, peer_shared_context);
+    fn shared_send_eligibility_plan_requires_index_membership_and_blob_presence() {
+        let context = normalize_shared_send_eligibility_context(SharedSendEligibilityRawRows {
+            requested_by_reconciliation: true,
+            present_in_workspace_index: true,
+            shared_blob_available: true,
+        });
         assert_eq!(
-            decide_shared_send_eligibility_plan(&bootstrap_context),
-            SharedSendEligibilityPlan::SendRoot
-        );
-        assert_eq!(
-            decide_shared_send_eligibility_plan(&peer_shared_context),
+            decide_shared_send_eligibility_plan(&context),
             SharedSendEligibilityPlan::SendRoot
         );
     }
@@ -1949,7 +2076,7 @@ mod tests {
             &store,
             workspace_id,
             SyncWindow {
-                kind: SyncWindowKind::Full,
+                kind: SyncWindowKind::Old,
                 ts_min_inclusive_ms: None,
                 ts_max_exclusive_ms: None,
             },
@@ -1980,7 +2107,7 @@ mod tests {
 
         let store = Store::new(&conn);
         let range = SyncWindow {
-            kind: SyncWindowKind::Full,
+            kind: SyncWindowKind::Old,
             ts_min_inclusive_ms: None,
             ts_max_exclusive_ms: None,
         };
@@ -2244,6 +2371,162 @@ mod tests {
     }
 
     #[test]
+    fn load_shared_event_index_slice_reuses_cached_storage_until_full_epoch_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+        let db_path = db_path.to_str().unwrap();
+        let workspace_id = "workspace-negentropy-cache";
+        let range = SyncWindow {
+            kind: SyncWindowKind::Old,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: Some(1_000),
+        };
+
+        insert_shared_bench_dep(&conn, workspace_id, 20, vec![], 1);
+        let first = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+        let second = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.size().unwrap(), 1);
+
+        insert_shared_bench_dep(&conn, workspace_id, 30, vec![], 2);
+        let third = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(third.size().unwrap(), 2);
+    }
+
+    #[test]
+    fn load_shared_event_index_slice_invalidates_window_cache_when_hot_deps_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+        let db_path = db_path.to_str().unwrap();
+        let workspace_id = "workspace-window-cache";
+        let now_ms = current_timestamp_ms();
+        let hot_created_at_ms = now_ms - 1_000;
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(hot_created_at_ms - 1_000),
+            ts_max_exclusive_ms: Some(hot_created_at_ms + 1_000),
+        };
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, hot_created_at_ms, vec![root], 2);
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[root]).unwrap();
+
+        let before = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+        assert_eq!(before.size().unwrap(), 1);
+
+        crate::db::hot_week_deps::track_valid_shared_event_deps(
+            &conn,
+            workspace_id,
+            &leaf,
+            hot_created_at_ms,
+            now_ms,
+        )
+        .unwrap();
+        let after = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.size().unwrap(), 2);
+    }
+
+    #[test]
+    fn load_shared_event_index_slice_reuses_cached_storage_across_repeated_steady_state_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+        let db_path = db_path.to_str().unwrap();
+        let workspace_id = "workspace-steady-state-cache";
+        let now_ms = current_timestamp_ms();
+        let hot_created_at_ms = now_ms - 1_000;
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(hot_created_at_ms - 1_000),
+            ts_max_exclusive_ms: Some(hot_created_at_ms + 1_000),
+        };
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, hot_created_at_ms, vec![root], 2);
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[root]).unwrap();
+        crate::db::hot_week_deps::track_valid_shared_event_deps(
+            &conn,
+            workspace_id,
+            &leaf,
+            hot_created_at_ms,
+            now_ms,
+        )
+        .unwrap();
+
+        let baseline = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+        assert_eq!(baseline.size().unwrap(), 2);
+
+        for _ in 0..16 {
+            let repeated =
+                load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+            assert!(Arc::ptr_eq(&baseline, &repeated));
+            assert_eq!(repeated.size().unwrap(), 2);
+
+            let mut neg =
+                negentropy::Negentropy::new(negentropy::Storage::Borrowed(repeated.as_ref()), 0)
+                    .unwrap();
+            let initial = neg.initiate().unwrap();
+            assert!(!initial.is_empty());
+        }
+    }
+
+    #[test]
+    fn load_shared_event_index_slice_applies_pending_overlay_without_replacing_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("node.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+        let db_path = db_path.to_str().unwrap();
+        let workspace_id = "workspace-overlay-cache";
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(10),
+            ts_max_exclusive_ms: Some(100),
+        };
+        let durable_id = insert_shared_bench_dep(&conn, workspace_id, 20, vec![], 1);
+        let pending_id = [0x55; 32];
+
+        let cached = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+        assert_eq!(cached.size().unwrap(), 1);
+
+        let overlay = crate::sync::session::receive_log::open_pending_receive_overlay_session(
+            db_path,
+            workspace_id,
+            range.kind,
+            88,
+        );
+        crate::sync::session::receive_log::record_pending_receive_overlay_entry(
+            overlay.session(),
+            30,
+            pending_id,
+        );
+        crate::sync::session::receive_log::record_pending_receive_overlay_entry(
+            overlay.session(),
+            30,
+            durable_id,
+        );
+
+        let overlaid = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+        assert!(!Arc::ptr_eq(&cached, &overlaid));
+        assert_eq!(overlaid.size().unwrap(), 2);
+
+        drop(overlay);
+        let reloaded = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
+        assert!(Arc::ptr_eq(&cached, &reloaded));
+        assert_eq!(reloaded.size().unwrap(), 1);
+    }
+
+    #[test]
     fn full_window_sync_entries_do_not_include_week_deps() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
@@ -2266,7 +2549,7 @@ mod tests {
             &conn,
             workspace_id,
             SyncWindow {
-                kind: SyncWindowKind::Full,
+                kind: SyncWindowKind::Old,
                 ts_min_inclusive_ms: Some(0),
                 ts_max_exclusive_ms: Some(now_ms - (12 * 7 * 24 * 60 * 60 * 1000)),
             },

@@ -6,6 +6,7 @@ pub mod hot_week_deps;
 pub mod iroh_log;
 pub mod local_client_ops;
 pub mod need_queue;
+pub mod negentropy_cache;
 pub mod observability;
 pub mod project_queue;
 pub mod queue;
@@ -115,6 +116,7 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     project_queue::ensure_schema(conn)?;
     health::ensure_schema(conn)?;
     hot_week_deps::ensure_schema(conn)?;
+    negentropy_cache::ensure_schema(conn)?;
     sync_log::ensure_schema(conn)?;
     timeline::ensure_schema(conn)?;
     topo_log::ensure_schema(conn)?;
