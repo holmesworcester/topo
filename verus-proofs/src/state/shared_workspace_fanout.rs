@@ -124,4 +124,15 @@ proof fn no_eligible_sibling_produces_no_targets()
 {
 }
 
+proof fn fanout_to_targets_requires_unblocked_origin_and_eligible_sibling(
+    context: SharedFanoutDecisionContext,
+)
+    ensures
+        decide_shared_fanout_plan(&context) == SharedFanoutPlan::FanoutToTargets
+            ==> !context.origin_rejected
+                && !(context.origin_removed && !context.removal_event)
+                && context.has_any_eligible_sibling,
+{
+}
+
 } // verus!

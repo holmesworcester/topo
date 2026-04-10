@@ -626,6 +626,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_fanout_plan_fanout_requires_unblocked_origin_and_eligible_sibling() {
+        for origin_rejected in [false, true] {
+            for origin_removed in [false, true] {
+                for removal_event in [false, true] {
+                    for sibling_eligible in [false, true] {
+                        let sibling = SharedFanoutSiblingDecisionContext {
+                            sibling_peer_id: "sibling".to_string(),
+                            sibling_removed: !sibling_eligible,
+                            event_predates_removal: false,
+                            removal_targets_sibling: false,
+                        };
+                        let context = SharedFanoutDecisionContext {
+                            origin_rejected,
+                            origin_removed,
+                            removal_event,
+                            siblings: vec![sibling],
+                        };
+                        if matches!(
+                            decide_shared_fanout_plan(&context),
+                            SharedFanoutPlan::FanoutTo { .. }
+                        ) {
+                            assert!(!origin_rejected);
+                            assert!(!(origin_removed && !removal_event));
+                            assert!(sibling_eligible);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn setup() -> Connection {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
