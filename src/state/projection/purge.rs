@@ -3,14 +3,20 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 use std::cell::Cell;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
-use crate::crypto::{event_id_from_base64, EventId};
+use crate::crypto::{EventId, event_id_from_base64};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PurgeManifest {
     event_ids: BTreeSet<String>,
     file_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HardPurgeRawRows {
+    tombstoned: bool,
+    manifest: PurgeManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,13 +44,10 @@ impl PurgeManifest {
     }
 }
 
-fn normalize_hard_purge_context(
-    tombstoned: bool,
-    manifest: PurgeManifest,
-) -> HardPurgeDecisionContext {
+fn normalize_hard_purge_context(raw_rows: HardPurgeRawRows) -> HardPurgeDecisionContext {
     HardPurgeDecisionContext {
-        tombstoned,
-        manifest,
+        tombstoned: raw_rows.tombstoned,
+        manifest: raw_rows.manifest,
     }
 }
 
@@ -598,14 +601,17 @@ pub(crate) fn hard_purge_deleted_message_graph(
     }
 
     let manifest = build_manifest(conn, recorded_by, root_message_event_id)?;
-    let purge_context = normalize_hard_purge_context(tombstoned, manifest);
+    let purge_context = normalize_hard_purge_context(HardPurgeRawRows {
+        tombstoned,
+        manifest,
+    });
     match decide_hard_purge_plan(&purge_context) {
         HardPurgePlan::RejectMissingTombstone => {
             return Err(format!(
                 "hard purge requires tombstone for message {}",
                 root_message_event_id
             )
-            .into())
+            .into());
         }
         HardPurgePlan::ExecuteManifest { .. } => {}
     }
@@ -632,8 +638,22 @@ mod tests {
     fn hard_purge_plan_rejects_missing_tombstone() {
         let mut manifest = PurgeManifest::default();
         manifest.add_event_id("message".to_string());
+        let context = normalize_hard_purge_context(HardPurgeRawRows {
+            tombstoned: false,
+            manifest,
+        });
         assert_eq!(
-            decide_hard_purge_plan(&normalize_hard_purge_context(false, manifest)),
+            context,
+            HardPurgeDecisionContext {
+                tombstoned: false,
+                manifest: PurgeManifest {
+                    event_ids: BTreeSet::from(["message".to_string()]),
+                    file_ids: BTreeSet::new(),
+                },
+            }
+        );
+        assert_eq!(
+            decide_hard_purge_plan(&context),
             HardPurgePlan::RejectMissingTombstone
         );
     }
@@ -644,7 +664,10 @@ mod tests {
         manifest.add_event_id("message".to_string());
         manifest.add_file_id("file".to_string());
         assert_eq!(
-            decide_hard_purge_plan(&normalize_hard_purge_context(true, manifest)),
+            decide_hard_purge_plan(&normalize_hard_purge_context(HardPurgeRawRows {
+                tombstoned: true,
+                manifest,
+            })),
             HardPurgePlan::ExecuteManifest {
                 event_ids: BTreeSet::from(["message".to_string()]),
                 file_ids: BTreeSet::from(["file".to_string()]),
