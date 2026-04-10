@@ -7,10 +7,16 @@ use rusqlite::{params, Connection};
 
 use crate::crypto::{event_id_from_base64, EventId};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PurgeManifest {
     event_ids: BTreeSet<String>,
     file_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HardPurgeDecisionContext {
+    tombstoned: bool,
+    manifest: PurgeManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,13 +38,23 @@ impl PurgeManifest {
     }
 }
 
-fn decide_hard_purge_plan(tombstoned: bool, manifest: &PurgeManifest) -> HardPurgePlan {
-    if !tombstoned {
+fn normalize_hard_purge_context(
+    tombstoned: bool,
+    manifest: PurgeManifest,
+) -> HardPurgeDecisionContext {
+    HardPurgeDecisionContext {
+        tombstoned,
+        manifest,
+    }
+}
+
+fn decide_hard_purge_plan(context: &HardPurgeDecisionContext) -> HardPurgePlan {
+    if !context.tombstoned {
         HardPurgePlan::RejectMissingTombstone
     } else {
         HardPurgePlan::ExecuteManifest {
-            event_ids: manifest.event_ids.clone(),
-            file_ids: manifest.file_ids.clone(),
+            event_ids: context.manifest.event_ids.clone(),
+            file_ids: context.manifest.file_ids.clone(),
         }
     }
 }
@@ -582,7 +598,8 @@ pub(crate) fn hard_purge_deleted_message_graph(
     }
 
     let manifest = build_manifest(conn, recorded_by, root_message_event_id)?;
-    match decide_hard_purge_plan(tombstoned, &manifest) {
+    let purge_context = normalize_hard_purge_context(tombstoned, manifest);
+    match decide_hard_purge_plan(&purge_context) {
         HardPurgePlan::RejectMissingTombstone => {
             return Err(format!(
                 "hard purge requires tombstone for message {}",
@@ -593,15 +610,15 @@ pub(crate) fn hard_purge_deleted_message_graph(
         HardPurgePlan::ExecuteManifest { .. } => {}
     }
     test_checkpoint("after_manifest_build")?;
-    delete_tenant_scoped_rows(conn, recorded_by, &manifest)?;
+    delete_tenant_scoped_rows(conn, recorded_by, &purge_context.manifest)?;
     test_checkpoint("after_tenant_scoped_delete")?;
-    let orphaned_event_ids = delete_global_rows(conn, &manifest)?;
+    let orphaned_event_ids = delete_global_rows(conn, &purge_context.manifest)?;
     test_checkpoint("after_global_delete")?;
     verify_purge(
         conn,
         recorded_by,
         root_message_event_id,
-        &manifest,
+        &purge_context.manifest,
         &orphaned_event_ids,
     )?;
     Ok(())
@@ -616,7 +633,7 @@ mod tests {
         let mut manifest = PurgeManifest::default();
         manifest.add_event_id("message".to_string());
         assert_eq!(
-            decide_hard_purge_plan(false, &manifest),
+            decide_hard_purge_plan(&normalize_hard_purge_context(false, manifest)),
             HardPurgePlan::RejectMissingTombstone
         );
     }
@@ -627,7 +644,7 @@ mod tests {
         manifest.add_event_id("message".to_string());
         manifest.add_file_id("file".to_string());
         assert_eq!(
-            decide_hard_purge_plan(true, &manifest),
+            decide_hard_purge_plan(&normalize_hard_purge_context(true, manifest)),
             HardPurgePlan::ExecuteManifest {
                 event_ids: BTreeSet::from(["message".to_string()]),
                 file_ids: BTreeSet::from(["file".to_string()]),
