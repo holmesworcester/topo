@@ -2195,6 +2195,32 @@ mod tests {
     }
 
     #[test]
+    fn content_authority_allows_duplicate_matching_signer_user() {
+        let signer_id = event_id_b64(1);
+        let author_id = event_id_b64(2);
+        let context = normalize_content_authority(
+            &content_authority_raw(
+                signer_id.clone(),
+                vec![Some(author_id.clone()), Some(author_id.clone())],
+            ),
+            &author_id,
+        );
+
+        assert_eq!(
+            context,
+            ContentAuthorityDecisionContext::UniqueSignerUser {
+                signer_event_id: signer_id,
+                signer_user_id: author_id.clone(),
+                author_id
+            }
+        );
+        assert_eq!(
+            decide_content_authority_plan(&context),
+            ContentAuthorityPlan::Ready
+        );
+    }
+
+    #[test]
     fn content_authority_rejects_mismatched_signer_user() {
         let signer_id = event_id_b64(1);
         let context = normalize_content_authority(
@@ -2287,6 +2313,32 @@ mod tests {
         let admin_key = [2u8; 32];
         let context = normalize_admin_authority(
             &admin_authority_raw(user_id.clone(), vec![Some(admin_key.to_vec())]),
+            &admin_key,
+        );
+
+        assert_eq!(
+            context,
+            AdminAuthorityDecisionContext::UniqueUserKey {
+                user_event_id: user_id,
+                user_public_key: admin_key.to_vec(),
+                admin_public_key: admin_key.to_vec()
+            }
+        );
+        assert_eq!(
+            decide_admin_authority_plan(&context),
+            AdminAuthorityPlan::Ready
+        );
+    }
+
+    #[test]
+    fn admin_authority_allows_duplicate_matching_workspace_signed_user_key() {
+        let user_id = event_id_b64(1);
+        let admin_key = [2u8; 32];
+        let context = normalize_admin_authority(
+            &admin_authority_raw(
+                user_id.clone(),
+                vec![Some(admin_key.to_vec()), Some(admin_key.to_vec())],
+            ),
             &admin_key,
         );
 
@@ -2503,6 +2555,30 @@ mod tests {
         let context = normalize_deletion_signer(&deletion_signer_raw(
             signer_id.clone(),
             vec![Some(user_id.clone())],
+        ));
+
+        assert_eq!(
+            context,
+            DeletionSignerDecisionContext::UniquePeerSharedSignerUser {
+                signer_event_id: signer_id,
+                signer_user_id: user_id.clone()
+            }
+        );
+        assert_eq!(
+            decide_deletion_signer_plan(&context),
+            DeletionSignerPlan::ReadyPeerSharedUser {
+                signer_user_id: user_id
+            }
+        );
+    }
+
+    #[test]
+    fn deletion_signer_allows_duplicate_peer_user() {
+        let signer_id = event_id_b64(1);
+        let user_id = event_id_b64(2);
+        let context = normalize_deletion_signer(&deletion_signer_raw(
+            signer_id.clone(),
+            vec![Some(user_id.clone()), Some(user_id.clone())],
         ));
 
         assert_eq!(

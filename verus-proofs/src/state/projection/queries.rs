@@ -156,14 +156,16 @@ proof fn workspace_query_malformation_fails_closed()
 {
 }
 
-pub enum SignerUserRows {
+pub enum ContentAuthorityRows {
     NoAuthorCheckNeeded,
     MissingCurrentSigner,
     UnsupportedSignerType,
-    Unique { signer_matches_author: bool },
-    MissingSignerUser,
-    AmbiguousSignerUser,
-    Malformed,
+    PeerSharedSigner {
+        row_count: nat,
+        all_signer_user_ids_equal: bool,
+        representative_signer_matches_author: bool,
+        malformed: bool,
+    },
 }
 
 pub enum ContentAuthorityDecisionContext {
@@ -182,31 +184,35 @@ pub enum ContentAuthorityPlan {
 }
 
 pub open spec fn normalize_content_authority(
-    rows: SignerUserRows,
+    rows: ContentAuthorityRows,
 ) -> ContentAuthorityDecisionContext {
     match rows {
-        SignerUserRows::NoAuthorCheckNeeded => {
+        ContentAuthorityRows::NoAuthorCheckNeeded => {
             ContentAuthorityDecisionContext::NoAuthorCheckNeeded
         }
-        SignerUserRows::MissingCurrentSigner => {
+        ContentAuthorityRows::MissingCurrentSigner => {
             ContentAuthorityDecisionContext::RejectMissingCurrentSigner
         }
-        SignerUserRows::UnsupportedSignerType => {
+        ContentAuthorityRows::UnsupportedSignerType => {
             ContentAuthorityDecisionContext::RejectUnsupportedSignerType
         }
-        SignerUserRows::Unique { signer_matches_author } => {
-            ContentAuthorityDecisionContext::UniqueSignerUser {
-                signer_matches_author,
+        ContentAuthorityRows::PeerSharedSigner {
+            row_count,
+            all_signer_user_ids_equal,
+            representative_signer_matches_author,
+            malformed,
+        } => {
+            if malformed {
+                ContentAuthorityDecisionContext::RejectMalformedSignerUser
+            } else if row_count == 0 {
+                ContentAuthorityDecisionContext::RejectMissingSignerUser
+            } else if all_signer_user_ids_equal {
+                ContentAuthorityDecisionContext::UniqueSignerUser {
+                    signer_matches_author: representative_signer_matches_author,
+                }
+            } else {
+                ContentAuthorityDecisionContext::RejectAmbiguousSignerUser
             }
-        }
-        SignerUserRows::MissingSignerUser => {
-            ContentAuthorityDecisionContext::RejectMissingSignerUser
-        }
-        SignerUserRows::AmbiguousSignerUser => {
-            ContentAuthorityDecisionContext::RejectAmbiguousSignerUser
-        }
-        SignerUserRows::Malformed => {
-            ContentAuthorityDecisionContext::RejectMalformedSignerUser
         }
     }
 }
@@ -236,7 +242,7 @@ pub open spec fn decide_content_authority_plan(
 proof fn content_authority_missing_current_signer_rejects()
     ensures
         decide_content_authority_plan(normalize_content_authority(
-            SignerUserRows::MissingCurrentSigner,
+            ContentAuthorityRows::MissingCurrentSigner,
         )) == ContentAuthorityPlan::Reject,
 {
 }
@@ -244,7 +250,7 @@ proof fn content_authority_missing_current_signer_rejects()
 proof fn content_authority_unsupported_signer_type_rejects()
     ensures
         decide_content_authority_plan(normalize_content_authority(
-            SignerUserRows::UnsupportedSignerType,
+            ContentAuthorityRows::UnsupportedSignerType,
         )) == ContentAuthorityPlan::Reject,
 {
 }
@@ -252,15 +258,51 @@ proof fn content_authority_unsupported_signer_type_rejects()
 proof fn content_authority_unique_match_is_ready()
     ensures
         decide_content_authority_plan(normalize_content_authority(
-            SignerUserRows::Unique { signer_matches_author: true },
+            ContentAuthorityRows::PeerSharedSigner {
+                row_count: 1,
+                all_signer_user_ids_equal: true,
+                representative_signer_matches_author: true,
+                malformed: false,
+            },
         )) == ContentAuthorityPlan::Ready,
+{
+}
+
+proof fn content_authority_duplicate_matching_rows_are_noninterfering(
+    row_count_a: nat,
+    row_count_b: nat,
+)
+    requires
+        row_count_a > 0,
+        row_count_b > 0,
+    ensures
+        decide_content_authority_plan(normalize_content_authority(
+            ContentAuthorityRows::PeerSharedSigner {
+                row_count: row_count_a,
+                all_signer_user_ids_equal: true,
+                representative_signer_matches_author: true,
+                malformed: false,
+            },
+        )) == decide_content_authority_plan(normalize_content_authority(
+            ContentAuthorityRows::PeerSharedSigner {
+                row_count: row_count_b,
+                all_signer_user_ids_equal: true,
+                representative_signer_matches_author: true,
+                malformed: false,
+            },
+        )),
 {
 }
 
 proof fn content_authority_unique_mismatch_rejects()
     ensures
         decide_content_authority_plan(normalize_content_authority(
-            SignerUserRows::Unique { signer_matches_author: false },
+            ContentAuthorityRows::PeerSharedSigner {
+                row_count: 1,
+                all_signer_user_ids_equal: true,
+                representative_signer_matches_author: false,
+                malformed: false,
+            },
         )) == ContentAuthorityPlan::Reject,
 {
 }
@@ -268,25 +310,38 @@ proof fn content_authority_unique_mismatch_rejects()
 proof fn content_authority_ambiguity_fails_closed()
     ensures
         decide_content_authority_plan(normalize_content_authority(
-            SignerUserRows::AmbiguousSignerUser,
+            ContentAuthorityRows::PeerSharedSigner {
+                row_count: 2,
+                all_signer_user_ids_equal: false,
+                representative_signer_matches_author: true,
+                malformed: false,
+            },
         )) == ContentAuthorityPlan::Reject,
 {
 }
 
 proof fn content_authority_malformation_fails_closed()
     ensures
-        decide_content_authority_plan(normalize_content_authority(SignerUserRows::Malformed))
-            == ContentAuthorityPlan::Reject,
+        decide_content_authority_plan(normalize_content_authority(
+            ContentAuthorityRows::PeerSharedSigner {
+                row_count: 1,
+                all_signer_user_ids_equal: true,
+                representative_signer_matches_author: true,
+                malformed: true,
+            },
+        )) == ContentAuthorityPlan::Reject,
 {
 }
 
 pub enum AdminAuthorityRows {
     MissingCurrentSigner,
     UnsupportedSignerType,
-    UniqueUserKey { admin_key_matches_user_key: bool },
-    MissingUser,
-    AmbiguousUser,
-    MalformedUserKey,
+    WorkspaceSigner {
+        row_count: nat,
+        all_user_keys_equal: bool,
+        representative_key_matches_admin_key: bool,
+        malformed: bool,
+    },
 }
 
 pub enum AdminAuthorityDecisionContext {
@@ -313,17 +368,23 @@ pub open spec fn normalize_admin_authority(
         AdminAuthorityRows::UnsupportedSignerType => {
             AdminAuthorityDecisionContext::RejectUnsupportedSignerType
         }
-        AdminAuthorityRows::UniqueUserKey { admin_key_matches_user_key } => {
-            AdminAuthorityDecisionContext::UniqueUserKey {
-                admin_key_matches_user_key,
+        AdminAuthorityRows::WorkspaceSigner {
+            row_count,
+            all_user_keys_equal,
+            representative_key_matches_admin_key,
+            malformed,
+        } => {
+            if malformed {
+                AdminAuthorityDecisionContext::RejectMalformedUserKey
+            } else if row_count == 0 {
+                AdminAuthorityDecisionContext::RejectMissingUser
+            } else if all_user_keys_equal {
+                AdminAuthorityDecisionContext::UniqueUserKey {
+                    admin_key_matches_user_key: representative_key_matches_admin_key,
+                }
+            } else {
+                AdminAuthorityDecisionContext::RejectAmbiguousUser
             }
-        }
-        AdminAuthorityRows::MissingUser => AdminAuthorityDecisionContext::RejectMissingUser,
-        AdminAuthorityRows::AmbiguousUser => {
-            AdminAuthorityDecisionContext::RejectAmbiguousUser
-        }
-        AdminAuthorityRows::MalformedUserKey => {
-            AdminAuthorityDecisionContext::RejectMalformedUserKey
         }
     }
 }
@@ -352,15 +413,51 @@ pub open spec fn decide_admin_authority_plan(
 proof fn admin_authority_matching_key_is_ready()
     ensures
         decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::UniqueUserKey { admin_key_matches_user_key: true },
+            AdminAuthorityRows::WorkspaceSigner {
+                row_count: 1,
+                all_user_keys_equal: true,
+                representative_key_matches_admin_key: true,
+                malformed: false,
+            },
         )) == AdminAuthorityPlan::Ready,
+{
+}
+
+proof fn admin_authority_duplicate_matching_rows_are_noninterfering(
+    row_count_a: nat,
+    row_count_b: nat,
+)
+    requires
+        row_count_a > 0,
+        row_count_b > 0,
+    ensures
+        decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::WorkspaceSigner {
+                row_count: row_count_a,
+                all_user_keys_equal: true,
+                representative_key_matches_admin_key: true,
+                malformed: false,
+            },
+        )) == decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::WorkspaceSigner {
+                row_count: row_count_b,
+                all_user_keys_equal: true,
+                representative_key_matches_admin_key: true,
+                malformed: false,
+            },
+        )),
 {
 }
 
 proof fn admin_authority_key_mismatch_rejects()
     ensures
         decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::UniqueUserKey { admin_key_matches_user_key: false },
+            AdminAuthorityRows::WorkspaceSigner {
+                row_count: 1,
+                all_user_keys_equal: true,
+                representative_key_matches_admin_key: false,
+                malformed: false,
+            },
         )) == AdminAuthorityPlan::Reject,
 {
 }
@@ -384,7 +481,12 @@ proof fn admin_authority_unsupported_signer_type_rejects()
 proof fn admin_authority_missing_user_rejects()
     ensures
         decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::MissingUser,
+            AdminAuthorityRows::WorkspaceSigner {
+                row_count: 0,
+                all_user_keys_equal: true,
+                representative_key_matches_admin_key: true,
+                malformed: false,
+            },
         )) == AdminAuthorityPlan::Reject,
 {
 }
@@ -392,7 +494,12 @@ proof fn admin_authority_missing_user_rejects()
 proof fn admin_authority_ambiguous_user_rejects()
     ensures
         decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::AmbiguousUser,
+            AdminAuthorityRows::WorkspaceSigner {
+                row_count: 2,
+                all_user_keys_equal: false,
+                representative_key_matches_admin_key: true,
+                malformed: false,
+            },
         )) == AdminAuthorityPlan::Reject,
 {
 }
@@ -400,7 +507,12 @@ proof fn admin_authority_ambiguous_user_rejects()
 proof fn admin_authority_malformed_user_key_rejects()
     ensures
         decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::MalformedUserKey,
+            AdminAuthorityRows::WorkspaceSigner {
+                row_count: 1,
+                all_user_keys_equal: true,
+                representative_key_matches_admin_key: true,
+                malformed: true,
+            },
         )) == AdminAuthorityPlan::Reject,
 {
 }
@@ -528,10 +640,11 @@ pub enum DeletionSignerRows {
     MissingCurrentSigner,
     AdminSigner,
     UnsupportedSignerType,
-    UniquePeerSharedSigner,
-    MissingSignerUser,
-    AmbiguousSignerUser,
-    Malformed,
+    PeerSharedSigner {
+        row_count: nat,
+        all_signer_user_ids_equal: bool,
+        malformed: bool,
+    },
 }
 
 pub enum DeletionSignerDecisionContext {
@@ -561,17 +674,20 @@ pub open spec fn normalize_deletion_signer(
         DeletionSignerRows::UnsupportedSignerType => {
             DeletionSignerDecisionContext::RejectUnsupportedSignerType
         }
-        DeletionSignerRows::UniquePeerSharedSigner => {
-            DeletionSignerDecisionContext::UniquePeerSharedSignerUser
-        }
-        DeletionSignerRows::MissingSignerUser => {
-            DeletionSignerDecisionContext::RejectMissingSignerUser
-        }
-        DeletionSignerRows::AmbiguousSignerUser => {
-            DeletionSignerDecisionContext::RejectAmbiguousSignerUser
-        }
-        DeletionSignerRows::Malformed => {
-            DeletionSignerDecisionContext::RejectMalformedSignerUser
+        DeletionSignerRows::PeerSharedSigner {
+            row_count,
+            all_signer_user_ids_equal,
+            malformed,
+        } => {
+            if malformed {
+                DeletionSignerDecisionContext::RejectMalformedSignerUser
+            } else if row_count == 0 {
+                DeletionSignerDecisionContext::RejectMissingSignerUser
+            } else if all_signer_user_ids_equal {
+                DeletionSignerDecisionContext::UniquePeerSharedSignerUser
+            } else {
+                DeletionSignerDecisionContext::RejectAmbiguousSignerUser
+            }
         }
     }
 }
@@ -605,8 +721,36 @@ proof fn deletion_signer_admin_is_ready()
 proof fn deletion_signer_peer_user_is_ready()
     ensures
         decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::UniquePeerSharedSigner,
+            DeletionSignerRows::PeerSharedSigner {
+                row_count: 1,
+                all_signer_user_ids_equal: true,
+                malformed: false,
+            },
         )) == DeletionSignerPlan::ReadyPeerSharedUser,
+{
+}
+
+proof fn deletion_signer_duplicate_peer_user_rows_are_noninterfering(
+    row_count_a: nat,
+    row_count_b: nat,
+)
+    requires
+        row_count_a > 0,
+        row_count_b > 0,
+    ensures
+        decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::PeerSharedSigner {
+                row_count: row_count_a,
+                all_signer_user_ids_equal: true,
+                malformed: false,
+            },
+        )) == decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::PeerSharedSigner {
+                row_count: row_count_b,
+                all_signer_user_ids_equal: true,
+                malformed: false,
+            },
+        )),
 {
 }
 
@@ -629,7 +773,11 @@ proof fn deletion_signer_unsupported_type_rejects()
 proof fn deletion_signer_missing_user_rejects()
     ensures
         decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::MissingSignerUser,
+            DeletionSignerRows::PeerSharedSigner {
+                row_count: 0,
+                all_signer_user_ids_equal: true,
+                malformed: false,
+            },
         )) == DeletionSignerPlan::Reject,
 {
 }
@@ -637,15 +785,24 @@ proof fn deletion_signer_missing_user_rejects()
 proof fn deletion_signer_ambiguous_user_rejects()
     ensures
         decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::AmbiguousSignerUser,
+            DeletionSignerRows::PeerSharedSigner {
+                row_count: 2,
+                all_signer_user_ids_equal: false,
+                malformed: false,
+            },
         )) == DeletionSignerPlan::Reject,
 {
 }
 
 proof fn deletion_signer_malformed_user_rejects()
     ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(DeletionSignerRows::Malformed))
-            == DeletionSignerPlan::Reject,
+        decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::PeerSharedSigner {
+                row_count: 1,
+                all_signer_user_ids_equal: true,
+                malformed: true,
+            },
+        )) == DeletionSignerPlan::Reject,
 {
 }
 
