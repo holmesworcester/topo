@@ -15,37 +15,41 @@ pub enum DispatchAction {
     Reconnect,
 }
 
+pub struct TargetDispatchDecisionContext {
+    pub incoming_source: TargetSourceKind,
+    pub should_initiate_connect: bool,
+    pub bootstrap_phase: bool,
+    pub has_active_higher_precedence_worker: bool,
+    pub dispatch_action: DispatchAction,
+}
+
 pub enum TargetDispatchPlan {
     Skip,
     Spawn { cancel_existing_dispatch_key: bool, cancel_bootstrap_prefix: bool },
 }
 
 pub open spec fn decide_target_dispatch_plan(
-    incoming_source: TargetSourceKind,
-    should_initiate_connect: bool,
-    bootstrap_phase: bool,
-    has_active_higher_precedence_worker: bool,
-    dispatch_action: DispatchAction,
+    context: &TargetDispatchDecisionContext,
 ) -> TargetDispatchPlan {
-    if !should_initiate_connect {
+    if !context.should_initiate_connect {
         TargetDispatchPlan::Skip
-    } else if matches!(incoming_source, TargetSourceKind::Bootstrap)
-        && has_active_higher_precedence_worker
-        && !bootstrap_phase
+    } else if matches!(context.incoming_source, TargetSourceKind::Bootstrap)
+        && context.has_active_higher_precedence_worker
+        && !context.bootstrap_phase
     {
         TargetDispatchPlan::Skip
     } else {
-        match dispatch_action {
+        match context.dispatch_action {
             DispatchAction::Skip => TargetDispatchPlan::Skip,
             DispatchAction::Connect => TargetDispatchPlan::Spawn {
                 cancel_existing_dispatch_key: false,
-                cancel_bootstrap_prefix: matches!(incoming_source, TargetSourceKind::KnownPeer)
-                    && !bootstrap_phase,
+                cancel_bootstrap_prefix: matches!(context.incoming_source, TargetSourceKind::KnownPeer)
+                    && !context.bootstrap_phase,
             },
             DispatchAction::Reconnect => TargetDispatchPlan::Spawn {
                 cancel_existing_dispatch_key: true,
-                cancel_bootstrap_prefix: matches!(incoming_source, TargetSourceKind::KnownPeer)
-                    && !bootstrap_phase,
+                cancel_bootstrap_prefix: matches!(context.incoming_source, TargetSourceKind::KnownPeer)
+                    && !context.bootstrap_phase,
             },
         }
     }
@@ -56,13 +60,13 @@ proof fn bootstrap_is_suppressed_by_active_known_peer_outside_bootstrap_phase(
 )
     requires !matches!(dispatch_action, DispatchAction::Skip)
     ensures matches!(
-        decide_target_dispatch_plan(
-            TargetSourceKind::Bootstrap,
-            true,
-            false,
-            true,
+        decide_target_dispatch_plan(&TargetDispatchDecisionContext {
+            incoming_source: TargetSourceKind::Bootstrap,
+            should_initiate_connect: true,
+            bootstrap_phase: false,
+            has_active_higher_precedence_worker: true,
             dispatch_action,
-        ),
+        }),
         TargetDispatchPlan::Skip
     ),
 {
@@ -71,13 +75,13 @@ proof fn bootstrap_is_suppressed_by_active_known_peer_outside_bootstrap_phase(
 proof fn bootstrap_phase_keeps_bootstrap_dispatch_available(dispatch_action: DispatchAction)
     requires !matches!(dispatch_action, DispatchAction::Skip)
     ensures !matches!(
-        decide_target_dispatch_plan(
-            TargetSourceKind::Bootstrap,
-            true,
-            true,
-            true,
+        decide_target_dispatch_plan(&TargetDispatchDecisionContext {
+            incoming_source: TargetSourceKind::Bootstrap,
+            should_initiate_connect: true,
+            bootstrap_phase: true,
+            has_active_higher_precedence_worker: true,
             dispatch_action,
-        ),
+        }),
         TargetDispatchPlan::Skip
     ),
 {
@@ -93,13 +97,13 @@ proof fn dispatcher_skip_produces_no_spawn(
             && has_active_higher_precedence_worker
             && !bootstrap_phase)
     ensures matches!(
-        decide_target_dispatch_plan(
+        decide_target_dispatch_plan(&TargetDispatchDecisionContext {
             incoming_source,
-            true,
+            should_initiate_connect: true,
             bootstrap_phase,
             has_active_higher_precedence_worker,
-            DispatchAction::Skip,
-        ),
+            dispatch_action: DispatchAction::Skip,
+        }),
         TargetDispatchPlan::Skip
     ),
 {
@@ -109,17 +113,17 @@ proof fn known_peer_outside_bootstrap_phase_cancels_bootstrap_prefix(
     cancel_existing_dispatch_key: bool,
 )
     ensures
-        decide_target_dispatch_plan(
-            TargetSourceKind::KnownPeer,
-            true,
-            false,
-            false,
-            if cancel_existing_dispatch_key {
+        decide_target_dispatch_plan(&TargetDispatchDecisionContext {
+            incoming_source: TargetSourceKind::KnownPeer,
+            should_initiate_connect: true,
+            bootstrap_phase: false,
+            has_active_higher_precedence_worker: false,
+            dispatch_action: if cancel_existing_dispatch_key {
                 DispatchAction::Reconnect
             } else {
                 DispatchAction::Connect
             },
-        ) == (TargetDispatchPlan::Spawn {
+        }) == (TargetDispatchPlan::Spawn {
             cancel_existing_dispatch_key,
             cancel_bootstrap_prefix: true,
         }),
@@ -130,17 +134,17 @@ proof fn known_peer_during_bootstrap_phase_keeps_bootstrap_prefix(
     cancel_existing_dispatch_key: bool,
 )
     ensures
-        decide_target_dispatch_plan(
-            TargetSourceKind::KnownPeer,
-            true,
-            true,
-            false,
-            if cancel_existing_dispatch_key {
+        decide_target_dispatch_plan(&TargetDispatchDecisionContext {
+            incoming_source: TargetSourceKind::KnownPeer,
+            should_initiate_connect: true,
+            bootstrap_phase: true,
+            has_active_higher_precedence_worker: false,
+            dispatch_action: if cancel_existing_dispatch_key {
                 DispatchAction::Reconnect
             } else {
                 DispatchAction::Connect
             },
-        ) == (TargetDispatchPlan::Spawn {
+        }) == (TargetDispatchPlan::Spawn {
             cancel_existing_dispatch_key,
             cancel_bootstrap_prefix: false,
         }),

@@ -30,7 +30,17 @@ pub(crate) enum DispatchAction {
     Reconnect,
 }
 
-/// Bootstrap dial planning decision from a single query snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BootstrapDialRawRows {
+    pub(crate) workspace_already_local_elsewhere: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BootstrapDialDecisionContext {
+    pub(crate) workspace_already_local_elsewhere: bool,
+}
+
+/// Bootstrap dial planning decision from a single DecisionContext.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BootstrapDialPlan {
     /// The workspace is already present locally under another tenant, so link
@@ -39,10 +49,18 @@ pub(crate) enum BootstrapDialPlan {
     UseBootstrapTarget,
 }
 
+pub(crate) fn normalize_bootstrap_dial_decision_context(
+    raw_rows: BootstrapDialRawRows,
+) -> BootstrapDialDecisionContext {
+    BootstrapDialDecisionContext {
+        workspace_already_local_elsewhere: raw_rows.workspace_already_local_elsewhere,
+    }
+}
+
 pub(crate) fn decide_bootstrap_dial_plan(
-    target: &crate::db::transport_trust::InviteBootstrapTarget,
+    context: &BootstrapDialDecisionContext,
 ) -> BootstrapDialPlan {
-    if target.workspace_already_local_elsewhere {
+    if context.workspace_already_local_elsewhere {
         BootstrapDialPlan::IgnoreAlreadyLocalWorkspace
     } else {
         BootstrapDialPlan::UseBootstrapTarget
@@ -150,8 +168,12 @@ pub(crate) fn load_bootstrap_targets(
 
     for tenant_id in tenant_ids {
         for target in list_active_invite_bootstrap_targets(&db, tenant_id)? {
+            let decision_context =
+                normalize_bootstrap_dial_decision_context(BootstrapDialRawRows {
+                    workspace_already_local_elsewhere: target.workspace_already_local_elsewhere,
+                });
             if matches!(
-                decide_bootstrap_dial_plan(&target),
+                decide_bootstrap_dial_plan(&decision_context),
                 BootstrapDialPlan::IgnoreAlreadyLocalWorkspace
             ) {
                 continue;
@@ -414,7 +436,7 @@ pub(crate) fn known_peer_dispatch_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::transport_trust::{record_invite_bootstrap_trust, InviteBootstrapTarget};
+    use crate::db::transport_trust::record_invite_bootstrap_trust;
     use crate::db::{open_connection, schema::create_tables};
     use rusqlite::params;
 
@@ -447,18 +469,12 @@ mod tests {
 
     #[test]
     fn bootstrap_dial_plan_ignores_already_local_workspace_regardless_of_endpoint() {
-        let direct = InviteBootstrapTarget {
-            invite_event_id: "invite-1".to_string(),
-            transport_peer_id: "peer-1".to_string(),
-            bootstrap_addr: "127.0.0.1:7777".to_string(),
+        let direct = normalize_bootstrap_dial_decision_context(BootstrapDialRawRows {
             workspace_already_local_elsewhere: true,
-        };
-        let relay = InviteBootstrapTarget {
-            invite_event_id: "invite-1".to_string(),
-            transport_peer_id: "peer-1".to_string(),
-            bootstrap_addr: "https://relay.example".to_string(),
+        });
+        let relay = normalize_bootstrap_dial_decision_context(BootstrapDialRawRows {
             workspace_already_local_elsewhere: true,
-        };
+        });
 
         assert_eq!(
             decide_bootstrap_dial_plan(&direct),

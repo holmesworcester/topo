@@ -120,4 +120,131 @@ proof fn bootstrap_fallback_rejects_ambiguous_candidates(candidate_count: nat)
 {
 }
 
+pub struct BootstrapSessionFallbackRawRows {
+    pub require_local_bootstrap_phase: bool,
+    pub local_bootstrap_phase: bool,
+    pub candidate_count: nat,
+    pub unique_candidate_workspace_already_local_before_candidate: bool,
+}
+
+pub enum BootstrapSessionFallbackDecisionContext {
+    RejectRequiresLocalBootstrapPhase,
+    MissingCandidate,
+    UniqueCandidate {
+        workspace_already_local_before_candidate: bool,
+    },
+    AmbiguousCandidate,
+}
+
+pub enum BootstrapSessionFallbackPlan {
+    RejectRequiresLocalBootstrapPhase,
+    RejectMissingCandidate,
+    UseFallback,
+    RejectAmbiguousCandidate,
+    RejectAlreadyLocalWorkspaceCandidate,
+}
+
+pub open spec fn normalize_bootstrap_session_fallback_decision_context(
+    raw_rows: BootstrapSessionFallbackRawRows,
+) -> BootstrapSessionFallbackDecisionContext {
+    if raw_rows.require_local_bootstrap_phase && !raw_rows.local_bootstrap_phase {
+        BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase
+    } else if raw_rows.candidate_count == 0 {
+        BootstrapSessionFallbackDecisionContext::MissingCandidate
+    } else if raw_rows.candidate_count == 1 {
+        BootstrapSessionFallbackDecisionContext::UniqueCandidate {
+            workspace_already_local_before_candidate:
+                raw_rows.unique_candidate_workspace_already_local_before_candidate,
+        }
+    } else {
+        BootstrapSessionFallbackDecisionContext::AmbiguousCandidate
+    }
+}
+
+pub open spec fn decide_bootstrap_session_fallback_plan(
+    context: BootstrapSessionFallbackDecisionContext,
+) -> BootstrapSessionFallbackPlan {
+    match context {
+        BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase => {
+            BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase
+        }
+        BootstrapSessionFallbackDecisionContext::MissingCandidate => {
+            BootstrapSessionFallbackPlan::RejectMissingCandidate
+        }
+        BootstrapSessionFallbackDecisionContext::UniqueCandidate {
+            workspace_already_local_before_candidate,
+        } => {
+            if workspace_already_local_before_candidate {
+                BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate
+            } else {
+                BootstrapSessionFallbackPlan::UseFallback
+            }
+        }
+        BootstrapSessionFallbackDecisionContext::AmbiguousCandidate => {
+            BootstrapSessionFallbackPlan::RejectAmbiguousCandidate
+        }
+    }
+}
+
+proof fn bootstrap_session_fallback_rejects_when_local_bootstrap_phase_required_but_missing()
+    ensures
+        decide_bootstrap_session_fallback_plan(
+            normalize_bootstrap_session_fallback_decision_context(
+                BootstrapSessionFallbackRawRows {
+                    require_local_bootstrap_phase: true,
+                    local_bootstrap_phase: false,
+                    candidate_count: 1,
+                    unique_candidate_workspace_already_local_before_candidate: false,
+                },
+            )
+        ) == BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase,
+{
+}
+
+proof fn bootstrap_session_fallback_rejects_unique_same_workspace_candidate()
+    ensures
+        decide_bootstrap_session_fallback_plan(
+            normalize_bootstrap_session_fallback_decision_context(
+                BootstrapSessionFallbackRawRows {
+                    require_local_bootstrap_phase: false,
+                    local_bootstrap_phase: false,
+                    candidate_count: 1,
+                    unique_candidate_workspace_already_local_before_candidate: true,
+                },
+            )
+        ) == BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate,
+{
+}
+
+proof fn bootstrap_session_fallback_accepts_unique_nonlocal_candidate()
+    ensures
+        decide_bootstrap_session_fallback_plan(
+            normalize_bootstrap_session_fallback_decision_context(
+                BootstrapSessionFallbackRawRows {
+                    require_local_bootstrap_phase: false,
+                    local_bootstrap_phase: false,
+                    candidate_count: 1,
+                    unique_candidate_workspace_already_local_before_candidate: false,
+                },
+            )
+        ) == BootstrapSessionFallbackPlan::UseFallback,
+{
+}
+
+proof fn bootstrap_session_fallback_rejects_ambiguous_candidates(candidate_count: nat)
+    requires candidate_count > 1
+    ensures
+        decide_bootstrap_session_fallback_plan(
+            normalize_bootstrap_session_fallback_decision_context(
+                BootstrapSessionFallbackRawRows {
+                    require_local_bootstrap_phase: false,
+                    local_bootstrap_phase: false,
+                    candidate_count,
+                    unique_candidate_workspace_already_local_before_candidate: false,
+                },
+            )
+        ) == BootstrapSessionFallbackPlan::RejectAmbiguousCandidate,
+{
+}
+
 } // verus!

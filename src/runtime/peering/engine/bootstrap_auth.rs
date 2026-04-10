@@ -7,7 +7,9 @@
 
 use crate::db::open_connection;
 use crate::db::transport_creds::{resolve_tenant_transport_target, CRED_SOURCE_BOOTSTRAP};
-use crate::db::transport_trust::list_active_bootstrap_session_fallback_candidates;
+use crate::db::transport_trust::{
+    list_active_bootstrap_session_fallback_candidates, BootstrapSessionFallbackCandidate,
+};
 
 use super::target_dispatch::{should_initiate_connect_for_source, TargetIngressSource};
 
@@ -18,12 +20,21 @@ pub(super) struct BootstrapSessionFallback {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum BootstrapSessionFallbackContext {
-    Candidates {
-        require_local_bootstrap_phase: bool,
-        local_bootstrap_phase: bool,
-        candidates: Vec<crate::db::transport_trust::BootstrapSessionFallbackCandidate>,
+struct BootstrapSessionFallbackRawRows {
+    require_local_bootstrap_phase: bool,
+    local_bootstrap_phase: bool,
+    candidates: Vec<BootstrapSessionFallbackCandidate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BootstrapSessionFallbackDecisionContext {
+    RejectRequiresLocalBootstrapPhase,
+    MissingCandidate,
+    UniqueCandidate {
+        fallback: BootstrapSessionFallback,
+        workspace_already_local_before_candidate: bool,
     },
+    AmbiguousCandidate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,53 +47,69 @@ enum BootstrapSessionFallbackDecision {
 }
 
 fn decide_bootstrap_session_fallback(
-    context: &BootstrapSessionFallbackContext,
+    context: &BootstrapSessionFallbackDecisionContext,
 ) -> BootstrapSessionFallbackDecision {
     match context {
-        BootstrapSessionFallbackContext::Candidates {
-            require_local_bootstrap_phase,
-            local_bootstrap_phase,
-            candidates,
+        BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase => {
+            BootstrapSessionFallbackDecision::RejectRequiresLocalBootstrapPhase
+        }
+        BootstrapSessionFallbackDecisionContext::MissingCandidate => {
+            BootstrapSessionFallbackDecision::RejectMissing
+        }
+        BootstrapSessionFallbackDecisionContext::UniqueCandidate {
+            fallback,
+            workspace_already_local_before_candidate,
         } => {
-            if *require_local_bootstrap_phase && !*local_bootstrap_phase {
-                return BootstrapSessionFallbackDecision::RejectRequiresLocalBootstrapPhase;
-            }
-
-            let mut candidates = candidates.clone();
-            candidates.sort_by(|a, b| {
-                a.invite_event_id
-                    .cmp(&b.invite_event_id)
-                    .then_with(|| a.daemon_peer_id.cmp(&b.daemon_peer_id))
-            });
-            let mut normalized: Vec<crate::db::transport_trust::BootstrapSessionFallbackCandidate> =
-                Vec::new();
-            for candidate in candidates {
-                if let Some(last) = normalized.last_mut() {
-                    if last.invite_event_id == candidate.invite_event_id
-                        && last.daemon_peer_id == candidate.daemon_peer_id
-                    {
-                        last.workspace_already_local_before_candidate |=
-                            candidate.workspace_already_local_before_candidate;
-                        continue;
-                    }
-                }
-                normalized.push(candidate);
-            }
-
-            match normalized.as_slice() {
-                [] => BootstrapSessionFallbackDecision::RejectMissing,
-                [candidate] if candidate.workspace_already_local_before_candidate => {
-                    BootstrapSessionFallbackDecision::RejectAlreadyLocalWorkspaceCandidate
-                }
-                [candidate] => {
-                    BootstrapSessionFallbackDecision::UseFallback(BootstrapSessionFallback {
-                        daemon_peer_id: candidate.daemon_peer_id.clone(),
-                        invite_event_id: candidate.invite_event_id.clone(),
-                    })
-                }
-                _ => BootstrapSessionFallbackDecision::RejectAmbiguous,
+            if *workspace_already_local_before_candidate {
+                BootstrapSessionFallbackDecision::RejectAlreadyLocalWorkspaceCandidate
+            } else {
+                BootstrapSessionFallbackDecision::UseFallback(fallback.clone())
             }
         }
+        BootstrapSessionFallbackDecisionContext::AmbiguousCandidate => {
+            BootstrapSessionFallbackDecision::RejectAmbiguous
+        }
+    }
+}
+
+fn normalize_bootstrap_session_fallback_decision_context(
+    raw_rows: BootstrapSessionFallbackRawRows,
+) -> BootstrapSessionFallbackDecisionContext {
+    if raw_rows.require_local_bootstrap_phase && !raw_rows.local_bootstrap_phase {
+        return BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase;
+    }
+
+    let mut candidates = raw_rows.candidates;
+    candidates.sort_by(|a, b| {
+        a.invite_event_id
+            .cmp(&b.invite_event_id)
+            .then_with(|| a.daemon_peer_id.cmp(&b.daemon_peer_id))
+    });
+    let mut normalized: Vec<BootstrapSessionFallbackCandidate> = Vec::new();
+    for candidate in candidates {
+        if let Some(last) = normalized.last_mut() {
+            if last.invite_event_id == candidate.invite_event_id
+                && last.daemon_peer_id == candidate.daemon_peer_id
+            {
+                last.workspace_already_local_before_candidate |=
+                    candidate.workspace_already_local_before_candidate;
+                continue;
+            }
+        }
+        normalized.push(candidate);
+    }
+
+    match normalized.as_slice() {
+        [] => BootstrapSessionFallbackDecisionContext::MissingCandidate,
+        [candidate] => BootstrapSessionFallbackDecisionContext::UniqueCandidate {
+            fallback: BootstrapSessionFallback {
+                daemon_peer_id: candidate.daemon_peer_id.clone(),
+                invite_event_id: candidate.invite_event_id.clone(),
+            },
+            workspace_already_local_before_candidate: candidate
+                .workspace_already_local_before_candidate,
+        },
+        _ => BootstrapSessionFallbackDecisionContext::AmbiguousCandidate,
     }
 }
 
@@ -110,12 +137,13 @@ pub(super) fn resolve_active_bootstrap_session_fallback(
     require_local_bootstrap_phase: bool,
 ) -> Option<BootstrapSessionFallback> {
     let conn = open_connection(db_path).ok()?;
-    let decision =
-        decide_bootstrap_session_fallback(&BootstrapSessionFallbackContext::Candidates {
+    let decision_context =
+        normalize_bootstrap_session_fallback_decision_context(BootstrapSessionFallbackRawRows {
             require_local_bootstrap_phase,
             local_bootstrap_phase: local_transport_target_is_bootstrap(&conn, tenant_id),
             candidates: list_active_bootstrap_session_fallback_candidates(&conn, tenant_id).ok()?,
         });
+    let decision = decide_bootstrap_session_fallback(&decision_context);
     match decision {
         BootstrapSessionFallbackDecision::UseFallback(fallback) => Some(fallback),
         BootstrapSessionFallbackDecision::RejectRequiresLocalBootstrapPhase

@@ -74,7 +74,7 @@ impl TargetIngressSource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TargetDispatchContext {
+pub(super) struct TargetDispatchDecisionContext {
     pub(super) incoming_source: TargetIngressSourceKind,
     pub(super) should_initiate_connect: bool,
     pub(super) bootstrap_phase: bool,
@@ -115,7 +115,9 @@ pub(super) fn should_ignore_target_event(
     source_precedence(existing) > source_precedence(incoming)
 }
 
-pub(super) fn decide_target_dispatch_plan(context: &TargetDispatchContext) -> TargetDispatchPlan {
+pub(super) fn decide_target_dispatch_plan(
+    context: &TargetDispatchDecisionContext,
+) -> TargetDispatchPlan {
     if !context.should_initiate_connect {
         return TargetDispatchPlan::Skip(TargetDispatchSkipReason::NonPreferredSource);
     }
@@ -338,7 +340,7 @@ pub(super) async fn run_target_dispatcher(
                     .map(|existing| should_ignore_target_event(&existing.source, &event.source))
                     .unwrap_or(false);
         let dispatch_action = dispatch_action_for_event(&dispatcher, &event);
-        let dispatch_plan = decide_target_dispatch_plan(&TargetDispatchContext {
+        let dispatch_plan = decide_target_dispatch_plan(&TargetDispatchDecisionContext {
             incoming_source: event.source.kind(),
             should_initiate_connect,
             bootstrap_phase,
@@ -628,8 +630,8 @@ mod tests {
         bootstrap_phase: bool,
         has_active_higher_precedence_worker: bool,
         dispatch_action: DispatchAction,
-    ) -> TargetDispatchContext {
-        TargetDispatchContext {
+    ) -> TargetDispatchDecisionContext {
+        TargetDispatchDecisionContext {
             incoming_source: TargetIngressSourceKind::Bootstrap,
             should_initiate_connect: true,
             bootstrap_phase,
@@ -640,7 +642,7 @@ mod tests {
 
     #[test]
     fn target_dispatch_plan_skips_non_preferred_sources() {
-        let context = TargetDispatchContext {
+        let context = TargetDispatchDecisionContext {
             incoming_source: TargetIngressSourceKind::KnownPeer,
             should_initiate_connect: false,
             bootstrap_phase: false,
@@ -683,7 +685,7 @@ mod tests {
 
     #[test]
     fn known_peer_spawn_outside_bootstrap_phase_cancels_bootstrap_prefix() {
-        let context = TargetDispatchContext {
+        let context = TargetDispatchDecisionContext {
             incoming_source: TargetIngressSourceKind::KnownPeer,
             should_initiate_connect: true,
             bootstrap_phase: false,

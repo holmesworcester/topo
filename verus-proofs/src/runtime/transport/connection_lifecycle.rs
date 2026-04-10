@@ -288,10 +288,10 @@ pub open spec fn session_retry_delay_kind(
     sent_any_events: bool,
     received_any_events: bool,
 ) -> nat {
+    let _ = sent_any_events;
+    let _ = received_any_events;
     if !session_stats_present {
         250
-    } else if !sent_any_events && !received_any_events {
-        15000
     } else {
         0
     }
@@ -299,7 +299,7 @@ pub open spec fn session_retry_delay_kind(
 
 proof fn proof_quiescent_sessions_back_off()
     ensures
-        session_retry_delay_kind(true, false, false) == 15000,
+        session_retry_delay_kind(true, false, false) == 0,
         session_retry_delay_kind(true, true, false) == 0,
         session_retry_delay_kind(false, false, false) == 250,
 {

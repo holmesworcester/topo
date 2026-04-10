@@ -35,7 +35,7 @@ const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DialFailureContext {
+struct DialFailureDecisionContext {
     has_connected_once: bool,
     stale_dial_failure: bool,
     consecutive_stale_dial_failures: u32,
@@ -61,9 +61,25 @@ enum SessionOpenFailurePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionOpenFailureDecisionContext {
+    connection_lost: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionAuthFailureDecisionContext {
+    connection_lost: bool,
+    bootstrap_retry_invite: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionAuthFailurePlan {
     next_auth_plan_override: Option<OutboundSessionAuthPlan>,
     evict_live_connection: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRetryDecisionContext {
+    session_stats_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +116,7 @@ fn should_evict_closed_daemon_connection(
     is_connection_lost_message(message)
 }
 
-fn decide_dial_failure_plan(context: &DialFailureContext) -> DialFailurePlan {
+fn decide_dial_failure_plan(context: &DialFailureDecisionContext) -> DialFailurePlan {
     let should_warn = should_warn_for_connect_failure(
         context.has_connected_once,
         context.stale_dial_failure,
@@ -126,8 +142,10 @@ fn decide_dial_failure_plan(context: &DialFailureContext) -> DialFailurePlan {
     }
 }
 
-fn decide_session_open_failure_plan(connection_lost: bool) -> SessionOpenFailurePlan {
-    if connection_lost {
+fn decide_session_open_failure_plan(
+    context: &SessionOpenFailureDecisionContext,
+) -> SessionOpenFailurePlan {
+    if context.connection_lost {
         SessionOpenFailurePlan::EvictAndBreak
     } else {
         SessionOpenFailurePlan::Break
@@ -135,22 +153,29 @@ fn decide_session_open_failure_plan(connection_lost: bool) -> SessionOpenFailure
 }
 
 fn decide_session_auth_failure_plan(
-    connection_lost: bool,
-    bootstrap_retry_invite: Option<String>,
+    context: SessionAuthFailureDecisionContext,
 ) -> SessionAuthFailurePlan {
     SessionAuthFailurePlan {
-        next_auth_plan_override: bootstrap_retry_invite
+        next_auth_plan_override: context
+            .bootstrap_retry_invite
             .map(|invite_event_id| OutboundSessionAuthPlan::InviteBootstrap { invite_event_id }),
-        evict_live_connection: connection_lost,
+        evict_live_connection: context.connection_lost,
     }
 }
 
-fn decide_session_retry_plan(
+fn normalize_session_retry_decision_context(
     session_stats: Option<&crate::runtime::SyncStats>,
-) -> SessionRetryPlan {
-    match session_stats {
-        Some(_) => SessionRetryPlan::NoDelay,
-        None => SessionRetryPlan::Delay(Duration::from_millis(250)),
+) -> SessionRetryDecisionContext {
+    SessionRetryDecisionContext {
+        session_stats_present: session_stats.is_some(),
+    }
+}
+
+fn decide_session_retry_plan(context: &SessionRetryDecisionContext) -> SessionRetryPlan {
+    if context.session_stats_present {
+        SessionRetryPlan::NoDelay
+    } else {
+        SessionRetryPlan::Delay(Duration::from_millis(250))
     }
 }
 
@@ -258,7 +283,7 @@ async fn connect_loop_inner(
                 Ok(outcome) => outcome,
                 Err(e) => {
                     let message = describe_connect_failure(&remote_target, &e);
-                    let dial_failure_plan = decide_dial_failure_plan(&DialFailureContext {
+                    let dial_failure_plan = decide_dial_failure_plan(&DialFailureDecisionContext {
                         has_connected_once,
                         stale_dial_failure: is_stale_dial_failure(&e),
                         consecutive_stale_dial_failures,
@@ -353,9 +378,13 @@ async fn connect_loop_inner(
                     if let Some(reason) = extract_build_mismatch_reason(&err.to_string()) {
                         note_build_mismatch(daemon_connection.remote_daemon_peer_id(), reason);
                     }
-                    let plan = decide_session_open_failure_plan(
-                        should_evict_closed_daemon_connection(&daemon_connection, &err.to_string()),
-                    );
+                    let plan =
+                        decide_session_open_failure_plan(&SessionOpenFailureDecisionContext {
+                            connection_lost: should_evict_closed_daemon_connection(
+                                &daemon_connection,
+                                &err.to_string(),
+                            ),
+                        });
                     if matches!(plan, SessionOpenFailurePlan::EvictAndBreak) {
                         daemon_connection
                             .connection()
@@ -421,10 +450,14 @@ async fn connect_loop_inner(
                     auth_result
                 }
                 Err(e) => {
-                    let plan = decide_session_auth_failure_plan(
-                        should_evict_closed_daemon_connection(&daemon_connection, &e.to_string()),
-                        bootstrap_retry_invite,
-                    );
+                    let plan =
+                        decide_session_auth_failure_plan(SessionAuthFailureDecisionContext {
+                            connection_lost: should_evict_closed_daemon_connection(
+                                &daemon_connection,
+                                &e.to_string(),
+                            ),
+                            bootstrap_retry_invite,
+                        });
                     next_auth_plan_override = plan.next_auth_plan_override.clone();
                     if plan.evict_live_connection {
                         daemon_connection
@@ -510,7 +543,9 @@ async fn connect_loop_inner(
             )
             .await;
 
-            let session_retry_plan = decide_session_retry_plan(session_stats.as_ref());
+            let session_retry_context =
+                normalize_session_retry_decision_context(session_stats.as_ref());
+            let session_retry_plan = decide_session_retry_plan(&session_retry_context);
             let session_retry_delay = match session_retry_plan {
                 SessionRetryPlan::NoDelay => Duration::ZERO,
                 SessionRetryPlan::Delay(delay) => delay,
@@ -725,7 +760,7 @@ mod tests {
     #[test]
     fn dial_failure_plan_terminates_after_threshold_stale_failures() {
         assert_eq!(
-            decide_dial_failure_plan(&DialFailureContext {
+            decide_dial_failure_plan(&DialFailureDecisionContext {
                 has_connected_once: false,
                 stale_dial_failure: true,
                 consecutive_stale_dial_failures: STALE_DIAL_FAILURE_THRESHOLD - 1,
@@ -741,7 +776,10 @@ mod tests {
     #[test]
     fn session_auth_failure_plan_preserves_bootstrap_retry_override() {
         assert_eq!(
-            decide_session_auth_failure_plan(true, Some("invite-1".to_string())),
+            decide_session_auth_failure_plan(SessionAuthFailureDecisionContext {
+                connection_lost: true,
+                bootstrap_retry_invite: Some("invite-1".to_string()),
+            }),
             SessionAuthFailurePlan {
                 next_auth_plan_override: Some(OutboundSessionAuthPlan::InviteBootstrap {
                     invite_event_id: "invite-1".to_string(),
@@ -762,7 +800,7 @@ mod tests {
             duration_ms: 0,
         };
         assert_eq!(
-            decide_session_retry_plan(Some(&stats)),
+            decide_session_retry_plan(&normalize_session_retry_decision_context(Some(&stats))),
             SessionRetryPlan::NoDelay
         );
     }
