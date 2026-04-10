@@ -52,6 +52,12 @@ pub enum ProjectionDecisionEffectPlan {
     NoEffects,
 }
 
+pub struct ProjectionEffectAllowance {
+    pub allow_write_ops: bool,
+    pub allow_emit_commands: bool,
+    pub allow_record_block: bool,
+}
+
 pub open spec fn normalize_context_load_disposition(
     raw_rows: ContextLoadDispositionRawRows,
 ) -> ContextLoadDispositionDecisionContext {
@@ -105,6 +111,28 @@ pub open spec fn decide_projection_decision_effect_plan(
         | ProjectionDecisionEffectDecisionContext::AlreadyProcessed => {
             ProjectionDecisionEffectPlan::NoEffects
         }
+    }
+}
+
+pub open spec fn projection_effect_allowance(
+    plan: ProjectionDecisionEffectPlan,
+) -> ProjectionEffectAllowance {
+    match plan {
+        ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands => ProjectionEffectAllowance {
+            allow_write_ops: true,
+            allow_emit_commands: true,
+            allow_record_block: false,
+        },
+        ProjectionDecisionEffectPlan::EmitCommandsOnly => ProjectionEffectAllowance {
+            allow_write_ops: false,
+            allow_emit_commands: true,
+            allow_record_block: true,
+        },
+        ProjectionDecisionEffectPlan::NoEffects => ProjectionEffectAllowance {
+            allow_write_ops: false,
+            allow_emit_commands: false,
+            allow_record_block: false,
+        },
     }
 }
 
@@ -175,12 +203,57 @@ proof fn reject_and_already_processed_have_no_effects()
 {
 }
 
+proof fn reject_and_already_processed_allow_no_executor_effects()
+    ensures
+        projection_effect_allowance(decide_projection_decision_effect_plan(
+            normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Reject),
+        )) == (ProjectionEffectAllowance {
+            allow_write_ops: false,
+            allow_emit_commands: false,
+            allow_record_block: false,
+        }),
+        projection_effect_allowance(decide_projection_decision_effect_plan(
+            normalize_projection_decision_effect_context(
+                ProjectionDecisionEffectRawRows::AlreadyProcessed,
+            ),
+        )) == (ProjectionEffectAllowance {
+            allow_write_ops: false,
+            allow_emit_commands: false,
+            allow_record_block: false,
+        }),
+{
+}
+
 proof fn valid_applies_write_ops_and_commands()
     ensures
         decide_projection_decision_effect_plan(normalize_projection_decision_effect_context(
             ProjectionDecisionEffectRawRows::Valid,
         ))
             == ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands,
+{
+}
+
+proof fn block_decision_never_allows_write_ops()
+    ensures
+        projection_effect_allowance(decide_projection_decision_effect_plan(
+            normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Block),
+        )) == (ProjectionEffectAllowance {
+            allow_write_ops: false,
+            allow_emit_commands: true,
+            allow_record_block: true,
+        }),
+{
+}
+
+proof fn valid_decision_allows_write_ops_and_commands_only()
+    ensures
+        projection_effect_allowance(decide_projection_decision_effect_plan(
+            normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Valid),
+        )) == (ProjectionEffectAllowance {
+            allow_write_ops: true,
+            allow_emit_commands: true,
+            allow_record_block: false,
+        }),
 {
 }
 

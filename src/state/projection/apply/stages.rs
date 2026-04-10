@@ -717,4 +717,39 @@ mod tests {
             ProjectionDecisionEffectPlan::NoEffects
         );
     }
+
+    #[test]
+    fn projection_decision_effect_plan_disables_effects_for_already_processed() {
+        let context = normalize_projection_decision_effect_context(
+            load_projection_decision_effect_raw_rows(&ProjectionDecision::AlreadyProcessed),
+        );
+        assert_eq!(
+            context,
+            ProjectionDecisionEffectDecisionContext::AlreadyProcessed
+        );
+        assert_eq!(
+            decide_projection_decision_effect_plan(&context),
+            ProjectionDecisionEffectPlan::NoEffects
+        );
+    }
+
+    #[test]
+    fn projection_decision_effect_plan_does_not_apply_writes_for_blocks() {
+        let missing = vec![[0x22; 32]];
+        let context = normalize_projection_decision_effect_context(
+            load_projection_decision_effect_raw_rows(&ProjectionDecision::Block {
+                missing: missing.clone(),
+            }),
+        );
+        assert_eq!(
+            context,
+            ProjectionDecisionEffectDecisionContext::Block {
+                missing: missing.clone(),
+            }
+        );
+        assert_eq!(
+            decide_projection_decision_effect_plan(&context),
+            ProjectionDecisionEffectPlan::EmitCommandsOnly { missing }
+        );
+    }
 }
