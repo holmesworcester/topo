@@ -118,8 +118,9 @@ These are required, not optional:
    - `peer_shared` projection materializes deterministic `peers_shared.transport_fingerprint` and indexes `(recorded_by, transport_fingerprint)`.
    - trust lookup paths use projected `transport_fingerprint` rows and do not fallback to runtime scan+derive over `peers_shared.public_key`.
 13. Context-query planner seam for proof-bearing runtime policy.
-   - security-sensitive runtime behavior should be structured as `context query -> pure planner -> executor`.
-   - the context query is responsible for loading and normalizing the SQL snapshot that determines behavior.
+   - security-sensitive runtime behavior should be structured as `context query -> normalizer -> pure planner -> executor`.
+   - the context query is responsible for loading typed raw rows from the SQL state that determines behavior.
+   - a pure normalizer collapses those rows into the normalized decision boundary.
    - here `DecisionContext` means the normalized post-query decision boundary, not a full database snapshot: the smallest typed value that still determines one runtime decision.
    - raw typed rows belong to the query boundary; the `DecisionContext` is the post-normalization ADT consumed by the planner.
    - the planner must be side-effect free and emit an explicit plan enum/flags.
@@ -134,6 +135,15 @@ These are required, not optional:
 
 Goal: cover security-sensitive behavior as a composition of proof-bearing seams instead of one monolithic proof over live SQL, network I/O, and concurrency.
 
+End-to-end chain to preserve:
+
+1. command parameters or outside wire input become canonical events where possible,
+2. events project through the normal projector pipeline into SQLite,
+3. SQL queries return typed `RawRows` for one decision,
+4. normalizers build constrained `DecisionContext` values from those rows,
+5. pure planners emit explicit `Plan` values,
+6. executors perform only the runtime actions named by the plan.
+
 Required shape per seam:
 
 1. `RawRows`: typed query result(s) representing the actual SQL boundary.
@@ -142,6 +152,14 @@ Required shape per seam:
 4. `normalize_*`: pure collapse from `RawRows -> DecisionContext`.
 5. `decide_*`: pure planner from `DecisionContext -> Plan`.
 6. executor: runtime code that performs only the effects named by `Plan`.
+
+Proof organization:
+
+1. Verus files live in a mirrored tree under `verus-proofs/src/`, matching production ownership (`runtime/...`, `state/...`, `pipeline/...`).
+2. Proof modules model the `RawRows`, `DecisionContext`, normalizer, planner, and plan invariants for the owning runtime seam.
+3. Production Rust modules should expose small pure normalizer/planner functions when possible, but they should not absorb large inline proof blocks.
+4. Inline Verus proof code is allowed only for small local facts where colocating the proof is clearer than creating a mirrored module.
+5. The working seam inventory is `docs/planning/FORMAL_SEAM_COVERAGE.md`; update it when a proof-bearing seam is added, moved, or renamed.
 
 Required proof/test split:
 

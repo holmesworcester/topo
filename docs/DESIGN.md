@@ -74,12 +74,14 @@ The design goal is to keep protocol behavior auditable while still supporting re
 
 For security-sensitive runtime behavior, the preferred shape is:
 
-1. one context query loads a transactionally consistent snapshot of the relevant SQL state,
-2. one normalizer collapses the raw query result into a `DecisionContext`,
-3. one pure planner maps that `DecisionContext` to an explicit plan,
-4. one executor performs only the side effects named by that plan.
+1. commands or wire input become canonical events where possible,
+2. projectors materialize those events into SQLite through the normal pipeline,
+3. one context query loads transactionally consistent typed raw rows for the runtime decision,
+4. one normalizer collapses the raw rows into a `DecisionContext`,
+5. one pure planner maps that `DecisionContext` to an explicit plan,
+6. one executor performs only the side effects named by that plan.
 
-The context query should collapse live runtime state into the smallest stable decision context that still determines behavior. Avoid planners that reach back into SQLite, inspect the network directly, or depend on hidden ambient state after the decision context is loaded.
+The normalizer should collapse live runtime state into the smallest stable decision context that still determines behavior. Avoid planners that reach back into SQLite, inspect the network directly, or depend on hidden ambient state after the decision context is loaded.
 
 This shape is important for proofs. Verus can prove local planner properties such as noninterference, rejection on ambiguity, or "already-local means no bootstrap" directly over the decision-context-to-plan function. TLA can then model retries, refresh loops, cancellation, and cross-component composition around that planner without needing to model SQL internals in full detail.
 
@@ -92,12 +94,21 @@ Preferred boundary:
 3. a pure planner maps `*DecisionContext -> *Plan`,
 4. an executor performs only the effects named by `*Plan`.
 
+Proof split:
+
+1. runtime tests prove the SQL query returns the raw rows intended for representative database states,
+2. Verus proves the normalizer and planner over pure data types,
+3. executor tests prove each plan variant produces only the named side effects,
+4. TLA models temporal behavior such as retry, refresh, cancellation, and multi-node interleaving.
+
 Design guidance:
 
-1. decision-context queries should deduplicate and normalize rows before returning them to the planner,
+1. decision-context queries should return typed raw rows with enough data for the normalizer to detect absence, ambiguity, and malformation,
 2. planner outputs should be explicit enums/flags rather than implicit control flow,
 3. executors should not add extra authority decisions beyond the emitted plan,
 4. when a behavior needs a proof, prefer introducing a context-query seam rather than proving over ad-hoc interleaved SQL and network logic.
+
+Verus proof organization mirrors runtime ownership instead of living inline in production modules. The proof tree under `verus-proofs/src/` should follow the owning Rust module shape (`runtime/...`, `state/...`, `pipeline/...`) so proof modules can be reviewed with the code they model without adding verification-only syntax to hot production files. Inline proof-style code is reserved for tiny local helpers only when it materially improves readability.
 
 For the accepted-workspace guard specifically, the context query normalizes
 `invites_accepted` by distinct `workspace_id`: zero rows block on missing
