@@ -6,12 +6,12 @@
 //!   normal preferred-side gate?
 
 use crate::db::open_connection;
-use crate::db::transport_creds::{resolve_tenant_transport_target, CRED_SOURCE_BOOTSTRAP};
+use crate::db::transport_creds::{CRED_SOURCE_BOOTSTRAP, resolve_tenant_transport_target};
 use crate::db::transport_trust::{
-    list_active_bootstrap_session_fallback_candidates, BootstrapSessionFallbackCandidate,
+    BootstrapSessionFallbackCandidate, list_active_bootstrap_session_fallback_candidates,
 };
 
-use super::target_dispatch::{should_initiate_connect_for_source, TargetIngressSource};
+use super::target_dispatch::{TargetIngressSource, should_initiate_connect_for_source};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BootstrapSessionFallback {
@@ -38,36 +38,36 @@ enum BootstrapSessionFallbackDecisionContext {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum BootstrapSessionFallbackDecision {
+enum BootstrapSessionFallbackPlan {
     RejectRequiresLocalBootstrapPhase,
-    RejectMissing,
+    RejectMissingCandidate,
     UseFallback(BootstrapSessionFallback),
-    RejectAmbiguous,
+    RejectAmbiguousCandidate,
     RejectAlreadyLocalWorkspaceCandidate,
 }
 
-fn decide_bootstrap_session_fallback(
+fn decide_bootstrap_session_fallback_plan(
     context: &BootstrapSessionFallbackDecisionContext,
-) -> BootstrapSessionFallbackDecision {
+) -> BootstrapSessionFallbackPlan {
     match context {
         BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase => {
-            BootstrapSessionFallbackDecision::RejectRequiresLocalBootstrapPhase
+            BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase
         }
         BootstrapSessionFallbackDecisionContext::MissingCandidate => {
-            BootstrapSessionFallbackDecision::RejectMissing
+            BootstrapSessionFallbackPlan::RejectMissingCandidate
         }
         BootstrapSessionFallbackDecisionContext::UniqueCandidate {
             fallback,
             workspace_already_local_before_candidate,
         } => {
             if *workspace_already_local_before_candidate {
-                BootstrapSessionFallbackDecision::RejectAlreadyLocalWorkspaceCandidate
+                BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate
             } else {
-                BootstrapSessionFallbackDecision::UseFallback(fallback.clone())
+                BootstrapSessionFallbackPlan::UseFallback(fallback.clone())
             }
         }
         BootstrapSessionFallbackDecisionContext::AmbiguousCandidate => {
-            BootstrapSessionFallbackDecision::RejectAmbiguous
+            BootstrapSessionFallbackPlan::RejectAmbiguousCandidate
         }
     }
 }
@@ -143,13 +143,13 @@ pub(super) fn resolve_active_bootstrap_session_fallback(
             local_bootstrap_phase: local_transport_target_is_bootstrap(&conn, tenant_id),
             candidates: list_active_bootstrap_session_fallback_candidates(&conn, tenant_id).ok()?,
         });
-    let decision = decide_bootstrap_session_fallback(&decision_context);
-    match decision {
-        BootstrapSessionFallbackDecision::UseFallback(fallback) => Some(fallback),
-        BootstrapSessionFallbackDecision::RejectRequiresLocalBootstrapPhase
-        | BootstrapSessionFallbackDecision::RejectMissing
-        | BootstrapSessionFallbackDecision::RejectAmbiguous
-        | BootstrapSessionFallbackDecision::RejectAlreadyLocalWorkspaceCandidate => None,
+    let plan = decide_bootstrap_session_fallback_plan(&decision_context);
+    match plan {
+        BootstrapSessionFallbackPlan::UseFallback(fallback) => Some(fallback),
+        BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase
+        | BootstrapSessionFallbackPlan::RejectMissingCandidate
+        | BootstrapSessionFallbackPlan::RejectAmbiguousCandidate
+        | BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate => None,
     }
 }
 
@@ -172,7 +172,7 @@ mod tests {
     use super::*;
     use crate::db::open_connection;
     use crate::db::schema::create_tables;
-    use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_BOOTSTRAP};
+    use crate::db::transport_creds::{CRED_SOURCE_BOOTSTRAP, set_local_transport_target};
     use crate::db::transport_trust::record_invite_bootstrap_trust;
 
     #[test]
