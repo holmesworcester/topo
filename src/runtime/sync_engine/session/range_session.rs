@@ -5,7 +5,7 @@ use std::time::Duration;
 use negentropy::{Id, NegentropyStorageVector};
 use rusqlite::Connection;
 
-use crate::crypto::{event_id_to_base64, hash_event, EventId};
+use crate::crypto::{EventId, event_id_to_base64, hash_event};
 use crate::db::hot_week_deps::{
     list_hot_week_dep_entries, should_include_week_deps, week_starts_for_window,
 };
@@ -37,8 +37,20 @@ struct SharedSyncEntryDecisionContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedSyncEntryRawRows {
+    window_kind: SyncWindowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SharedSyncEntryPlan {
     include_hot_week_deps: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedDepOrderRawRows {
+    dep_is_selected: bool,
+    dep_already_emitted: bool,
+    dep_currently_visiting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,21 +75,34 @@ fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolic
     }
 }
 
-fn decide_shared_sync_entry_plan(
-    context: &SharedSyncEntryDecisionContext,
-) -> SharedSyncEntryPlan {
+fn normalize_shared_sync_entry_context(
+    raw_rows: SharedSyncEntryRawRows,
+) -> SharedSyncEntryDecisionContext {
+    SharedSyncEntryDecisionContext {
+        window_kind: raw_rows.window_kind,
+    }
+}
+
+fn decide_shared_sync_entry_plan(context: &SharedSyncEntryDecisionContext) -> SharedSyncEntryPlan {
     SharedSyncEntryPlan {
         include_hot_week_deps: should_include_week_deps(context.window_kind),
+    }
+}
+
+fn normalize_selected_dep_order_context(
+    raw_rows: SelectedDepOrderRawRows,
+) -> SelectedDepOrderDecisionContext {
+    SelectedDepOrderDecisionContext {
+        dep_is_selected: raw_rows.dep_is_selected,
+        dep_already_emitted: raw_rows.dep_already_emitted,
+        dep_currently_visiting: raw_rows.dep_currently_visiting,
     }
 }
 
 fn decide_selected_dep_order_plan(
     context: &SelectedDepOrderDecisionContext,
 ) -> SelectedDepOrderPlan {
-    if context.dep_is_selected
-        && !context.dep_already_emitted
-        && !context.dep_currently_visiting
-    {
+    if context.dep_is_selected && !context.dep_already_emitted && !context.dep_currently_visiting {
         SelectedDepOrderPlan::EmitDepBeforeRoot
     } else {
         SelectedDepOrderPlan::SkipDepEdge
@@ -142,9 +167,11 @@ fn load_shared_sync_entries(
         }
     }
 
-    let sync_entry_plan = decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-        window_kind: range.kind,
-    });
+    let sync_entry_plan = decide_shared_sync_entry_plan(&normalize_shared_sync_entry_context(
+        SharedSyncEntryRawRows {
+            window_kind: range.kind,
+        },
+    ));
     if sync_entry_plan.include_hot_week_deps {
         let now_ms = range
             .ts_max_exclusive()
@@ -286,11 +313,13 @@ fn visit_selected_send_order(
         created_at_by_id,
         dep_cache,
     )? {
-        let dep_plan = decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
-            dep_is_selected: selected_ids.contains(&dep_id),
-            dep_already_emitted: emitted.contains(&dep_id),
-            dep_currently_visiting: visiting.contains(&dep_id),
-        });
+        let dep_plan = decide_selected_dep_order_plan(&normalize_selected_dep_order_context(
+            SelectedDepOrderRawRows {
+                dep_is_selected: selected_ids.contains(&dep_id),
+                dep_already_emitted: emitted.contains(&dep_id),
+                dep_currently_visiting: visiting.contains(&dep_id),
+            },
+        ));
         match dep_plan {
             SelectedDepOrderPlan::EmitDepBeforeRoot => {
                 visit_selected_send_order(
@@ -486,8 +515,8 @@ mod tests {
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
     use crate::db::{open_connection, open_in_memory};
     use crate::event_modules::{
-        encode_event, endpoint_shared, registry::ShareScope, BenchDepEvent, MessageEvent,
-        ParsedEvent, PeerSharedEvent,
+        BenchDepEvent, MessageEvent, ParsedEvent, PeerSharedEvent, encode_event, endpoint_shared,
+        registry::ShareScope,
     };
     use crate::state::pipeline::ingest_now;
 
@@ -755,6 +784,26 @@ mod tests {
     }
 
     #[test]
+    fn shared_sync_entry_normalizer_preserves_raw_rows_for_planner() {
+        let raw = SharedSyncEntryRawRows {
+            window_kind: SyncWindowKind::LastDay,
+        };
+        let context = normalize_shared_sync_entry_context(raw);
+        assert_eq!(
+            context,
+            SharedSyncEntryDecisionContext {
+                window_kind: SyncWindowKind::LastDay,
+            }
+        );
+        assert_eq!(
+            decide_shared_sync_entry_plan(&context),
+            SharedSyncEntryPlan {
+                include_hot_week_deps: true,
+            }
+        );
+    }
+
+    #[test]
     fn selected_dep_order_plan_emits_only_selected_unvisited_deps() {
         assert_eq!(
             decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
@@ -787,6 +836,28 @@ mod tests {
                 dep_currently_visiting: true,
             }),
             SelectedDepOrderPlan::SkipDepEdge
+        );
+    }
+
+    #[test]
+    fn selected_dep_order_normalizer_preserves_raw_rows_for_planner() {
+        let raw = SelectedDepOrderRawRows {
+            dep_is_selected: true,
+            dep_already_emitted: false,
+            dep_currently_visiting: false,
+        };
+        let context = normalize_selected_dep_order_context(raw);
+        assert_eq!(
+            context,
+            SelectedDepOrderDecisionContext {
+                dep_is_selected: true,
+                dep_already_emitted: false,
+                dep_currently_visiting: false,
+            }
+        );
+        assert_eq!(
+            decide_selected_dep_order_plan(&context),
+            SelectedDepOrderPlan::EmitDepBeforeRoot
         );
     }
 
