@@ -111,13 +111,13 @@ pub fn encode_signed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(out)
 }
 
-use crate::projection::contract::{ContextSnapshot, ProjectorResult};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult};
 
 pub fn project_pure(
     _recorded_by: &str,
     _event_id_b64: &str,
     _parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    _ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     ProjectorResult::reject("signed events should not reach projector dispatch".to_string())
 }

@@ -195,11 +195,11 @@ fn decide_projection_decision_effect_plan(
     }
 }
 
-/// Shared projection helper: verify signer (if required), build context snapshot,
+/// Shared projection helper: verify signer (if required), build decision context,
 /// dispatch to pure projector, execute write_ops, return decision.
 ///
 /// This is the core of the pure functional projector architecture: projectors
-/// are pure functions over (event, context snapshot) that return deterministic
+/// are pure functions over (event, decision context) that return deterministic
 /// write_ops and emit_commands. The apply engine executes them.
 pub(crate) fn apply_projection_with_backend<B: ProjectionBackend>(
     backend: &B,

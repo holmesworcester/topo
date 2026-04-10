@@ -1,4 +1,4 @@
-use super::super::contract::{ContextSnapshot, ProjectorResult};
+use super::super::contract::{ProjectorDecisionContext, ProjectorResult};
 use crate::event_modules::{registry, ParsedEvent};
 
 /// Dispatch to the appropriate pure projector via registry lookup.
@@ -9,7 +9,7 @@ pub(crate) fn dispatch_pure_projector(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let type_code = parsed.event_type_code();
     match registry().lookup(type_code) {

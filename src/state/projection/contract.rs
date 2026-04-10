@@ -1,6 +1,6 @@
 //! Pure projector contract types.
 //!
-//! Projectors are pure functions over `(ParsedEvent, ContextSnapshot)` that
+//! Projectors are pure functions over `(ParsedEvent, ProjectorDecisionContext)` that
 //! return a `ProjectorResult`. They do not execute SQL or any other side
 //! effects directly. The apply engine in `apply.rs` executes the returned
 //! `write_ops` transactionally, then runs `emit_commands` via explicit handlers.
@@ -146,14 +146,14 @@ pub struct CurrentSignerInfo {
     pub semantic_type_code: u8,
 }
 
-/// Read-model snapshot passed to pure projectors for context queries.
+/// Read-model decision context passed to pure projectors for decision-context queries.
 ///
 /// Projectors must not access the database directly. Instead, the pipeline
 /// populates this struct with whatever the projector needs to make its
 /// decision. Fields are `Option` — only populated when the projector's
 /// event type requires them.
 #[derive(Debug, Clone, Default)]
-pub struct ContextSnapshot {
+pub struct ProjectorDecisionContext {
     /// Accepted workspace_id for this tenant (from invites_accepted projection rows).
     pub accepted_workspace_id: Option<String>,
 
@@ -219,7 +219,7 @@ pub struct ContextSnapshot {
     /// For invite events (UserInvite, DeviceInvite, InviteAccepted):
     /// local bootstrap context if available. Populated from `bootstrap_context`
     /// table so projectors can emit trust writes without the service layer.
-    pub bootstrap_context: Option<BootstrapContextSnapshot>,
+    pub bootstrap_context: Option<BootstrapDecisionContext>,
 
     /// For invite events signed by peer_shared: whether `authority_event_id`
     /// resolves to the identity authorized by `signed_by`.
@@ -260,9 +260,9 @@ pub struct UnwrappedSecretMaterial {
 }
 
 /// Bootstrap context read from the `bootstrap_context` table, passed to
-/// projectors as part of `ContextSnapshot`.
+/// projectors as part of `ProjectorDecisionContext`.
 #[derive(Debug, Clone)]
-pub struct BootstrapContextSnapshot {
+pub struct BootstrapDecisionContext {
     pub workspace_id: String,
     pub bootstrap_addrs: Vec<String>,
     pub bootstrap_spki_fingerprint: [u8; 32],

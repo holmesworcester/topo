@@ -1,7 +1,7 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::event_modules::{EVENT_TYPE_PEER_SHARED, EVENT_TYPE_USER};
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
@@ -50,7 +50,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let (public_key, created_at_ms) = match parsed {
         ParsedEvent::DeviceInvite(di) => (&di.public_key, di.created_at_ms as i64),
@@ -105,7 +105,7 @@ mod device_invite_projector_tests {
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{DeviceInviteEvent, ParsedEvent, WorkspaceEvent};
     use crate::projection::contract::{
-        BootstrapContextSnapshot, ContextSnapshot, CurrentSignerInfo, WriteOp,
+        BootstrapDecisionContext, CurrentSignerInfo, ProjectorDecisionContext, WriteOp,
     };
     use crate::projection::decision::ProjectionDecision;
     use crate::projection::queries::ProjectionFrameContext;
@@ -126,15 +126,15 @@ mod device_invite_projector_tests {
         })
     }
 
-    fn local_bootstrap_ctx() -> ContextSnapshot {
-        ContextSnapshot {
-            bootstrap_context: Some(BootstrapContextSnapshot {
+    fn local_bootstrap_ctx() -> ProjectorDecisionContext {
+        ProjectorDecisionContext {
+            bootstrap_context: Some(BootstrapDecisionContext {
                 workspace_id: "workspace".to_string(),
                 bootstrap_addrs: vec!["tcp://127.0.0.1:7777".to_string()],
                 bootstrap_spki_fingerprint: [7u8; 32],
             }),
             is_local_create: true,
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         }
     }
 
@@ -233,7 +233,7 @@ mod device_invite_projector_tests {
             "peer1",
             "workspace-event",
             &other,
-            &ContextSnapshot::default(),
+            &ProjectorDecisionContext::default(),
         );
         assert!(matches!(result.decision, ProjectionDecision::Reject { .. }));
     }

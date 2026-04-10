@@ -1,6 +1,8 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{
+    EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
+};
 use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
@@ -24,14 +26,14 @@ pub fn build_projector_context(
 
 /// Pure projector: Message -> messages table insert.
 ///
-/// Also checks the context snapshot for a matching deletion_intent. If the
+/// Also checks the decision context for a matching deletion_intent. If the
 /// message target already has a deletion intent recorded, the message is
 /// projected as tombstoned on first materialization.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let msg = match parsed {
         ParsedEvent::Message(m) => m,

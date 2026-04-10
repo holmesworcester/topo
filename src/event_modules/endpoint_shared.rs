@@ -3,7 +3,7 @@ use super::layout::field_spec::{
 };
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_ENDPOINT_SHARED};
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::{Connection, OptionalExtension};
 
 pub const ENDPOINT_SHARED_FIELDS: &[FieldSpec] = &[
@@ -235,7 +235,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    _ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let event = match parsed {
         ParsedEvent::EndpointShared(v) => v,

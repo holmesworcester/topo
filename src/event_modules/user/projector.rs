@@ -1,12 +1,12 @@
 use super::super::ParsedEvent;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: User -> users table.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    _ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let (public_key, username) = match parsed {
         ParsedEvent::User(u) => (&u.public_key, &u.username),
@@ -49,7 +49,7 @@ mod projector_tests {
             "peer1",
             "user-event",
             &user_event(),
-            &ContextSnapshot::default(),
+            &ProjectorDecisionContext::default(),
         );
         assert!(matches!(
             result.decision,
@@ -69,7 +69,7 @@ mod projector_tests {
             "peer1",
             "workspace-event",
             &other,
-            &ContextSnapshot::default(),
+            &ProjectorDecisionContext::default(),
         );
         assert!(matches!(
             result.decision,

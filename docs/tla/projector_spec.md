@@ -469,7 +469,7 @@ TLC status: correct model passes (11.5M states, 771K distinct, 2 peers / 3 SPKIs
 Buggy model (guard weakened to `inviteCreator[s] # None`) violates invariant in 5 steps:
 counterexample shows Bob (joiner) materializing pending trust for Alice's (inviter's) SPKI.
 
-Rust mapping: `is_local_create` field in `ContextSnapshot` (populated from
+Rust mapping: `is_local_create` field in `ProjectorDecisionContext` (populated from
 `recorded_events.source`) gates `WritePendingBootstrapTrust` emission in
 UserInvite and DeviceInvite projectors.
 

@@ -1,5 +1,5 @@
 use super::super::ParsedEvent;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
@@ -26,7 +26,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    _ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let public_key = match parsed {
         ParsedEvent::Admin(a) => &a.public_key,
@@ -69,7 +69,7 @@ mod projector_tests {
             "peer1",
             "admin-event",
             &admin_event(),
-            &ContextSnapshot::default(),
+            &ProjectorDecisionContext::default(),
         );
         assert!(matches!(
             result.decision,
@@ -89,7 +89,7 @@ mod projector_tests {
             "peer1",
             "workspace-event",
             &other,
-            &ContextSnapshot::default(),
+            &ProjectorDecisionContext::default(),
         );
         assert!(matches!(
             result.decision,

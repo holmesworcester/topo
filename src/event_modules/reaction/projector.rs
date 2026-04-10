@@ -1,6 +1,6 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
@@ -30,7 +30,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let rxn = match parsed {
         ParsedEvent::Reaction(r) => r,

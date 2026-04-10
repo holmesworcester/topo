@@ -105,14 +105,14 @@ pub fn encode_bench_dep(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 // === Projector (event-module locality) ===
 
-use crate::projection::contract::{ContextSnapshot, ProjectorResult};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult};
 
 /// Pure projector: BenchDep — no projection table, valid_events tracks completion.
 pub fn project_pure(
     _recorded_by: &str,
     _event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    _ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     match parsed {
         ParsedEvent::BenchDep(_) => {}

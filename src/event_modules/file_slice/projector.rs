@@ -2,7 +2,7 @@ use super::super::ParsedEvent;
 use super::wire::{unpack_bao_payload, FILE_SLICE_CIPHERTEXT_BYTES};
 use crate::crypto::bao_verify;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
@@ -26,7 +26,7 @@ pub fn build_projector_context(
 
 /// Pure projector: FileSlice → file_slices table insert.
 ///
-/// Uses ContextSnapshot.file_descriptors to determine authorization:
+/// Uses ProjectorDecisionContext.file_descriptors to determine authorization:
 /// - No descriptors → dep-block on file_id
 /// - Multiple descriptors → reject
 /// - Signer mismatch → reject
@@ -36,7 +36,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let fs = match parsed {
         ParsedEvent::FileSlice(f) => f,

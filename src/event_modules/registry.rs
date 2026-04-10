@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::{EventError, ParsedEvent};
-use crate::projection::contract::{ContextSnapshot, ProjectorResult};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult};
 use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub struct EventTypeMeta {
     pub encryptable: bool,
     pub parse: fn(&[u8]) -> Result<ParsedEvent, EventError>,
     pub encode: fn(&ParsedEvent) -> Result<Vec<u8>, EventError>,
-    pub projector: fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult,
+    pub projector: fn(&str, &str, &ParsedEvent, &ProjectorDecisionContext) -> ProjectorResult,
     pub context_loader: fn(
         &dyn ProjectionQueries,
         &ProjectionFrameContext,
@@ -55,7 +55,7 @@ pub fn load_empty_context(
     _event_id_b64: &str,
     _parsed: &ParsedEvent,
 ) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
-    Ok(ContextLoadResult::ready(ContextSnapshot::default()))
+    Ok(ContextLoadResult::ready(ProjectorDecisionContext::default()))
 }
 
 pub struct EventRegistry {

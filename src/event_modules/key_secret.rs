@@ -85,7 +85,7 @@ pub fn deterministic_key_secret_event_id(key_bytes: &[u8; 32]) -> EventId {
 
 // === Projector (event-module locality) ===
 
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -108,7 +108,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    _ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let sk = match parsed {
         ParsedEvent::KeySecret(s) => s,

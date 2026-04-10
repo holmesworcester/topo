@@ -99,7 +99,7 @@ pub fn deterministic_invite_secret_event_id(
 }
 
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -122,7 +122,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    _ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let e = match parsed {
         ParsedEvent::InviteSecret(v) => v,

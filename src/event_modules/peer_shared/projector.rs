@@ -1,6 +1,6 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
@@ -48,7 +48,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let (public_key, user_event_id, device_name) = match parsed {
         ParsedEvent::PeerShared(p) => (&p.public_key, &p.user_event_id, &p.device_name),
@@ -120,9 +120,9 @@ mod projector_tests {
             "peer1",
             "peer-shared-event",
             &peer_shared_event(),
-            &ContextSnapshot {
+            &ProjectorDecisionContext {
                 peer_shared_endpoint_id: Some("endpoint-1".to_string()),
-                ..ContextSnapshot::default()
+                ..ProjectorDecisionContext::default()
             },
         );
         assert!(matches!(
@@ -143,9 +143,9 @@ mod projector_tests {
             "peer1",
             "workspace-event",
             &other,
-            &ContextSnapshot {
+            &ProjectorDecisionContext {
                 peer_shared_endpoint_id: Some("endpoint-1".to_string()),
-                ..ContextSnapshot::default()
+                ..ProjectorDecisionContext::default()
             },
         );
         assert!(matches!(

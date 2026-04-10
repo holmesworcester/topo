@@ -363,7 +363,7 @@ mod tests {
 
     use crate::crypto::{event_id_to_base64, hash_event};
     use crate::event_modules::{encode_event, ParsedEvent, TenantEvent};
-    use crate::projection::contract::{ContextSnapshot, EmitCommand, WriteOp};
+    use crate::projection::contract::{EmitCommand, ProjectorDecisionContext, WriteOp};
     use crate::projection::decision::ProjectionDecision;
     use crate::projection::queries::{DepLoadResult, ProjectionQueryResult};
 
@@ -517,8 +517,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _workspace: &crate::event_modules::WorkspaceEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_admin_context(
@@ -527,8 +527,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _admin: &crate::event_modules::AdminEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_peer_shared_context(
@@ -537,8 +537,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _peer_shared: &crate::event_modules::PeerSharedEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_user_invite_context(
@@ -547,8 +547,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _user_invite: &crate::event_modules::UserInviteEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_device_invite_context(
@@ -557,8 +557,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _device_invite: &crate::event_modules::DeviceInviteEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_message_context(
@@ -567,8 +567,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _message: &crate::event_modules::MessageEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_message_deletion_context(
@@ -577,8 +577,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _message_deletion: &crate::event_modules::MessageDeletionEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_reaction_context(
@@ -587,8 +587,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _reaction: &crate::event_modules::ReactionEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_file_context(
@@ -597,8 +597,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _file: &crate::event_modules::FileEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_file_slice_context(
@@ -607,8 +607,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _file_slice: &crate::event_modules::FileSliceEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_invite_accepted_context(
@@ -617,8 +617,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _invite_accepted: &crate::event_modules::InviteAcceptedEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
 
         fn load_key_shared_context(
@@ -627,8 +627,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _key_shared: &crate::event_modules::KeySharedEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
         }
     }
 

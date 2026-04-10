@@ -617,7 +617,7 @@ Implement projection semantics before adding heavy queue machinery.
 
 ## 6.1 Pure functional projector contract
 
-Projectors are **pure functions** over `(ParsedEvent, ContextSnapshot)`. They return
+Projectors are **pure functions** over `(ParsedEvent, ProjectorDecisionContext)`. They return
 a deterministic `ProjectorResult` containing write operations and emitted commands.
 They do not execute SQL or any other side effects directly.
 
@@ -650,7 +650,7 @@ Entry-point requirement:
 - Internal cascade optimization: `project_one_step` (the 7-step algorithm without cascade) is used by the Kahn cascade worklist to avoid redundant recursive cascade. `apply_projection` executes `emit_commands` (which handles guard retries), so the cascade only manages Kahn dependency unblocking. All projection stages are shared; the split is a performance optimization, not an alternate path.
 
 Apply engine execution stages:
-1. Pipeline resolves `EventTypeMeta` and calls the event-module-owned `context_loader(conn, recorded_by, event_id_b64, parsed)` to build `ContextSnapshot`.
+1. Pipeline resolves `EventTypeMeta` and calls the event-module-owned `context_loader(conn, recorded_by, event_id_b64, parsed)` to build `ProjectorDecisionContext`.
 2. Pipeline calls pure projector → receives `ProjectorResult`.
 3. Pipeline executes `write_ops` transactionally only on `Valid`.
 4. Pipeline executes `emit_commands` via explicit handlers on `Valid` and `Block`.
@@ -667,7 +667,7 @@ DRY split (required):
 - Per-event projector code owns only:
   1. event-specific predicate/policy checks,
   2. returning `ProjectorResult` with deterministic `write_ops` and `emit_commands`.
-- Event modules own projector-specific SQL context queries through module-local context loaders (`queries.rs` or projector-local helpers).
+- Event modules own projector-specific SQL decision-context queries through module-local context loaders (`queries.rs` or projector-local helpers).
 - Per-event projector functions (`project_pure`) must not access the database, implement their own dependency walker, signer verifier, queue handling, or terminal-state writer.
 
 ### Default behavior
@@ -712,7 +712,7 @@ Two-stage model so deletes stay deterministic when events arrive out of order:
    `HardPurgeMessageGraph` follow-up in the same projection transaction.
 3. If target does not exist yet, projector only records intent; no imperative retries.
 4. Target-creation projectors check for matching `deletion_intent` rows in their
-   `ContextSnapshot` and immediately tombstone on first materialization, using the
+   `ProjectorDecisionContext` and immediately tombstone on first materialization, using the
    original deletion event's identity for replay invariance.
 5. Hard purge owns all live-state cleanup for the deleted message graph.
 6. Deletion state is monotonic: `active → tombstoned` allowed, `tombstoned → active` forbidden.

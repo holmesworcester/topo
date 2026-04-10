@@ -6,8 +6,8 @@ use crate::event_modules::{
     EVENT_TYPE_ADMIN, EVENT_TYPE_DEVICE_INVITE, EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
 };
 use crate::projection::contract::{
-    BootstrapContextSnapshot, ContextSnapshot, CurrentSignerInfo, DeletionIntentInfo,
-    FileDescriptorInfo, UnwrappedSecretMaterial,
+    BootstrapDecisionContext, CurrentSignerInfo, DeletionIntentInfo, FileDescriptorInfo,
+    ProjectorDecisionContext, UnwrappedSecretMaterial,
 };
 use crate::projection::encrypted::unwrap_key_from_sender;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
@@ -20,14 +20,14 @@ pub(crate) type ProjectionQueryResult<T> = Result<T, Box<dyn std::error::Error>>
 
 #[derive(Debug, Clone)]
 pub enum ContextLoadResult {
-    Ready(ContextSnapshot),
+    Ready(ProjectorDecisionContext),
     Block { missing: Vec<EventId> },
     Reject { reason: String },
     Purge { message_event_id: String },
 }
 
 impl ContextLoadResult {
-    pub fn ready(ctx: ContextSnapshot) -> Self {
+    pub fn ready(ctx: ProjectorDecisionContext) -> Self {
         Self::Ready(ctx)
     }
 
@@ -105,7 +105,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         workspace: &WorkspaceEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_admin_context(
         &self,
@@ -113,7 +113,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         admin: &AdminEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_peer_shared_context(
         &self,
@@ -121,7 +121,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         peer_shared: &PeerSharedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_user_invite_context(
         &self,
@@ -129,7 +129,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         user_invite: &UserInviteEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_device_invite_context(
         &self,
@@ -137,7 +137,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         device_invite: &DeviceInviteEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_message_context(
         &self,
@@ -145,7 +145,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         message: &MessageEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_message_deletion_context(
         &self,
@@ -153,7 +153,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         message_deletion: &MessageDeletionEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_reaction_context(
         &self,
@@ -161,7 +161,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         reaction: &ReactionEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_file_context(
         &self,
@@ -169,7 +169,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         file: &FileEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_file_slice_context(
         &self,
@@ -177,7 +177,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         file_slice: &FileSliceEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_invite_accepted_context(
         &self,
@@ -185,7 +185,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         invite_accepted: &InviteAcceptedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
     fn load_key_shared_context(
         &self,
@@ -193,7 +193,7 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         key_shared: &KeySharedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot>;
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 }
 
 /// Declare a projector-local context loader that downcasts ParsedEvent to the
@@ -356,15 +356,15 @@ fn deleted_message_purges_dep(
     Ok(deleted.then(|| dep_b64.to_string()))
 }
 
-fn load_bootstrap_context_snapshot(
+fn load_bootstrap_decision_context(
     conn: &Connection,
     recorded_by: &str,
     invite_event_id_b64: &str,
-) -> ProjectionQueryResult<Option<BootstrapContextSnapshot>> {
+) -> ProjectionQueryResult<Option<BootstrapDecisionContext>> {
     Ok(
         read_bootstrap_context(conn, recorded_by, invite_event_id_b64)
             .map_err(|err| -> Box<dyn std::error::Error> { err })?
-            .map(|bc| BootstrapContextSnapshot {
+            .map(|bc| BootstrapDecisionContext {
                 workspace_id: bc.workspace_id,
                 bootstrap_addrs: bc.bootstrap_addrs,
                 bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,
@@ -653,7 +653,7 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         _event_id_b64: &str,
         _workspace: &WorkspaceEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let accepted_workspace_id = match self.query_row(
             "SELECT workspace_id
              FROM invites_accepted
@@ -668,9 +668,9 @@ impl ProjectionQueries for Connection {
             Err(e) => return Err(e.into()),
         };
 
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             accepted_workspace_id,
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -680,25 +680,25 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         _event_id_b64: &str,
         admin: &AdminEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
-        let mut ctx = ContextSnapshot::default();
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let mut ctx = ProjectorDecisionContext::default();
         match frame.current_signer.as_ref() {
             Some(current_signer) if current_signer.semantic_type_code == EVENT_TYPE_WORKSPACE => {}
             Some(current_signer) => {
-                return Ok(ContextSnapshot {
+                return Ok(ProjectorDecisionContext {
                     admin_user_key_mismatch_reason: Some(format!(
                         "admin signer must be workspace, got semantic type {}",
                         current_signer.semantic_type_code
                     )),
-                    ..ContextSnapshot::default()
+                    ..ProjectorDecisionContext::default()
                 });
             }
             None => {
-                return Ok(ContextSnapshot {
+                return Ok(ProjectorDecisionContext {
                     admin_user_key_mismatch_reason: Some(
                         "admin event missing current signer envelope".to_string(),
                     ),
-                    ..ContextSnapshot::default()
+                    ..ProjectorDecisionContext::default()
                 });
             }
         }
@@ -741,34 +741,34 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         _event_id_b64: &str,
         peer_shared: &PeerSharedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ContextSnapshot {
+            return Ok(ProjectorDecisionContext {
                 peer_shared_user_mismatch_reason: Some(
                     "peer_shared missing current signer envelope".to_string(),
                 ),
-                ..ContextSnapshot::default()
+                ..ProjectorDecisionContext::default()
             });
         };
         if current_signer.semantic_type_code != EVENT_TYPE_DEVICE_INVITE {
-            return Ok(ContextSnapshot {
+            return Ok(ProjectorDecisionContext {
                 peer_shared_user_mismatch_reason: Some(format!(
                     "peer_shared signer must be device_invite, got semantic type {}",
                     current_signer.semantic_type_code
                 )),
-                ..ContextSnapshot::default()
+                ..ProjectorDecisionContext::default()
             });
         }
 
         let signed_by_b64 = current_signer.event_id.clone();
         let blob = load_valid_event_blob(self, recorded_by, &signed_by_b64)?;
         let Some(blob) = blob else {
-            return Ok(ContextSnapshot {
+            return Ok(ProjectorDecisionContext {
                 peer_shared_user_mismatch_reason: Some(format!(
                     "no valid device_invite blob for signer {}",
                     signed_by_b64
                 )),
-                ..ContextSnapshot::default()
+                ..ProjectorDecisionContext::default()
             });
         };
 
@@ -777,42 +777,42 @@ impl ProjectionQueries for Connection {
             Ok(ParsedEvent::Signed(signed)) => match parse_event(&signed.payload) {
                 Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
                 Ok(other) => {
-                    return Ok(ContextSnapshot {
+                    return Ok(ProjectorDecisionContext {
                         peer_shared_user_mismatch_reason: Some(format!(
                             "peer_shared signer {} resolved to unexpected event type {}",
                             signed_by_b64,
                             other.event_type_code()
                         )),
-                        ..ContextSnapshot::default()
+                        ..ProjectorDecisionContext::default()
                     })
                 }
                 Err(err) => {
-                    return Ok(ContextSnapshot {
+                    return Ok(ProjectorDecisionContext {
                         peer_shared_user_mismatch_reason: Some(format!(
                             "failed to parse signed device_invite signer {}: {}",
                             signed_by_b64, err
                         )),
-                        ..ContextSnapshot::default()
+                        ..ProjectorDecisionContext::default()
                     })
                 }
             },
             Ok(other) => {
-                return Ok(ContextSnapshot {
+                return Ok(ProjectorDecisionContext {
                     peer_shared_user_mismatch_reason: Some(format!(
                         "peer_shared signer {} resolved to unexpected event type {}",
                         signed_by_b64,
                         other.event_type_code()
                     )),
-                    ..ContextSnapshot::default()
+                    ..ProjectorDecisionContext::default()
                 })
             }
             Err(err) => {
-                return Ok(ContextSnapshot {
+                return Ok(ProjectorDecisionContext {
                     peer_shared_user_mismatch_reason: Some(format!(
                         "failed to parse device_invite signer {}: {}",
                         signed_by_b64, err
                     )),
-                    ..ContextSnapshot::default()
+                    ..ProjectorDecisionContext::default()
                 })
             }
         };
@@ -823,7 +823,7 @@ impl ProjectionQueries for Connection {
             load_endpoint_shared_by_event_id(self, &endpoint_shared_event_id_b64)
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             peer_shared_user_mismatch_reason: peer_shared_user_mismatch_reason(
                 self,
                 frame,
@@ -840,7 +840,7 @@ impl ProjectionQueries for Connection {
                     endpoint_shared_event_id_b64
                 )),
             },
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -850,8 +850,8 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         event_id_b64: &str,
         _user_invite: &UserInviteEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
-        let mut ctx = ContextSnapshot::default();
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let mut ctx = ProjectorDecisionContext::default();
 
         ctx.is_local_create = match self.query_row(
             "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -887,7 +887,7 @@ impl ProjectionQueries for Connection {
             }
         }
 
-        ctx.bootstrap_context = load_bootstrap_context_snapshot(self, recorded_by, event_id_b64)?;
+        ctx.bootstrap_context = load_bootstrap_decision_context(self, recorded_by, event_id_b64)?;
         Ok(ctx)
     }
 
@@ -897,8 +897,8 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         event_id_b64: &str,
         device_invite: &DeviceInviteEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
-        let mut ctx = ContextSnapshot::default();
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let mut ctx = ProjectorDecisionContext::default();
 
         ctx.is_local_create = match self.query_row(
             "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -928,7 +928,7 @@ impl ProjectionQueries for Connection {
             }
         }
 
-        ctx.bootstrap_context = load_bootstrap_context_snapshot(self, recorded_by, event_id_b64)?;
+        ctx.bootstrap_context = load_bootstrap_decision_context(self, recorded_by, event_id_b64)?;
         Ok(ctx)
     }
 
@@ -938,7 +938,7 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         event_id_b64: &str,
         message: &MessageEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let signer_user_mismatch_reason =
             signer_user_mismatch_reason(self, frame, recorded_by, &message.author_id)?;
 
@@ -960,10 +960,10 @@ impl ProjectionQueries for Connection {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             signer_user_mismatch_reason,
             deletion_intents,
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -973,8 +973,8 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         _event_id_b64: &str,
         message_deletion: &MessageDeletionEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
-        let mut ctx = ContextSnapshot::default();
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let mut ctx = ProjectorDecisionContext::default();
         let (deletion_signer_user_id, deletion_signer_is_admin, deletion_signer_reject_reason) =
             deletion_signer_context(self, frame, recorded_by)?;
         ctx.deletion_signer_user_id = deletion_signer_user_id;
@@ -1015,13 +1015,13 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         _event_id_b64: &str,
         reaction: &ReactionEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let signer_user_mismatch_reason =
             signer_user_mismatch_reason(self, frame, recorded_by, &reaction.author_id)?;
 
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             signer_user_mismatch_reason,
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -1031,8 +1031,8 @@ impl ProjectionQueries for Connection {
         _recorded_by: &str,
         _event_id_b64: &str,
         _file: &FileEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
-        Ok(ContextSnapshot::default())
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        Ok(ProjectorDecisionContext::default())
     }
 
     fn load_file_slice_context(
@@ -1041,8 +1041,8 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         _event_id_b64: &str,
         file_slice: &FileSliceEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
-        let mut ctx = ContextSnapshot::default();
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let mut ctx = ProjectorDecisionContext::default();
         let file_id_b64 = event_id_to_base64(&file_slice.file_id);
 
         if let Some(owner_event_id_b64) = frame.current_owner_event_id.as_deref() {
@@ -1125,8 +1125,8 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         _event_id_b64: &str,
         invite_accepted: &InviteAcceptedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
-        let mut ctx = ContextSnapshot::default();
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let mut ctx = ProjectorDecisionContext::default();
         let invite_event_id_b64 = event_id_to_base64(&invite_accepted.invite_event_id);
         let workspace_id_b64 = event_id_to_base64(&invite_accepted.workspace_id);
 
@@ -1144,7 +1144,7 @@ impl ProjectionQueries for Connection {
         ctx.peer_shared_transport_identity_active =
             peer_has_creds_with_source(self, recorded_by, CRED_SOURCE_PEER_SHARED).unwrap_or(false);
 
-        if let Some(bc) = load_bootstrap_context_snapshot(self, recorded_by, &invite_event_id_b64)?
+        if let Some(bc) = load_bootstrap_decision_context(self, recorded_by, &invite_event_id_b64)?
         {
             if bc.workspace_id != workspace_id_b64 {
                 ctx.invite_accepted_link_workspace_mismatch_reason = Some(
@@ -1174,7 +1174,7 @@ impl ProjectionQueries for Connection {
         recorded_by: &str,
         _event_id_b64: &str,
         key_shared: &KeySharedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let recipient_b64 = event_id_to_base64(&key_shared.recipient_event_id);
         let unwrap_key_b64 = event_id_to_base64(&key_shared.unwrap_key_event_id);
 
@@ -1192,17 +1192,17 @@ impl ProjectionQueries for Connection {
             .optional()?;
 
         let Some(private_key_bytes) = invite_secret_row else {
-            return Ok(ContextSnapshot::default());
+            return Ok(ProjectorDecisionContext::default());
         };
         if private_key_bytes.len() != 32 {
-            return Ok(ContextSnapshot::default());
+            return Ok(ProjectorDecisionContext::default());
         }
 
         let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ContextSnapshot::default());
+            return Ok(ProjectorDecisionContext::default());
         };
         let Some(current_signer_event_id) = event_id_from_base64(&current_signer.event_id) else {
-            return Ok(ContextSnapshot::default());
+            return Ok(ProjectorDecisionContext::default());
         };
 
         let mut key_arr = [0u8; 32];
@@ -1211,21 +1211,21 @@ impl ProjectionQueries for Connection {
 
         let sender_key = match resolve_signer_key(self, recorded_by, &current_signer_event_id)? {
             SignerResolution::Found(k) => k,
-            _ => return Ok(ContextSnapshot::default()),
+            _ => return Ok(ProjectorDecisionContext::default()),
         };
         let sender_pub = match VerifyingKey::from_bytes(&sender_key.public_key) {
             Ok(vk) => vk,
-            Err(_) => return Ok(ContextSnapshot::default()),
+            Err(_) => return Ok(ProjectorDecisionContext::default()),
         };
 
         let plaintext_key =
             unwrap_key_from_sender(&local_signing_key, &sender_pub, &key_shared.wrapped_key);
 
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             unwrapped_secret_material: Some(UnwrappedSecretMaterial {
                 key_bytes: plaintext_key,
             }),
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 }

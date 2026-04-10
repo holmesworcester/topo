@@ -11,8 +11,8 @@ use crate::projection::apply::{
     project_one::project_one_step_with_backend, ProjectionApplyResult, ProjectionBackend,
 };
 use crate::projection::contract::{
-    ContextSnapshot, CurrentSignerInfo, DeletionIntentInfo, EmitCommand, FileDescriptorInfo,
-    SqlVal, WriteOp,
+    CurrentSignerInfo, DeletionIntentInfo, EmitCommand, FileDescriptorInfo,
+    ProjectorDecisionContext, SqlVal, WriteOp,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::queries::{
@@ -858,11 +858,11 @@ fn recorded_source(
         .flatten()
 }
 
-fn bootstrap_context_snapshot(
+fn bootstrap_decision_context(
     state: &NodeBehaviorData,
     recorded_by: &str,
     invite_event_id_b64: &str,
-) -> Option<crate::projection::contract::BootstrapContextSnapshot> {
+) -> Option<crate::projection::contract::BootstrapDecisionContext> {
     let mut rows = rows_for_recorded_matching(
         state,
         "bootstrap_context",
@@ -894,7 +894,7 @@ fn bootstrap_context_snapshot(
             addrs.insert(addr.to_string());
         }
     }
-    Some(crate::projection::contract::BootstrapContextSnapshot {
+    Some(crate::projection::contract::BootstrapDecisionContext {
         workspace_id,
         bootstrap_addrs: addrs.into_iter().collect(),
         bootstrap_spki_fingerprint,
@@ -1157,7 +1157,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         _event_id_b64: &str,
         _workspace: &events::WorkspaceEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let accepted_workspace_id =
             table_rows_for_recorded(&state, "invites_accepted", recorded_by)
@@ -1171,9 +1171,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 })
                 .min_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))
                 .map(|(_, _, workspace_id)| workspace_id);
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             accepted_workspace_id,
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -1183,7 +1183,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         _event_id_b64: &str,
         admin: &events::AdminEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let user_event_id_b64 = event_id_to_base64(&admin.user_event_id);
         let admin_user_key_mismatch_reason = match first_row_for_recorded(
@@ -1214,9 +1214,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 )),
             },
         };
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             admin_user_key_mismatch_reason,
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -1226,45 +1226,45 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         _event_id_b64: &str,
         peer_shared: &events::PeerSharedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ContextSnapshot {
+            return Ok(ProjectorDecisionContext {
                 peer_shared_user_mismatch_reason: Some(
                     "peer_shared missing current signer envelope".to_string(),
                 ),
-                ..ContextSnapshot::default()
+                ..ProjectorDecisionContext::default()
             });
         };
         if current_signer.semantic_type_code != events::EVENT_TYPE_DEVICE_INVITE {
-            return Ok(ContextSnapshot {
+            return Ok(ProjectorDecisionContext {
                 peer_shared_user_mismatch_reason: Some(format!(
                     "peer_shared signer must be device_invite, got semantic type {}",
                     current_signer.semantic_type_code
                 )),
-                ..ContextSnapshot::default()
+                ..ProjectorDecisionContext::default()
             });
         }
         let signed_by_b64 = current_signer.event_id.clone();
         let Some(blob) = valid_event_blob(&state, recorded_by, &signed_by_b64) else {
-            return Ok(ContextSnapshot {
+            return Ok(ProjectorDecisionContext {
                 peer_shared_user_mismatch_reason: Some(format!(
                     "no valid device_invite blob for signer {}",
                     signed_by_b64
                 )),
-                ..ContextSnapshot::default()
+                ..ProjectorDecisionContext::default()
             });
         };
 
         let parsed_signer = match parse_event(&blob) {
             Ok(parsed_signer) => parsed_signer,
             Err(err) => {
-                return Ok(ContextSnapshot {
+                return Ok(ProjectorDecisionContext {
                     peer_shared_user_mismatch_reason: Some(format!(
                         "failed to parse device_invite signer {}: {}",
                         signed_by_b64, err
                     )),
-                    ..ContextSnapshot::default()
+                    ..ProjectorDecisionContext::default()
                 })
             }
         };
@@ -1274,33 +1274,33 @@ impl ProjectionQueries for NodeBehaviorEngine {
             ParsedEvent::Signed(signed) => match parse_event(&signed.payload) {
                 Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
                 Ok(other) => {
-                    return Ok(ContextSnapshot {
+                    return Ok(ProjectorDecisionContext {
                         peer_shared_user_mismatch_reason: Some(format!(
                             "peer_shared signer {} resolved to unexpected event type {}",
                             signed_by_b64,
                             other.event_type_code()
                         )),
-                        ..ContextSnapshot::default()
+                        ..ProjectorDecisionContext::default()
                     })
                 }
                 Err(err) => {
-                    return Ok(ContextSnapshot {
+                    return Ok(ProjectorDecisionContext {
                         peer_shared_user_mismatch_reason: Some(format!(
                             "failed to parse signed device_invite signer {}: {}",
                             signed_by_b64, err
                         )),
-                        ..ContextSnapshot::default()
+                        ..ProjectorDecisionContext::default()
                     })
                 }
             },
             other => {
-                return Ok(ContextSnapshot {
+                return Ok(ProjectorDecisionContext {
                     peer_shared_user_mismatch_reason: Some(format!(
                         "peer_shared signer {} resolved to unexpected event type {}",
                         signed_by_b64,
                         other.event_type_code()
                     )),
-                    ..ContextSnapshot::default()
+                    ..ProjectorDecisionContext::default()
                 })
             }
         };
@@ -1332,7 +1332,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
             &endpoint_shared_event_id_b64,
         );
 
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             peer_shared_user_mismatch_reason,
             peer_shared_endpoint_id: endpoint_shared_row
                 .and_then(|row| row_text(row, "endpoint_id").map(ToOwned::to_owned)),
@@ -1343,7 +1343,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
                     endpoint_shared_event_id_b64
                 )),
             },
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -1353,9 +1353,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         event_id_b64: &str,
         user_invite: &events::UserInviteEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
-        let mut ctx = ContextSnapshot::default();
+        let mut ctx = ProjectorDecisionContext::default();
         ctx.is_local_create = recorded_source(&state, recorded_by, event_id_b64)
             .is_some_and(|source| source == "local" || source == "local_create");
         if frame
@@ -1389,7 +1389,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
                     });
             ctx.invite_authority_matches_signer = Some(authority_matches_signer);
         }
-        ctx.bootstrap_context = bootstrap_context_snapshot(&state, recorded_by, event_id_b64);
+        ctx.bootstrap_context = bootstrap_decision_context(&state, recorded_by, event_id_b64);
         Ok(ctx)
     }
 
@@ -1399,9 +1399,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         event_id_b64: &str,
         device_invite: &events::DeviceInviteEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
-        let mut ctx = ContextSnapshot::default();
+        let mut ctx = ProjectorDecisionContext::default();
         ctx.is_local_create = recorded_source(&state, recorded_by, event_id_b64)
             .is_some_and(|source| source == "local" || source == "local_create");
         if frame
@@ -1422,7 +1422,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
             .is_some_and(|user_event_id| user_event_id == authority_b64);
             ctx.invite_authority_matches_signer = Some(authority_matches_signer);
         }
-        ctx.bootstrap_context = bootstrap_context_snapshot(&state, recorded_by, event_id_b64);
+        ctx.bootstrap_context = bootstrap_decision_context(&state, recorded_by, event_id_b64);
         Ok(ctx)
     }
 
@@ -1432,7 +1432,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         event_id_b64: &str,
         message: &events::MessageEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let signer_user_mismatch_reason =
             signer_user_mismatch_reason_behavior(&state, frame, recorded_by, &message.author_id);
@@ -1450,10 +1450,10 @@ impl ProjectionQueries for NodeBehaviorEngine {
             .collect::<Vec<_>>();
         deletion_intents
             .sort_by(|left, right| left.deletion_event_id.cmp(&right.deletion_event_id));
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             signer_user_mismatch_reason,
             deletion_intents,
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -1463,9 +1463,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         _event_id_b64: &str,
         message_deletion: &events::MessageDeletionEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
-        let mut ctx = ContextSnapshot::default();
+        let mut ctx = ProjectorDecisionContext::default();
         let (deletion_signer_user_id, deletion_signer_is_admin, deletion_signer_reject_reason) =
             deletion_signer_context_behavior(&state, frame, recorded_by);
         ctx.deletion_signer_user_id = deletion_signer_user_id;
@@ -1496,13 +1496,13 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         _event_id_b64: &str,
         reaction: &events::ReactionEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let signer_user_mismatch_reason =
             signer_user_mismatch_reason_behavior(&state, frame, recorded_by, &reaction.author_id);
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             signer_user_mismatch_reason,
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 
@@ -1512,8 +1512,8 @@ impl ProjectionQueries for NodeBehaviorEngine {
         _recorded_by: &str,
         _event_id_b64: &str,
         _file: &events::FileEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
-        Ok(ContextSnapshot::default())
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        Ok(ProjectorDecisionContext::default())
     }
 
     fn load_file_slice_context(
@@ -1522,10 +1522,10 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         _event_id_b64: &str,
         file_slice: &events::FileSliceEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let file_id_b64 = event_id_to_base64(&file_slice.file_id);
-        let mut ctx = ContextSnapshot::default();
+        let mut ctx = ProjectorDecisionContext::default();
         if let Some(owner_event_id_b64) = frame.current_owner_event_id.as_deref() {
             if first_row_for_recorded(
                 &state,
@@ -1593,9 +1593,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         _event_id_b64: &str,
         invite_accepted: &events::InviteAcceptedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
-        let mut ctx = ContextSnapshot::default();
+        let mut ctx = ProjectorDecisionContext::default();
         let invite_event_id_b64 = event_id_to_base64(&invite_accepted.invite_event_id);
         let workspace_id_b64 = event_id_to_base64(&invite_accepted.workspace_id);
         ctx.has_local_invite_secret =
@@ -1609,7 +1609,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
         ctx.peer_shared_transport_identity_active = state.local_transport_peer_id.as_deref()
             == Some(recorded_by)
             && state.local_transport_source.as_deref() == Some("peershared");
-        if let Some(bc) = bootstrap_context_snapshot(&state, recorded_by, &invite_event_id_b64) {
+        if let Some(bc) = bootstrap_decision_context(&state, recorded_by, &invite_event_id_b64) {
             if bc.workspace_id != workspace_id_b64 {
                 ctx.invite_accepted_link_workspace_mismatch_reason = Some(
                     "invite_accepted workspace_id does not match locally recorded invite-link workspace"
@@ -1639,7 +1639,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
         recorded_by: &str,
         _event_id_b64: &str,
         key_shared: &events::KeySharedEvent,
-    ) -> ProjectionQueryResult<ContextSnapshot> {
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let recipient_b64 = event_id_to_base64(&key_shared.recipient_event_id);
         let unwrap_key_b64 = event_id_to_base64(&key_shared.unwrap_key_event_id);
@@ -1652,41 +1652,41 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 })
                 .and_then(|row| row_blob(row, "private_key").map(|v| v.to_vec()))
         else {
-            return Ok(ContextSnapshot::default());
+            return Ok(ProjectorDecisionContext::default());
         };
         if private_key_bytes.len() != 32 {
-            return Ok(ContextSnapshot::default());
+            return Ok(ProjectorDecisionContext::default());
         }
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&private_key_bytes);
         let local_signing_key = ed25519_dalek::SigningKey::from_bytes(&key_arr);
         let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ContextSnapshot::default());
+            return Ok(ProjectorDecisionContext::default());
         };
         let Some(current_signer_event_id) =
             crate::crypto::event_id_from_base64(&current_signer.event_id)
         else {
-            return Ok(ContextSnapshot::default());
+            return Ok(ProjectorDecisionContext::default());
         };
         let sender_key =
             match resolve_signer_key_behavior(&state, recorded_by, &current_signer_event_id)? {
                 SignerResolution::Found(key) => key,
-                _ => return Ok(ContextSnapshot::default()),
+                _ => return Ok(ProjectorDecisionContext::default()),
             };
         let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key.public_key) {
             Ok(key) => key,
-            Err(_) => return Ok(ContextSnapshot::default()),
+            Err(_) => return Ok(ProjectorDecisionContext::default()),
         };
         let plaintext_key = crate::projection::encrypted::unwrap_key_from_sender(
             &local_signing_key,
             &sender_pub,
             &key_shared.wrapped_key,
         );
-        Ok(ContextSnapshot {
+        Ok(ProjectorDecisionContext {
             unwrapped_secret_material: Some(crate::projection::contract::UnwrappedSecretMaterial {
                 key_bytes: plaintext_key,
             }),
-            ..ContextSnapshot::default()
+            ..ProjectorDecisionContext::default()
         })
     }
 }

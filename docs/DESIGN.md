@@ -94,7 +94,7 @@ Preferred boundary:
 
 Design guidance:
 
-1. context queries should deduplicate and normalize rows before returning them to the planner,
+1. decision-context queries should deduplicate and normalize rows before returning them to the planner,
 2. planner outputs should be explicit enums/flags rather than implicit control flow,
 3. executors should not add extra authority decisions beyond the emitted plan,
 4. when a behavior needs a proof, prefer introducing a context-query seam rather than proving over ad-hoc interleaved SQL and network logic.
@@ -926,7 +926,7 @@ Internally it delegates to `project_one_step` (the 7-step single-event algorithm
 
 ## 4.2 Pure functional projector contract
 
-Projectors are **pure functions** over `(ParsedEvent, ContextSnapshot)` that return
+Projectors are **pure functions** over `(ParsedEvent, ProjectorDecisionContext)` that return
 a deterministic `ProjectorResult`. They do not execute SQL or any other side effects
 directly. The apply engine executes the returned operations.
 
@@ -963,16 +963,16 @@ Bootstrap trust materialization uses projector `WriteOp`s (not `EmitCommand`s):
 3. `peer_shared` projector consumes matching bootstrap trust rows using deterministic `Delete` write-ops,
 4. trust-check functions (`is_authorized_for_tenant`, `authorized_fingerprints_from_db`) remain read-only.
 
-### ContextSnapshot
+### ProjectorDecisionContext
 
-Read-model snapshot populated before calling the pure projector.
-Projectors must not access the database directly. `ContextSnapshot` carries
+Read-model decision context populated before calling the pure projector.
+Projectors must not access the database directly. `ProjectorDecisionContext` carries
 query-derived read facts for projector predicates; it does not carry a generic
 dependency list. Dependency IDs are extracted from parsed event fields via
 schema metadata on each projection attempt.
 
 Context ownership rule:
-1. projector-specific context queries are owned by the event module via
+1. projector-specific decision-context queries are owned by the event module via
    `EventTypeMeta.context_loader`,
 2. shared pipeline code invokes the module-owned loader and remains free of
    projector-specific SQL branches.
@@ -987,7 +987,7 @@ Fields include:
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
 - `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates pending bootstrap trust `InsertOrIgnore` writes so only the invite creator materializes pending trust
 
-Encrypted key resolution/decryption is handled in the encrypted-wrapper stage (`projection/encrypted.rs`), not via `ContextSnapshot`.
+Encrypted key resolution/decryption is handled in the encrypted-wrapper stage (`projection/encrypted.rs`), not via `ProjectorDecisionContext`.
 
 ### Command/effect execution stage semantics
 
@@ -1004,13 +1004,13 @@ final state.
    - event load/decode dispatch,
    - dependency extraction and blocking,
    - signer resolution and signature verification ordering,
-   - invoking `EventTypeMeta.context_loader` to build `ContextSnapshot`,
+   - invoking `EventTypeMeta.context_loader` to build `ProjectorDecisionContext`,
    - executing `write_ops` and `emit_commands`,
    - queue/state transitions and terminal status writes.
 2. per-event projector code handles:
    - event-specific predicate/policy logic,
    - returning `ProjectorResult` with deterministic `write_ops` and `emit_commands`.
-3. projector-specific SQL context queries live in event modules (`queries.rs` or
+3. projector-specific SQL decision-context queries live in event modules (`queries.rs` or
    projector-local helpers), not in shared pipeline files.
 4. per-event projector functions do not access the database, implement custom
    dependency resolution, signature pipeline, or queue/terminal-write paths.
@@ -1069,7 +1069,7 @@ target message exists yet.
 
 **Delete-before-create convergence:**
 Target-creation projectors (`project_message_pure`) check for matching `deletion_intent`
-rows in their context snapshot and immediately tombstone on first materialization. The
+rows in their decision context and immediately tombstone on first materialization. The
 tombstone row uses the original deletion event's ID and the arriving message's author,
 ensuring identical final state regardless of arrival order.
 
@@ -1110,7 +1110,7 @@ These invariants are enforced by tests (`test_deletion_invariant_*`):
 1. **Duplicate replay:** Re-projecting a deletion event leaves state unchanged after first application.
 2. **Order convergence:** Delete-before-create produces identical tombstone rows as create-before-delete.
 3. **Replay invariance:** Full forward replay from event log reproduces identical tombstone state.
-4. **Auth determinism:** Authorization failure paths are deterministic from projected context snapshot.
+4. **Auth determinism:** Authorization failure paths are deterministic from projected decision context.
 5. **Cleanup completeness:** No live reactions, file descriptors, or file slices remain for tombstoned messages; no query can surface deleted entities.
 6. **Command idempotence:** `deletion_intent` identities are stable (derived from event identity); re-running does not mutate final state.
 7. **Monotonicity:** Once tombstoned, a message cannot revert to active state.
@@ -1606,7 +1606,7 @@ Projector-spec mapping: each Rust projector predicate maps to a named TLA guard.
 
 Tests are organized into three layers, each exercising a different scope of the TLA+ conformance contract:
 
-1. **Projector unit** (`tests/projectors/*_projector_tests.rs`) — pure function contract. Each test calls `project_pure(event, ctx)` directly with a hand-built `ContextSnapshot` and asserts decision, write_ops, and emit_commands. Covers event-local predicates (accepted workspace binding, signer mismatch, deletion author, bootstrap trust emission, file slice auth).
+1. **Projector unit** (`tests/projectors/*_projector_tests.rs`) — pure function contract. Each test calls `project_pure(event, ctx)` directly with a hand-built `ProjectorDecisionContext` and asserts decision, write_ops, and emit_commands. Covers event-local predicates (accepted workspace binding, signer mismatch, deletion author, bootstrap trust emission, file slice auth).
 2. **Pipeline integration** (`src/state/projection/apply/tests/`) — shared pipeline stages. Tests exercise `project_one_step` end-to-end through dep presence, dep type checks, signer resolution, encrypted wrapper decrypt/dispatch, and cascade unblock. Uses a real SQLite DB with the full projection pipeline.
 3. **Replay/order conformance** (`src/state/projection/apply/tests/`) — model-critical convergence properties. Source-isomorphism tests replay the same events in different orderings and assert identical terminal state. Covers out-of-order convergence, idempotent replay, stable terminal state, and deletion two-stage convergence.
 
@@ -1724,7 +1724,7 @@ TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and
 
 User removal is out of scope in this transport model; trust derives only from bootstrap trust rows and steady-state `PeerShared` projection state.
 
-Invite ownership: `inviteCreator` tracks which peer created each invite SPKI. Only the invite creator (inviter) may materialize pending bootstrap trust — the joiner must not write pending bootstrap trust when syncing the invite event. This is enforced by the `is_local_create` flag in `ContextSnapshot`, populated from `recorded_events.source`. The TLA+ model captures this via the `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust` and the `InvPendingTrustOnlyOnInviter` invariant.
+Invite ownership: `inviteCreator` tracks which peer created each invite SPKI. Only the invite creator (inviter) may materialize pending bootstrap trust — the joiner must not write pending bootstrap trust when syncing the invite event. This is enforced by the `is_local_create` flag in `ProjectorDecisionContext`, populated from `recorded_events.source`. The TLA+ model captures this via the `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust` and the `InvPendingTrustOnlyOnInviter` invariant.
 
 TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust checks in `docs/tla/projector_spec.md`):
 1. `InvSPKIUniqueness` — no two peers share an active SPKI,
@@ -1928,8 +1928,8 @@ Event modules (`src/event_modules/<type>/`) own five concerns. During migration,
 some event types may remain single-file under `src/event_modules/<type>.rs`.
 
 1. **Wire** — struct definition, parse/encode, wire layout, `EventTypeMeta`.
-2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ContextSnapshot)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
-3. **Projector context loader** — `build_projector_context(...)` (location: `queries.rs` or projector-local helper) performs projector-specific SQL reads and returns `ContextSnapshot`. Registered in `EventTypeMeta.context_loader`.
+2. **Projector** — `project_pure()` function: the pure projector for this event type. Takes `(recorded_by, event_id_b64, &ParsedEvent, &ProjectorDecisionContext)` and returns `ProjectorResult`. Registered in `EventTypeMeta.projector` so the pipeline dispatches via registry lookup with no central match statement.
+3. **Projector context loader** — `build_projector_context(...)` (location: `queries.rs` or projector-local helper) performs projector-specific SQL reads and returns `ProjectorDecisionContext`. Registered in `EventTypeMeta.context_loader`.
 4. **Commands** — `CreateXxxCmd` struct + `create()` function that builds the `ParsedEvent`, calls `create_signed_event_synchronous`, and returns `EventId`. High-level command helpers callable from service/RPC routes (for example `send`, `react`) and multi-step workflows (for example workspace onboarding) are first-class command APIs in this layer.
 5. **Queries** — `list()`, `count()`, `resolve()`, `list_for_message_with_authors()`, etc. — SQL against projection tables scoped by `recorded_by`. All event-specific SQL lives here.
 6. **Response types** — serializable structs for the event domain (e.g. `MessageItem`, `MessagesResponse`, `SendResponse`). Owned by the event module, re-exported by `src/runtime/control/service.rs` for external callers.
@@ -1959,12 +1959,12 @@ The service layer (`src/runtime/control/service.rs`) is a thin orchestrator:
 1. a `projector` function pointer with the uniform signature:
 
 ```rust
-fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult
+fn(&str, &str, &ParsedEvent, &ProjectorDecisionContext) -> ProjectorResult
 ```
 2. a `context_loader` function pointer with the uniform signature:
 
 ```rust
-fn(&Connection, &str, &str, &ParsedEvent) -> Result<ContextSnapshot, Box<dyn Error>>
+fn(&Connection, &str, &str, &ParsedEvent) -> Result<ProjectorDecisionContext, Box<dyn Error>>
 ```
 
 ### Service command routing

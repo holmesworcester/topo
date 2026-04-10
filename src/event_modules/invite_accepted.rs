@@ -78,7 +78,9 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
 
 use crate::contracts::transport_identity_contract::TransportIdentitySpec;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{
+    EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
+};
 use crate::projection::queries::{ProjectionFrameContext, ProjectionQueries};
 use rusqlite::Connection;
 
@@ -140,7 +142,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let ia = match parsed {
         ParsedEvent::InviteAccepted(a) => a,
