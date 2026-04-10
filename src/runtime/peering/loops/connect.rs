@@ -12,27 +12,35 @@ use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
-use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
-use crate::sync::session::windowing::reset_outbound_window_state;
+use crate::runtime::repeated_warning::{RepeatedWarningGate, should_emit_globally};
 use crate::sync::SyncConnectionHandler;
+use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{
-    dial_daemon_connection_target, load_daemon_identity_from_db,
+    ConnectionLifecycleError, DaemonConnection, OutboundSessionAuthPlan, SessionClass,
+    TransportEndpoint, dial_daemon_connection_target, load_daemon_identity_from_db,
     resolve_bootstrap_fallback_invite_for_daemon, resolve_outbound_session_auth_plan,
-    send_outbound_session_auth, ConnectionLifecycleError, DaemonConnection,
-    OutboundSessionAuthPlan, SessionClass, TransportEndpoint,
+    send_outbound_session_auth,
 };
 
 use super::supervisor::{run_startup_preflight, supervise_inbound_daemon_connection};
 use super::{
+    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
     claim_live_daemon_connection_slot, claim_live_session_peer, current_timestamp_ms,
     evict_live_daemon_connection, live_daemon_connection, peer_fingerprint_from_hex,
-    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
 pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialFailureRawRows {
+    has_connected_once: bool,
+    stale_dial_failure: bool,
+    consecutive_stale_dial_failures: u32,
+    warn_on_startup_stale_failure: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DialFailureDecisionContext {
@@ -61,8 +69,19 @@ enum SessionOpenFailurePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionOpenFailureRawRows {
+    connection_lost: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionOpenFailureDecisionContext {
     connection_lost: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionAuthFailureRawRows {
+    connection_lost: bool,
+    bootstrap_retry_invite: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +94,11 @@ struct SessionAuthFailureDecisionContext {
 struct SessionAuthFailurePlan {
     next_auth_plan_override: Option<OutboundSessionAuthPlan>,
     evict_live_connection: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRetryRawRows {
+    session_stats_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +140,17 @@ fn should_evict_closed_daemon_connection(
     is_connection_lost_message(message)
 }
 
+fn normalize_dial_failure_decision_context(
+    raw_rows: DialFailureRawRows,
+) -> DialFailureDecisionContext {
+    DialFailureDecisionContext {
+        has_connected_once: raw_rows.has_connected_once,
+        stale_dial_failure: raw_rows.stale_dial_failure,
+        consecutive_stale_dial_failures: raw_rows.consecutive_stale_dial_failures,
+        warn_on_startup_stale_failure: raw_rows.warn_on_startup_stale_failure,
+    }
+}
+
 fn decide_dial_failure_plan(context: &DialFailureDecisionContext) -> DialFailurePlan {
     let should_warn = should_warn_for_connect_failure(
         context.has_connected_once,
@@ -142,6 +177,14 @@ fn decide_dial_failure_plan(context: &DialFailureDecisionContext) -> DialFailure
     }
 }
 
+fn normalize_session_open_failure_decision_context(
+    raw_rows: SessionOpenFailureRawRows,
+) -> SessionOpenFailureDecisionContext {
+    SessionOpenFailureDecisionContext {
+        connection_lost: raw_rows.connection_lost,
+    }
+}
+
 fn decide_session_open_failure_plan(
     context: &SessionOpenFailureDecisionContext,
 ) -> SessionOpenFailurePlan {
@@ -149,6 +192,15 @@ fn decide_session_open_failure_plan(
         SessionOpenFailurePlan::EvictAndBreak
     } else {
         SessionOpenFailurePlan::Break
+    }
+}
+
+fn normalize_session_auth_failure_decision_context(
+    raw_rows: SessionAuthFailureRawRows,
+) -> SessionAuthFailureDecisionContext {
+    SessionAuthFailureDecisionContext {
+        connection_lost: raw_rows.connection_lost,
+        bootstrap_retry_invite: raw_rows.bootstrap_retry_invite,
     }
 }
 
@@ -163,11 +215,19 @@ fn decide_session_auth_failure_plan(
     }
 }
 
-fn normalize_session_retry_decision_context(
+fn load_session_retry_raw_rows(
     session_stats: Option<&crate::runtime::SyncStats>,
+) -> SessionRetryRawRows {
+    SessionRetryRawRows {
+        session_stats_present: session_stats.is_some(),
+    }
+}
+
+fn normalize_session_retry_decision_context(
+    raw_rows: SessionRetryRawRows,
 ) -> SessionRetryDecisionContext {
     SessionRetryDecisionContext {
-        session_stats_present: session_stats.is_some(),
+        session_stats_present: raw_rows.session_stats_present,
     }
 }
 
@@ -283,15 +343,17 @@ async fn connect_loop_inner(
                 Ok(outcome) => outcome,
                 Err(e) => {
                     let message = describe_connect_failure(&remote_target, &e);
-                    let dial_failure_plan = decide_dial_failure_plan(&DialFailureDecisionContext {
-                        has_connected_once,
-                        stale_dial_failure: is_stale_dial_failure(&e),
-                        consecutive_stale_dial_failures,
-                        warn_on_startup_stale_failure: matches!(
-                            auth_plan,
-                            OutboundSessionAuthPlan::InviteBootstrap { .. }
-                        ),
-                    });
+                    let dial_failure_plan = decide_dial_failure_plan(
+                        &normalize_dial_failure_decision_context(DialFailureRawRows {
+                            has_connected_once,
+                            stale_dial_failure: is_stale_dial_failure(&e),
+                            consecutive_stale_dial_failures,
+                            warn_on_startup_stale_failure: matches!(
+                                auth_plan,
+                                OutboundSessionAuthPlan::InviteBootstrap { .. }
+                            ),
+                        }),
+                    );
                     let (should_warn, next_consecutive_stale_dial_failures, terminal_stale_target) =
                         match dial_failure_plan {
                             DialFailurePlan::ReturnStaleTarget {
@@ -378,13 +440,16 @@ async fn connect_loop_inner(
                     if let Some(reason) = extract_build_mismatch_reason(&err.to_string()) {
                         note_build_mismatch(daemon_connection.remote_daemon_peer_id(), reason);
                     }
-                    let plan =
-                        decide_session_open_failure_plan(&SessionOpenFailureDecisionContext {
-                            connection_lost: should_evict_closed_daemon_connection(
-                                &daemon_connection,
-                                &err.to_string(),
-                            ),
-                        });
+                    let plan = decide_session_open_failure_plan(
+                        &normalize_session_open_failure_decision_context(
+                            SessionOpenFailureRawRows {
+                                connection_lost: should_evict_closed_daemon_connection(
+                                    &daemon_connection,
+                                    &err.to_string(),
+                                ),
+                            },
+                        ),
+                    );
                     if matches!(plan, SessionOpenFailurePlan::EvictAndBreak) {
                         daemon_connection
                             .connection()
@@ -450,14 +515,17 @@ async fn connect_loop_inner(
                     auth_result
                 }
                 Err(e) => {
-                    let plan =
-                        decide_session_auth_failure_plan(SessionAuthFailureDecisionContext {
-                            connection_lost: should_evict_closed_daemon_connection(
-                                &daemon_connection,
-                                &e.to_string(),
-                            ),
-                            bootstrap_retry_invite,
-                        });
+                    let plan = decide_session_auth_failure_plan(
+                        normalize_session_auth_failure_decision_context(
+                            SessionAuthFailureRawRows {
+                                connection_lost: should_evict_closed_daemon_connection(
+                                    &daemon_connection,
+                                    &e.to_string(),
+                                ),
+                                bootstrap_retry_invite,
+                            },
+                        ),
+                    );
                     next_auth_plan_override = plan.next_auth_plan_override.clone();
                     if plan.evict_live_connection {
                         daemon_connection
@@ -543,8 +611,9 @@ async fn connect_loop_inner(
             )
             .await;
 
-            let session_retry_context =
-                normalize_session_retry_decision_context(session_stats.as_ref());
+            let session_retry_context = normalize_session_retry_decision_context(
+                load_session_retry_raw_rows(session_stats.as_ref()),
+            );
             let session_retry_plan = decide_session_retry_plan(&session_retry_context);
             let session_retry_delay = match session_retry_plan {
                 SessionRetryPlan::NoDelay => Duration::ZERO,
@@ -774,6 +843,63 @@ mod tests {
     }
 
     #[test]
+    fn dial_failure_normalizer_preserves_raw_rows_for_planner() {
+        let raw = DialFailureRawRows {
+            has_connected_once: true,
+            stale_dial_failure: false,
+            consecutive_stale_dial_failures: 3,
+            warn_on_startup_stale_failure: false,
+        };
+
+        let context = normalize_dial_failure_decision_context(raw.clone());
+
+        assert_eq!(
+            context,
+            DialFailureDecisionContext {
+                has_connected_once: raw.has_connected_once,
+                stale_dial_failure: raw.stale_dial_failure,
+                consecutive_stale_dial_failures: raw.consecutive_stale_dial_failures,
+                warn_on_startup_stale_failure: raw.warn_on_startup_stale_failure,
+            }
+        );
+        assert_eq!(
+            decide_dial_failure_plan(&context),
+            DialFailurePlan::Retry {
+                should_warn: true,
+                next_consecutive_stale_dial_failures: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn session_open_failure_normalizer_preserves_raw_rows_for_planner() {
+        for raw in [
+            SessionOpenFailureRawRows {
+                connection_lost: true,
+            },
+            SessionOpenFailureRawRows {
+                connection_lost: false,
+            },
+        ] {
+            let context = normalize_session_open_failure_decision_context(raw.clone());
+            assert_eq!(
+                context,
+                SessionOpenFailureDecisionContext {
+                    connection_lost: raw.connection_lost,
+                }
+            );
+            assert_eq!(
+                decide_session_open_failure_plan(&context),
+                if raw.connection_lost {
+                    SessionOpenFailurePlan::EvictAndBreak
+                } else {
+                    SessionOpenFailurePlan::Break
+                }
+            );
+        }
+    }
+
+    #[test]
     fn session_auth_failure_plan_preserves_bootstrap_retry_override() {
         assert_eq!(
             decide_session_auth_failure_plan(SessionAuthFailureDecisionContext {
@@ -790,6 +916,61 @@ mod tests {
     }
 
     #[test]
+    fn session_auth_failure_normalizer_preserves_raw_rows_for_planner() {
+        let raw = SessionAuthFailureRawRows {
+            connection_lost: false,
+            bootstrap_retry_invite: Some("invite-1".to_string()),
+        };
+
+        let context = normalize_session_auth_failure_decision_context(raw.clone());
+
+        assert_eq!(
+            context,
+            SessionAuthFailureDecisionContext {
+                connection_lost: raw.connection_lost,
+                bootstrap_retry_invite: raw.bootstrap_retry_invite.clone(),
+            }
+        );
+        assert_eq!(
+            decide_session_auth_failure_plan(context),
+            SessionAuthFailurePlan {
+                next_auth_plan_override: Some(OutboundSessionAuthPlan::InviteBootstrap {
+                    invite_event_id: "invite-1".to_string(),
+                }),
+                evict_live_connection: false,
+            }
+        );
+    }
+
+    #[test]
+    fn session_retry_normalizer_preserves_raw_rows_for_planner() {
+        for raw in [
+            SessionRetryRawRows {
+                session_stats_present: true,
+            },
+            SessionRetryRawRows {
+                session_stats_present: false,
+            },
+        ] {
+            let context = normalize_session_retry_decision_context(raw.clone());
+            assert_eq!(
+                context,
+                SessionRetryDecisionContext {
+                    session_stats_present: raw.session_stats_present,
+                }
+            );
+            assert_eq!(
+                decide_session_retry_plan(&context),
+                if raw.session_stats_present {
+                    SessionRetryPlan::NoDelay
+                } else {
+                    SessionRetryPlan::Delay(Duration::from_millis(250))
+                }
+            );
+        }
+    }
+
+    #[test]
     fn session_retry_plan_quiescent_sessions_do_not_back_off() {
         let stats = SyncStats {
             events_sent: 0,
@@ -800,7 +981,9 @@ mod tests {
             duration_ms: 0,
         };
         assert_eq!(
-            decide_session_retry_plan(&normalize_session_retry_decision_context(Some(&stats))),
+            decide_session_retry_plan(&normalize_session_retry_decision_context(
+                load_session_retry_raw_rows(Some(&stats))
+            )),
             SessionRetryPlan::NoDelay
         );
     }

@@ -6,6 +6,13 @@ verus! {
 
 pub spec const STALE_DIAL_FAILURE_THRESHOLD: nat = 8;
 
+pub struct DialFailureRawRows {
+    pub has_connected_once: bool,
+    pub stale_dial_failure: bool,
+    pub consecutive_stale_dial_failures: nat,
+    pub warn_on_startup_stale_failure: bool,
+}
+
 pub struct DialFailureDecisionContext {
     pub has_connected_once: bool,
     pub stale_dial_failure: bool,
@@ -24,6 +31,10 @@ pub enum DialFailurePlan {
     },
 }
 
+pub struct SessionOpenFailureRawRows {
+    pub connection_lost: bool,
+}
+
 pub struct SessionOpenFailureDecisionContext {
     pub connection_lost: bool,
 }
@@ -31,6 +42,11 @@ pub struct SessionOpenFailureDecisionContext {
 pub enum SessionOpenFailurePlan {
     Break,
     EvictAndBreak,
+}
+
+pub struct SessionAuthFailureRawRows {
+    pub connection_lost: bool,
+    pub has_bootstrap_retry_invite: bool,
 }
 
 pub struct SessionAuthFailureDecisionContext {
@@ -41,6 +57,10 @@ pub struct SessionAuthFailureDecisionContext {
 pub struct SessionAuthFailurePlan {
     pub next_auth_plan_override: bool,
     pub evict_live_connection: bool,
+}
+
+pub struct SessionRetryRawRows {
+    pub session_stats_present: bool,
 }
 
 pub struct SessionRetryDecisionContext {
@@ -58,6 +78,17 @@ pub open spec fn should_warn_for_connect_failure(
     warn_on_startup_stale_failure: bool,
 ) -> bool {
     has_connected_once || !stale_dial_failure || warn_on_startup_stale_failure
+}
+
+pub open spec fn normalize_dial_failure_decision_context(
+    raw_rows: DialFailureRawRows,
+) -> DialFailureDecisionContext {
+    DialFailureDecisionContext {
+        has_connected_once: raw_rows.has_connected_once,
+        stale_dial_failure: raw_rows.stale_dial_failure,
+        consecutive_stale_dial_failures: raw_rows.consecutive_stale_dial_failures,
+        warn_on_startup_stale_failure: raw_rows.warn_on_startup_stale_failure,
+    }
 }
 
 pub open spec fn decide_dial_failure_plan(
@@ -88,6 +119,14 @@ pub open spec fn decide_dial_failure_plan(
     }
 }
 
+pub open spec fn normalize_session_open_failure_decision_context(
+    raw_rows: SessionOpenFailureRawRows,
+) -> SessionOpenFailureDecisionContext {
+    SessionOpenFailureDecisionContext {
+        connection_lost: raw_rows.connection_lost,
+    }
+}
+
 pub open spec fn decide_session_open_failure_plan(
     context: &SessionOpenFailureDecisionContext,
 ) -> SessionOpenFailurePlan {
@@ -95,6 +134,15 @@ pub open spec fn decide_session_open_failure_plan(
         SessionOpenFailurePlan::EvictAndBreak
     } else {
         SessionOpenFailurePlan::Break
+    }
+}
+
+pub open spec fn normalize_session_auth_failure_decision_context(
+    raw_rows: SessionAuthFailureRawRows,
+) -> SessionAuthFailureDecisionContext {
+    SessionAuthFailureDecisionContext {
+        connection_lost: raw_rows.connection_lost,
+        has_bootstrap_retry_invite: raw_rows.has_bootstrap_retry_invite,
     }
 }
 
@@ -107,6 +155,14 @@ pub open spec fn decide_session_auth_failure_plan(
     }
 }
 
+pub open spec fn normalize_session_retry_decision_context(
+    raw_rows: SessionRetryRawRows,
+) -> SessionRetryDecisionContext {
+    SessionRetryDecisionContext {
+        session_stats_present: raw_rows.session_stats_present,
+    }
+}
+
 pub open spec fn decide_session_retry_plan(
     context: &SessionRetryDecisionContext,
 ) -> SessionRetryPlan {
@@ -115,6 +171,62 @@ pub open spec fn decide_session_retry_plan(
     } else {
         SessionRetryPlan::Delay250Ms
     }
+}
+
+proof fn dial_failure_normalizer_preserves_query_facts(
+    has_connected_once: bool,
+    stale_dial_failure: bool,
+    consecutive_stale_dial_failures: nat,
+    warn_on_startup_stale_failure: bool,
+)
+    ensures
+        normalize_dial_failure_decision_context(DialFailureRawRows {
+            has_connected_once,
+            stale_dial_failure,
+            consecutive_stale_dial_failures,
+            warn_on_startup_stale_failure,
+        }) == (DialFailureDecisionContext {
+            has_connected_once,
+            stale_dial_failure,
+            consecutive_stale_dial_failures,
+            warn_on_startup_stale_failure,
+        }),
+{
+}
+
+proof fn session_open_failure_normalizer_preserves_query_facts(connection_lost: bool)
+    ensures
+        normalize_session_open_failure_decision_context(SessionOpenFailureRawRows {
+            connection_lost,
+        }) == (SessionOpenFailureDecisionContext {
+            connection_lost,
+        }),
+{
+}
+
+proof fn session_auth_failure_normalizer_preserves_query_facts(
+    connection_lost: bool,
+    has_bootstrap_retry_invite: bool,
+)
+    ensures
+        normalize_session_auth_failure_decision_context(SessionAuthFailureRawRows {
+            connection_lost,
+            has_bootstrap_retry_invite,
+        }) == (SessionAuthFailureDecisionContext {
+            connection_lost,
+            has_bootstrap_retry_invite,
+        }),
+{
+}
+
+proof fn session_retry_normalizer_preserves_query_facts(session_stats_present: bool)
+    ensures
+        normalize_session_retry_decision_context(SessionRetryRawRows {
+            session_stats_present,
+        }) == (SessionRetryDecisionContext {
+            session_stats_present,
+        }),
+{
 }
 
 proof fn stale_dial_failure_returns_stale_target_at_threshold()
