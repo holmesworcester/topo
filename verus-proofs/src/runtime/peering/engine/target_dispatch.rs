@@ -15,6 +15,14 @@ pub enum DispatchAction {
     Reconnect,
 }
 
+pub struct TargetDispatchRawRows {
+    pub incoming_source: TargetSourceKind,
+    pub should_initiate_connect: bool,
+    pub bootstrap_phase: bool,
+    pub has_active_higher_precedence_worker: bool,
+    pub dispatch_action: DispatchAction,
+}
+
 pub struct TargetDispatchDecisionContext {
     pub incoming_source: TargetSourceKind,
     pub should_initiate_connect: bool,
@@ -26,6 +34,18 @@ pub struct TargetDispatchDecisionContext {
 pub enum TargetDispatchPlan {
     Skip,
     Spawn { cancel_existing_dispatch_key: bool, cancel_bootstrap_prefix: bool },
+}
+
+pub open spec fn normalize_target_dispatch_decision_context(
+    raw_rows: TargetDispatchRawRows,
+) -> TargetDispatchDecisionContext {
+    TargetDispatchDecisionContext {
+        incoming_source: raw_rows.incoming_source,
+        should_initiate_connect: raw_rows.should_initiate_connect,
+        bootstrap_phase: raw_rows.bootstrap_phase,
+        has_active_higher_precedence_worker: raw_rows.has_active_higher_precedence_worker,
+        dispatch_action: raw_rows.dispatch_action,
+    }
 }
 
 pub open spec fn decide_target_dispatch_plan(
@@ -53,6 +73,30 @@ pub open spec fn decide_target_dispatch_plan(
             },
         }
     }
+}
+
+proof fn target_dispatch_normalizer_preserves_query_facts(
+    incoming_source: TargetSourceKind,
+    should_initiate_connect: bool,
+    bootstrap_phase: bool,
+    has_active_higher_precedence_worker: bool,
+    dispatch_action: DispatchAction,
+)
+    ensures
+        normalize_target_dispatch_decision_context(TargetDispatchRawRows {
+            incoming_source,
+            should_initiate_connect,
+            bootstrap_phase,
+            has_active_higher_precedence_worker,
+            dispatch_action,
+        }) == (TargetDispatchDecisionContext {
+            incoming_source,
+            should_initiate_connect,
+            bootstrap_phase,
+            has_active_higher_precedence_worker,
+            dispatch_action,
+        }),
+{
 }
 
 proof fn bootstrap_is_suppressed_by_active_known_peer_outside_bootstrap_phase(

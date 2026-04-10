@@ -15,23 +15,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::bootstrap_auth::{
-    is_tenant_in_bootstrap_phase, resolve_active_bootstrap_session_fallback,
-    should_initiate_connect_for_source_with_db, BootstrapSessionFallback,
+    BootstrapSessionFallback, is_tenant_in_bootstrap_phase,
+    resolve_active_bootstrap_session_fallback, should_initiate_connect_for_source_with_db,
 };
 use super::target_planner::{
-    bootstrap_dispatch_action, bootstrap_dispatch_key, bootstrap_dispatch_key_prefix,
-    dispatch_bootstrap_target, dispatch_known_peer_target, known_peer_dispatch_action,
-    known_peer_dispatch_key, DispatchAction, PeerDispatcher,
+    DispatchAction, PeerDispatcher, bootstrap_dispatch_action, bootstrap_dispatch_key,
+    bootstrap_dispatch_key_prefix, dispatch_bootstrap_target, dispatch_known_peer_target,
+    known_peer_dispatch_action, known_peer_dispatch_key,
 };
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::open_connection;
 use crate::peering::loops::{
-    connect_loop, preferred_connection_direction, short_peer_id, ConnectLoopConfig,
-    STALE_DIAL_TARGET_MARKER,
+    ConnectLoopConfig, STALE_DIAL_TARGET_MARKER, connect_loop, preferred_connection_direction,
+    short_peer_id,
 };
-use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
-use crate::transport::{resolve_bound_daemon_peer_id, OutboundSessionAuthPlan, TransportEndpoint};
+use crate::runtime::repeated_warning::{RepeatedWarningGate, should_emit_globally};
+use crate::transport::{OutboundSessionAuthPlan, TransportEndpoint, resolve_bound_daemon_peer_id};
 
 #[derive(Clone, Debug)]
 pub(crate) enum TargetIngressSource {
@@ -74,6 +74,15 @@ impl TargetIngressSource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TargetDispatchRawRows {
+    pub(super) incoming_source: TargetIngressSourceKind,
+    pub(super) should_initiate_connect: bool,
+    pub(super) bootstrap_phase: bool,
+    pub(super) has_active_higher_precedence_worker: bool,
+    pub(super) dispatch_action: DispatchAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TargetDispatchDecisionContext {
     pub(super) incoming_source: TargetIngressSourceKind,
     pub(super) should_initiate_connect: bool,
@@ -113,6 +122,18 @@ pub(super) fn should_ignore_target_event(
     incoming: &TargetIngressSource,
 ) -> bool {
     source_precedence(existing) > source_precedence(incoming)
+}
+
+pub(super) fn normalize_target_dispatch_decision_context(
+    raw_rows: TargetDispatchRawRows,
+) -> TargetDispatchDecisionContext {
+    TargetDispatchDecisionContext {
+        incoming_source: raw_rows.incoming_source,
+        should_initiate_connect: raw_rows.should_initiate_connect,
+        bootstrap_phase: raw_rows.bootstrap_phase,
+        has_active_higher_precedence_worker: raw_rows.has_active_higher_precedence_worker,
+        dispatch_action: raw_rows.dispatch_action,
+    }
 }
 
 pub(super) fn decide_target_dispatch_plan(
@@ -340,13 +361,15 @@ pub(super) async fn run_target_dispatcher(
                     .map(|existing| should_ignore_target_event(&existing.source, &event.source))
                     .unwrap_or(false);
         let dispatch_action = dispatch_action_for_event(&dispatcher, &event);
-        let dispatch_plan = decide_target_dispatch_plan(&TargetDispatchDecisionContext {
-            incoming_source: event.source.kind(),
-            should_initiate_connect,
-            bootstrap_phase,
-            has_active_higher_precedence_worker,
-            dispatch_action,
-        });
+        let dispatch_plan = decide_target_dispatch_plan(
+            &normalize_target_dispatch_decision_context(TargetDispatchRawRows {
+                incoming_source: event.source.kind(),
+                should_initiate_connect,
+                bootstrap_phase,
+                has_active_higher_precedence_worker,
+                dispatch_action,
+            }),
+        );
 
         if matches!(
             dispatch_plan,
@@ -631,24 +654,24 @@ mod tests {
         has_active_higher_precedence_worker: bool,
         dispatch_action: DispatchAction,
     ) -> TargetDispatchDecisionContext {
-        TargetDispatchDecisionContext {
+        normalize_target_dispatch_decision_context(TargetDispatchRawRows {
             incoming_source: TargetIngressSourceKind::Bootstrap,
             should_initiate_connect: true,
             bootstrap_phase,
             has_active_higher_precedence_worker,
             dispatch_action,
-        }
+        })
     }
 
     #[test]
     fn target_dispatch_plan_skips_non_preferred_sources() {
-        let context = TargetDispatchDecisionContext {
+        let context = normalize_target_dispatch_decision_context(TargetDispatchRawRows {
             incoming_source: TargetIngressSourceKind::KnownPeer,
             should_initiate_connect: false,
             bootstrap_phase: false,
             has_active_higher_precedence_worker: false,
             dispatch_action: DispatchAction::Connect,
-        };
+        });
 
         assert_eq!(
             decide_target_dispatch_plan(&context),
@@ -685,7 +708,26 @@ mod tests {
 
     #[test]
     fn known_peer_spawn_outside_bootstrap_phase_cancels_bootstrap_prefix() {
-        let context = TargetDispatchDecisionContext {
+        let context = normalize_target_dispatch_decision_context(TargetDispatchRawRows {
+            incoming_source: TargetIngressSourceKind::KnownPeer,
+            should_initiate_connect: true,
+            bootstrap_phase: false,
+            has_active_higher_precedence_worker: false,
+            dispatch_action: DispatchAction::Reconnect,
+        });
+
+        assert_eq!(
+            decide_target_dispatch_plan(&context),
+            TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
+                cancel_existing_dispatch_key: true,
+                cancel_bootstrap_prefix: true,
+            })
+        );
+    }
+
+    #[test]
+    fn target_dispatch_normalizer_preserves_raw_rows_for_planner() {
+        let raw = TargetDispatchRawRows {
             incoming_source: TargetIngressSourceKind::KnownPeer,
             should_initiate_connect: true,
             bootstrap_phase: false,
@@ -693,6 +735,18 @@ mod tests {
             dispatch_action: DispatchAction::Reconnect,
         };
 
+        let context = normalize_target_dispatch_decision_context(raw.clone());
+
+        assert_eq!(
+            context,
+            TargetDispatchDecisionContext {
+                incoming_source: raw.incoming_source,
+                should_initiate_connect: raw.should_initiate_connect,
+                bootstrap_phase: raw.bootstrap_phase,
+                has_active_higher_precedence_worker: raw.has_active_higher_precedence_worker,
+                dispatch_action: raw.dispatch_action,
+            }
+        );
         assert_eq!(
             decide_target_dispatch_plan(&context),
             TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
