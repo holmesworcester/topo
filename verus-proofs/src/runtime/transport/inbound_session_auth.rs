@@ -4,10 +4,21 @@ use vstd::prelude::*;
 
 verus! {
 
-pub enum BootstrapSessionTenantDecision {
-    RejectMissing,
+pub struct BootstrapSessionTenantRawRows {
+    pub row_count: nat,
+    pub all_tenant_ids_equal: bool,
+}
+
+pub enum BootstrapSessionTenantDecisionContext {
+    MissingTenantBinding,
+    UniqueTenantBinding,
+    AmbiguousTenantBinding,
+}
+
+pub enum BootstrapSessionTenantPlan {
+    RejectMissingTenantBinding,
     Accept,
-    RejectAmbiguous,
+    RejectAmbiguousTenantBinding,
 }
 
 pub enum InboundRouteAuthDecision {
@@ -22,6 +33,34 @@ pub enum InboundBootstrapAuthDecision {
     RejectTenantResolution,
 }
 
+pub open spec fn normalize_bootstrap_session_tenant_decision_context(
+    raw_rows: BootstrapSessionTenantRawRows,
+) -> BootstrapSessionTenantDecisionContext {
+    if raw_rows.row_count == 0 {
+        BootstrapSessionTenantDecisionContext::MissingTenantBinding
+    } else if raw_rows.all_tenant_ids_equal {
+        BootstrapSessionTenantDecisionContext::UniqueTenantBinding
+    } else {
+        BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding
+    }
+}
+
+pub open spec fn decide_bootstrap_session_tenant_plan(
+    context: BootstrapSessionTenantDecisionContext,
+) -> BootstrapSessionTenantPlan {
+    match context {
+        BootstrapSessionTenantDecisionContext::MissingTenantBinding => {
+            BootstrapSessionTenantPlan::RejectMissingTenantBinding
+        }
+        BootstrapSessionTenantDecisionContext::UniqueTenantBinding => {
+            BootstrapSessionTenantPlan::Accept
+        }
+        BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding => {
+            BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding
+        }
+    }
+}
+
 pub open spec fn decide_inbound_route_auth(route_authorized: bool) -> InboundRouteAuthDecision {
     if route_authorized {
         InboundRouteAuthDecision::Accept
@@ -31,22 +70,23 @@ pub open spec fn decide_inbound_route_auth(route_authorized: bool) -> InboundRou
 }
 
 pub open spec fn decide_inbound_bootstrap_auth(
-    tenant_resolution: BootstrapSessionTenantDecision,
+    tenant_resolution: BootstrapSessionTenantDecisionContext,
     has_cached_tenant: bool,
     expiry_valid: bool,
     daemon_binding_valid: bool,
     claimed_peer_matches_key: bool,
     invite_signature_valid: bool,
 ) -> InboundBootstrapAuthDecision {
-    if !expiry_valid || !daemon_binding_valid || !claimed_peer_matches_key || !invite_signature_valid {
+    if !expiry_valid || !daemon_binding_valid || !claimed_peer_matches_key || !invite_signature_valid
+    {
         InboundBootstrapAuthDecision::RejectInvalidAuth
     } else {
         match tenant_resolution {
-            BootstrapSessionTenantDecision::Accept => {
+            BootstrapSessionTenantDecisionContext::UniqueTenantBinding => {
                 InboundBootstrapAuthDecision::AcceptResolvedTenant
             }
-            BootstrapSessionTenantDecision::RejectMissing
-            | BootstrapSessionTenantDecision::RejectAmbiguous => {
+            BootstrapSessionTenantDecisionContext::MissingTenantBinding
+            | BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding => {
                 if has_cached_tenant {
                     InboundBootstrapAuthDecision::AcceptCachedTenant
                 } else {
@@ -67,10 +107,51 @@ proof fn inbound_route_accepts_authorized()
 {
 }
 
+proof fn bootstrap_session_tenant_normalizes_empty_to_missing()
+    ensures
+        normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
+            row_count: 0,
+            all_tenant_ids_equal: true,
+        }) == BootstrapSessionTenantDecisionContext::MissingTenantBinding,
+{
+}
+
+proof fn bootstrap_session_tenant_normalizes_equal_rows_to_unique(row_count: nat)
+    requires row_count > 0
+    ensures
+        normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
+            row_count,
+            all_tenant_ids_equal: true,
+        }) == BootstrapSessionTenantDecisionContext::UniqueTenantBinding,
+        decide_bootstrap_session_tenant_plan(
+            normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
+                row_count,
+                all_tenant_ids_equal: true,
+            })
+        ) == BootstrapSessionTenantPlan::Accept,
+{
+}
+
+proof fn bootstrap_session_tenant_normalizes_mixed_rows_to_ambiguous(row_count: nat)
+    requires row_count > 0
+    ensures
+        normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
+            row_count,
+            all_tenant_ids_equal: false,
+        }) == BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding,
+        decide_bootstrap_session_tenant_plan(
+            normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
+                row_count,
+                all_tenant_ids_equal: false,
+            })
+        ) == BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding,
+{
+}
+
 proof fn inbound_bootstrap_rejects_invalid_auth_even_with_cached_tenant()
     ensures
         decide_inbound_bootstrap_auth(
-            BootstrapSessionTenantDecision::RejectMissing,
+            BootstrapSessionTenantDecisionContext::MissingTenantBinding,
             true,
             false,
             true,
@@ -83,7 +164,7 @@ proof fn inbound_bootstrap_rejects_invalid_auth_even_with_cached_tenant()
 proof fn inbound_bootstrap_accepts_cached_tenant_after_resolution_loss()
     ensures
         decide_inbound_bootstrap_auth(
-            BootstrapSessionTenantDecision::RejectMissing,
+            BootstrapSessionTenantDecisionContext::MissingTenantBinding,
             true,
             true,
             true,
@@ -96,7 +177,7 @@ proof fn inbound_bootstrap_accepts_cached_tenant_after_resolution_loss()
 proof fn inbound_bootstrap_accepts_resolved_tenant_without_cache()
     ensures
         decide_inbound_bootstrap_auth(
-            BootstrapSessionTenantDecision::Accept,
+            BootstrapSessionTenantDecisionContext::UniqueTenantBinding,
             false,
             true,
             true,

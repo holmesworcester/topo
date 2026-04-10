@@ -61,15 +61,22 @@ pub struct InboundSessionAuthContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapSessionTenantContext {
-    CandidateTenants { tenant_ids: Vec<String> },
+struct BootstrapSessionTenantRawRows {
+    tenant_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapSessionTenantDecision {
-    RejectMissing,
+enum BootstrapSessionTenantDecisionContext {
+    MissingTenantBinding,
+    UniqueTenantBinding { tenant_id: String },
+    AmbiguousTenantBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapSessionTenantPlan {
+    RejectMissingTenantBinding,
     Accept { tenant_id: String },
-    RejectAmbiguous,
+    RejectAmbiguousTenantBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,17 +86,25 @@ struct BootstrapFallbackInviteCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapFallbackInviteContext {
-    Candidates {
-        candidates: Vec<BootstrapFallbackInviteCandidate>,
-    },
+struct BootstrapFallbackInviteRawRows {
+    candidates: Vec<BootstrapFallbackInviteCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapFallbackInviteDecision {
-    RejectMissing,
+enum BootstrapFallbackInviteDecisionContext {
+    MissingCandidate,
+    UniqueCandidate {
+        invite_event_id: String,
+        workspace_already_local_before_candidate: bool,
+    },
+    AmbiguousCandidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapFallbackInvitePlan {
+    RejectMissingCandidate,
     UseInvite { invite_event_id: String },
-    RejectAmbiguous,
+    RejectAmbiguousCandidate,
     RejectAlreadyLocalWorkspaceCandidate,
 }
 
@@ -124,7 +139,7 @@ enum InboundRouteAuthDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InboundBootstrapAuthContext {
-    tenant_resolution: BootstrapSessionTenantDecision,
+    tenant_resolution: BootstrapSessionTenantDecisionContext,
     tenant_resolution_error: Option<String>,
     cached_tenant_id: Option<String>,
     expiry_valid: bool,
@@ -141,53 +156,87 @@ enum InboundBootstrapAuthDecision {
     RejectTenantResolution,
 }
 
-fn decide_bootstrap_session_tenant(
-    context: &BootstrapSessionTenantContext,
-) -> BootstrapSessionTenantDecision {
+fn normalize_bootstrap_session_tenant_decision_context(
+    raw_rows: &BootstrapSessionTenantRawRows,
+) -> BootstrapSessionTenantDecisionContext {
+    let mut tenant_ids = raw_rows.tenant_ids.clone();
+    tenant_ids.sort();
+    tenant_ids.dedup();
+    match tenant_ids.as_slice() {
+        [] => BootstrapSessionTenantDecisionContext::MissingTenantBinding,
+        [tenant_id] => BootstrapSessionTenantDecisionContext::UniqueTenantBinding {
+            tenant_id: tenant_id.clone(),
+        },
+        _ => BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding,
+    }
+}
+
+fn decide_bootstrap_session_tenant_plan(
+    context: &BootstrapSessionTenantDecisionContext,
+) -> BootstrapSessionTenantPlan {
     match context {
-        BootstrapSessionTenantContext::CandidateTenants { tenant_ids } => {
-            let mut tenant_ids = tenant_ids.clone();
-            tenant_ids.sort();
-            tenant_ids.dedup();
-            match tenant_ids.as_slice() {
-                [] => BootstrapSessionTenantDecision::RejectMissing,
-                [tenant_id] => BootstrapSessionTenantDecision::Accept {
-                    tenant_id: tenant_id.clone(),
-                },
-                _ => BootstrapSessionTenantDecision::RejectAmbiguous,
+        BootstrapSessionTenantDecisionContext::MissingTenantBinding => {
+            BootstrapSessionTenantPlan::RejectMissingTenantBinding
+        }
+        BootstrapSessionTenantDecisionContext::UniqueTenantBinding { tenant_id } => {
+            BootstrapSessionTenantPlan::Accept {
+                tenant_id: tenant_id.clone(),
             }
+        }
+        BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding => {
+            BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding
         }
     }
 }
 
-fn decide_bootstrap_fallback_invite(
-    context: &BootstrapFallbackInviteContext,
-) -> BootstrapFallbackInviteDecision {
+fn normalize_bootstrap_fallback_invite_decision_context(
+    raw_rows: &BootstrapFallbackInviteRawRows,
+) -> BootstrapFallbackInviteDecisionContext {
+    let mut candidates = raw_rows.candidates.clone();
+    candidates.sort_by(|a, b| a.invite_event_id.cmp(&b.invite_event_id));
+    let mut normalized: Vec<BootstrapFallbackInviteCandidate> = Vec::new();
+    for candidate in candidates {
+        if let Some(last) = normalized.last_mut() {
+            if last.invite_event_id == candidate.invite_event_id {
+                last.workspace_already_local_before_candidate |=
+                    candidate.workspace_already_local_before_candidate;
+                continue;
+            }
+        }
+        normalized.push(candidate);
+    }
+    match normalized.as_slice() {
+        [] => BootstrapFallbackInviteDecisionContext::MissingCandidate,
+        [candidate] => BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+            invite_event_id: candidate.invite_event_id.clone(),
+            workspace_already_local_before_candidate: candidate
+                .workspace_already_local_before_candidate,
+        },
+        _ => BootstrapFallbackInviteDecisionContext::AmbiguousCandidate,
+    }
+}
+
+fn decide_bootstrap_fallback_invite_plan(
+    context: &BootstrapFallbackInviteDecisionContext,
+) -> BootstrapFallbackInvitePlan {
     match context {
-        BootstrapFallbackInviteContext::Candidates { candidates } => {
-            let mut candidates = candidates.clone();
-            candidates.sort_by(|a, b| a.invite_event_id.cmp(&b.invite_event_id));
-            let mut normalized: Vec<BootstrapFallbackInviteCandidate> = Vec::new();
-            for candidate in candidates {
-                if let Some(last) = normalized.last_mut() {
-                    if last.invite_event_id == candidate.invite_event_id {
-                        last.workspace_already_local_before_candidate |=
-                            candidate.workspace_already_local_before_candidate;
-                        continue;
-                    }
+        BootstrapFallbackInviteDecisionContext::MissingCandidate => {
+            BootstrapFallbackInvitePlan::RejectMissingCandidate
+        }
+        BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+            invite_event_id,
+            workspace_already_local_before_candidate,
+        } => {
+            if *workspace_already_local_before_candidate {
+                BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
+            } else {
+                BootstrapFallbackInvitePlan::UseInvite {
+                    invite_event_id: invite_event_id.clone(),
                 }
-                normalized.push(candidate);
             }
-            match normalized.as_slice() {
-                [] => BootstrapFallbackInviteDecision::RejectMissing,
-                [candidate] if candidate.workspace_already_local_before_candidate => {
-                    BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate
-                }
-                [candidate] => BootstrapFallbackInviteDecision::UseInvite {
-                    invite_event_id: candidate.invite_event_id.clone(),
-                },
-                _ => BootstrapFallbackInviteDecision::RejectAmbiguous,
-            }
+        }
+        BootstrapFallbackInviteDecisionContext::AmbiguousCandidate => {
+            BootstrapFallbackInvitePlan::RejectAmbiguousCandidate
         }
     }
 }
@@ -258,13 +307,13 @@ fn decide_inbound_bootstrap_auth(
     }
 
     match &context.tenant_resolution {
-        BootstrapSessionTenantDecision::Accept { tenant_id } => {
+        BootstrapSessionTenantDecisionContext::UniqueTenantBinding { tenant_id } => {
             InboundBootstrapAuthDecision::AcceptResolvedTenant {
                 tenant_id: tenant_id.clone(),
             }
         }
-        BootstrapSessionTenantDecision::RejectMissing
-        | BootstrapSessionTenantDecision::RejectAmbiguous => {
+        BootstrapSessionTenantDecisionContext::MissingTenantBinding
+        | BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding => {
             if let Some(tenant_id) = &context.cached_tenant_id {
                 InboundBootstrapAuthDecision::AcceptCachedTenant {
                     tenant_id: tenant_id.clone(),
@@ -382,11 +431,11 @@ fn load_invite_public_key(
     }
 }
 
-fn load_bootstrap_session_tenant_context(
+fn load_bootstrap_session_tenant_raw_rows(
     conn: &Connection,
     invite_event_id_b64: &str,
     remote_daemon_peer_id: &[u8; 32],
-) -> Result<BootstrapSessionTenantContext, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<BootstrapSessionTenantRawRows, Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms()? as i64;
     let tenant_ids = conn
         .prepare(
@@ -410,25 +459,27 @@ fn load_bootstrap_session_tenant_context(
             |row| crate::db::sql_types::get_text(row, 0),
         )?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(BootstrapSessionTenantContext::CandidateTenants { tenant_ids })
+    Ok(BootstrapSessionTenantRawRows { tenant_ids })
 }
 
+#[cfg(test)]
 fn resolve_bootstrap_session_tenant(
     conn: &Connection,
     invite_event_id_b64: &str,
     remote_daemon_peer_id: &[u8; 32],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let context =
-        load_bootstrap_session_tenant_context(conn, invite_event_id_b64, remote_daemon_peer_id)?;
-    match decide_bootstrap_session_tenant(&context) {
-        BootstrapSessionTenantDecision::RejectMissing => Err(format!(
+    let raw_rows =
+        load_bootstrap_session_tenant_raw_rows(conn, invite_event_id_b64, remote_daemon_peer_id)?;
+    let decision_context = normalize_bootstrap_session_tenant_decision_context(&raw_rows);
+    match decide_bootstrap_session_tenant_plan(&decision_context) {
+        BootstrapSessionTenantPlan::RejectMissingTenantBinding => Err(format!(
             "no active bootstrap trust for invite {} and daemon {}",
             invite_event_id_b64,
             hex::encode(remote_daemon_peer_id)
         )
         .into()),
-        BootstrapSessionTenantDecision::Accept { tenant_id } => Ok(tenant_id),
-        BootstrapSessionTenantDecision::RejectAmbiguous => Err(format!(
+        BootstrapSessionTenantPlan::Accept { tenant_id } => Ok(tenant_id),
+        BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding => Err(format!(
             "invite {} and daemon {} resolve to multiple local tenants; bootstrap auth is ambiguous",
             invite_event_id_b64,
             hex::encode(remote_daemon_peer_id)
@@ -703,17 +754,23 @@ async fn read_inbound_session_auth_inner(
             let claimed_peer_matches_key = auth.source_peer_id == derived_source_peer_id;
             let invite_event_id_b64 = event_id_to_base64(&auth.target_invite_event_id);
             let remote_peer_id = hex::encode(auth.source_peer_id);
-            let (tenant_resolution, tenant_resolution_error) =
-                match resolve_bootstrap_session_tenant(
-                    &db,
-                    &invite_event_id_b64,
-                    &actual_remote_daemon_peer_id_raw,
-                ) {
-                    Ok(tenant_id) => (BootstrapSessionTenantDecision::Accept { tenant_id }, None),
-                    Err(err) => (
-                        BootstrapSessionTenantDecision::RejectMissing,
-                        Some(err.to_string()),
-                    ),
+            let raw_rows = load_bootstrap_session_tenant_raw_rows(
+                &db,
+                &invite_event_id_b64,
+                &actual_remote_daemon_peer_id_raw,
+            )?;
+            let tenant_resolution = normalize_bootstrap_session_tenant_decision_context(&raw_rows);
+            let tenant_resolution_error =
+                match decide_bootstrap_session_tenant_plan(&tenant_resolution) {
+                    BootstrapSessionTenantPlan::Accept { .. } => None,
+                    BootstrapSessionTenantPlan::RejectMissingTenantBinding => Some(format!(
+                        "no active bootstrap trust for invite {} and daemon {}",
+                        invite_event_id_b64, actual_remote_daemon_peer_id
+                    )),
+                    BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding => Some(format!(
+                        "invite {} and daemon {} resolve to multiple local tenants; bootstrap auth is ambiguous",
+                        invite_event_id_b64, actual_remote_daemon_peer_id
+                    )),
                 };
             let invite_public_key = load_invite_public_key(&db, &invite_event_id_b64)?;
             let signing_bytes = encode_invite_signing_bytes(&auth);
@@ -877,11 +934,11 @@ fn has_active_local_bootstrap_session_auth(
     Ok(has_accepted)
 }
 
-pub fn resolve_bootstrap_fallback_invite_for_daemon(
+fn load_bootstrap_fallback_invite_raw_rows_for_daemon(
     conn: &Connection,
     recorded_by: &str,
     actual_remote_daemon_peer_id: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<BootstrapFallbackInviteRawRows, Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms()? as i64;
     let remote_daemon_peer_id =
         decode_hex32(actual_remote_daemon_peer_id, "actual remote daemon peer id")?;
@@ -937,16 +994,28 @@ pub fn resolve_bootstrap_fallback_invite_for_daemon(
             },
         )?
         .collect::<Result<Vec<_>, _>>()?;
+    Ok(BootstrapFallbackInviteRawRows { candidates })
+}
 
-    let decision = decide_bootstrap_fallback_invite(&BootstrapFallbackInviteContext::Candidates {
-        candidates,
-    });
-    Ok(match decision {
-        BootstrapFallbackInviteDecision::UseInvite { invite_event_id } => Some(invite_event_id),
-        BootstrapFallbackInviteDecision::RejectMissing
-        | BootstrapFallbackInviteDecision::RejectAmbiguous
-        | BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate => None,
-    })
+pub fn resolve_bootstrap_fallback_invite_for_daemon(
+    conn: &Connection,
+    recorded_by: &str,
+    actual_remote_daemon_peer_id: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let raw_rows = load_bootstrap_fallback_invite_raw_rows_for_daemon(
+        conn,
+        recorded_by,
+        actual_remote_daemon_peer_id,
+    )?;
+    let decision_context = normalize_bootstrap_fallback_invite_decision_context(&raw_rows);
+    Ok(
+        match decide_bootstrap_fallback_invite_plan(&decision_context) {
+            BootstrapFallbackInvitePlan::UseInvite { invite_event_id } => Some(invite_event_id),
+            BootstrapFallbackInvitePlan::RejectMissingCandidate
+            | BootstrapFallbackInvitePlan::RejectAmbiguousCandidate
+            | BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate => None,
+        },
+    )
 }
 
 fn load_outbound_session_auth_context(
@@ -1290,16 +1359,32 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_session_tenant_decision_accepts_unique_tenant_after_dedup() {
-        let decision =
-            decide_bootstrap_session_tenant(&BootstrapSessionTenantContext::CandidateTenants {
+    fn bootstrap_session_tenant_decision_context_accepts_unique_tenant_after_dedup() {
+        let decision_context =
+            normalize_bootstrap_session_tenant_decision_context(&BootstrapSessionTenantRawRows {
                 tenant_ids: vec!["tenant-a".to_string(), "tenant-a".to_string()],
             });
         assert_eq!(
-            decision,
-            BootstrapSessionTenantDecision::Accept {
+            decision_context,
+            BootstrapSessionTenantDecisionContext::UniqueTenantBinding {
                 tenant_id: "tenant-a".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn bootstrap_session_tenant_plan_rejects_ambiguous_binding() {
+        let decision_context =
+            normalize_bootstrap_session_tenant_decision_context(&BootstrapSessionTenantRawRows {
+                tenant_ids: vec!["tenant-a".to_string(), "tenant-b".to_string()],
+            });
+        assert_eq!(
+            decision_context,
+            BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding
+        );
+        assert_eq!(
+            decide_bootstrap_session_tenant_plan(&decision_context),
+            BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding
         );
     }
 
@@ -1340,17 +1425,86 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_fallback_invite_decision_rejects_candidate_created_after_workspace_was_local() {
-        let decision =
-            decide_bootstrap_fallback_invite(&BootstrapFallbackInviteContext::Candidates {
+    fn load_bootstrap_session_tenant_raw_rows_collects_pending_and_accepted_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("server.sqlite3");
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        crate::db::schema::create_tables(&db).unwrap();
+
+        let invite_event_id = "invite-candidates";
+        let daemon_fp = [0x52; 32];
+        record_pending_invite_bootstrap_trust(
+            &db,
+            "tenant-a",
+            invite_event_id,
+            "workspace",
+            &daemon_fp,
+        )
+        .unwrap();
+        record_invite_bootstrap_trust(
+            &db,
+            "tenant-b",
+            "accepted-b",
+            invite_event_id,
+            "workspace",
+            "",
+            &daemon_fp,
+        )
+        .unwrap();
+
+        let raw_rows =
+            load_bootstrap_session_tenant_raw_rows(&db, invite_event_id, &daemon_fp).unwrap();
+        assert_eq!(
+            raw_rows,
+            BootstrapSessionTenantRawRows {
+                tenant_ids: vec!["tenant-a".to_string(), "tenant-b".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_fallback_invite_plan_rejects_candidate_created_after_workspace_was_local() {
+        let decision_context =
+            normalize_bootstrap_fallback_invite_decision_context(&BootstrapFallbackInviteRawRows {
                 candidates: vec![BootstrapFallbackInviteCandidate {
                     invite_event_id: "invite-1".to_string(),
                     workspace_already_local_before_candidate: true,
                 }],
             });
         assert_eq!(
-            decision,
-            BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate
+            decision_context,
+            BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+                invite_event_id: "invite-1".to_string(),
+                workspace_already_local_before_candidate: true,
+            }
+        );
+        assert_eq!(
+            decide_bootstrap_fallback_invite_plan(&decision_context),
+            BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
+        );
+    }
+
+    #[test]
+    fn bootstrap_fallback_invite_decision_context_merges_duplicate_candidates() {
+        let decision_context =
+            normalize_bootstrap_fallback_invite_decision_context(&BootstrapFallbackInviteRawRows {
+                candidates: vec![
+                    BootstrapFallbackInviteCandidate {
+                        invite_event_id: "invite-1".to_string(),
+                        workspace_already_local_before_candidate: false,
+                    },
+                    BootstrapFallbackInviteCandidate {
+                        invite_event_id: "invite-1".to_string(),
+                        workspace_already_local_before_candidate: true,
+                    },
+                ],
+            });
+        assert_eq!(
+            decision_context,
+            BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+                invite_event_id: "invite-1".to_string(),
+                workspace_already_local_before_candidate: true,
+            }
         );
     }
 
@@ -1367,7 +1521,7 @@ mod tests {
     #[test]
     fn inbound_bootstrap_auth_decision_accepts_cached_tenant_after_resolution_loss() {
         let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthContext {
-            tenant_resolution: BootstrapSessionTenantDecision::RejectMissing,
+            tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
             tenant_resolution_error: None,
             cached_tenant_id: Some("tenant-a".to_string()),
             expiry_valid: true,
@@ -1386,7 +1540,7 @@ mod tests {
     #[test]
     fn inbound_bootstrap_auth_decision_rejects_invalid_auth_before_cache_use() {
         let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthContext {
-            tenant_resolution: BootstrapSessionTenantDecision::RejectMissing,
+            tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
             tenant_resolution_error: None,
             cached_tenant_id: Some("tenant-a".to_string()),
             expiry_valid: false,
