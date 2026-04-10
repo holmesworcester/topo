@@ -12,7 +12,8 @@ Enforces:
   4. Every covered seam row has non-empty Requires / Provides / Targeted Checks,
      uses known invariant keys, names cargo-verus verification, and names at
      least one real `cargo test` target (`--lib <filter>` and/or `--test
-     <target>`).
+     <target>`). Any referenced `python3 scripts/...` or `bash scripts/...`
+     check must point at a real script path.
 """
 
 from __future__ import annotations
@@ -152,6 +153,10 @@ def extract_integration_test_targets(checks: str) -> list[str]:
     return re.findall(r"cargo test\b[^;\n]*?--test\s+([A-Za-z0-9_:-]+)\s+--", checks)
 
 
+def extract_script_paths(checks: str) -> list[str]:
+    return re.findall(r"(?:python3|bash)\s+(scripts/[A-Za-z0-9_./-]+)", checks)
+
+
 def parse_invariant_keys(cell: str) -> list[str]:
     return [token.strip().strip("`") for token in cell.split(",") if token.strip()]
 
@@ -223,6 +228,7 @@ def main() -> int:
 
         test_filters = extract_lib_test_filters(checks)
         integration_targets = extract_integration_test_targets(checks)
+        script_paths = extract_script_paths(checks)
 
         if not test_filters and not integration_targets:
             errors.append(f"ROW_NO_CARGO_TEST_TARGET: {area}")
@@ -242,6 +248,12 @@ def main() -> int:
                         f"ROW_BAD_INTEGRATION_TEST_TARGET: {area} references '{target}', "
                         "but no integration test target matches"
                     )
+
+        for script_path in script_paths:
+            if not (REPO_ROOT / script_path).exists():
+                errors.append(
+                    f"ROW_BAD_SCRIPT_PATH: {area} references missing script '{script_path}'"
+                )
 
         for invariant in parse_invariant_keys(provides):
             if invariant not in KNOWN_INVARIANTS:
