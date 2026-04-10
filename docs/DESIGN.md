@@ -75,12 +75,22 @@ The design goal is to keep protocol behavior auditable while still supporting re
 For security-sensitive runtime behavior, the preferred shape is:
 
 1. one context query loads a transactionally consistent snapshot of the relevant SQL state,
-2. one pure planner maps that snapshot to an explicit plan,
-3. one executor performs only the side effects named by that plan.
+2. one normalizer collapses the raw query result into a `DecisionContext`,
+3. one pure planner maps that `DecisionContext` to an explicit plan,
+4. one executor performs only the side effects named by that plan.
 
-The context query should collapse live runtime state into the smallest stable snapshot that still determines behavior. Avoid planners that reach back into SQLite, inspect the network directly, or depend on hidden ambient state after the snapshot is loaded.
+The context query should collapse live runtime state into the smallest stable decision context that still determines behavior. Avoid planners that reach back into SQLite, inspect the network directly, or depend on hidden ambient state after the decision context is loaded.
 
-This shape is important for proofs. Verus can prove local planner properties such as noninterference, rejection on ambiguity, or "already-local means no bootstrap" directly over the snapshot-to-plan function. TLA can then model retries, refresh loops, cancellation, and cross-component composition around that planner without needing to model SQL internals in full detail.
+This shape is important for proofs. Verus can prove local planner properties such as noninterference, rejection on ambiguity, or "already-local means no bootstrap" directly over the decision-context-to-plan function. TLA can then model retries, refresh loops, cancellation, and cross-component composition around that planner without needing to model SQL internals in full detail.
+
+Here `DecisionContext` means a normalized decision context, not a full database snapshot. It should be a small typed value built from one query (or one fixed set of query rows) that contains only the facts relevant to one decision. Raw query rows may still be messy or redundant; the `DecisionContext` is the compact ADT that removes impossible combinations and names ambiguity explicitly.
+
+Preferred boundary:
+
+1. the DB/query layer returns raw typed rows,
+2. a normalizer collapses those rows into a `*DecisionContext`,
+3. a pure planner maps `*DecisionContext -> *Plan`,
+4. an executor performs only the effects named by `*Plan`.
 
 Design guidance:
 
@@ -88,6 +98,30 @@ Design guidance:
 2. planner outputs should be explicit enums/flags rather than implicit control flow,
 3. executors should not add extra authority decisions beyond the emitted plan,
 4. when a behavior needs a proof, prefer introducing a context-query seam rather than proving over ad-hoc interleaved SQL and network logic.
+
+### Composition Invariants
+
+Local planner proofs are not enough on their own. The repo-wide proof story should compose around a small set of system-level invariants:
+
+1. **Unique current authority or reject.**
+   - No security-relevant runtime action may start unless it is justified by a unique, current, non-revoked binding or authority chain.
+   - Missing, ambiguous, expired, or removed authority must resolve to rejection.
+2. **Already-local workspaces cannot gain bootstrap power.**
+   - If a workspace is already local, bootstrap-derived link data must not create dial targets, bootstrap auth fallback, bootstrap trust, or bootstrap-started sync for that workspace.
+3. **Workspace confinement.**
+   - Workspace-scoped replay, fanout, and sync may only affect tenants that are bound to that same workspace by valid local state.
+4. **Ambiguity and malformation fail closed.**
+   - Contradictory, duplicate, malformed, or out-of-range context state must normalize to rejection, ambiguity, or absence, never silent authorization.
+5. **Executors cannot exceed their plan.**
+   - Runtime code may only perform side effects explicitly authorized by the computed plan. Executors must not re-query broader authority after planning.
+
+Each proof-bearing seam should state:
+
+1. which of these invariants it helps uphold,
+2. what upstream invariant it requires from projector/query state,
+3. what `DecisionContext` it consumes,
+4. what `Plan` it emits,
+5. what runtime tests and Verus lemmas demonstrate the contract.
 
 ## How it Works (Narrative Overview)
 

@@ -120,9 +120,109 @@ These are required, not optional:
 13. Context-query planner seam for proof-bearing runtime policy.
    - security-sensitive runtime behavior should be structured as `context query -> pure planner -> executor`.
    - the context query is responsible for loading and normalizing the SQL snapshot that determines behavior.
+   - here `DecisionContext` means the normalized post-query decision boundary, not a full database snapshot: the smallest typed value that still determines one runtime decision.
+   - raw typed rows belong to the query boundary; the `DecisionContext` is the post-normalization ADT consumed by the planner.
    - the planner must be side-effect free and emit an explicit plan enum/flags.
    - the executor must perform only the side effects authorized by that plan.
-   - when we want Verus/TLA coverage, prove the planner over the query snapshot and model temporal/runtime composition around it instead of proving directly over interleaved SQL and network code.
+   - when we want Verus/TLA coverage, prove the planner over the query `DecisionContext` and model temporal/runtime composition around it instead of proving directly over interleaved SQL and network code.
+   - do not collapse SQL/query correctness, normalizer correctness, and planner correctness into one obligation:
+     - SQLite/query execution may be trusted to run as written,
+     - the SQL text still needs runtime tests proving it returns the intended raw rows,
+     - the normalizer and planner are the preferred Verus proof targets.
+
+### 13.1 Formal Verification Program
+
+Goal: cover security-sensitive behavior as a composition of proof-bearing seams instead of one monolithic proof over live SQL, network I/O, and concurrency.
+
+Required shape per seam:
+
+1. `RawRows`: typed query result(s) representing the actual SQL boundary.
+2. `DecisionContext`: normalized decision context with impossible combinations removed.
+3. `Plan`: explicit bounded authority/effect result.
+4. `normalize_*`: pure collapse from `RawRows -> DecisionContext`.
+5. `decide_*`: pure planner from `DecisionContext -> Plan`.
+6. executor: runtime code that performs only the effects named by `Plan`.
+
+Required proof/test split:
+
+1. runtime tests prove query correctness:
+   - the real SQL returns the intended raw rows for representative DB states,
+   - ambiguity, missing rows, expiry, and removal appear when they should.
+2. Verus proves normalizer and planner correctness:
+   - malformed or contradictory raw states fail closed,
+   - the planner is deterministic,
+   - irrelevant fields do not change the plan,
+   - each seam-specific safety property holds over the `DecisionContext`.
+3. runtime tests prove executor conformance:
+   - each plan variant produces exactly the named effects and no broader authority.
+4. TLA covers temporal/concurrent properties:
+   - retries,
+   - refresh loops,
+   - cancellation,
+   - fairness/liveness,
+   - cross-component temporal composition.
+
+Repo-wide composition invariants:
+
+1. **Unique current authority or reject.**
+   - No security-relevant runtime action may start unless it is justified by a unique, current, non-revoked binding or authority chain.
+   - Missing, ambiguous, expired, or removed authority must resolve to rejection.
+2. **Already-local workspaces cannot gain bootstrap power.**
+   - If a workspace is already local, bootstrap-derived link data must not create dial targets, bootstrap auth fallback, bootstrap trust, or bootstrap-started sync for that workspace.
+3. **Workspace confinement.**
+   - Workspace-scoped replay, fanout, and sync may only affect tenants that are bound to that same workspace by valid local state.
+4. **Ambiguity and malformation fail closed.**
+   - Contradictory, duplicate, malformed, or out-of-range context state must normalize to rejection, ambiguity, or absence, never silent authorization.
+5. **Executors cannot exceed their plan.**
+   - Runtime code may only perform side effects explicitly authorized by the computed plan.
+   - Executors must not widen scope by re-querying broader authority after planning.
+
+Each proof-bearing seam should declare:
+
+1. `Requires`: which upstream invariant(s) it assumes.
+2. `Provides`: which composition invariant(s) it helps uphold.
+3. `RawRows`, `DecisionContext`, and `Plan` types.
+4. Verus lemmas covering normalizer and planner properties.
+5. runtime tests covering query correctness and executor conformance.
+6. TLA model coverage when the property is temporal rather than single-step.
+
+Rollout order:
+
+1. **Auth and admission.**
+   - outbound session auth,
+   - inbound route/bootstrap admission,
+   - sync admission.
+2. **Dial and dispatch.**
+   - bootstrap dial target selection,
+   - bootstrap fallback selection,
+   - target dispatch reconciliation,
+   - connection lifecycle retry/eviction.
+3. **Sync scheduling.**
+   - range/window scheduler,
+   - hot/cold window restrictions,
+   - dependency-expansion policy.
+4. **State fanout and cleanup.**
+   - shared workspace fanout,
+   - projection unblock/requeue disposition,
+   - deletion/purge planning.
+5. **Event-pipeline boundaries.**
+   - command/wire validation inputs,
+   - projector context-load/query normalization seams.
+
+Hot-path performance gate:
+
+1. planner seams on sync/auth hot paths must not move runtime decisions into per-message loops,
+2. each hot-path refactor must name the benchmark it is guarding and the metric that must not regress,
+3. any planner change touching warm sync/catchup behavior must run the relevant release benchmark before merge.
+
+Definition of done for a covered seam:
+
+1. the runtime decision uses `query/context -> DecisionContext -> planner -> executor`,
+2. the planner consumes only the normalized `DecisionContext`,
+3. Verus proves the seam-local safety properties,
+4. runtime tests prove query correctness and executor conformance,
+5. any touched temporal property is covered in TLA rather than hand-waved,
+6. the seam is mapped to one or more repo-wide composition invariants above.
 
 ## 2.1 Strict Endpoint/Auth Target
 
