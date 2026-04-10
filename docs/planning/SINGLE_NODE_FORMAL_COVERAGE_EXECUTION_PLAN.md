@@ -24,8 +24,8 @@ Success Criteria:
 2. Every non-module Verus source in `verus-proofs/src/**` is indexed either as a
    covered seam or a supporting proof module.
 3. Every covered-seam row references existing runtime path(s), existing Verus
-   mirror path(s), known invariant keys, and real `cargo test --lib <filter>`
-   targets.
+   mirror path(s), known invariant keys, and real `cargo test` targets
+   (`--lib <filter>` and/or `--test <target>`).
 4. Every covered-seam row has non-empty `Requires`, `Provides`, and
    `Targeted Checks`, and every row names `cargo-verus verify`.
 

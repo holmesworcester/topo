@@ -11,7 +11,8 @@ Enforces:
      indexed in the covered-seams table.
   4. Every covered seam row has non-empty Requires / Provides / Targeted Checks,
      uses known invariant keys, names cargo-verus verification, and names at
-     least one real `cargo test --lib <filter>` target.
+     least one real `cargo test` target (`--lib <filter>` and/or `--test
+     <target>`).
 """
 
 from __future__ import annotations
@@ -126,8 +127,29 @@ def collect_lib_test_names() -> set[str]:
     return test_names
 
 
+def collect_integration_test_targets() -> set[str]:
+    targets: set[str] = set()
+    tests_dir = REPO_ROOT / "tests"
+    if not tests_dir.exists():
+        return targets
+
+    for rs_file in tests_dir.glob("*.rs"):
+        targets.add(rs_file.stem)
+
+    for main_rs in tests_dir.glob("**/main.rs"):
+        if main_rs.parent == tests_dir:
+            continue
+        targets.add(main_rs.parent.name)
+
+    return targets
+
+
 def extract_lib_test_filters(checks: str) -> list[str]:
     return re.findall(r"cargo test\b[^;\n]*?--lib\s+([A-Za-z0-9_:-]+)\s+--", checks)
+
+
+def extract_integration_test_targets(checks: str) -> list[str]:
+    return re.findall(r"cargo test\b[^;\n]*?--test\s+([A-Za-z0-9_:-]+)\s+--", checks)
 
 
 def parse_invariant_keys(cell: str) -> list[str]:
@@ -174,6 +196,7 @@ def main() -> int:
     indexed_verus_specs: list[str] = []
 
     lib_test_names = collect_lib_test_names()
+    integration_test_targets = collect_integration_test_targets()
 
     for row in seam_rows:
         area = row.get("Area", "").strip() or "<unknown>"
@@ -199,14 +222,25 @@ def main() -> int:
             errors.append(f"ROW_NO_VERUS_CHECK: {area}")
 
         test_filters = extract_lib_test_filters(checks)
-        if not test_filters:
-            errors.append(f"ROW_NO_LIB_TEST_FILTER: {area}")
-        else:
+        integration_targets = extract_integration_test_targets(checks)
+
+        if not test_filters and not integration_targets:
+            errors.append(f"ROW_NO_CARGO_TEST_TARGET: {area}")
+
+        if test_filters:
             for test_filter in test_filters:
                 if not any(test_filter in name for name in lib_test_names):
                     errors.append(
                         f"ROW_BAD_LIB_TEST_FILTER: {area} references '{test_filter}', "
                         "but no lib test name matches"
+                    )
+
+        if integration_targets:
+            for target in integration_targets:
+                if target not in integration_test_targets:
+                    errors.append(
+                        f"ROW_BAD_INTEGRATION_TEST_TARGET: {area} references '{target}', "
+                        "but no integration test target matches"
                     )
 
         for invariant in parse_invariant_keys(provides):
