@@ -96,6 +96,22 @@ pub(crate) struct SharedEventFanout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedFanoutSiblingRawRows {
+    sibling_peer_id: String,
+    sibling_removed: bool,
+    event_predates_removal: bool,
+    removal_targets_sibling: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedFanoutRawRows {
+    origin_rejected: bool,
+    origin_removed: bool,
+    removal_event: bool,
+    siblings: Vec<SharedFanoutSiblingRawRows>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SharedFanoutSiblingContext {
     sibling_peer_id: String,
     sibling_removed: bool,
@@ -117,6 +133,24 @@ enum SharedFanoutPlan {
     SkipOriginRemoved,
     NoTargets,
     FanoutTo { sibling_peer_ids: Vec<String> },
+}
+
+fn normalize_shared_fanout(raw_rows: SharedFanoutRawRows) -> SharedFanoutContext {
+    SharedFanoutContext {
+        origin_rejected: raw_rows.origin_rejected,
+        origin_removed: raw_rows.origin_removed,
+        removal_event: raw_rows.removal_event,
+        siblings: raw_rows
+            .siblings
+            .into_iter()
+            .map(|sibling| SharedFanoutSiblingContext {
+                sibling_peer_id: sibling.sibling_peer_id,
+                sibling_removed: sibling.sibling_removed,
+                event_predates_removal: sibling.event_predates_removal,
+                removal_targets_sibling: sibling.removal_targets_sibling,
+            })
+            .collect(),
+    }
 }
 
 fn decide_shared_fanout_plan(context: &SharedFanoutContext) -> SharedFanoutPlan {
@@ -340,6 +374,47 @@ fn is_removal_targeting_sibling(
     .unwrap_or(false)
 }
 
+fn load_shared_fanout_raw_rows(
+    conn: &Connection,
+    origin_peer_id: &str,
+    workspace_id: &str,
+    event_id: &EventId,
+) -> Result<SharedFanoutRawRows, Box<dyn std::error::Error + Send + Sync>> {
+    let siblings = sibling_tenants_in_workspace(conn, origin_peer_id, workspace_id)?;
+    let removal = is_removal_event(conn, event_id);
+    let check_scopes: Vec<&str> = siblings
+        .iter()
+        .map(|s| s.as_str())
+        .chain(std::iter::once(origin_peer_id))
+        .collect();
+
+    Ok(SharedFanoutRawRows {
+        origin_rejected: is_origin_rejected(conn, origin_peer_id, event_id),
+        origin_removed: is_sibling_removed(conn, origin_peer_id, &check_scopes),
+        removal_event: removal,
+        siblings: siblings
+            .iter()
+            .map(|sibling_peer_id| SharedFanoutSiblingRawRows {
+                sibling_peer_id: sibling_peer_id.clone(),
+                sibling_removed: is_sibling_removed(conn, sibling_peer_id, &check_scopes),
+                event_predates_removal: event_predates_sibling_removal(
+                    conn,
+                    event_id,
+                    sibling_peer_id,
+                    &check_scopes,
+                ),
+                removal_targets_sibling: removal
+                    && is_removal_targeting_sibling(
+                        conn,
+                        event_id,
+                        sibling_peer_id,
+                        origin_peer_id,
+                    ),
+            })
+            .collect(),
+    })
+}
+
 fn workspace_id_for_stored_shared_event(
     conn: &Connection,
     recorded_by: &str,
@@ -429,43 +504,12 @@ pub(crate) fn fanout_shared_event_immediate(
     workspace_id: &str,
     event_id: &EventId,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let siblings = sibling_tenants_in_workspace(conn, origin_peer_id, workspace_id)?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as i64;
     let source = fanout_source(origin_peer_id);
-
-    let removal = is_removal_event(conn, event_id);
-    let check_scopes: Vec<&str> = siblings
-        .iter()
-        .map(|s| s.as_str())
-        .chain(std::iter::once(origin_peer_id))
-        .collect();
-    let plan = decide_shared_fanout_plan(&SharedFanoutContext {
-        origin_rejected: is_origin_rejected(conn, origin_peer_id, event_id),
-        origin_removed: is_sibling_removed(conn, origin_peer_id, &check_scopes),
-        removal_event: removal,
-        siblings: siblings
-            .iter()
-            .map(|sibling_peer_id| SharedFanoutSiblingContext {
-                sibling_peer_id: sibling_peer_id.clone(),
-                sibling_removed: is_sibling_removed(conn, sibling_peer_id, &check_scopes),
-                event_predates_removal: event_predates_sibling_removal(
-                    conn,
-                    event_id,
-                    sibling_peer_id,
-                    &check_scopes,
-                ),
-                removal_targets_sibling: removal
-                    && is_removal_targeting_sibling(
-                        conn,
-                        event_id,
-                        sibling_peer_id,
-                        origin_peer_id,
-                    ),
-            })
-            .collect(),
-    });
+    let raw_rows = load_shared_fanout_raw_rows(conn, origin_peer_id, workspace_id, event_id)?;
+    let plan = decide_shared_fanout_plan(&normalize_shared_fanout(raw_rows));
     let sibling_peer_ids = match plan {
         SharedFanoutPlan::SkipOriginRejected
         | SharedFanoutPlan::SkipOriginRemoved
@@ -487,9 +531,6 @@ pub(crate) fn fanout_shared_event_enqueue(
     conn: &Connection,
     fanout: &SharedEventFanout,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let siblings =
-        sibling_tenants_in_workspace(conn, &fanout.origin_peer_id, &fanout.workspace_id)?;
-
     let pq = ProjectQueue::new(conn);
     let event_id_b64 = event_id_to_base64(&fanout.event_id);
     let now_ms = std::time::SystemTime::now()
@@ -497,38 +538,13 @@ pub(crate) fn fanout_shared_event_enqueue(
         .as_millis() as i64;
     let source = fanout_source(&fanout.origin_peer_id);
 
-    // Removal events fan out only to the specific target sibling.
-    let removal = is_removal_event(conn, &fanout.event_id);
-    let check_scopes: Vec<&str> = siblings
-        .iter()
-        .map(|s| s.as_str())
-        .chain(std::iter::once(fanout.origin_peer_id.as_str()))
-        .collect();
-    let plan = decide_shared_fanout_plan(&SharedFanoutContext {
-        origin_rejected: is_origin_rejected(conn, &fanout.origin_peer_id, &fanout.event_id),
-        origin_removed: is_sibling_removed(conn, &fanout.origin_peer_id, &check_scopes),
-        removal_event: removal,
-        siblings: siblings
-            .iter()
-            .map(|sibling_peer_id| SharedFanoutSiblingContext {
-                sibling_peer_id: sibling_peer_id.clone(),
-                sibling_removed: is_sibling_removed(conn, sibling_peer_id, &check_scopes),
-                event_predates_removal: event_predates_sibling_removal(
-                    conn,
-                    &fanout.event_id,
-                    sibling_peer_id,
-                    &check_scopes,
-                ),
-                removal_targets_sibling: removal
-                    && is_removal_targeting_sibling(
-                        conn,
-                        &fanout.event_id,
-                        sibling_peer_id,
-                        &fanout.origin_peer_id,
-                    ),
-            })
-            .collect(),
-    });
+    let raw_rows = load_shared_fanout_raw_rows(
+        conn,
+        &fanout.origin_peer_id,
+        &fanout.workspace_id,
+        &fanout.event_id,
+    )?;
+    let plan = decide_shared_fanout_plan(&normalize_shared_fanout(raw_rows));
     let sibling_peer_ids = match plan {
         SharedFanoutPlan::SkipOriginRejected
         | SharedFanoutPlan::SkipOriginRemoved
@@ -582,6 +598,28 @@ mod tests {
         });
         assert_eq!(
             plan,
+            SharedFanoutPlan::FanoutTo {
+                sibling_peer_ids: vec!["sibling".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn shared_fanout_normalizer_preserves_raw_rows_for_planner() {
+        let context = normalize_shared_fanout(SharedFanoutRawRows {
+            origin_rejected: false,
+            origin_removed: false,
+            removal_event: true,
+            siblings: vec![SharedFanoutSiblingRawRows {
+                sibling_peer_id: "sibling".to_string(),
+                sibling_removed: true,
+                event_predates_removal: false,
+                removal_targets_sibling: true,
+            }],
+        });
+
+        assert_eq!(
+            decide_shared_fanout_plan(&context),
             SharedFanoutPlan::FanoutTo {
                 sibling_peer_ids: vec!["sibling".to_string()],
             }

@@ -4,6 +4,13 @@ use vstd::prelude::*;
 
 verus! {
 
+pub struct SharedFanoutRawRows {
+    pub origin_rejected: bool,
+    pub origin_removed: bool,
+    pub removal_event: bool,
+    pub has_any_eligible_sibling: bool,
+}
+
 pub struct SharedFanoutDecisionContext {
     pub origin_rejected: bool,
     pub origin_removed: bool,
@@ -16,6 +23,17 @@ pub enum SharedFanoutPlan {
     SkipOriginRemoved,
     NoTargets,
     FanoutToTargets,
+}
+
+pub open spec fn normalize_shared_fanout(
+    raw_rows: SharedFanoutRawRows,
+) -> SharedFanoutDecisionContext {
+    SharedFanoutDecisionContext {
+        origin_rejected: raw_rows.origin_rejected,
+        origin_removed: raw_rows.origin_removed,
+        removal_event: raw_rows.removal_event,
+        has_any_eligible_sibling: raw_rows.has_any_eligible_sibling,
+    }
 }
 
 pub open spec fn sibling_is_eligible_for_fanout(
@@ -38,6 +56,27 @@ pub open spec fn decide_shared_fanout_plan(
     } else {
         SharedFanoutPlan::NoTargets
     }
+}
+
+proof fn shared_fanout_normalizer_preserves_query_facts(
+    origin_rejected: bool,
+    origin_removed: bool,
+    removal_event: bool,
+    has_any_eligible_sibling: bool,
+)
+    ensures
+        normalize_shared_fanout(SharedFanoutRawRows {
+            origin_rejected,
+            origin_removed,
+            removal_event,
+            has_any_eligible_sibling,
+        }) == (SharedFanoutDecisionContext {
+            origin_rejected,
+            origin_removed,
+            removal_event,
+            has_any_eligible_sibling,
+        }),
+{
 }
 
 proof fn removed_origin_cannot_fanout_non_removal_events()
