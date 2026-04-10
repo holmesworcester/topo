@@ -361,6 +361,42 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_session_fallback_duplicate_rows_preserve_same_workspace_rejection() {
+        let decision_context = normalize_bootstrap_session_fallback_decision_context(
+            BootstrapSessionFallbackRawRows {
+                require_local_bootstrap_phase: false,
+                local_bootstrap_phase: true,
+                candidates: vec![
+                    BootstrapSessionFallbackCandidate {
+                        daemon_peer_id: "daemon-a".to_string(),
+                        invite_event_id: "invite-a".to_string(),
+                        workspace_already_local_before_candidate: false,
+                    },
+                    BootstrapSessionFallbackCandidate {
+                        daemon_peer_id: "daemon-a".to_string(),
+                        invite_event_id: "invite-a".to_string(),
+                        workspace_already_local_before_candidate: true,
+                    },
+                ],
+            },
+        );
+        assert_eq!(
+            decision_context,
+            BootstrapSessionFallbackDecisionContext::UniqueCandidate {
+                fallback: BootstrapSessionFallback {
+                    daemon_peer_id: "daemon-a".to_string(),
+                    invite_event_id: "invite-a".to_string(),
+                },
+                workspace_already_local_before_candidate: true,
+            }
+        );
+        assert_eq!(
+            decide_bootstrap_session_fallback_plan(&decision_context),
+            BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate
+        );
+    }
+
+    #[test]
     fn bootstrap_session_fallback_keeps_older_candidate_after_later_sibling() {
         let tmpdir = tempfile::tempdir().unwrap();
         let db_path = tmpdir.path().join("bootstrap-older-candidate-kept.db");

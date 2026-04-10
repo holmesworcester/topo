@@ -160,6 +160,12 @@ mod tests {
                 workspace_id: "workspace-a".to_string(),
             }
         );
+        assert_eq!(
+            decide_sync_admission_plan(&context),
+            SyncAdmissionPlan::Start {
+                workspace_id: "workspace-a".to_string(),
+            }
+        );
     }
 
     #[test]

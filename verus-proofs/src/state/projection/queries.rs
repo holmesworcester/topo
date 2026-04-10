@@ -7,11 +7,11 @@ use vstd::prelude::*;
 
 verus! {
 
-pub enum WorkspaceAcceptedRows {
-    Missing,
-    Unique { workspace_matches_event: bool },
-    Ambiguous,
-    Malformed,
+pub struct WorkspaceAcceptedRawRows {
+    pub row_count: nat,
+    pub all_workspace_ids_equal: bool,
+    pub representative_workspace_matches_event: bool,
+    pub malformed: bool,
 }
 
 pub enum WorkspaceDecisionContext {
@@ -28,23 +28,18 @@ pub enum WorkspaceContextPlan {
 }
 
 pub open spec fn normalize_workspace_acceptance(
-    rows: WorkspaceAcceptedRows,
+    rows: WorkspaceAcceptedRawRows,
 ) -> WorkspaceDecisionContext {
-    match rows {
-        WorkspaceAcceptedRows::Missing => {
-            WorkspaceDecisionContext::MissingAcceptedWorkspace
+    if rows.malformed {
+        WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace
+    } else if rows.row_count == 0 {
+        WorkspaceDecisionContext::MissingAcceptedWorkspace
+    } else if rows.all_workspace_ids_equal {
+        WorkspaceDecisionContext::UniqueAcceptedWorkspace {
+            workspace_matches_event: rows.representative_workspace_matches_event,
         }
-        WorkspaceAcceptedRows::Unique { workspace_matches_event } => {
-            WorkspaceDecisionContext::UniqueAcceptedWorkspace {
-                workspace_matches_event,
-            }
-        }
-        WorkspaceAcceptedRows::Ambiguous => {
-            WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace
-        }
-        WorkspaceAcceptedRows::Malformed => {
-            WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace
-        }
+    } else {
+        WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace
     }
 }
 
@@ -72,7 +67,12 @@ pub open spec fn decide_workspace_context_plan(
 proof fn workspace_query_missing_blocks()
     ensures
         decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRows::Missing,
+            WorkspaceAcceptedRawRows {
+                row_count: 0,
+                all_workspace_ids_equal: true,
+                representative_workspace_matches_event: false,
+                malformed: false,
+            },
         )) == WorkspaceContextPlan::BlockOnAcceptedWorkspace,
 {
 }
@@ -80,15 +80,52 @@ proof fn workspace_query_missing_blocks()
 proof fn workspace_query_unique_match_is_ready()
     ensures
         decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRows::Unique { workspace_matches_event: true },
+            WorkspaceAcceptedRawRows {
+                row_count: 1,
+                all_workspace_ids_equal: true,
+                representative_workspace_matches_event: true,
+                malformed: false,
+            },
         )) == WorkspaceContextPlan::Ready,
+{
+}
+
+proof fn workspace_query_duplicate_same_workspace_rows_are_noninterfering(
+    row_count_a: nat,
+    row_count_b: nat,
+    workspace_matches_event: bool,
+)
+    requires
+        row_count_a > 0,
+        row_count_b > 0,
+    ensures
+        decide_workspace_context_plan(normalize_workspace_acceptance(
+            WorkspaceAcceptedRawRows {
+                row_count: row_count_a,
+                all_workspace_ids_equal: true,
+                representative_workspace_matches_event: workspace_matches_event,
+                malformed: false,
+            },
+        )) == decide_workspace_context_plan(normalize_workspace_acceptance(
+            WorkspaceAcceptedRawRows {
+                row_count: row_count_b,
+                all_workspace_ids_equal: true,
+                representative_workspace_matches_event: workspace_matches_event,
+                malformed: false,
+            },
+        )),
 {
 }
 
 proof fn workspace_query_unique_mismatch_rejects()
     ensures
         decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRows::Unique { workspace_matches_event: false },
+            WorkspaceAcceptedRawRows {
+                row_count: 1,
+                all_workspace_ids_equal: true,
+                representative_workspace_matches_event: false,
+                malformed: false,
+            },
         )) == WorkspaceContextPlan::Reject,
 {
 }
@@ -96,7 +133,12 @@ proof fn workspace_query_unique_mismatch_rejects()
 proof fn workspace_query_ambiguity_fails_closed()
     ensures
         decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRows::Ambiguous,
+            WorkspaceAcceptedRawRows {
+                row_count: 2,
+                all_workspace_ids_equal: false,
+                representative_workspace_matches_event: true,
+                malformed: false,
+            },
         )) == WorkspaceContextPlan::Reject,
 {
 }
@@ -104,7 +146,12 @@ proof fn workspace_query_ambiguity_fails_closed()
 proof fn workspace_query_malformation_fails_closed()
     ensures
         decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRows::Malformed,
+            WorkspaceAcceptedRawRows {
+                row_count: 1,
+                all_workspace_ids_equal: true,
+                representative_workspace_matches_event: true,
+                malformed: true,
+            },
         )) == WorkspaceContextPlan::Reject,
 {
 }

@@ -222,6 +222,28 @@ proof fn bootstrap_session_tenant_normalizes_equal_rows_to_unique(row_count: nat
 {
 }
 
+proof fn bootstrap_session_tenant_duplicate_row_count_is_noninterfering(
+    row_count_a: nat,
+    row_count_b: nat,
+)
+    requires
+        row_count_a > 0,
+        row_count_b > 0,
+    ensures
+        decide_bootstrap_session_tenant_plan(
+            normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
+                row_count: row_count_a,
+                all_tenant_ids_equal: true,
+            })
+        ) == decide_bootstrap_session_tenant_plan(
+            normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
+                row_count: row_count_b,
+                all_tenant_ids_equal: true,
+            })
+        ),
+{
+}
+
 proof fn bootstrap_session_tenant_normalizes_mixed_rows_to_ambiguous(row_count: nat)
     requires row_count > 0
     ensures

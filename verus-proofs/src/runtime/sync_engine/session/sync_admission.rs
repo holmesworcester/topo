@@ -82,6 +82,38 @@ proof fn proof_sync_admission_normalize_equal_rows_to_unique(
 {
 }
 
+proof fn proof_sync_admission_duplicate_row_count_is_noninterfering(
+    row_count_a: nat,
+    row_count_b: nat,
+    workspace_id: nat,
+)
+    requires
+        row_count_a > 0,
+        row_count_b > 0,
+    ensures
+        decide_sync_admission_plan(&normalize_sync_admission_decision_context(
+            &SyncAdmissionRawRows {
+                row_count: row_count_a,
+                all_workspace_ids_equal: true,
+                representative_workspace_id: workspace_id,
+            },
+        )) == decide_sync_admission_plan(&normalize_sync_admission_decision_context(
+            &SyncAdmissionRawRows {
+                row_count: row_count_b,
+                all_workspace_ids_equal: true,
+                representative_workspace_id: workspace_id,
+            },
+        )),
+        decide_sync_admission_plan(&normalize_sync_admission_decision_context(
+            &SyncAdmissionRawRows {
+                row_count: row_count_a,
+                all_workspace_ids_equal: true,
+                representative_workspace_id: workspace_id,
+            },
+        )) == (SyncAdmissionPlan::Start { workspace_id }),
+{
+}
+
 proof fn proof_sync_admission_normalize_mixed_rows_to_ambiguous(
     row_count: nat,
     representative_workspace_id: nat,

@@ -1449,6 +1449,12 @@ mod tests {
                 tenant_id: "tenant-a".to_string(),
             }
         );
+        assert_eq!(
+            decide_bootstrap_session_tenant_plan(&decision_context),
+            BootstrapSessionTenantPlan::Accept {
+                tenant_id: "tenant-a".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1584,6 +1590,10 @@ mod tests {
                 invite_event_id: "invite-1".to_string(),
                 workspace_already_local_before_candidate: true,
             }
+        );
+        assert_eq!(
+            decide_bootstrap_fallback_invite_plan(&decision_context),
+            BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
         );
     }
 
