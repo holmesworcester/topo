@@ -21,9 +21,35 @@ pub enum BootstrapSessionTenantPlan {
     RejectAmbiguousTenantBinding,
 }
 
+pub struct InboundRouteAuthRawRows {
+    pub route_authorized: bool,
+}
+
+pub struct InboundRouteAuthDecisionContext {
+    pub route_authorized: bool,
+}
+
 pub enum InboundRouteAuthDecision {
     RejectUnauthorized,
     Accept,
+}
+
+pub struct InboundBootstrapAuthRawRows {
+    pub tenant_resolution: BootstrapSessionTenantDecisionContext,
+    pub has_cached_tenant: bool,
+    pub expiry_valid: bool,
+    pub daemon_binding_valid: bool,
+    pub claimed_peer_matches_key: bool,
+    pub invite_signature_valid: bool,
+}
+
+pub struct InboundBootstrapAuthDecisionContext {
+    pub tenant_resolution: BootstrapSessionTenantDecisionContext,
+    pub has_cached_tenant: bool,
+    pub expiry_valid: bool,
+    pub daemon_binding_valid: bool,
+    pub claimed_peer_matches_key: bool,
+    pub invite_signature_valid: bool,
 }
 
 pub enum InboundBootstrapAuthDecision {
@@ -61,33 +87,54 @@ pub open spec fn decide_bootstrap_session_tenant_plan(
     }
 }
 
-pub open spec fn decide_inbound_route_auth(route_authorized: bool) -> InboundRouteAuthDecision {
-    if route_authorized {
+pub open spec fn normalize_inbound_route_auth_decision_context(
+    raw_rows: InboundRouteAuthRawRows,
+) -> InboundRouteAuthDecisionContext {
+    InboundRouteAuthDecisionContext {
+        route_authorized: raw_rows.route_authorized,
+    }
+}
+
+pub open spec fn decide_inbound_route_auth(
+    context: &InboundRouteAuthDecisionContext,
+) -> InboundRouteAuthDecision {
+    if context.route_authorized {
         InboundRouteAuthDecision::Accept
     } else {
         InboundRouteAuthDecision::RejectUnauthorized
     }
 }
 
+pub open spec fn normalize_inbound_bootstrap_auth_decision_context(
+    raw_rows: InboundBootstrapAuthRawRows,
+) -> InboundBootstrapAuthDecisionContext {
+    InboundBootstrapAuthDecisionContext {
+        tenant_resolution: raw_rows.tenant_resolution,
+        has_cached_tenant: raw_rows.has_cached_tenant,
+        expiry_valid: raw_rows.expiry_valid,
+        daemon_binding_valid: raw_rows.daemon_binding_valid,
+        claimed_peer_matches_key: raw_rows.claimed_peer_matches_key,
+        invite_signature_valid: raw_rows.invite_signature_valid,
+    }
+}
+
 pub open spec fn decide_inbound_bootstrap_auth(
-    tenant_resolution: BootstrapSessionTenantDecisionContext,
-    has_cached_tenant: bool,
-    expiry_valid: bool,
-    daemon_binding_valid: bool,
-    claimed_peer_matches_key: bool,
-    invite_signature_valid: bool,
+    context: &InboundBootstrapAuthDecisionContext,
 ) -> InboundBootstrapAuthDecision {
-    if !expiry_valid || !daemon_binding_valid || !claimed_peer_matches_key || !invite_signature_valid
+    if !context.expiry_valid
+        || !context.daemon_binding_valid
+        || !context.claimed_peer_matches_key
+        || !context.invite_signature_valid
     {
         InboundBootstrapAuthDecision::RejectInvalidAuth
     } else {
-        match tenant_resolution {
+        match context.tenant_resolution {
             BootstrapSessionTenantDecisionContext::UniqueTenantBinding => {
                 InboundBootstrapAuthDecision::AcceptResolvedTenant
             }
             BootstrapSessionTenantDecisionContext::MissingTenantBinding
             | BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding => {
-                if has_cached_tenant {
+                if context.has_cached_tenant {
                     InboundBootstrapAuthDecision::AcceptCachedTenant
                 } else {
                     InboundBootstrapAuthDecision::RejectTenantResolution
@@ -98,12 +145,55 @@ pub open spec fn decide_inbound_bootstrap_auth(
 }
 
 proof fn inbound_route_rejects_unauthorized()
-    ensures decide_inbound_route_auth(false) == InboundRouteAuthDecision::RejectUnauthorized,
+    ensures
+        decide_inbound_route_auth(&InboundRouteAuthDecisionContext {
+            route_authorized: false,
+        }) == InboundRouteAuthDecision::RejectUnauthorized,
 {
 }
 
 proof fn inbound_route_accepts_authorized()
-    ensures decide_inbound_route_auth(true) == InboundRouteAuthDecision::Accept,
+    ensures
+        decide_inbound_route_auth(&InboundRouteAuthDecisionContext {
+            route_authorized: true,
+        }) == InboundRouteAuthDecision::Accept,
+{
+}
+
+proof fn inbound_route_auth_normalizer_preserves_query_facts(route_authorized: bool)
+    ensures
+        normalize_inbound_route_auth_decision_context(InboundRouteAuthRawRows {
+            route_authorized,
+        }) == (InboundRouteAuthDecisionContext {
+            route_authorized,
+        }),
+{
+}
+
+proof fn inbound_bootstrap_auth_normalizer_preserves_query_facts(
+    tenant_resolution: BootstrapSessionTenantDecisionContext,
+    has_cached_tenant: bool,
+    expiry_valid: bool,
+    daemon_binding_valid: bool,
+    claimed_peer_matches_key: bool,
+    invite_signature_valid: bool,
+)
+    ensures
+        normalize_inbound_bootstrap_auth_decision_context(InboundBootstrapAuthRawRows {
+            tenant_resolution,
+            has_cached_tenant,
+            expiry_valid,
+            daemon_binding_valid,
+            claimed_peer_matches_key,
+            invite_signature_valid,
+        }) == (InboundBootstrapAuthDecisionContext {
+            tenant_resolution,
+            has_cached_tenant,
+            expiry_valid,
+            daemon_binding_valid,
+            claimed_peer_matches_key,
+            invite_signature_valid,
+        }),
 {
 }
 
@@ -150,40 +240,40 @@ proof fn bootstrap_session_tenant_normalizes_mixed_rows_to_ambiguous(row_count: 
 
 proof fn inbound_bootstrap_rejects_invalid_auth_even_with_cached_tenant()
     ensures
-        decide_inbound_bootstrap_auth(
-            BootstrapSessionTenantDecisionContext::MissingTenantBinding,
-            true,
-            false,
-            true,
-            true,
-            true,
-        ) == InboundBootstrapAuthDecision::RejectInvalidAuth,
+        decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
+            tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
+            has_cached_tenant: true,
+            expiry_valid: false,
+            daemon_binding_valid: true,
+            claimed_peer_matches_key: true,
+            invite_signature_valid: true,
+        }) == InboundBootstrapAuthDecision::RejectInvalidAuth,
 {
 }
 
 proof fn inbound_bootstrap_accepts_cached_tenant_after_resolution_loss()
     ensures
-        decide_inbound_bootstrap_auth(
-            BootstrapSessionTenantDecisionContext::MissingTenantBinding,
-            true,
-            true,
-            true,
-            true,
-            true,
-        ) == InboundBootstrapAuthDecision::AcceptCachedTenant,
+        decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
+            tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
+            has_cached_tenant: true,
+            expiry_valid: true,
+            daemon_binding_valid: true,
+            claimed_peer_matches_key: true,
+            invite_signature_valid: true,
+        }) == InboundBootstrapAuthDecision::AcceptCachedTenant,
 {
 }
 
 proof fn inbound_bootstrap_accepts_resolved_tenant_without_cache()
     ensures
-        decide_inbound_bootstrap_auth(
-            BootstrapSessionTenantDecisionContext::UniqueTenantBinding,
-            false,
-            true,
-            true,
-            true,
-            true,
-        ) == InboundBootstrapAuthDecision::AcceptResolvedTenant,
+        decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
+            tenant_resolution: BootstrapSessionTenantDecisionContext::UniqueTenantBinding,
+            has_cached_tenant: false,
+            expiry_valid: true,
+            daemon_binding_valid: true,
+            claimed_peer_matches_key: true,
+            invite_signature_valid: true,
+        }) == InboundBootstrapAuthDecision::AcceptResolvedTenant,
 {
 }
 

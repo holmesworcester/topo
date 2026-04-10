@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{load_daemon_identity_from_db, DaemonConnection};
+use super::{DaemonConnection, load_daemon_identity_from_db};
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::crypto::{
     event_id_to_base64, sign_event_bytes, spki_fingerprint_from_ed25519_pubkey,
@@ -8,13 +8,13 @@ use crate::crypto::{
 };
 use crate::db::open_connection;
 use crate::db::transport_trust::is_authorized_for_tenant;
-use crate::event_modules::{parse_event, ParsedEvent};
+use crate::event_modules::{ParsedEvent, parse_event};
 use crate::protocol::{
-    encode_frame, parse_frame, Frame, OpenSessionAuthAck, OpenSessionAuthInvite, OpenSessionRoute,
+    Frame, OpenSessionAuthAck, OpenSessionAuthInvite, OpenSessionRoute, encode_frame, parse_frame,
 };
 use crate::runtime::repeated_warning::should_emit_globally;
 use ed25519_dalek::SigningKey;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use tracing::debug;
 
 pub const MAX_SESSION_AUTH_TTL_MS: u64 = 5 * 60 * 1000;
@@ -134,6 +134,11 @@ enum OutboundSessionAuthDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundRouteAuthRawRows {
+    route_authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct InboundRouteAuthDecisionContext {
     route_authorized: bool,
 }
@@ -142,6 +147,16 @@ struct InboundRouteAuthDecisionContext {
 enum InboundRouteAuthDecision {
     RejectUnauthorized,
     Accept,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundBootstrapAuthRawRows {
+    tenant_resolution: BootstrapSessionTenantDecisionContext,
+    cached_tenant_id: Option<String>,
+    expiry_valid: bool,
+    daemon_binding_valid: bool,
+    claimed_peer_matches_key: bool,
+    invite_signature_valid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +329,14 @@ fn plan_for_outbound_session_auth_decision(
     }
 }
 
+fn normalize_inbound_route_auth_decision_context(
+    raw_rows: InboundRouteAuthRawRows,
+) -> InboundRouteAuthDecisionContext {
+    InboundRouteAuthDecisionContext {
+        route_authorized: raw_rows.route_authorized,
+    }
+}
+
 fn decide_inbound_route_auth(
     context: &InboundRouteAuthDecisionContext,
 ) -> InboundRouteAuthDecision {
@@ -321,6 +344,19 @@ fn decide_inbound_route_auth(
         InboundRouteAuthDecision::Accept
     } else {
         InboundRouteAuthDecision::RejectUnauthorized
+    }
+}
+
+fn normalize_inbound_bootstrap_auth_decision_context(
+    raw_rows: InboundBootstrapAuthRawRows,
+) -> InboundBootstrapAuthDecisionContext {
+    InboundBootstrapAuthDecisionContext {
+        tenant_resolution: raw_rows.tenant_resolution,
+        cached_tenant_id: raw_rows.cached_tenant_id,
+        expiry_valid: raw_rows.expiry_valid,
+        daemon_binding_valid: raw_rows.daemon_binding_valid,
+        claimed_peer_matches_key: raw_rows.claimed_peer_matches_key,
+        invite_signature_valid: raw_rows.invite_signature_valid,
     }
 }
 
@@ -770,7 +806,9 @@ async fn read_inbound_session_auth_inner(
                 actual_remote_daemon_peer_id,
             )?;
             let decision =
-                decide_inbound_route_auth(&InboundRouteAuthDecisionContext { route_authorized });
+                decide_inbound_route_auth(&normalize_inbound_route_auth_decision_context(
+                    InboundRouteAuthRawRows { route_authorized },
+                ));
             if matches!(decision, InboundRouteAuthDecision::RejectUnauthorized) {
                 return Err(format!(
                     "session route not admitted for tenant {} peer {} on daemon {}",
@@ -821,14 +859,16 @@ async fn read_inbound_session_auth_inner(
             let cached_tenant_id = daemon_connection.and_then(|conn| {
                 conn.accepted_bootstrap_tenant(&invite_event_id_b64, &remote_peer_id)
             });
-            let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
-                tenant_resolution,
-                cached_tenant_id,
-                expiry_valid,
-                daemon_binding_valid,
-                claimed_peer_matches_key,
-                invite_signature_valid,
-            });
+            let decision = decide_inbound_bootstrap_auth(
+                &normalize_inbound_bootstrap_auth_decision_context(InboundBootstrapAuthRawRows {
+                    tenant_resolution,
+                    cached_tenant_id,
+                    expiry_valid,
+                    daemon_binding_valid,
+                    claimed_peer_matches_key,
+                    invite_signature_valid,
+                }),
+            );
             let tenant_id = match decision {
                 InboundBootstrapAuthDecision::AcceptResolvedTenant { tenant_id }
                 | InboundBootstrapAuthDecision::AcceptCachedTenant { tenant_id } => tenant_id,
@@ -1267,7 +1307,7 @@ pub fn resolve_bootstrap_inviter_peer_id(
 mod tests {
     use ed25519_dalek::SigningKey;
     use rusqlite::params;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     use crate::crypto::{event_id_to_base64, spki_fingerprint_from_ed25519_pubkey};
     use crate::db::open_connection;
@@ -1275,11 +1315,11 @@ mod tests {
         record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust,
         record_transport_binding,
     };
-    use crate::event_modules::{encode_event, ParsedEvent, UserInviteEvent};
+    use crate::event_modules::{ParsedEvent, UserInviteEvent, encode_event};
     use crate::transport::{
-        accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
-        ensure_daemon_identity_from_db, load_daemon_identity_from_db,
-        multi_workspace::transport_sni, TransportEndpoint,
+        TransportEndpoint, accept_daemon_connection, create_runtime_endpoint_for_tenants,
+        dial_daemon_connection, ensure_daemon_identity_from_db, load_daemon_identity_from_db,
+        multi_workspace::transport_sni,
     };
 
     use super::*;
@@ -1558,6 +1598,24 @@ mod tests {
     }
 
     #[test]
+    fn inbound_route_auth_normalizer_preserves_raw_rows_for_planner() {
+        let raw = InboundRouteAuthRawRows {
+            route_authorized: true,
+        };
+        let context = normalize_inbound_route_auth_decision_context(raw.clone());
+        assert_eq!(
+            context,
+            InboundRouteAuthDecisionContext {
+                route_authorized: raw.route_authorized,
+            }
+        );
+        assert_eq!(
+            decide_inbound_route_auth(&context),
+            InboundRouteAuthDecision::Accept
+        );
+    }
+
+    #[test]
     fn inbound_bootstrap_auth_decision_accepts_cached_tenant_after_resolution_loss() {
         let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
             tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
@@ -1569,6 +1627,38 @@ mod tests {
         });
         assert_eq!(
             decision,
+            InboundBootstrapAuthDecision::AcceptCachedTenant {
+                tenant_id: "tenant-a".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn inbound_bootstrap_auth_normalizer_preserves_raw_rows_for_planner() {
+        let raw = InboundBootstrapAuthRawRows {
+            tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
+            cached_tenant_id: Some("tenant-a".to_string()),
+            expiry_valid: true,
+            daemon_binding_valid: true,
+            claimed_peer_matches_key: true,
+            invite_signature_valid: true,
+        };
+
+        let context = normalize_inbound_bootstrap_auth_decision_context(raw.clone());
+
+        assert_eq!(
+            context,
+            InboundBootstrapAuthDecisionContext {
+                tenant_resolution: raw.tenant_resolution,
+                cached_tenant_id: raw.cached_tenant_id.clone(),
+                expiry_valid: raw.expiry_valid,
+                daemon_binding_valid: raw.daemon_binding_valid,
+                claimed_peer_matches_key: raw.claimed_peer_matches_key,
+                invite_signature_valid: raw.invite_signature_valid,
+            }
+        );
+        assert_eq!(
+            decide_inbound_bootstrap_auth(&context),
             InboundBootstrapAuthDecision::AcceptCachedTenant {
                 tenant_id: "tenant-a".to_string(),
             }
