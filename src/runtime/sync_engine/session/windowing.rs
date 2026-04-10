@@ -739,6 +739,40 @@ mod tests {
     }
 
     #[test]
+    fn select_outbound_window_last_day_only_ignores_peer_count_and_owner() {
+        for normalized_live_peer_count in [0, 1, 2, 10] {
+            for peer_is_priority_owner in [false, true] {
+                let context = SelectOutboundWindowDecisionContext {
+                    last_day_only_mode: true,
+                    normalized_live_peer_count,
+                    peer_is_priority_owner,
+                };
+                assert_eq!(
+                    decide_select_outbound_window_plan(&context),
+                    SelectOutboundWindowPlan::LastDayOnly
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn select_outbound_window_non_last_day_single_peer_counts_use_single_peer_plan() {
+        for normalized_live_peer_count in [0, 1] {
+            for peer_is_priority_owner in [false, true] {
+                let context = SelectOutboundWindowDecisionContext {
+                    last_day_only_mode: false,
+                    normalized_live_peer_count,
+                    peer_is_priority_owner,
+                };
+                assert_eq!(
+                    decide_select_outbound_window_plan(&context),
+                    SelectOutboundWindowPlan::SinglePeer
+                );
+            }
+        }
+    }
+
+    #[test]
     fn select_outbound_window_normalizer_preserves_raw_rows_for_planner() {
         let raw_rows = [
             (
