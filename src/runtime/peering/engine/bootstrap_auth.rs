@@ -2,16 +2,15 @@
 //!
 //! Daemon-scoped `iroh` transport only needs two decisions here:
 //! - is this tenant still in bootstrap phase?
-//! - does a known-peer target need bootstrap auth override instead of the
-//!   normal preferred-side gate?
+//! - can the known-peer target use a bootstrap auth fallback?
 
 use crate::db::open_connection;
-use crate::db::transport_creds::{CRED_SOURCE_BOOTSTRAP, resolve_tenant_transport_target};
+use crate::db::transport_creds::{resolve_tenant_transport_target, CRED_SOURCE_BOOTSTRAP};
 use crate::db::transport_trust::{
-    BootstrapSessionFallbackCandidate, list_active_bootstrap_session_fallback_candidates,
+    list_active_bootstrap_session_fallback_candidates, BootstrapSessionFallbackCandidate,
 };
 
-use super::target_dispatch::{TargetIngressSource, should_initiate_connect_for_source};
+use super::target_dispatch::{should_initiate_connect_for_source, TargetIngressSource};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BootstrapSessionFallback {
@@ -154,15 +153,14 @@ pub(super) fn resolve_active_bootstrap_session_fallback(
 }
 
 pub(crate) fn should_initiate_connect_for_source_with_db(
-    db_path: &str,
+    _db_path: &str,
     tenant_id: &str,
     source: &TargetIngressSource,
 ) -> bool {
     match source {
         TargetIngressSource::Bootstrap { .. } => true,
         TargetIngressSource::KnownPeer { .. } => {
-            resolve_active_bootstrap_session_fallback(db_path, tenant_id, false).is_some()
-                || should_initiate_connect_for_source(tenant_id, source)
+            should_initiate_connect_for_source(tenant_id, source)
         }
     }
 }
@@ -172,7 +170,7 @@ mod tests {
     use super::*;
     use crate::db::open_connection;
     use crate::db::schema::create_tables;
-    use crate::db::transport_creds::{CRED_SOURCE_BOOTSTRAP, set_local_transport_target};
+    use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_BOOTSTRAP};
     use crate::db::transport_trust::record_invite_bootstrap_trust;
 
     #[test]
@@ -209,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn known_peer_uses_bootstrap_fallback_when_available() {
+    fn known_peer_initiates_when_bootstrap_fallback_exists() {
         let lower = "0000000000000000000000000000000000000000000000000000000000000001";
         let higher = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let tmpdir = tempfile::tempdir().unwrap();
@@ -238,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn known_peer_without_bootstrap_fallback_keeps_preferred_side_gate() {
+    fn known_peer_initiates_without_bootstrap_fallback() {
         let lower = "0000000000000000000000000000000000000000000000000000000000000001";
         let higher = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
         let tmpdir = tempfile::tempdir().unwrap();
@@ -247,7 +245,7 @@ mod tests {
         create_tables(&conn).unwrap();
         drop(conn);
 
-        assert!(!should_initiate_connect_for_source_with_db(
+        assert!(should_initiate_connect_for_source_with_db(
             db_path.to_str().unwrap(),
             higher,
             &TargetIngressSource::KnownPeer {

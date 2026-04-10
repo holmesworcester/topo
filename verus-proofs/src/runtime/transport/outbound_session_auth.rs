@@ -49,7 +49,6 @@ pub struct OutboundSessionAuthDecisionContext {
 
 pub enum OutboundSessionAuthDecision {
     KeepRequested,
-    KeepBootstrapWhileStillActiveWithSteadyStateBinding,
     UpgradeToPeerSharedAfterRouteAdmission,
     UpgradeToPeerSharedAfterBootstrapLapse,
 }
@@ -117,13 +116,11 @@ pub open spec fn decide_outbound_session_auth_decision(
         RequestedSessionAuthPlan::PeerShared => OutboundSessionAuthDecision::KeepRequested,
         RequestedSessionAuthPlan::InviteBootstrap => {
             if context.bootstrap_auth_still_valid {
-                if context.daemon_connection_admits_route
-                    && context.bound_daemon_matches_remote
-                    && context.remote_session_peer_authorized
+                if context.remote_session_peer_authorized
+                    && (context.bound_daemon_matches_remote
+                        || context.daemon_connection_admits_route)
                 {
                     OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
-                } else if context.bound_daemon_matches_remote {
-                    OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding
                 } else {
                     OutboundSessionAuthDecision::KeepRequested
                 }
@@ -145,9 +142,6 @@ pub open spec fn plan_for_outbound_session_auth_decision(
             RequestedSessionAuthPlan::PeerShared => ResolvedSessionAuthPlan::PeerShared,
             RequestedSessionAuthPlan::InviteBootstrap => ResolvedSessionAuthPlan::InviteBootstrap,
         },
-        OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding => {
-            ResolvedSessionAuthPlan::InviteBootstrap
-        }
         OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
         | OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
             ResolvedSessionAuthPlan::PeerShared
@@ -284,21 +278,19 @@ proof fn outbound_peer_shared_request_is_preserved(
 {
 }
 
-proof fn outbound_bootstrap_keeps_bound_bootstrap_while_active_without_admitted_route(
-    remote_session_peer_authorized: bool,
-)
+proof fn outbound_bootstrap_upgrades_bound_known_daemon_while_active_when_authorized()
     ensures
         decide_outbound_session_auth_decision(
             normalize_outbound_session_auth_decision_context(
                 OutboundSessionAuthRawRows {
                     bootstrap_auth_still_valid: true,
                     bound_daemon_matches_remote: true,
-                    remote_session_peer_authorized,
+                    remote_session_peer_authorized: true,
                 },
                 RequestedSessionAuthPlan::InviteBootstrap,
                 false,
             ),
-        ) == OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding,
+        ) == OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission,
         plan_for_outbound_session_auth_decision(
             RequestedSessionAuthPlan::InviteBootstrap,
             decide_outbound_session_auth_decision(
@@ -306,7 +298,37 @@ proof fn outbound_bootstrap_keeps_bound_bootstrap_while_active_without_admitted_
                     OutboundSessionAuthRawRows {
                         bootstrap_auth_still_valid: true,
                         bound_daemon_matches_remote: true,
-                        remote_session_peer_authorized,
+                        remote_session_peer_authorized: true,
+                    },
+                    RequestedSessionAuthPlan::InviteBootstrap,
+                    false,
+                ),
+            ),
+        ) == ResolvedSessionAuthPlan::PeerShared,
+{
+}
+
+proof fn outbound_bootstrap_keeps_bound_known_daemon_while_active_without_peer_route()
+    ensures
+        decide_outbound_session_auth_decision(
+            normalize_outbound_session_auth_decision_context(
+                OutboundSessionAuthRawRows {
+                    bootstrap_auth_still_valid: true,
+                    bound_daemon_matches_remote: true,
+                    remote_session_peer_authorized: false,
+                },
+                RequestedSessionAuthPlan::InviteBootstrap,
+                false,
+            ),
+        ) == OutboundSessionAuthDecision::KeepRequested,
+        plan_for_outbound_session_auth_decision(
+            RequestedSessionAuthPlan::InviteBootstrap,
+            decide_outbound_session_auth_decision(
+                normalize_outbound_session_auth_decision_context(
+                    OutboundSessionAuthRawRows {
+                        bootstrap_auth_still_valid: true,
+                        bound_daemon_matches_remote: true,
+                        remote_session_peer_authorized: false,
                     },
                     RequestedSessionAuthPlan::InviteBootstrap,
                     false,
@@ -322,7 +344,7 @@ proof fn outbound_bootstrap_upgrades_after_admitted_route()
             normalize_outbound_session_auth_decision_context(
                 OutboundSessionAuthRawRows {
                     bootstrap_auth_still_valid: true,
-                    bound_daemon_matches_remote: true,
+                    bound_daemon_matches_remote: false,
                     remote_session_peer_authorized: true,
                 },
                 RequestedSessionAuthPlan::InviteBootstrap,
@@ -335,7 +357,7 @@ proof fn outbound_bootstrap_upgrades_after_admitted_route()
                 normalize_outbound_session_auth_decision_context(
                     OutboundSessionAuthRawRows {
                         bootstrap_auth_still_valid: true,
-                        bound_daemon_matches_remote: true,
+                        bound_daemon_matches_remote: false,
                         remote_session_peer_authorized: true,
                     },
                     RequestedSessionAuthPlan::InviteBootstrap,

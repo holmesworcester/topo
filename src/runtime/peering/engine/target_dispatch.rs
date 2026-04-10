@@ -15,23 +15,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::bootstrap_auth::{
-    BootstrapSessionFallback, is_tenant_in_bootstrap_phase,
-    resolve_active_bootstrap_session_fallback, should_initiate_connect_for_source_with_db,
+    is_tenant_in_bootstrap_phase, resolve_active_bootstrap_session_fallback,
+    should_initiate_connect_for_source_with_db, BootstrapSessionFallback,
 };
 use super::target_planner::{
-    DispatchAction, PeerDispatcher, bootstrap_dispatch_action, bootstrap_dispatch_key,
-    bootstrap_dispatch_key_prefix, dispatch_bootstrap_target, dispatch_known_peer_target,
-    known_peer_dispatch_action, known_peer_dispatch_key,
+    bootstrap_dispatch_action, bootstrap_dispatch_key, bootstrap_dispatch_key_prefix,
+    dispatch_bootstrap_target, dispatch_known_peer_target, known_peer_dispatch_action,
+    known_peer_dispatch_key, DispatchAction, PeerDispatcher,
 };
 use crate::contracts::event_pipeline_contract::IngestFns;
-use crate::contracts::peering_contract::SessionDirection;
 use crate::db::open_connection;
 use crate::peering::loops::{
-    ConnectLoopConfig, STALE_DIAL_TARGET_MARKER, connect_loop, preferred_connection_direction,
-    short_peer_id,
+    connect_loop, short_peer_id, ConnectLoopConfig, STALE_DIAL_TARGET_MARKER,
 };
-use crate::runtime::repeated_warning::{RepeatedWarningGate, should_emit_globally};
-use crate::transport::{OutboundSessionAuthPlan, TransportEndpoint, resolve_bound_daemon_peer_id};
+use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
+use crate::transport::{resolve_bound_daemon_peer_id, OutboundSessionAuthPlan, TransportEndpoint};
 
 #[derive(Clone, Debug)]
 pub(crate) enum TargetIngressSource {
@@ -93,7 +91,7 @@ pub(super) struct TargetDispatchDecisionContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum TargetDispatchSkipReason {
-    NonPreferredSource,
+    SourceNotInitiated,
     LowerPrecedenceThanActiveWorker,
     DispatcherNoop,
 }
@@ -140,7 +138,7 @@ pub(super) fn decide_target_dispatch_plan(
     context: &TargetDispatchDecisionContext,
 ) -> TargetDispatchPlan {
     if !context.should_initiate_connect {
-        return TargetDispatchPlan::Skip(TargetDispatchSkipReason::NonPreferredSource);
+        return TargetDispatchPlan::Skip(TargetDispatchSkipReason::SourceNotInitiated);
     }
 
     if matches!(context.incoming_source, TargetIngressSourceKind::Bootstrap)
@@ -169,7 +167,7 @@ pub(super) fn decide_target_dispatch_plan(
     }
 }
 
-fn preferred_outbound_only_peer_id(source: &TargetIngressSource) -> Option<&str> {
+fn known_peer_id(source: &TargetIngressSource) -> Option<&str> {
     match source {
         TargetIngressSource::KnownPeer { peer_id } => Some(peer_id),
         TargetIngressSource::Bootstrap { .. } => None,
@@ -195,16 +193,10 @@ fn select_outbound_session_auth_plan(
 }
 
 pub(super) fn should_initiate_connect_for_source(
-    tenant_id: &str,
-    source: &TargetIngressSource,
+    _tenant_id: &str,
+    _source: &TargetIngressSource,
 ) -> bool {
-    match source {
-        TargetIngressSource::Bootstrap { .. } => true,
-        TargetIngressSource::KnownPeer { peer_id } => matches!(
-            preferred_connection_direction(tenant_id, peer_id),
-            Some(SessionDirection::Outbound)
-        ),
-    }
+    true
 }
 
 async fn join_connect_worker(worker: ActiveConnectWorker) {
@@ -370,14 +362,26 @@ pub(super) async fn run_target_dispatcher(
                 dispatch_action,
             }),
         );
+        debug!(
+            target: "topo::connection",
+            "target_dispatch plan key={} tenant={} source={:?} should_initiate={} bootstrap_phase={} active_higher_precedence={} action={:?} plan={:?}",
+            dispatch_key,
+            short_peer_id(&event.tenant_id),
+            event.source,
+            should_initiate_connect,
+            bootstrap_phase,
+            has_active_higher_precedence_worker,
+            dispatch_action,
+            dispatch_plan,
+        );
 
         if matches!(
             dispatch_plan,
-            TargetDispatchPlan::Skip(TargetDispatchSkipReason::NonPreferredSource)
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::SourceNotInitiated)
         ) {
-            if let Some(peer_id) = preferred_outbound_only_peer_id(&event.source) {
+            if let Some(peer_id) = known_peer_id(&event.source) {
                 info!(
-                    "Skipping non-preferred {:?} dial key={} tenant={} peer={}",
+                    "Skipping disabled {:?} dial key={} tenant={} peer={}",
                     event.source,
                     dispatch_key,
                     short_peer_id(&event.tenant_id),
@@ -664,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn target_dispatch_plan_skips_non_preferred_sources() {
+    fn target_dispatch_plan_skips_when_source_is_not_initiated() {
         let context = normalize_target_dispatch_decision_context(TargetDispatchRawRows {
             incoming_source: TargetIngressSourceKind::KnownPeer,
             should_initiate_connect: false,
@@ -675,7 +679,7 @@ mod tests {
 
         assert_eq!(
             decide_target_dispatch_plan(&context),
-            TargetDispatchPlan::Skip(TargetDispatchSkipReason::NonPreferredSource)
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::SourceNotInitiated)
         );
     }
 
@@ -757,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn target_dispatch_spawn_requires_preferred_runnable_non_suppressed_source() {
+    fn target_dispatch_spawn_requires_runnable_non_suppressed_source() {
         for incoming_source in [
             TargetIngressSourceKind::Bootstrap,
             TargetIngressSourceKind::KnownPeer,
@@ -840,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn known_peer_targets_follow_preferred_side_gate() {
+    fn known_peer_targets_allow_either_side_to_initiate() {
         let lower = "0000000000000000000000000000000000000000000000000000000000000001";
         let higher = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
@@ -850,7 +854,7 @@ mod tests {
                 peer_id: higher.to_string(),
             }
         ));
-        assert!(!should_initiate_connect_for_source(
+        assert!(should_initiate_connect_for_source(
             higher,
             &TargetIngressSource::KnownPeer {
                 peer_id: lower.to_string(),

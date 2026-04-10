@@ -4,6 +4,8 @@
 //! - startup preflight/recovery
 //! - inbound logical-session supervision on a shared daemon connection
 
+use std::collections::HashMap;
+
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -24,11 +26,28 @@ use crate::transport::{
 };
 
 use super::{
-    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session, short_peer_id,
-    ENDPOINT_TTL_MS,
+    claim_live_session_peer, current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex,
+    run_session, short_peer_id, ENDPOINT_TTL_MS,
 };
 
 const FIRST_SESSION_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DaemonConnectionAdmission {
+    RequireFirstSessionAuth,
+    KnownDaemonRoute,
+}
+
+fn requires_first_session_auth_timeout(
+    connection_admitted: bool,
+    initial_admission: DaemonConnectionAdmission,
+) -> bool {
+    !connection_admitted
+        && matches!(
+            initial_admission,
+            DaemonConnectionAdmission::RequireFirstSessionAuth
+        )
+}
 
 /// Shared startup preflight:
 /// - `create_tables`
@@ -121,10 +140,15 @@ pub(super) async fn supervise_inbound_daemon_connection(
     daemon_connection: &DaemonConnection,
     handler: &SyncConnectionHandler,
     shutdown: CancellationToken,
+    initial_admission: DaemonConnectionAdmission,
 ) {
     let connection = daemon_connection.connection();
     let remote_daemon_peer_id = daemon_connection.remote_daemon_peer_id().to_string();
-    let mut connection_admitted = false;
+    let mut connection_admitted = matches!(
+        initial_admission,
+        DaemonConnectionAdmission::KnownDaemonRoute
+    );
+    let mut live_session_peer_registrations = HashMap::new();
 
     loop {
         if shutdown.is_cancelled() {
@@ -132,31 +156,32 @@ pub(super) async fn supervise_inbound_daemon_connection(
             return;
         }
 
-        let session_result = if connection_admitted {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    connection.close(0u32.into(), b"runtime shutdown");
-                    return;
+        let session_result =
+            if !requires_first_session_auth_timeout(connection_admitted, initial_admission) {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        connection.close(0u32.into(), b"runtime shutdown");
+                        return;
+                    }
+                    session = daemon_connection.accept_inbound_session() => Ok(session),
                 }
-                session = daemon_connection.accept_inbound_session() => Ok(session),
-            }
-        } else {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    connection.close(0u32.into(), b"runtime shutdown");
-                    return;
-                }
-                session = tokio::time::timeout(
-                    FIRST_SESSION_AUTH_TIMEOUT,
-                    daemon_connection.accept_inbound_session(),
-                ) => {
-                    match session {
-                        Ok(session) => Ok(session),
-                        Err(_) => Err("first session auth timeout".to_string()),
+            } else {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        connection.close(0u32.into(), b"runtime shutdown");
+                        return;
+                    }
+                    session = tokio::time::timeout(
+                        FIRST_SESSION_AUTH_TIMEOUT,
+                        daemon_connection.accept_inbound_session(),
+                    ) => {
+                        match session {
+                            Ok(session) => Ok(session),
+                            Err(_) => Err("first session auth timeout".to_string()),
+                        }
                     }
                 }
-            }
-        };
+            };
         let mut session = match session_result {
             Ok(session) => match session {
                 Ok(session) => session,
@@ -268,6 +293,18 @@ pub(super) async fn supervise_inbound_daemon_connection(
                 continue;
             }
         };
+        live_session_peer_registrations
+            .entry((
+                auth_context.tenant_id.clone(),
+                auth_context.remote_peer_id.clone(),
+            ))
+            .or_insert_with(|| {
+                claim_live_session_peer(
+                    db_path,
+                    &auth_context.tenant_id,
+                    &auth_context.remote_peer_id,
+                )
+            });
 
         let now = current_timestamp_ms();
         if let Ok(db) = open_connection(db_path) {
@@ -386,5 +423,21 @@ mod tests {
             "0123456789abcdef"
         );
         assert_eq!(short_peer_id("short"), "short");
+    }
+
+    #[test]
+    fn known_daemon_route_skips_first_session_auth_timeout() {
+        assert!(requires_first_session_auth_timeout(
+            false,
+            DaemonConnectionAdmission::RequireFirstSessionAuth
+        ));
+        assert!(!requires_first_session_auth_timeout(
+            false,
+            DaemonConnectionAdmission::KnownDaemonRoute
+        ));
+        assert!(!requires_first_session_auth_timeout(
+            true,
+            DaemonConnectionAdmission::RequireFirstSessionAuth
+        ));
     }
 }

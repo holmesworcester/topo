@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use tracing::debug;
+
 use crate::tuning::{low_mem_mode, sync_last_day_only_mode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncWindowKind {
     Full = 0,
     LastDay = 1,
@@ -96,15 +98,7 @@ struct SelectOutboundWindowDecisionContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectOutboundWindowPlan {
     LastDayOnly,
-    SinglePeer,
-    MultiPeerPriorityOwner,
-    MultiPeerCold,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TenantPriorityState {
-    owner_idx: usize,
-    cycle_anchor_now_ms: Option<i64>,
+    PerPeerCadence,
 }
 
 fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
@@ -112,21 +106,8 @@ fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn tenant_priority_state() -> &'static Mutex<HashMap<String, TenantPriorityState>> {
-    static STATE: OnceLock<Mutex<HashMap<String, TenantPriorityState>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn planner_key(db_path: &str, recorded_by: &str, peer_id: &str) -> String {
     format!("{db_path}|{recorded_by}|{peer_id}")
-}
-
-fn planner_tenant_prefix(db_path: &str, recorded_by: &str) -> String {
-    format!("{db_path}|{recorded_by}|")
-}
-
-fn tenant_priority_key(db_path: &str, recorded_by: &str) -> String {
-    format!("{db_path}|{recorded_by}")
 }
 
 fn state_for<'a>(
@@ -142,19 +123,6 @@ fn state_for<'a>(
             cycle_anchor_now_ms: None,
             restrict_to_low_mem_windows: false,
             single_peer_phase: SinglePeerPhase::LastDay,
-        })
-}
-
-fn tenant_state_for<'a>(
-    state: &'a mut HashMap<String, TenantPriorityState>,
-    db_path: &str,
-    recorded_by: &str,
-) -> &'a mut TenantPriorityState {
-    state
-        .entry(tenant_priority_key(db_path, recorded_by))
-        .or_insert(TenantPriorityState {
-            owner_idx: 0,
-            cycle_anchor_now_ms: None,
         })
 }
 
@@ -203,12 +171,8 @@ fn decide_select_outbound_window_plan(
 ) -> SelectOutboundWindowPlan {
     if context.last_day_only_mode {
         SelectOutboundWindowPlan::LastDayOnly
-    } else if context.normalized_live_peer_count <= 1 {
-        SelectOutboundWindowPlan::SinglePeer
-    } else if context.peer_is_priority_owner {
-        SelectOutboundWindowPlan::MultiPeerPriorityOwner
     } else {
-        SelectOutboundWindowPlan::MultiPeerCold
+        SelectOutboundWindowPlan::PerPeerCadence
     }
 }
 
@@ -217,17 +181,6 @@ pub fn reset_outbound_window_state(db_path: &str, recorded_by: &str, peer_id: &s
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.remove(&planner_key(db_path, recorded_by, peer_id));
-    let tenant_prefix = planner_tenant_prefix(db_path, recorded_by);
-    let should_remove_tenant_state = !state
-        .keys()
-        .any(|candidate| candidate.starts_with(&tenant_prefix));
-    drop(state);
-    if should_remove_tenant_state {
-        tenant_priority_state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&tenant_priority_key(db_path, recorded_by));
-    }
 }
 
 pub fn prime_outbound_window_kind(
@@ -279,28 +232,14 @@ fn select_single_peer_window(
     window_for_kind(kind, anchor_now_ms)
 }
 
-fn select_cold_window(
-    db_path: &str,
-    recorded_by: &str,
-    peer_id: &str,
-    live_peer_ids: &[String],
-    now_ms: i64,
-) -> SyncWindow {
-    let mut state = planner_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let planner = state_for(&mut state, db_path, recorded_by, peer_id);
-    let tier_order = cold_tier_order(planner);
-    let anchor_now_ms = *planner.cycle_anchor_now_ms.get_or_insert(now_ms);
-    let idx = planner.cold_next_idx % tier_order.len();
-    let kind = tier_order[idx];
-    assign_window(
-        window_for_kind(kind, anchor_now_ms),
-        kind,
-        peer_id,
-        live_peer_ids,
-        anchor_now_ms,
-    )
+fn normalized_live_peer_count(peer_id: &str, live_peer_ids: &[String]) -> usize {
+    let mut peers = live_peer_ids.to_vec();
+    if !peers.iter().any(|candidate| candidate == peer_id) {
+        peers.push(peer_id.to_string());
+    }
+    peers.sort();
+    peers.dedup();
+    peers.len()
 }
 
 pub fn select_outbound_window(
@@ -310,73 +249,39 @@ pub fn select_outbound_window(
     live_peer_ids: &[String],
     now_ms: i64,
 ) -> SyncWindow {
-    let last_day_only_mode = sync_last_day_only_mode();
-    if matches!(
-        decide_select_outbound_window_plan(&normalize_select_outbound_window_context(
-            SelectOutboundWindowRawRows {
-                last_day_only_mode,
-                normalized_live_peer_count: 0,
-                peer_is_priority_owner: false,
-            },
-        )),
-        SelectOutboundWindowPlan::LastDayOnly
-    ) {
-        return window_for_kind(SyncWindowKind::LastDay, now_ms);
+    let peer_short = &peer_id[..peer_id.len().min(16)];
+    let live_peer_count = normalized_live_peer_count(peer_id, live_peer_ids);
+    let plan = decide_select_outbound_window_plan(&normalize_select_outbound_window_context(
+        SelectOutboundWindowRawRows {
+            last_day_only_mode: sync_last_day_only_mode(),
+            normalized_live_peer_count: live_peer_count,
+            peer_is_priority_owner: false,
+        },
+    ));
+    if matches!(plan, SelectOutboundWindowPlan::LastDayOnly) {
+        let window = window_for_kind(SyncWindowKind::LastDay, now_ms);
+        debug!(
+            target: "topo::sync_window_planner",
+            db_path,
+            recorded_by,
+            peer = peer_short,
+            normalized_live_peer_count = live_peer_count,
+            kind = ?window.kind,
+            "selected outbound sync window in last-day-only mode"
+        );
+        return window;
     }
-    let live_peers = normalized_live_peers(peer_id, live_peer_ids);
-    if matches!(
-        decide_select_outbound_window_plan(&normalize_select_outbound_window_context(
-            SelectOutboundWindowRawRows {
-                last_day_only_mode,
-                normalized_live_peer_count: live_peers.len(),
-                peer_is_priority_owner: false,
-            },
-        )),
-        SelectOutboundWindowPlan::SinglePeer
-    ) {
-        return select_single_peer_window(db_path, recorded_by, peer_id, now_ms);
-    }
-
-    let (owner_peer_id, owner_kind) = {
-        let mut state = tenant_priority_state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let tenant_state = tenant_state_for(&mut state, db_path, recorded_by);
-        let owner_idx = tenant_state.owner_idx % live_peers.len();
-        let owner_peer_id = live_peers.get(owner_idx).cloned().unwrap_or_default();
-        let owner_kind = if owner_peer_id == peer_id {
-            let _ = tenant_state.cycle_anchor_now_ms.get_or_insert(now_ms);
-            Some(SyncWindowKind::LastDay)
-        } else {
-            None
-        };
-        (owner_peer_id, owner_kind)
-    };
-
-    if matches!(
-        decide_select_outbound_window_plan(&normalize_select_outbound_window_context(
-            SelectOutboundWindowRawRows {
-                last_day_only_mode,
-                normalized_live_peer_count: live_peers.len(),
-                peer_is_priority_owner: owner_kind.is_some(),
-            },
-        )),
-        SelectOutboundWindowPlan::MultiPeerPriorityOwner
-    ) {
-        let kind = owner_kind.expect("priority-owner plan requires owner window kind");
-        let mut state = tenant_priority_state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let tenant_state = tenant_state_for(&mut state, db_path, recorded_by);
-        let anchor_now_ms = *tenant_state.cycle_anchor_now_ms.get_or_insert(now_ms);
-        return window_for_kind(kind, anchor_now_ms);
-    }
-
-    let cold_peers: Vec<String> = live_peers
-        .into_iter()
-        .filter(|candidate| candidate != &owner_peer_id)
-        .collect();
-    select_cold_window(db_path, recorded_by, peer_id, &cold_peers, now_ms)
+    let window = select_single_peer_window(db_path, recorded_by, peer_id, now_ms);
+    debug!(
+        target: "topo::sync_window_planner",
+        db_path,
+        recorded_by,
+        peer = peer_short,
+        normalized_live_peer_count = live_peer_count,
+        kind = ?window.kind,
+        "selected outbound sync window in per-peer cadence"
+    );
+    window
 }
 
 pub fn mark_outbound_window_completed(
@@ -409,15 +314,6 @@ pub fn mark_outbound_window_completed(
                 }
             }
         }
-    }
-
-    if window.kind == SyncWindowKind::LastDay {
-        let mut state = tenant_priority_state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let tenant_state = tenant_state_for(&mut state, db_path, recorded_by);
-        tenant_state.owner_idx = tenant_state.owner_idx.saturating_add(1);
-        tenant_state.cycle_anchor_now_ms = None;
     }
 }
 
@@ -456,76 +352,12 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
     }
 }
 
-pub fn is_hot_window(kind: SyncWindowKind) -> bool {
-    matches!(kind, SyncWindowKind::LastDay)
-}
-
 pub fn is_priority_ingest_window(kind: SyncWindowKind) -> bool {
     matches!(kind, SyncWindowKind::LastDay)
 }
 
 pub fn is_low_mem_allowed_window(kind: SyncWindowKind) -> bool {
     matches!(kind, SyncWindowKind::LastDay | SyncWindowKind::LastWeek)
-}
-
-fn normalized_live_peers(peer_id: &str, live_peer_ids: &[String]) -> Vec<String> {
-    let mut peers = live_peer_ids.to_vec();
-    if !peers.iter().any(|candidate| candidate == peer_id) {
-        peers.push(peer_id.to_string());
-    }
-    peers.sort();
-    peers.dedup();
-    peers
-}
-
-fn partition_window_bounds(window: SyncWindow, now_ms: i64) -> Option<(i64, i64)> {
-    let start = window.ts_min()?;
-    let end = window.ts_max_exclusive().unwrap_or(now_ms);
-    (start < end).then_some((start, end))
-}
-
-fn partition_window(
-    window: SyncWindow,
-    peer_rank: usize,
-    peer_count: usize,
-    now_ms: i64,
-) -> SyncWindow {
-    if peer_count <= 1 {
-        return window;
-    }
-    let Some((start, end)) = partition_window_bounds(window, now_ms) else {
-        return window;
-    };
-    let width = end.saturating_sub(start);
-    if width <= 1 {
-        return window;
-    }
-
-    let oldest_slot = peer_count.saturating_sub(peer_rank + 1);
-    let slice_start = start + (width * oldest_slot as i64) / peer_count as i64;
-    let slice_end = start + (width * (oldest_slot + 1) as i64) / peer_count as i64;
-    SyncWindow {
-        kind: window.kind,
-        ts_min_inclusive_ms: Some(slice_start),
-        ts_max_exclusive_ms: Some(slice_end.max(slice_start)),
-    }
-}
-
-fn assign_window(
-    window: SyncWindow,
-    kind: SyncWindowKind,
-    peer_id: &str,
-    live_peer_ids: &[String],
-    now_ms: i64,
-) -> SyncWindow {
-    if is_hot_window(kind) {
-        return window;
-    }
-    let peers = normalized_live_peers(peer_id, live_peer_ids);
-    let Some(peer_rank) = peers.iter().position(|candidate| candidate == peer_id) else {
-        return window;
-    };
-    partition_window(window, peer_rank, peers.len(), now_ms)
 }
 
 impl SyncWindow {
@@ -703,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn select_outbound_window_decision_context_prioritizes_hot_window_owner() {
+    fn select_outbound_window_decision_context_uses_per_peer_cadence_without_partition_owner() {
         assert_eq!(
             decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
                 last_day_only_mode: true,
@@ -718,7 +550,7 @@ mod tests {
                 normalized_live_peer_count: 1,
                 peer_is_priority_owner: false,
             }),
-            SelectOutboundWindowPlan::SinglePeer
+            SelectOutboundWindowPlan::PerPeerCadence
         );
         assert_eq!(
             decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
@@ -726,7 +558,7 @@ mod tests {
                 normalized_live_peer_count: 3,
                 peer_is_priority_owner: true,
             }),
-            SelectOutboundWindowPlan::MultiPeerPriorityOwner
+            SelectOutboundWindowPlan::PerPeerCadence
         );
         assert_eq!(
             decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
@@ -734,7 +566,7 @@ mod tests {
                 normalized_live_peer_count: 3,
                 peer_is_priority_owner: false,
             }),
-            SelectOutboundWindowPlan::MultiPeerCold
+            SelectOutboundWindowPlan::PerPeerCadence
         );
     }
 
@@ -756,8 +588,8 @@ mod tests {
     }
 
     #[test]
-    fn select_outbound_window_non_last_day_single_peer_counts_use_single_peer_plan() {
-        for normalized_live_peer_count in [0, 1] {
+    fn select_outbound_window_non_last_day_mode_ignores_peer_count_and_owner() {
+        for normalized_live_peer_count in [0, 1, 2, 10] {
             for peer_is_priority_owner in [false, true] {
                 let context = SelectOutboundWindowDecisionContext {
                     last_day_only_mode: false,
@@ -766,7 +598,7 @@ mod tests {
                 };
                 assert_eq!(
                     decide_select_outbound_window_plan(&context),
-                    SelectOutboundWindowPlan::SinglePeer
+                    SelectOutboundWindowPlan::PerPeerCadence
                 );
             }
         }
@@ -789,7 +621,7 @@ mod tests {
                     normalized_live_peer_count: 1,
                     peer_is_priority_owner: false,
                 },
-                SelectOutboundWindowPlan::SinglePeer,
+                SelectOutboundWindowPlan::PerPeerCadence,
             ),
             (
                 SelectOutboundWindowRawRows {
@@ -797,7 +629,7 @@ mod tests {
                     normalized_live_peer_count: 3,
                     peer_is_priority_owner: true,
                 },
-                SelectOutboundWindowPlan::MultiPeerPriorityOwner,
+                SelectOutboundWindowPlan::PerPeerCadence,
             ),
             (
                 SelectOutboundWindowRawRows {
@@ -805,7 +637,7 @@ mod tests {
                     normalized_live_peer_count: 3,
                     peer_is_priority_owner: false,
                 },
-                SelectOutboundWindowPlan::MultiPeerCold,
+                SelectOutboundWindowPlan::PerPeerCadence,
             ),
         ];
 
@@ -979,30 +811,6 @@ mod tests {
     }
 
     #[test]
-    fn last_day_window_uses_single_owner_and_rotates_across_live_peers() {
-        let db_path = "/tmp/window-priority-owner";
-        let recorded_by = "tenant-a";
-        let peer_a = "peer-a";
-        let peer_b = "peer-b";
-        let peer_c = "peer-c";
-        let live_peers = vec![peer_a.to_string(), peer_b.to_string(), peer_c.to_string()];
-        reset_outbound_window_state(db_path, recorded_by, peer_a);
-        reset_outbound_window_state(db_path, recorded_by, peer_b);
-        reset_outbound_window_state(db_path, recorded_by, peer_c);
-
-        let day_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
-        let cold_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
-        assert_eq!(day_a.kind, SyncWindowKind::LastDay);
-        assert_eq!(cold_b.kind, SyncWindowKind::LastWeek);
-
-        mark_outbound_window_completed(db_path, recorded_by, peer_a, day_a);
-        let day_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
-        let cold_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
-        assert_eq!(day_b.kind, SyncWindowKind::LastDay);
-        assert_eq!(cold_a.kind, SyncWindowKind::LastWeek);
-    }
-
-    #[test]
     fn range_scheduler_uses_stable_cycle_anchor_across_window_steps() {
         let db_path = "/tmp/window-cycle-anchor";
         let recorded_by = "tenant-a";
@@ -1021,100 +829,28 @@ mod tests {
     }
 
     #[test]
-    fn cold_windows_partition_by_live_peer_rank() {
-        let db_path = "/tmp/window-partition";
+    fn multi_peer_scheduler_uses_independent_per_peer_cadence() {
+        let db_path = "/tmp/window-independent-peers";
         let recorded_by = "tenant-a";
+        let peer_a = "peer-a";
         let peer_b = "peer-b";
-        let peer_c = "peer-c";
-        let live_peers = vec!["peer-a".to_string(), peer_b.to_string(), peer_c.to_string()];
-        reset_outbound_window_state(db_path, recorded_by, "peer-a");
+        let live_peers = vec![peer_a.to_string(), peer_b.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_a);
         reset_outbound_window_state(db_path, recorded_by, peer_b);
-        reset_outbound_window_state(db_path, recorded_by, peer_c);
 
-        let week_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
-        let week_c = select_outbound_window(db_path, recorded_by, peer_c, &live_peers, 1_000_000);
+        let day_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let day_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        assert_eq!(day_a.kind, SyncWindowKind::LastDay);
+        assert_eq!(day_b.kind, SyncWindowKind::LastDay);
 
-        assert_eq!(week_b.kind, SyncWindowKind::LastWeek);
-        assert_eq!(week_c.kind, SyncWindowKind::LastWeek);
-        assert_eq!(week_b.ts_min(), week_c.ts_max_exclusive());
-        assert_eq!(week_b.ts_min(), Some(1_000_000 - (4 * DAY_MS)));
-        assert_eq!(week_b.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
-        assert_eq!(week_c.ts_min(), Some(1_000_000 - WEEK_MS));
-        assert_eq!(week_c.ts_max_exclusive(), Some(1_000_000 - (4 * DAY_MS)));
-    }
-
-    #[test]
-    fn cold_windows_expand_when_live_peer_set_shrinks() {
-        let db_path = "/tmp/window-peer-loss";
-        let recorded_by = "tenant-a";
-        let peer_b = "peer-b";
-        reset_outbound_window_state(db_path, recorded_by, "peer-a");
-        reset_outbound_window_state(db_path, recorded_by, peer_b);
-        reset_outbound_window_state(db_path, recorded_by, "peer-c");
-        let split_week = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_b,
-            &[
-                "peer-a".to_string(),
-                peer_b.to_string(),
-                "peer-c".to_string(),
-            ],
-            1_000_000,
-        );
-        let single_week = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_b,
-            &["peer-a".to_string(), peer_b.to_string()],
-            1_000_000,
-        );
-
-        assert_eq!(split_week.kind, SyncWindowKind::LastWeek);
-        assert_eq!(split_week.ts_min(), Some(1_000_000 - (4 * DAY_MS)));
-        assert_eq!(split_week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
-        assert_eq!(single_week.ts_min(), Some(1_000_000 - WEEK_MS));
-        assert_eq!(single_week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
-    }
-
-    #[test]
-    fn full_range_partitions_cover_without_overlap() {
-        let db_path = "/tmp/window-full-cover";
-        let recorded_by = "tenant-a";
-        let peers = vec![
-            "peer-a".to_string(),
-            "peer-b".to_string(),
-            "peer-c".to_string(),
-            "peer-d".to_string(),
-        ];
-        let now_ms = 4 * TWELVE_WEEK_MS;
-        for peer in &peers {
-            reset_outbound_window_state(db_path, recorded_by, peer);
-        }
-
-        for peer in peers.iter().skip(1) {
-            for _ in 0..2 {
-                let window = select_outbound_window(db_path, recorded_by, peer, &peers, now_ms);
-                mark_outbound_window_completed(db_path, recorded_by, peer, window);
-            }
-        }
-
-        let mut full_windows: Vec<SyncWindow> = peers
-            .iter()
-            .skip(1)
-            .map(|peer| select_outbound_window(db_path, recorded_by, peer, &peers, now_ms))
-            .collect();
-        full_windows.sort_by_key(|window| window.ts_min());
-
-        assert_eq!(full_windows.len(), 3);
-        assert_eq!(full_windows[0].ts_min(), Some(ALL_START_MS));
-        assert_eq!(
-            full_windows[2].ts_max_exclusive(),
-            Some(now_ms - TWELVE_WEEK_MS)
-        );
-        for pair in full_windows.windows(2) {
-            assert_eq!(pair[0].ts_max_exclusive(), pair[1].ts_min());
-        }
+        mark_outbound_window_completed(db_path, recorded_by, peer_a, day_a);
+        let week_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let still_day_b =
+            select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        assert_eq!(week_a.kind, SyncWindowKind::LastWeek);
+        assert_eq!(week_a.ts_min(), Some(1_000_000 - WEEK_MS));
+        assert_eq!(week_a.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
+        assert_eq!(still_day_b.kind, SyncWindowKind::LastDay);
     }
 
     #[test]

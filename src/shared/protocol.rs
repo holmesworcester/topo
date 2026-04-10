@@ -12,6 +12,8 @@ pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
 pub const MSG_TYPE_RANGE_POLICY_REJECT: u8 = 0x15; // Peer explicitly rejects a sync window policy
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
+pub const MSG_TYPE_RANGE_SUPPRESS_IDS: u8 = 0x04; // Suppress queued event ids on the active data session
+pub const MSG_TYPE_RANGE_DATA_DONE: u8 = 0x05; // No more event blobs will be sent on this data session
 pub const MSG_TYPE_OPEN_SESSION_AUTH_INVITE: u8 = 0x31;
 pub const MSG_TYPE_OPEN_SESSION_AUTH_ACK: u8 = 0x32;
 pub const MSG_TYPE_OPEN_SESSION_ROUTE: u8 = 0x33;
@@ -21,6 +23,7 @@ pub const MSG_TYPE_OPEN_SESSION_ROUTE: u8 = 0x33;
 /// (e.g. 500k items ≈ 18 MB of IdLists in worst case).  128 MiB leaves ample
 /// headroom without risking OOM from a single malformed frame.
 const MAX_NEG_MSG_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SUPPRESSION_IDS_PER_FRAME: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSessionAuthInvite {
@@ -65,6 +68,12 @@ pub enum Frame {
     Event {
         blob: Vec<u8>,
     },
+    /// Best-effort request to stop sending these ids on the current data session.
+    SuppressIds {
+        ids: Vec<EventId>,
+    },
+    /// Sender has finished emitting event blobs for the current data session.
+    RangeDataDone,
     OpenSessionAuthInvite {
         auth: OpenSessionAuthInvite,
     },
@@ -135,6 +144,29 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
             let blob = input[5..total_size].to_vec();
             Ok((Frame::Event { blob }, total_size))
         }
+        MSG_TYPE_RANGE_SUPPRESS_IDS => {
+            if input.len() < 3 {
+                return Err(ParseError::InsufficientData);
+            }
+            let count = u16::from_le_bytes([input[1], input[2]]) as usize;
+            if count > MAX_SUPPRESSION_IDS_PER_FRAME {
+                return Err(ParseError::TooManyIds(count));
+            }
+            let total_size = 3 + (count * 32);
+            if input.len() < total_size {
+                return Err(ParseError::InsufficientData);
+            }
+            let mut ids = Vec::with_capacity(count);
+            let mut pos = 3;
+            for _ in 0..count {
+                let mut event_id = [0u8; 32];
+                event_id.copy_from_slice(&input[pos..pos + 32]);
+                ids.push(event_id);
+                pos += 32;
+            }
+            Ok((Frame::SuppressIds { ids }, total_size))
+        }
+        MSG_TYPE_RANGE_DATA_DONE => Ok((Frame::RangeDataDone, 1)),
         MSG_TYPE_OPEN_SESSION_AUTH_INVITE => {
             const AUTH_SIZE: usize = 1 + 32 + 32 + 32 + 32 + 32 + 8 + 64;
             if input.len() < AUTH_SIZE {
@@ -248,6 +280,17 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             buf.extend_from_slice(blob);
             buf
         }
+        Frame::SuppressIds { ids } => {
+            let id_count = u16::try_from(ids.len()).expect("suppression id count must fit in u16");
+            let mut buf = Vec::with_capacity(3 + ids.len() * 32);
+            buf.push(MSG_TYPE_RANGE_SUPPRESS_IDS);
+            buf.extend_from_slice(&id_count.to_le_bytes());
+            for event_id in ids {
+                buf.extend_from_slice(event_id);
+            }
+            buf
+        }
+        Frame::RangeDataDone => vec![MSG_TYPE_RANGE_DATA_DONE],
         Frame::OpenSessionAuthInvite { auth } => {
             let mut buf = Vec::with_capacity(1 + 32 + 32 + 32 + 32 + 32 + 8 + 64);
             buf.push(MSG_TYPE_OPEN_SESSION_AUTH_INVITE);
@@ -344,6 +387,30 @@ mod tests {
     }
 
     #[test]
+    fn test_suppress_ids_roundtrip() {
+        let msg = Frame::SuppressIds {
+            ids: vec![[0x11; 32], [0x22; 32], [0x33; 32]],
+        };
+        let encoded = encode_frame(&msg);
+        assert_eq!(encoded.len(), 1 + 2 + (3 * 32));
+
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_range_data_done_roundtrip() {
+        let msg = Frame::RangeDataDone;
+        let encoded = encode_frame(&msg);
+        assert_eq!(encoded, vec![MSG_TYPE_RANGE_DATA_DONE]);
+
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
     fn test_event_variable_sizes() {
         for size in [0, 1, 75, 100, 512, 1000, 10000] {
             let blob = vec![0xABu8; size];
@@ -378,6 +445,16 @@ mod tests {
     fn test_parse_unknown_type() {
         let result = parse_frame(&[0xFF, 0, 0, 0, 0]);
         assert_eq!(result, Err(ParseError::UnknownType(0xFF)));
+    }
+
+    #[test]
+    fn test_suppress_ids_rejects_oversized_batch() {
+        let count = MAX_SUPPRESSION_IDS_PER_FRAME + 1;
+        let mut encoded = vec![MSG_TYPE_RANGE_SUPPRESS_IDS];
+        encoded.extend_from_slice(&(count as u16).to_le_bytes());
+        encoded.extend(std::iter::repeat_n(0u8, count * 32));
+
+        assert_eq!(parse_frame(&encoded), Err(ParseError::TooManyIds(count)));
     }
     #[test]
     fn test_open_session_auth_invite_roundtrip() {

@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
-use crate::crypto::{EventId, event_id_to_base64};
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
-use crate::event_modules::{self as events, EventTypeMeta, ShareScope, registry::EventRegistry};
+use crate::event_modules::{self as events, registry::EventRegistry, EventTypeMeta, ShareScope};
 use crate::state::shared_workspace_fanout::SharedEventFanout;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -380,7 +380,7 @@ mod tests {
         schema::create_tables,
         store::{SQL_INSERT_EVENT, SQL_INSERT_RECORDED_EVENT, SQL_INSERT_SHARED_EVENT_INDEX_ENTRY},
     };
-    use crate::event_modules::{self, EVENT_TYPE_FILE_SLICE, EncryptedEvent, ParsedEvent};
+    use crate::event_modules::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_FILE_SLICE};
 
     fn run_persist_phase_for_test(
         db: &rusqlite::Connection,

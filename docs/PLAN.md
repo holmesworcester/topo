@@ -1261,6 +1261,12 @@ Projection authorization also rejects when:
 
 Multi-source download allows a sink to pull events from N sources concurrently.
 
+Current daemon implementation note: live suppression uses deterministic shuffled
+send order plus a small per-batch settle delay only when the live peer-connection
+registry indicates multiple remote source peers. The 1:1 path skips that settle
+delay because there is no second source to suppress, and if one source can send
+the whole range before suppression matters, that is a good outcome.
+
 A naive approach — running N independent negentropy sessions, each with its own
 `batch_writer` and letting each session decide for itself which `need_ids` it
 will serve — fails at scale: N writers contend on SQLite WAL locks, overlapping

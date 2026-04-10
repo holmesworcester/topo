@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
@@ -12,22 +12,24 @@ use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
-use crate::runtime::repeated_warning::{RepeatedWarningGate, should_emit_globally};
-use crate::sync::SyncConnectionHandler;
+use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::session::windowing::reset_outbound_window_state;
+use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{
-    ConnectionLifecycleError, DaemonConnection, OutboundSessionAuthPlan, SessionClass,
-    TransportEndpoint, dial_daemon_connection_target, load_daemon_identity_from_db,
+    dial_daemon_connection_target, load_daemon_identity_from_db,
     resolve_bootstrap_fallback_invite_for_daemon, resolve_outbound_session_auth_plan,
-    send_outbound_session_auth,
+    send_outbound_session_auth, ConnectionLifecycleError, DaemonConnection,
+    OutboundSessionAuthPlan, SessionClass, TransportEndpoint,
 };
 
-use super::supervisor::{run_startup_preflight, supervise_inbound_daemon_connection};
+use super::supervisor::{
+    run_startup_preflight, supervise_inbound_daemon_connection, DaemonConnectionAdmission,
+};
 use super::{
-    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
     claim_live_daemon_connection_slot, claim_live_session_peer, current_timestamp_ms,
     evict_live_daemon_connection, live_daemon_connection, peer_fingerprint_from_hex,
+    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
 pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -318,6 +320,12 @@ async fn connect_loop_inner(
         let daemon_connection = if let Some(existing) =
             live_daemon_connection(db_path, expected_remote_daemon_peer_id)
         {
+            debug!(
+                target: "topo::connection",
+                "connect_loop reusing live daemon connection remote={} addr={:?}",
+                super::short_peer_id(existing.remote_daemon_peer_id()),
+                existing.remote_addr(),
+            );
             existing
         } else {
             if !announced_connecting {
@@ -403,6 +411,12 @@ async fn connect_loop_inner(
                 daemon_connection.clone(),
             ) {
                 super::LiveDaemonConnectionClaim::Acquired(connection_lease) => {
+                    debug!(
+                        target: "topo::connection",
+                        "connect_loop acquired outbound daemon={} addr={:?}",
+                        super::short_peer_id(daemon_connection.remote_daemon_peer_id()),
+                        daemon_connection.remote_addr(),
+                    );
                     spawn_daemon_connection_worker(
                         daemon_connection.clone(),
                         db_path.to_string(),
@@ -413,6 +427,13 @@ async fn connect_loop_inner(
                     daemon_connection
                 }
                 super::LiveDaemonConnectionClaim::Occupied(occupied) => {
+                    debug!(
+                        target: "topo::connection",
+                        "connect_loop closing duplicate outbound daemon={} active_direction={:?} preferred_direction={:?}",
+                        super::short_peer_id(daemon_connection.remote_daemon_peer_id()),
+                        occupied.active_direction,
+                        occupied.preferred_direction,
+                    );
                     daemon_connection
                         .connection()
                         .close(0u32.into(), b"duplicate daemon connection");
@@ -511,6 +532,13 @@ async fn connect_loop_inner(
             .await
             {
                 Ok(auth_result) => {
+                    debug!(
+                        target: "topo::connection",
+                        "connect_loop authenticated outbound session daemon={} session_peer={} auth_plan={}",
+                        super::short_peer_id(daemon_connection.remote_daemon_peer_id()),
+                        super::short_peer_id(&auth_result.session_peer_id),
+                        describe_outbound_session_auth_plan(&effective_auth_plan),
+                    );
                     next_auth_plan_override = None;
                     auth_result
                 }
@@ -663,6 +691,7 @@ pub(super) fn spawn_daemon_connection_worker(
                 &daemon_connection,
                 &responder_handler,
                 shutdown,
+                DaemonConnectionAdmission::KnownDaemonRoute,
             )
             .await;
         }));

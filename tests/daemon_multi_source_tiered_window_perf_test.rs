@@ -48,11 +48,16 @@ struct BenchOutcome {
     active_sources: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct ReplicatedRejoinOutcome {
     projected_delta_messages: i64,
     active_sources: usize,
     source_event_frames: Vec<i64>,
+    downloader_event_frames: i64,
+    delivery_efficiency: f64,
+    catchup_wall_secs: f64,
+    messages_per_second: f64,
 }
 
 fn current_timestamp_ms() -> i64 {
@@ -69,6 +74,13 @@ fn env_i64(name: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 fn inherited_tier_env() -> Vec<(String, String)> {
     [
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
@@ -77,6 +89,7 @@ fn inherited_tier_env() -> Vec<(String, String)> {
         "TOPO_ENABLE_LIVE_SUPPRESSION",
         "TOPO_LIVE_SUPPRESSION_EVENT_ID_CAP",
         "TOPO_LIVE_SUPPRESSION_SEND_BATCH_SIZE",
+        "TOPO_LIVE_SUPPRESSION_BATCH_SETTLE_MS",
     ]
     .into_iter()
     .filter_map(|key| {
@@ -95,6 +108,15 @@ fn enable_sync_logging(db: &str) {
         db,
         String::from_utf8_lossy(&out.stderr)
     );
+    let conn = topo::db::open_connection(db).expect("open db for sync-log retention");
+    topo::db::sync_log::update_config(
+        &conn,
+        topo::db::sync_log::SyncLogConfigPatch {
+            max_runs: Some(50_000),
+            ..Default::default()
+        },
+    )
+    .expect("raise sync-log retention for perf attribution");
 }
 
 fn bench_tmpdir(label: &str) -> tempfile::TempDir {
@@ -102,10 +124,16 @@ fn bench_tmpdir(label: &str) -> tempfile::TempDir {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/home/holmes/p7tmp"));
     std::fs::create_dir_all(&root).expect("create benchmark tmp root");
-    tempfile::Builder::new()
-        .prefix(label)
-        .tempdir_in(root)
-        .expect("create benchmark tempdir")
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(label);
+    if std::env::var_os("TOPO_KEEP_BENCH_TMPDIR").is_some() {
+        builder.disable_cleanup(true);
+    }
+    let tmpdir = builder.tempdir_in(root).expect("create benchmark tempdir");
+    if std::env::var_os("TOPO_KEEP_BENCH_TMPDIR").is_some() {
+        eprintln!("keeping benchmark tempdir: {}", tmpdir.path().display());
+    }
+    tmpdir
 }
 
 fn wait_for_predicate_with_sync_kicks(dbs: &[String], predicate: &str, timeout: Duration) {
@@ -142,8 +170,48 @@ fn wait_for_predicate_with_sync_kicks(dbs: &[String], predicate: &str, timeout: 
     }
 }
 
-fn wait_for_message_count_via_cli(db: &str, expected: i64, timeout: Duration) -> i64 {
-    wait_for_predicate_with_sync_kicks(
+fn wait_for_predicate_without_sync_kicks(dbs: &[String], predicate: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut last_failure = String::new();
+    loop {
+        let mut failures = Vec::new();
+        for db in dbs {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "predicate timed out after {:?}: predicate={} last_failure={}",
+                timeout,
+                predicate,
+                last_failure
+            );
+            let slice_ms = remaining.min(Duration::from_secs(1)).as_millis().max(1) as u64;
+            let out = topo_assert_eventually(db, predicate, slice_ms);
+            if !out.status.success() {
+                failures.push(format!(
+                    "{} => {}",
+                    db,
+                    String::from_utf8_lossy(&out.stdout).trim()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            return;
+        }
+        last_failure = failures.join(" | ");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_message_count_all_via_cli(dbs: &[String], expected: i64, timeout: Duration) {
+    wait_for_predicate_with_sync_kicks(dbs, &format!("message_count >= {}", expected), timeout);
+}
+
+fn wait_for_message_count_via_cli_without_sync_kicks(
+    db: &str,
+    expected: i64,
+    timeout: Duration,
+) -> i64 {
+    wait_for_predicate_without_sync_kicks(
         &[db.to_string()],
         &format!("message_count >= {}", expected),
         timeout,
@@ -151,8 +219,20 @@ fn wait_for_message_count_via_cli(db: &str, expected: i64, timeout: Duration) ->
     current_timestamp_ms()
 }
 
-fn wait_for_message_count_all_via_cli(dbs: &[String], expected: i64, timeout: Duration) {
-    wait_for_predicate_with_sync_kicks(dbs, &format!("message_count >= {}", expected), timeout);
+fn wait_for_message_count_all_via_cli_without_sync_kicks(
+    dbs: &[String],
+    expected: i64,
+    timeout: Duration,
+) {
+    wait_for_predicate_without_sync_kicks(dbs, &format!("message_count >= {}", expected), timeout);
+}
+
+fn event_visible_on_all_via_cli(dbs: &[String], event_id_hex: &str, timeout: Duration) -> bool {
+    let predicate = format!("has_event:{} >= 1", event_id_hex);
+    dbs.iter().all(|db| {
+        let out = topo_assert_eventually(db, &predicate, timeout.as_millis().max(1) as u64);
+        out.status.success()
+    })
 }
 
 fn peers_output(db: &str) -> String {
@@ -218,24 +298,43 @@ fn parse_sync_events_rx_total(stdout: &str) -> i64 {
         .sum()
 }
 
-fn total_sync_events_received_via_cli(db: &str) -> i64 {
-    parse_sync_events_rx_total(&sync_log_show_output(db, &[]))
-}
-
 fn sync_events_received_for_peer_via_cli(db: &str, peer_id: &str) -> i64 {
     parse_sync_events_rx_total(&sync_log_show_output(db, &["--peer", peer_id]))
 }
 
-fn wait_for_sync_log_receives_stable_via_cli(db: &str, timeout: Duration, stable_for: Duration) {
+fn nonnegative_count_delta(after: i64, before: i64) -> i64 {
+    after.checked_sub(before).unwrap_or(0).max(0)
+}
+
+fn source_sync_event_frame_deltas_via_cli(db: &str, sources: &[Node], before: &[i64]) -> Vec<i64> {
+    sources
+        .iter()
+        .zip(before.iter())
+        .map(|(source, before_count)| {
+            let after = sync_events_received_for_peer_via_cli(db, &source.tenant_peer_id);
+            nonnegative_count_delta(after, *before_count)
+        })
+        .collect()
+}
+
+fn wait_for_source_sync_event_frame_deltas_via_cli(
+    db: &str,
+    sources: &[Node],
+    before: &[i64],
+    minimum_total: i64,
+    timeout: Duration,
+    stable_for: Duration,
+) -> Vec<i64> {
     let start = Instant::now();
-    let mut last = total_sync_events_received_via_cli(db);
+    let mut last = source_sync_event_frame_deltas_via_cli(db, sources, before);
     let mut stable_since = None;
     loop {
-        let current = total_sync_events_received_via_cli(db);
-        if current == last {
+        let current = source_sync_event_frame_deltas_via_cli(db, sources, before);
+        let current_total: i64 = current.iter().sum();
+        if current == last && current_total >= minimum_total {
             let since = stable_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= stable_for {
-                return;
+                return current;
             }
         } else {
             last = current;
@@ -243,9 +342,11 @@ fn wait_for_sync_log_receives_stable_via_cli(db: &str, timeout: Duration, stable
         }
         assert!(
             start.elapsed() < timeout,
-            "downloader receive totals did not stabilize within {:?}: total={}",
+            "source sync-log receive deltas did not stabilize within {:?}: minimum_total={} current_total={} deltas={:?}",
             timeout,
-            current
+            minimum_total,
+            current_total,
+            last,
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -592,7 +693,7 @@ fn trigger_sync_round_all(db: &str) {
     }
 }
 
-fn wait_for_live_connection_count_at_least(db: &str, minimum: usize, timeout: Duration) {
+fn wait_for_endpoint_target_count_at_least(db: &str, minimum: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let connections = connections_json(db);
@@ -601,7 +702,7 @@ fn wait_for_live_connection_count_at_least(db: &str, minimum: usize, timeout: Du
         }
         assert!(
             Instant::now() < deadline,
-            "expected at least {} live connections in {} within {:?}, got {:?}",
+            "expected at least {} endpoint targets in {} within {:?}, got {:?}",
             minimum,
             db,
             timeout,
@@ -667,14 +768,65 @@ fn assert_full_mesh_connectivity_basics(nodes: &[NodeView], timeout: Duration) {
             .map(|remote| remote.label.clone())
             .collect();
         wait_for_peers_output_to_include_labels(&node.db, &expected_labels, timeout);
-        wait_for_live_connection_count_at_least(&node.db, 1, timeout);
+        wait_for_endpoint_target_count_at_least(&node.db, expected_endpoint_count, timeout);
     }
+}
+
+fn assert_full_mesh_live_message_delivery(nodes: &[NodeView], timeout: Duration) -> i64 {
+    let dbs: Vec<String> = nodes.iter().map(|node| node.db.clone()).collect();
+    let deadline = Instant::now() + timeout;
+    let mut remaining: BTreeSet<usize> = (0..nodes.len()).collect();
+    let mut delivered = 0;
+    let mut attempts = 0;
+    while !remaining.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "full-mesh live probe delivery did not converge within {:?}: remaining_origins={:?}",
+            timeout,
+            remaining
+                .iter()
+                .map(|idx| nodes[*idx].label.clone())
+                .collect::<Vec<_>>()
+        );
+        let origin_indexes: Vec<usize> = remaining.iter().copied().collect();
+        for origin_index in origin_indexes {
+            let remaining_time = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining_time.is_zero(),
+                "full-mesh live probe delivery timed out for origin={} after {:?}",
+                nodes[origin_index].label,
+                timeout
+            );
+            let node = &nodes[origin_index];
+            attempts += 1;
+            let event_id = send_message(
+                &node.db,
+                &format!("live-full-mesh-probe-{}-{}", node.label, attempts),
+            );
+            let probe_timeout = remaining_time.min(Duration::from_secs(2));
+            if event_visible_on_all_via_cli(&dbs, &event_id, probe_timeout) {
+                remaining.remove(&origin_index);
+                delivered += 1;
+                eprintln!(
+                    "full-mesh live probe from {} visible on {} nodes after {} attempts",
+                    node.label,
+                    nodes.len(),
+                    attempts
+                );
+            }
+        }
+        if !remaining.is_empty() {
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+    delivered
 }
 
 struct Node {
     label: String,
     db: String,
     _daemon: HarnessDaemon,
+    tenant_peer_id: String,
     transport_peer_id: String,
 }
 
@@ -755,6 +907,7 @@ fn create_online_community(
         label: "hub".to_string(),
         db: hub_db.clone(),
         _daemon: hub_daemon,
+        tenant_peer_id: active_tenant_peer_id(&hub_db).expect("hub active tenant peer id"),
         transport_peer_id: daemon_transport_fingerprint(&hub_db),
     });
 
@@ -780,6 +933,7 @@ fn create_online_community(
             label: label.clone(),
             db: db.clone(),
             _daemon: daemon,
+            tenant_peer_id: active_tenant_peer_id(&db).expect("joined active tenant peer id"),
             transport_peer_id: daemon_transport_fingerprint(&db),
         });
     }
@@ -788,8 +942,16 @@ fn create_online_community(
 }
 
 fn emit_warmup_messages(nodes: &[Node]) -> i64 {
+    let trace_warmup_events = std::env::var_os("TOPO_TRACE_WARMUP_EVENTS").is_some();
     for node in nodes {
-        let _ = send_message(&node.db, &format!("warmup-{}", node.label));
+        let label = format!("warmup-{}", node.label);
+        let event_id = send_message(&node.db, &label);
+        if trace_warmup_events {
+            eprintln!(
+                "warmup event: origin={} label={} event_id={}",
+                node.label, label, event_id
+            );
+        }
     }
     nodes.len() as i64
 }
@@ -982,7 +1144,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
         .iter()
         .map(|source| {
             sink_received_frame_deltas
-                .get(&source.transport_peer_id)
+                .get(&source.tenant_peer_id)
                 .copied()
                 .unwrap_or(0)
         })
@@ -1207,7 +1369,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
         .iter()
         .map(|source| {
             rejoiner_received_frame_deltas
-                .get(&source.transport_peer_id)
+                .get(&source.tenant_peer_id)
                 .copied()
                 .unwrap_or(0)
         })
@@ -1299,7 +1461,7 @@ fn run_replicated_rejoin_bench(
     source_count: usize,
     connectivity: ConnectivityMode,
 ) -> ReplicatedRejoinOutcome {
-    assert!(source_count >= 2, "source_count must be >= 2");
+    assert!(source_count >= 1, "source_count must be >= 1");
     hold_network_test_lock_for_binary();
     std::env::set_var("TOPO_GENERATE_MESSAGE_SPREAD_MS", HOUR_MS.to_string());
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
@@ -1331,10 +1493,22 @@ fn run_replicated_rejoin_bench(
         .collect();
 
     assert_full_mesh_connectivity_basics(&all_node_views, Duration::from_secs(120));
+    let live_probe_messages =
+        assert_full_mesh_live_message_delivery(&all_node_views, Duration::from_secs(120));
 
-    let warmup_messages = emit_warmup_messages(&sources) + 1;
-    let _ = send_message(&rejoiner.db, "warmup-rejoiner");
-    wait_for_message_count_all(&all_dbs, warmup_messages, Duration::from_secs(120));
+    let warmup_messages = live_probe_messages + emit_warmup_messages(&sources) + 1;
+    let rejoiner_warmup_id = send_message(&rejoiner.db, "warmup-rejoiner");
+    if std::env::var_os("TOPO_TRACE_WARMUP_EVENTS").is_some() {
+        eprintln!(
+            "warmup event: origin={} label=warmup-rejoiner event_id={}",
+            rejoiner.label, rejoiner_warmup_id
+        );
+    }
+    wait_for_message_count_all_via_cli_without_sync_kicks(
+        &all_dbs,
+        warmup_messages,
+        Duration::from_secs(120),
+    );
 
     let mut rejoiner_daemon = rejoiner._daemon;
     stop_daemon(&rejoiner.db, &mut rejoiner_daemon);
@@ -1342,7 +1516,7 @@ fn run_replicated_rejoin_bench(
 
     generate_messages_replicated(&sources, total_messages);
     let expected_source_total = total_messages + warmup_messages;
-    wait_for_message_count_all_via_cli(
+    wait_for_message_count_all_via_cli_without_sync_kicks(
         &source_dbs,
         expected_source_total,
         Duration::from_secs(1200),
@@ -1350,47 +1524,49 @@ fn run_replicated_rejoin_bench(
 
     let rejoiner_received_frames_before: Vec<i64> = sources
         .iter()
-        .map(|source| {
-            sync_events_received_for_peer_via_cli(&rejoiner.db, &source.transport_peer_id)
-        })
+        .map(|source| sync_events_received_for_peer_via_cli(&rejoiner.db, &source.tenant_peer_id))
         .collect();
     let inherited_env = inherited_tier_env();
+    let catchup_start = Instant::now();
     rejoiner_daemon = start_peer(&rejoiner.db, inherited_env, connectivity);
     ensure_active_peer(&rejoiner.db, Duration::from_secs(10));
     wait_for_active_tenant_ready(&rejoiner.db, Duration::from_secs(120));
     assert_full_mesh_connectivity_basics(&all_node_views, Duration::from_secs(120));
-    let _ = wait_for_message_count_via_cli(
+    let _ = wait_for_message_count_via_cli_without_sync_kicks(
         &rejoiner.db,
         expected_source_total,
         Duration::from_secs(1800),
     );
-    wait_for_sync_log_receives_stable_via_cli(
+    let catchup_wall_secs = catchup_start.elapsed().as_secs_f64();
+    let source_event_frames = wait_for_source_sync_event_frame_deltas_via_cli(
         &rejoiner.db,
+        &sources,
+        &rejoiner_received_frames_before,
+        total_messages,
         Duration::from_secs(60),
         Duration::from_millis(500),
     );
-
-    let rejoiner_received_frames_after: Vec<i64> = sources
-        .iter()
-        .map(|source| {
-            sync_events_received_for_peer_via_cli(&rejoiner.db, &source.transport_peer_id)
-        })
-        .collect();
-    let source_event_frames: Vec<i64> = rejoiner_received_frames_after
-        .iter()
-        .zip(rejoiner_received_frames_before.iter())
-        .map(|(after, before)| after.saturating_sub(*before))
-        .collect();
     let active_sources = source_event_frames
         .iter()
         .filter(|count| **count > 0)
         .count();
+    let downloader_event_frames: i64 = source_event_frames.iter().sum();
+    let delivery_efficiency = if downloader_event_frames > 0 {
+        total_messages as f64 / downloader_event_frames as f64
+    } else {
+        0.0
+    };
+    let messages_per_second = total_messages as f64 / catchup_wall_secs.max(f64::EPSILON);
 
     eprintln!(
-        "\nreplicated rejoin {}: projected_delta_messages={} active_sources={} sync_log_rx_by_source={:?}",
+        "\nreplicated rejoin {}: projected_delta_messages={} catchup_wall={:.2}s messages_per_second={:.1} active_sources={} downloader_event_frames={} delivery_efficiency={:.1}% sync_log_rx_by_source={:?}",
         connectivity.title(),
         total_messages,
+        catchup_wall_secs,
+        messages_per_second,
         active_sources,
+        downloader_event_frames,
+        delivery_efficiency * 100.0,
         source_event_frames,
     );
     stop_daemon(&rejoiner.db, &mut rejoiner_daemon);
@@ -1400,6 +1576,10 @@ fn run_replicated_rejoin_bench(
         projected_delta_messages: total_messages,
         active_sources,
         source_event_frames,
+        downloader_event_frames,
+        delivery_efficiency,
+        catchup_wall_secs,
+        messages_per_second,
     }
 }
 
@@ -1492,6 +1672,23 @@ fn replicated_rejoin_2x_10k_live_suppression_uses_multiple_sources_after_preconv
     assert!(
         outcome.projected_delta_messages > 0,
         "expected the rejoiner to ingest replicated events"
+    );
+}
+
+#[test]
+#[ignore = "env-driven replicated rejoin perf comparison"]
+fn replicated_rejoin_live_suppression_compare_from_env() {
+    let source_count = env_usize("TOPO_MULTI_SOURCE_COMPARE_SOURCE_COUNT", 2);
+    let outcome = run_replicated_rejoin_bench(source_count, ConnectivityMode::DiscoveryLoopback);
+    assert!(
+        outcome.projected_delta_messages > 0,
+        "expected the rejoiner to ingest replicated events"
+    );
+    assert!(
+        outcome.active_sources >= 1,
+        "expected at least one source to contribute, got active_sources={} sync_log_rx={:?}",
+        outcome.active_sources,
+        outcome.source_event_frames,
     );
 }
 

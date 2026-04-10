@@ -72,6 +72,8 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
             }))
             .ok()
         }
+        Frame::SuppressIds { ids } => serde_json::to_string(&json!({ "id_count": ids.len() })).ok(),
+        Frame::RangeDataDone => None,
         Frame::OpenSessionRoute { .. }
         | Frame::OpenSessionAuthInvite { .. }
         | Frame::OpenSessionAuthAck { .. } => None,
@@ -84,6 +86,8 @@ fn frame_type(frame: &Frame) -> &'static str {
         Frame::NegMsg { .. } => "NegMsg",
         Frame::RangePolicyReject { .. } => "RangePolicyReject",
         Frame::Event { .. } => "Event",
+        Frame::SuppressIds { .. } => "SuppressIds",
+        Frame::RangeDataDone => "RangeDataDone",
         Frame::OpenSessionRoute { .. } => "OpenSessionRoute",
         Frame::OpenSessionAuthInvite { .. } => "OpenSessionAuthInvite",
         Frame::OpenSessionAuthAck { .. } => "OpenSessionAuthAck",

@@ -302,12 +302,16 @@ fn run_cli_with_db_lock_retry(args: &[&str], description: &str, timeout: Duratio
             return output;
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("database is locked") && start.elapsed() < timeout {
+        if is_database_locked_message(&stderr) && start.elapsed() < timeout {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
         return output;
     }
+}
+
+fn is_database_locked_message(message: &str) -> bool {
+    message.contains("database is locked") || message.contains("SQLITE_BUSY")
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,7 +1265,8 @@ pub fn send_message(db: &str, content: &str) -> String {
         let retryable = stderr.contains("no identity")
             || stderr.contains("no active tenant")
             || stderr.contains("workspace has not completed initial sync yet")
-            || stderr.contains("blocked on");
+            || stderr.contains("blocked on")
+            || is_database_locked_message(&stderr);
         if retryable && start.elapsed() < send_timeout {
             if stderr.contains("no active tenant") {
                 ensure_active_peer(db, Duration::from_secs(5));
@@ -2454,10 +2459,24 @@ pub fn generate_messages(db: &str, count: usize) {
         .filter(|value| *value > 0)
         .unwrap_or(100_000);
     let mut remaining = count;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(120);
     while remaining > 0 {
         let next = remaining.min(chunk_size);
-        topo::event_modules::message::commands::generate_for_peer(db, &peer_id, next, None)
-            .expect("generate synthetic messages");
+        loop {
+            let result =
+                topo::event_modules::message::commands::generate_for_peer(db, &peer_id, next, None);
+            match result {
+                Ok(_) => break,
+                Err(err)
+                    if is_database_locked_message(&err.to_string())
+                        && start.elapsed() < timeout =>
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(err) => panic!("generate synthetic messages: {err}"),
+            }
+        }
         remaining -= next;
     }
 }
@@ -2488,6 +2507,7 @@ pub fn is_transient_rpc_startup_error(stderr: &str) -> bool {
         || stderr.contains("no live sessions")
         || stderr.contains("timeout waiting for round reply")
         || stderr.contains("blocked on")
+        || is_database_locked_message(stderr)
 }
 
 /// Run a topo RPC command with automatic retry on transient errors.

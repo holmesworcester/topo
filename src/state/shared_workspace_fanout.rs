@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-use crate::crypto::{EventId, event_id_to_base64};
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::store::{insert_recorded_event, lookup_workspace_id};
 use crate::event_modules::ShareScope;
 use crate::projection::apply::project_one;
@@ -695,11 +695,9 @@ mod tests {
             sibling_tenants_in_workspace(&conn, "tenant-b", "ws-1").unwrap(),
             vec!["tenant-a".to_string()]
         );
-        assert!(
-            sibling_tenants_in_workspace(&conn, "tenant-c", "ws-2")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(sibling_tenants_in_workspace(&conn, "tenant-c", "ws-2")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

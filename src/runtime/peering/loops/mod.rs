@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::contracts::peering_contract::{
     PeerFingerprint, SessionDirection, SessionMeta, TenantId, TransportSessionIo,
@@ -219,6 +219,13 @@ pub(crate) fn claim_live_daemon_connection_slot(
             .unwrap_or_else(|poison| poison.into_inner());
         match slots.get_mut(&key) {
             None => {
+                debug!(
+                    target: "topo::connection",
+                    "claim live daemon connection acquired remote={} direction={:?} preferred={:?}",
+                    short_peer_id(remote_daemon_peer_id),
+                    direction,
+                    preferred_direction,
+                );
                 let released = Arc::new(tokio::sync::Notify::new());
                 slots.insert(
                     key.clone(),
@@ -236,10 +243,39 @@ pub(crate) fn claim_live_daemon_connection_slot(
                     .daemon_connection
                     .connection()
                     .close_reason()
-                    .is_some()
-                    || existing.daemon_connection.remote_addr()
+                    .is_some() =>
+            {
+                debug!(
+                    target: "topo::connection",
+                    "claim live daemon connection replacing closed remote={} old_direction={:?} new_direction={:?}",
+                    short_peer_id(remote_daemon_peer_id),
+                    existing.direction,
+                    direction,
+                );
+                let released = Arc::new(tokio::sync::Notify::new());
+                replaced = Some((
+                    existing.daemon_connection.clone(),
+                    existing.released.clone(),
+                ));
+                *existing = LiveDaemonConnectionSlot {
+                    claim_id,
+                    direction,
+                    daemon_connection,
+                    released,
+                };
+                LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
+            }
+            Some(existing)
+                if existing.direction == direction
+                    && existing.daemon_connection.remote_addr()
                         != daemon_connection.remote_addr() =>
             {
+                debug!(
+                    target: "topo::connection",
+                    "claim live daemon connection replacing stale same-direction remote={} direction={:?}",
+                    short_peer_id(remote_daemon_peer_id),
+                    existing.direction,
+                );
                 let released = Arc::new(tokio::sync::Notify::new());
                 replaced = Some((
                     existing.daemon_connection.clone(),
@@ -256,6 +292,13 @@ pub(crate) fn claim_live_daemon_connection_slot(
             Some(existing)
                 if preferred_direction == Some(direction) && existing.direction != direction =>
             {
+                debug!(
+                    target: "topo::connection",
+                    "claim live daemon connection replacing non-preferred remote={} old_direction={:?} new_direction={:?}",
+                    short_peer_id(remote_daemon_peer_id),
+                    existing.direction,
+                    direction,
+                );
                 let released = Arc::new(tokio::sync::Notify::new());
                 replaced = Some((
                     existing.daemon_connection.clone(),
@@ -269,18 +312,28 @@ pub(crate) fn claim_live_daemon_connection_slot(
                 };
                 LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
             }
-            Some(existing) => LiveDaemonConnectionClaim::Occupied(LiveDaemonConnectionOccupied {
-                preferred_direction,
-                active_direction: existing.direction,
-                daemon_connection: existing.daemon_connection.clone(),
-            }),
+            Some(existing) => {
+                debug!(
+                    target: "topo::connection",
+                    "claim live daemon connection occupied remote={} active_direction={:?} requested_direction={:?} preferred={:?}",
+                    short_peer_id(remote_daemon_peer_id),
+                    existing.direction,
+                    direction,
+                    preferred_direction,
+                );
+                LiveDaemonConnectionClaim::Occupied(LiveDaemonConnectionOccupied {
+                    preferred_direction,
+                    active_direction: existing.direction,
+                    daemon_connection: existing.daemon_connection.clone(),
+                })
+            }
         }
     };
 
     if let Some((existing_connection, released)) = replaced {
         existing_connection
             .connection()
-            .close(0u32.into(), b"replaced by preferred daemon connection");
+            .close(0u32.into(), b"replaced live daemon connection");
         released.notify_waiters();
     }
 
@@ -310,6 +363,11 @@ pub(crate) fn live_daemon_connection(
         }
     };
     if let Some(released) = released {
+        debug!(
+            target: "topo::connection",
+            "removed closed live daemon connection remote={}",
+            short_peer_id(remote_daemon_peer_id),
+        );
         released.notify_waiters();
     }
     connection
@@ -336,6 +394,12 @@ pub(crate) fn evict_live_daemon_connection(
         }
     };
     if let Some(released) = released {
+        debug!(
+            target: "topo::connection",
+            "evicted live daemon connection remote={} stable_id={}",
+            short_peer_id(remote_daemon_peer_id),
+            stable_id,
+        );
         released.notify_waiters();
     }
 }
@@ -717,6 +781,135 @@ mod tests {
         drop(inbound_lease);
         local_ep.close(0u32.into(), b"test close");
         remote_ep.close(0u32.into(), b"test close");
+    }
+
+    #[tokio::test]
+    async fn preferred_existing_connection_rejects_opposite_direction_duplicate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_a = temp.path().join("a.sqlite3");
+        let db_b = temp.path().join("b.sqlite3");
+        let ep_a = create_runtime_endpoint_for_tenants(
+            "127.0.0.1:0".parse().unwrap(),
+            db_a.to_str().unwrap(),
+        )
+        .await
+        .expect("endpoint a");
+        let ep_b = create_runtime_endpoint_for_tenants(
+            "127.0.0.1:0".parse().unwrap(),
+            db_b.to_str().unwrap(),
+        )
+        .await
+        .expect("endpoint b");
+        let peer_a = load_daemon_identity_from_db(db_a.to_str().unwrap())
+            .expect("daemon identity a")
+            .0;
+        let peer_b = load_daemon_identity_from_db(db_b.to_str().unwrap())
+            .expect("daemon identity b")
+            .0;
+
+        let (local_peer_id, remote_peer_id, local_ep, remote_ep, remote_db) = if peer_a < peer_b {
+            (
+                peer_a.clone(),
+                peer_b.clone(),
+                ep_a.clone(),
+                ep_b.clone(),
+                db_b.to_str().unwrap().to_string(),
+            )
+        } else {
+            (
+                peer_b.clone(),
+                peer_a.clone(),
+                ep_b.clone(),
+                ep_a.clone(),
+                db_a.to_str().unwrap().to_string(),
+            )
+        };
+        let remote_ep_duplicate =
+            create_runtime_endpoint_for_tenants("127.0.0.1:0".parse().unwrap(), &remote_db)
+                .await
+                .expect("duplicate remote endpoint");
+
+        assert_eq!(
+            preferred_connection_direction(&local_peer_id, &remote_peer_id),
+            Some(SessionDirection::Outbound)
+        );
+
+        let local_addr = local_ep.local_addr().expect("local addr");
+        let remote_addr = remote_ep.local_addr().expect("remote addr");
+        let local_sni = transport_sni(&local_peer_id);
+        let remote_sni = transport_sni(&remote_peer_id);
+        let db_path = temp.path().join("preferred-slot-kept.db");
+        let db_str = db_path.to_str().expect("db path");
+
+        let (accepted_remote, dialed_local) = tokio::join!(
+            accept_daemon_connection(&remote_ep),
+            dial_daemon_connection(&local_ep, remote_addr, &remote_sni),
+        );
+        let _accepted_remote = accepted_remote
+            .expect("accept remote")
+            .expect("accepted remote daemon connection");
+        let dialed_local = dialed_local.expect("dial local");
+        let outbound_stable_id = dialed_local.connection().stable_id();
+        let outbound_lease = match claim_live_daemon_connection_slot(
+            db_str,
+            &local_peer_id,
+            &remote_peer_id,
+            SessionDirection::Outbound,
+            dialed_local.clone(),
+        ) {
+            LiveDaemonConnectionClaim::Acquired(lease) => lease,
+            LiveDaemonConnectionClaim::Occupied(_) => {
+                panic!("initial preferred outbound connection should acquire slot")
+            }
+        };
+
+        let (accepted_local, dialed_remote) = tokio::join!(
+            accept_daemon_connection(&local_ep),
+            dial_daemon_connection(&remote_ep_duplicate, local_addr, &local_sni),
+        );
+        let accepted_local = accepted_local
+            .expect("accept local")
+            .expect("accepted local daemon connection");
+        let _dialed_remote = dialed_remote.expect("dial remote");
+        assert_ne!(
+            dialed_local.remote_addr(),
+            accepted_local.remote_addr(),
+            "test requires opposite-direction duplicate to present a distinct remote addr"
+        );
+
+        match claim_live_daemon_connection_slot(
+            db_str,
+            &local_peer_id,
+            &remote_peer_id,
+            SessionDirection::Inbound,
+            accepted_local.clone(),
+        ) {
+            LiveDaemonConnectionClaim::Acquired(_) => {
+                panic!("non-preferred duplicate should not replace preferred live slot")
+            }
+            LiveDaemonConnectionClaim::Occupied(occupied) => {
+                assert_eq!(occupied.active_direction, SessionDirection::Outbound);
+                assert_eq!(
+                    occupied.preferred_direction,
+                    Some(SessionDirection::Outbound)
+                );
+                assert_eq!(
+                    occupied.daemon_connection.connection().stable_id(),
+                    outbound_stable_id
+                );
+            }
+        }
+
+        let live = live_daemon_connection(db_str, &remote_peer_id).expect("live slot");
+        assert_eq!(live.connection().stable_id(), outbound_stable_id);
+
+        accepted_local
+            .connection()
+            .close(0u32.into(), b"test close duplicate");
+        drop(outbound_lease);
+        local_ep.close(0u32.into(), b"test close");
+        remote_ep.close(0u32.into(), b"test close");
+        remote_ep_duplicate.close(0u32.into(), b"test close");
     }
 
     #[tokio::test]

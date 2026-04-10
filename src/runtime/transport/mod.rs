@@ -32,7 +32,7 @@ pub use peering_boundary::{
     DaemonConnection, SessionEnvelope, SessionProvider, TransportConnection, TransportEndpoint,
     TOPO_ALPN,
 };
-pub(crate) use session_auth::send_inbound_session_auth_ack;
+pub(crate) use session_auth::{daemon_has_authorized_peer_route, send_inbound_session_auth_ack};
 pub use session_auth::{
     read_inbound_session_auth, read_inbound_session_auth_for_connection,
     resolve_bootstrap_fallback_invite_for_daemon, resolve_bootstrap_inviter_peer_id,

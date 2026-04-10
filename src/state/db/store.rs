@@ -6,6 +6,8 @@ use super::sql_types::{get_blob, get_text};
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::{self as events, ParsedEvent, ShareScope};
 
+const SHARED_BATCH_QUERY_CHUNK_SIZE: usize = 512;
+
 pub const SQL_INSERT_EVENT: &str =
     "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
@@ -294,20 +296,22 @@ impl<'a> Store<'a> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT event_id, blob FROM events WHERE event_id IN ({}) AND share_scope = 'shared'",
-            placeholders
-        );
-        let id_strs: Vec<String> = ids.iter().map(event_id_to_base64).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
         let mut map = HashMap::with_capacity(ids.len());
-        let mut rows = stmt.query(rusqlite::params_from_iter(id_strs.iter()))?;
-        while let Some(row) = rows.next()? {
-            let id_str = get_text(row, 0)?;
-            let blob = get_blob(row, 1)?;
-            if let Some(event_id) = event_id_from_base64(&id_str) {
-                map.insert(event_id, blob);
+        for chunk in ids.chunks(SHARED_BATCH_QUERY_CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT event_id, blob FROM events WHERE event_id IN ({}) AND share_scope = 'shared'",
+                placeholders
+            );
+            let id_strs: Vec<String> = chunk.iter().map(event_id_to_base64).collect();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(id_strs.iter()))?;
+            while let Some(row) = rows.next()? {
+                let id_str = get_text(row, 0)?;
+                let blob = get_blob(row, 1)?;
+                if let Some(event_id) = event_id_from_base64(&id_str) {
+                    map.insert(event_id, blob);
+                }
             }
         }
         Ok(map)
@@ -320,23 +324,25 @@ impl<'a> Store<'a> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT event_id, created_at
-             FROM events
-             WHERE event_id IN ({})
-               AND share_scope = 'shared'",
-            placeholders
-        );
-        let id_strs: Vec<String> = ids.iter().map(event_id_to_base64).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
         let mut map = HashMap::with_capacity(ids.len());
-        let mut rows = stmt.query(rusqlite::params_from_iter(id_strs.iter()))?;
-        while let Some(row) = rows.next()? {
-            let id_str = get_text(row, 0)?;
-            let created_at: i64 = row.get(1)?;
-            if let Some(event_id) = event_id_from_base64(&id_str) {
-                map.insert(event_id, created_at);
+        for chunk in ids.chunks(SHARED_BATCH_QUERY_CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT event_id, created_at
+                 FROM events
+                 WHERE event_id IN ({})
+                   AND share_scope = 'shared'",
+                placeholders
+            );
+            let id_strs: Vec<String> = chunk.iter().map(event_id_to_base64).collect();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(id_strs.iter()))?;
+            while let Some(row) = rows.next()? {
+                let id_str = get_text(row, 0)?;
+                let created_at: i64 = row.get(1)?;
+                if let Some(event_id) = event_id_from_base64(&id_str) {
+                    map.insert(event_id, created_at);
+                }
             }
         }
         Ok(map)
@@ -481,5 +487,34 @@ mod tests {
             crate::event_modules::EVENT_TYPE_MESSAGE
         );
         assert_eq!(summary.encoded_size_bytes, blob.len() as u32);
+    }
+
+    #[test]
+    fn test_get_shared_created_at_batch_chunks_large_queries() {
+        let conn = setup();
+        let store = Store::new(&conn);
+        let now = now_ms();
+        let mut ids = Vec::new();
+
+        for idx in 0..(SHARED_BATCH_QUERY_CHUNK_SIZE * 3 + 17) {
+            let blob = format!("shared-{idx}").into_bytes();
+            let id = hash_event(&blob);
+            let id_str = event_id_to_base64(&id);
+            conn.execute(
+                "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id_str, "message", &blob[..], "shared", now + idx as i64, now + idx as i64],
+            )
+            .unwrap();
+            ids.push(id);
+        }
+
+        let created_at = store.get_shared_created_at_batch(&ids).unwrap();
+        assert_eq!(created_at.len(), ids.len());
+        assert_eq!(created_at.get(&ids[0]).copied(), Some(now));
+        assert_eq!(
+            created_at.get(ids.last().unwrap()).copied(),
+            Some(now + ids.len() as i64 - 1)
+        );
     }
 }

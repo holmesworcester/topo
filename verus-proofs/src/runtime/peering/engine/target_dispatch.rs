@@ -153,7 +153,7 @@ proof fn dispatcher_skip_produces_no_spawn(
 {
 }
 
-proof fn spawn_requires_preferred_runnable_non_suppressed_source(
+proof fn spawn_requires_runnable_non_suppressed_source(
     context: TargetDispatchDecisionContext,
 )
     ensures

@@ -3,9 +3,9 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 use std::cell::Cell;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
-use crate::crypto::{EventId, event_id_from_base64};
+use crate::crypto::{event_id_from_base64, EventId};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PurgeManifest {

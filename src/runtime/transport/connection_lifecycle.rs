@@ -6,6 +6,7 @@
 use std::net::SocketAddr;
 
 use thiserror::Error;
+use tracing::debug;
 
 use super::{TransportConnection, TransportEndpoint, TOPO_ALPN};
 
@@ -63,6 +64,10 @@ fn connection_socket_addr(connection: &iroh::endpoint::Connection) -> Option<Soc
     None
 }
 
+fn short_peer_id(peer_id: &str) -> &str {
+    &peer_id[..16.min(peer_id.len())]
+}
+
 fn into_connected_daemon(
     connection: TransportConnection,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
@@ -108,13 +113,26 @@ pub async fn dial_daemon(
     } else {
         iroh::EndpointAddr::from_parts(endpoint_id, transport_addrs)
     };
+    debug!(
+        target: "topo::connection",
+        "dial_daemon start target={} sni={}",
+        target,
+        sni,
+    );
     let connection = endpoint
         .inner
         .connect(endpoint_addr, TOPO_ALPN)
         .await
         .map_err(|e| ConnectionLifecycleError::Dial(format!("connect to {target}: {e}")))?;
     let remote_addr = connection_socket_addr(&connection);
-    into_connected_daemon(TransportConnection::new(connection, remote_addr))
+    let connected = into_connected_daemon(TransportConnection::new(connection, remote_addr))?;
+    debug!(
+        target: "topo::connection",
+        "dial_daemon success daemon={} remote_addr={:?}",
+        short_peer_id(&connected.daemon_peer_id),
+        connected.connection.remote_address(),
+    );
+    Ok(connected)
 }
 
 /// Accept the next inbound connection and extract peer identity.
@@ -130,10 +148,14 @@ pub async fn accept_daemon(
         .await
         .map_err(|e| ConnectionLifecycleError::Accept(e.to_string()))?;
     let remote_addr = connection_socket_addr(&connection);
-    Ok(Some(into_connected_daemon(TransportConnection::new(
-        connection,
-        remote_addr,
-    ))?))
+    let connected = into_connected_daemon(TransportConnection::new(connection, remote_addr))?;
+    debug!(
+        target: "topo::connection",
+        "accept_daemon success daemon={} remote_addr={:?}",
+        short_peer_id(&connected.daemon_peer_id),
+        connected.connection.remote_address(),
+    );
+    Ok(Some(connected))
 }
 
 #[cfg(test)]

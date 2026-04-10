@@ -1,15 +1,15 @@
 use super::super::decision::ProjectionDecision;
-use super::super::signer::{SignerResolution, verify_ed25519_signature};
+use super::super::signer::{verify_ed25519_signature, SignerResolution};
 use super::backend::{ProjectionApplyResult, ProjectionBackend};
-use crate::crypto::{EventId, event_id_to_base64};
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
-use crate::event_modules::{ParsedEvent, TransportPrivacy, registry};
+use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
 use crate::projection::contract::EmitCommand;
 use crate::projection::queries::{
-    ContextLoadResult, DepLoadResult, ProjectionFrameContext, SemanticTypePlan,
-    decide_semantic_type_plan, normalize_semantic_type,
+    decide_semantic_type_plan, normalize_semantic_type, ContextLoadResult, DepLoadResult,
+    ProjectionFrameContext, SemanticTypePlan,
 };
 use rusqlite::Connection;
 

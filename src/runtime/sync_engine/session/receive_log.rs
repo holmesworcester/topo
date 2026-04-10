@@ -1,33 +1,37 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
-use crate::crypto::hash_event;
+use crate::crypto::EventId;
 use crate::db::queue::current_timestamp_ms;
-use crate::protocol::{parse_frame, Frame, ParseError};
 use crate::state::pipeline::ingest_now;
+use crate::sync::session::windowing::SyncWindowKind;
 
 const RECEIVE_LOG_PREFIX: &str = "recvlog";
 const RECEIVE_LOG_DATA_SUFFIX: &str = "bin";
-const RECEIVE_LOG_META_SUFFIX: &str = "meta";
 const RECEIVE_LOG_INGEST_BATCH_CAP: usize = 256;
 const RECEIVE_LOG_INGEST_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RECEIVE_LOG_HEADER_MAGIC: &[u8; 4] = b"P7RL";
-const RECEIVE_LOG_HEADER_VERSION: u8 = 2;
+const RECEIVE_LOG_HEADER_VERSION: u8 = 3;
 const RECEIVE_LOG_HEADER_PREFIX_LEN: usize = 9;
 const RECEIVE_LOG_HEADER_MAX_BYTES: usize = 64 * 1024;
 const RECEIVE_LOG_RECORD_PREFIX_LEN: usize = 12;
 const RECEIVE_LOG_RECORD_SUFFIX_LEN: usize = 8;
+const RECEIVE_LOG_RECORD_EVENT_ID_LEN: usize = 32;
+const RECEIVE_LOG_RECORD_WITH_EVENT_ID_PREFIX_LEN: usize =
+    RECEIVE_LOG_RECORD_PREFIX_LEN + RECEIVE_LOG_RECORD_EVENT_ID_LEN;
 
 #[derive(Default)]
 struct ReceiveLogIngestInner {
-    pending: VecDeque<PathBuf>,
+    pending: VecDeque<ReceiveLogIngestJob>,
     active_hot_receives: usize,
     worker_running: bool,
 }
@@ -36,6 +40,14 @@ struct ReceiveLogIngestInner {
 struct ReceiveLogIngestState {
     inner: Mutex<ReceiveLogIngestInner>,
     wake: Condvar,
+}
+
+#[derive(Debug, Clone)]
+struct ReceiveLogIngestJob {
+    path: PathBuf,
+    priority: bool,
+    pending_overlay: Option<PendingReceiveOverlaySession>,
+    completion: Option<mpsc::Sender<Result<usize, String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +61,141 @@ pub struct ReceiveLogWriter {
     path: PathBuf,
     file: File,
     bytes_written: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PendingReceiveOverlayKey {
+    db_path: String,
+    workspace_id: String,
+    window_kind: SyncWindowKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PendingReceiveOverlaySession {
+    key: PendingReceiveOverlayKey,
+    session_id: u64,
+}
+
+pub struct PendingReceiveOverlayGuard {
+    session: Option<PendingReceiveOverlaySession>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingReceiveOverlayEntry {
+    pub created_at_ms: i64,
+    pub event_id: EventId,
+}
+
+fn pending_receive_overlay(
+) -> &'static Mutex<HashMap<PendingReceiveOverlayKey, HashMap<u64, Vec<PendingReceiveOverlayEntry>>>>
+{
+    static OVERLAY: OnceLock<
+        Mutex<HashMap<PendingReceiveOverlayKey, HashMap<u64, Vec<PendingReceiveOverlayEntry>>>>,
+    > = OnceLock::new();
+    OVERLAY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn open_pending_receive_overlay_session(
+    db_path: &str,
+    workspace_id: &str,
+    window_kind: SyncWindowKind,
+    session_id: u64,
+) -> PendingReceiveOverlayGuard {
+    let session = PendingReceiveOverlaySession {
+        key: PendingReceiveOverlayKey {
+            db_path: db_path.to_string(),
+            workspace_id: workspace_id.to_string(),
+            window_kind,
+        },
+        session_id,
+    };
+    pending_receive_overlay()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(session.key.clone())
+        .or_default()
+        .entry(session.session_id)
+        .or_default();
+    PendingReceiveOverlayGuard {
+        session: Some(session),
+    }
+}
+
+impl PendingReceiveOverlayGuard {
+    pub fn session(&self) -> &PendingReceiveOverlaySession {
+        self.session
+            .as_ref()
+            .expect("pending receive overlay guard already disarmed")
+    }
+
+    pub fn into_session(mut self) -> PendingReceiveOverlaySession {
+        self.session
+            .take()
+            .expect("pending receive overlay guard already disarmed")
+    }
+}
+
+impl Drop for PendingReceiveOverlayGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            clear_pending_receive_overlay_session(&session);
+        }
+    }
+}
+
+pub fn record_pending_receive_overlay_entry(
+    session: &PendingReceiveOverlaySession,
+    created_at_ms: i64,
+    event_id: EventId,
+) {
+    record_pending_receive_overlay_entries(
+        session,
+        std::iter::once(PendingReceiveOverlayEntry {
+            created_at_ms,
+            event_id,
+        }),
+    );
+}
+
+pub fn record_pending_receive_overlay_entries(
+    session: &PendingReceiveOverlaySession,
+    entries: impl IntoIterator<Item = PendingReceiveOverlayEntry>,
+) {
+    pending_receive_overlay()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(session.key.clone())
+        .or_default()
+        .entry(session.session_id)
+        .or_default()
+        .extend(entries);
+}
+
+pub fn load_pending_receive_overlay_entries(
+    db_path: &str,
+    workspace_id: &str,
+    _window_kind: SyncWindowKind,
+) -> Vec<PendingReceiveOverlayEntry> {
+    pending_receive_overlay()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter(|(key, _)| key.db_path == db_path && key.workspace_id == workspace_id)
+        .flat_map(|(_, sessions)| sessions.values())
+        .flat_map(|entries| entries.iter().copied())
+        .collect()
+}
+
+pub fn clear_pending_receive_overlay_session(session: &PendingReceiveOverlaySession) {
+    let mut overlay = pending_receive_overlay()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(sessions) = overlay.get_mut(&session.key) {
+        sessions.remove(&session.session_id);
+        if sessions.is_empty() {
+            overlay.remove(&session.key);
+        }
+    }
 }
 
 fn ingest_state_map() -> &'static Mutex<HashMap<String, Arc<ReceiveLogIngestState>>> {
@@ -73,6 +220,12 @@ pub fn note_hot_receive_started(db_path: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     inner.active_hot_receives = inner.active_hot_receives.saturating_add(1);
+    debug!(
+        target: "topo::sync_operation",
+        db_path,
+        active_hot_receives = inner.active_hot_receives,
+        "hot receive started"
+    );
 }
 
 pub fn note_hot_receive_finished(db_path: &str) {
@@ -83,11 +236,17 @@ pub fn note_hot_receive_finished(db_path: &str) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.active_hot_receives = inner.active_hot_receives.saturating_sub(1);
+        debug!(
+            target: "topo::sync_operation",
+            db_path,
+            active_hot_receives = inner.active_hot_receives,
+            "hot receive finished"
+        );
     }
     state.wake.notify_all();
 }
 
-pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf) {
+pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf, priority: bool) {
     let state = ingest_state(db_path);
     let mut spawn_worker = false;
     {
@@ -95,7 +254,20 @@ pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf) {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.pending.push_back(path);
+        inner.pending.push_back(ReceiveLogIngestJob {
+            path,
+            priority,
+            pending_overlay: None,
+            completion: None,
+        });
+        debug!(
+            target: "topo::sync_operation",
+            db_path,
+            pending_receive_logs = inner.pending.len(),
+            active_hot_receives = inner.active_hot_receives,
+            priority,
+            "receive log ingest enqueued"
+        );
         if !inner.worker_running {
             inner.worker_running = true;
             spawn_worker = true;
@@ -115,6 +287,102 @@ pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf) {
     }
 }
 
+pub fn enqueue_receive_log_ingest_with_pending_overlay(
+    db_path: &str,
+    path: PathBuf,
+    priority: bool,
+    pending_overlay: PendingReceiveOverlaySession,
+) {
+    let state = ingest_state(db_path);
+    let mut spawn_worker = false;
+    {
+        let mut inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.pending.push_back(ReceiveLogIngestJob {
+            path,
+            priority,
+            pending_overlay: Some(pending_overlay),
+            completion: None,
+        });
+        debug!(
+            target: "topo::sync_operation",
+            db_path,
+            pending_receive_logs = inner.pending.len(),
+            active_hot_receives = inner.active_hot_receives,
+            priority,
+            "receive log ingest enqueued with pending overlay"
+        );
+        if !inner.worker_running {
+            inner.worker_running = true;
+            spawn_worker = true;
+        }
+    }
+    state.wake.notify_all();
+
+    if spawn_worker {
+        let db_path = db_path.to_string();
+        let state = state.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("recvlog-ingest-{}", current_timestamp_ms()))
+            .spawn(move || receive_log_ingest_worker(db_path, state))
+        {
+            tracing::warn!("spawn receive log ingest worker: {}", e);
+        }
+    }
+}
+
+pub fn enqueue_receive_log_ingest_and_wait(
+    db_path: &str,
+    path: PathBuf,
+    priority: bool,
+) -> Result<usize, String> {
+    let state = ingest_state(db_path);
+    let (completion_tx, completion_rx) = mpsc::channel();
+    let mut spawn_worker = false;
+    {
+        let mut inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.pending.push_back(ReceiveLogIngestJob {
+            path,
+            priority,
+            pending_overlay: None,
+            completion: Some(completion_tx),
+        });
+        debug!(
+            target: "topo::sync_operation",
+            db_path,
+            pending_receive_logs = inner.pending.len(),
+            active_hot_receives = inner.active_hot_receives,
+            priority,
+            "receive log ingest enqueued with waiter"
+        );
+        if !inner.worker_running {
+            inner.worker_running = true;
+            spawn_worker = true;
+        }
+    }
+    state.wake.notify_all();
+
+    if spawn_worker {
+        let db_path = db_path.to_string();
+        let state = state.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("recvlog-ingest-{}", current_timestamp_ms()))
+            .spawn(move || receive_log_ingest_worker(db_path, state))
+        {
+            return Err(format!("spawn receive log ingest worker: {e}"));
+        }
+    }
+
+    completion_rx
+        .recv()
+        .map_err(|e| format!("receive log ingest waiter dropped: {e}"))?
+}
+
 fn receive_log_ingest_worker(db_path: String, state: Arc<ReceiveLogIngestState>) {
     loop {
         let next_path = {
@@ -130,6 +398,16 @@ fn receive_log_ingest_worker(db_path: String, state: Arc<ReceiveLogIngestState>)
                 if inner.active_hot_receives == 0 {
                     break inner.pending.pop_front();
                 }
+                if let Some(priority_idx) = inner.pending.iter().position(|job| job.priority) {
+                    break inner.pending.remove(priority_idx);
+                }
+                debug!(
+                    target: "topo::sync_operation",
+                    db_path = %db_path,
+                    pending_receive_logs = inner.pending.len(),
+                    active_hot_receives = inner.active_hot_receives,
+                    "receive log ingest waiting for active hot receives"
+                );
                 inner = state
                     .wake
                     .wait(inner)
@@ -140,23 +418,48 @@ fn receive_log_ingest_worker(db_path: String, state: Arc<ReceiveLogIngestState>)
         let Some(path) = next_path else {
             continue;
         };
-        if let Err(e) = ingest_receive_log(&db_path, &path) {
-            tracing::warn!("background receive log ingest {}: {}", path.display(), e);
+        debug!(
+            target: "topo::sync_operation",
+            db_path = %db_path,
+            path = %path.path.display(),
+            priority = path.priority,
+            "receive log ingest starting"
+        );
+        let result = ingest_receive_log(&db_path, &path.path);
+        if let Some(pending_overlay) = &path.pending_overlay {
+            clear_pending_receive_overlay_session(pending_overlay);
+        }
+        match (&result, path.completion) {
+            (Err(e), None) => {
+                tracing::warn!(
+                    "background receive log ingest {}: {}",
+                    path.path.display(),
+                    e
+                );
+            }
+            (Ok(ingested), None) => {
+                debug!(
+                    target: "topo::sync_operation",
+                    db_path = %db_path,
+                    path = %path.path.display(),
+                    priority = path.priority,
+                    ingested,
+                    "receive log ingest finished"
+                );
+            }
+            (_, Some(completion)) => {
+                let _ = completion.send(result);
+            }
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReceiveLogRecord {
+    event_id: EventId,
     blob: Vec<u8>,
     received_at_ms: i64,
     first_stored_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReceiveLogVersion {
-    V1Frames,
-    V2Records,
 }
 
 impl ReceiveLogWriter {
@@ -191,7 +494,7 @@ impl ReceiveLogWriter {
         })
     }
 
-    pub fn append_blob(&mut self, blob: &[u8]) -> Result<(), String> {
+    pub fn append_blob(&mut self, event_id: &EventId, blob: &[u8]) -> Result<(), String> {
         let received_at = current_timestamp_ms();
         let blob_len = u32::try_from(blob.len())
             .map_err(|_| format!("receive log blob too large: {} bytes", blob.len()))?;
@@ -202,6 +505,9 @@ impl ReceiveLogWriter {
             .write_all(&blob_len.to_le_bytes())
             .map_err(|e| format!("append receive log {}: {e}", self.path.display()))?;
         self.file
+            .write_all(event_id)
+            .map_err(|e| format!("append receive log {}: {e}", self.path.display()))?;
+        self.file
             .write_all(blob)
             .map_err(|e| format!("append receive log {}: {e}", self.path.display()))?;
         let first_stored_at_ms = current_timestamp_ms();
@@ -209,7 +515,9 @@ impl ReceiveLogWriter {
             .write_all(&first_stored_at_ms.to_le_bytes())
             .map_err(|e| format!("append receive log {}: {e}", self.path.display()))?;
         self.bytes_written = self.bytes_written.saturating_add(
-            (RECEIVE_LOG_RECORD_PREFIX_LEN + blob.len() + RECEIVE_LOG_RECORD_SUFFIX_LEN) as u64,
+            (RECEIVE_LOG_RECORD_WITH_EVENT_ID_PREFIX_LEN
+                + blob.len()
+                + RECEIVE_LOG_RECORD_SUFFIX_LEN) as u64,
         );
         Ok(())
     }
@@ -249,16 +557,15 @@ pub fn receive_log_dir(db_path: &str) -> PathBuf {
 }
 
 pub fn ingest_receive_log(db_path: &str, path: &Path) -> Result<usize, String> {
-    let (mut file, header, version) = open_receive_log(path)?;
+    let (mut file, header) = open_receive_log(path)?;
     let mut ingested = 0usize;
     let mut batch = Vec::<IngestItem>::with_capacity(RECEIVE_LOG_INGEST_BATCH_CAP);
     let mut batch_bytes = 0usize;
 
-    stream_receive_log(&mut file, path, version, |record| {
-        let event_id = hash_event(&record.blob);
+    stream_receive_log(&mut file, path, |record| {
         batch_bytes = batch_bytes.saturating_add(record.blob.len());
         batch.push((
-            event_id,
+            record.event_id,
             record.blob,
             header.recorded_by.clone(),
             header.source_tag.clone(),
@@ -278,7 +585,6 @@ pub fn ingest_receive_log(db_path: &str, path: &Path) -> Result<usize, String> {
     }
 
     fs::remove_file(path).map_err(|e| format!("delete receive log {}: {e}", path.display()))?;
-    let _ = fs::remove_file(legacy_receive_log_meta_path(path));
     Ok(ingested)
 }
 
@@ -342,50 +648,31 @@ fn write_receive_log_header(file: &mut File, header: &ReceiveLogHeader) -> Resul
     Ok(())
 }
 
-fn open_receive_log(path: &Path) -> Result<(File, ReceiveLogHeader, ReceiveLogVersion), String> {
+fn open_receive_log(path: &Path) -> Result<(File, ReceiveLogHeader), String> {
     let mut file =
         File::open(path).map_err(|e| format!("open receive log {}: {e}", path.display()))?;
-    let (header, version) = match try_read_embedded_receive_log_header(&mut file, path)? {
-        Some(result) => result,
-        None => (
-            parse_legacy_receive_log_meta(path)?,
-            ReceiveLogVersion::V1Frames,
-        ),
-    };
-    Ok((file, header, version))
+    let header = read_receive_log_header(&mut file, path)?;
+    Ok((file, header))
 }
 
-fn try_read_embedded_receive_log_header(
-    file: &mut File,
-    path: &Path,
-) -> Result<Option<(ReceiveLogHeader, ReceiveLogVersion)>, String> {
+fn read_receive_log_header(file: &mut File, path: &Path) -> Result<ReceiveLogHeader, String> {
     let mut prefix = [0u8; RECEIVE_LOG_HEADER_PREFIX_LEN];
-    match file.read_exact(&mut prefix) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            file.seek(SeekFrom::Start(0))
-                .map_err(|seek_err| format!("rewind receive log {}: {seek_err}", path.display()))?;
-            return Ok(None);
-        }
-        Err(e) => return Err(format!("read receive log header {}: {e}", path.display())),
-    }
+    file.read_exact(&mut prefix)
+        .map_err(|e| format!("read receive log header {}: {e}", path.display()))?;
 
     if &prefix[..4] != RECEIVE_LOG_HEADER_MAGIC {
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| format!("rewind receive log {}: {e}", path.display()))?;
-        return Ok(None);
+        return Err(format!(
+            "receive log {} has unsupported header magic",
+            path.display()
+        ));
     }
-    let version = match prefix[4] {
-        1 => ReceiveLogVersion::V1Frames,
-        2 => ReceiveLogVersion::V2Records,
-        other => {
-            return Err(format!(
-                "unsupported receive log header version {} for {}",
-                other,
-                path.display()
-            ))
-        }
-    };
+    if prefix[4] != RECEIVE_LOG_HEADER_VERSION {
+        return Err(format!(
+            "unsupported receive log header version {} for {}",
+            prefix[4],
+            path.display()
+        ));
+    }
     let len = u32::from_le_bytes(prefix[5..9].try_into().unwrap()) as usize;
     if len > RECEIVE_LOG_HEADER_MAX_BYTES {
         return Err(format!(
@@ -399,85 +686,10 @@ fn try_read_embedded_receive_log_header(
         .map_err(|e| format!("read receive log header payload {}: {e}", path.display()))?;
     let header: ReceiveLogHeader = serde_json::from_slice(&payload)
         .map_err(|e| format!("decode receive log header {}: {e}", path.display()))?;
-    Ok(Some((header, version)))
+    Ok(header)
 }
 
-fn parse_legacy_receive_log_meta(path: &Path) -> Result<ReceiveLogHeader, String> {
-    let meta_path = legacy_receive_log_meta_path(path);
-    let bytes = fs::read(&meta_path)
-        .map_err(|e| format!("read receive log meta {}: {e}", meta_path.display()))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| format!("decode receive log meta {}: {e}", meta_path.display()))
-}
-
-fn legacy_receive_log_meta_path(path: &Path) -> PathBuf {
-    path.with_extension(RECEIVE_LOG_META_SUFFIX)
-}
-
-fn stream_receive_log<F>(
-    file: &mut File,
-    path: &Path,
-    version: ReceiveLogVersion,
-    on_record: F,
-) -> Result<usize, String>
-where
-    F: FnMut(ReceiveLogRecord) -> Result<(), String>,
-{
-    match version {
-        ReceiveLogVersion::V1Frames => stream_legacy_receive_log(file, path, on_record),
-        ReceiveLogVersion::V2Records => stream_record_receive_log(file, path, on_record),
-    }
-}
-
-fn stream_legacy_receive_log<F>(
-    file: &mut File,
-    path: &Path,
-    mut on_record: F,
-) -> Result<usize, String>
-where
-    F: FnMut(ReceiveLogRecord) -> Result<(), String>,
-{
-    let mut buffer = Vec::<u8>::with_capacity(64 * 1024);
-    let mut read_buf = [0u8; 64 * 1024];
-    let mut offset = 0usize;
-    let mut sent = 0usize;
-
-    loop {
-        match parse_next_frame(&buffer, &mut offset)? {
-            Some(Frame::Event { blob }) => {
-                let now_ms = current_timestamp_ms();
-                on_record(ReceiveLogRecord {
-                    blob,
-                    received_at_ms: now_ms,
-                    first_stored_at_ms: now_ms,
-                })?;
-                sent += 1;
-            }
-            Some(_) => {}
-            None => {
-                if offset > 0 {
-                    buffer.drain(..offset);
-                    offset = 0;
-                }
-                let read = file
-                    .read(&mut read_buf)
-                    .map_err(|e| format!("read receive log {}: {e}", path.display()))?;
-                if read == 0 {
-                    break;
-                }
-                buffer.extend_from_slice(&read_buf[..read]);
-            }
-        }
-    }
-
-    Ok(sent)
-}
-
-fn stream_record_receive_log<F>(
-    file: &mut File,
-    path: &Path,
-    mut on_record: F,
-) -> Result<usize, String>
+fn stream_receive_log<F>(file: &mut File, path: &Path, mut on_record: F) -> Result<usize, String>
 where
     F: FnMut(ReceiveLogRecord) -> Result<(), String>,
 {
@@ -511,24 +723,6 @@ where
     Ok(sent)
 }
 
-fn parse_next_frame(buffer: &[u8], offset: &mut usize) -> Result<Option<Frame>, String> {
-    if *offset >= buffer.len() {
-        return Ok(None);
-    }
-
-    match parse_frame(&buffer[*offset..]) {
-        Ok((frame, consumed)) => {
-            *offset += consumed;
-            Ok(Some(frame))
-        }
-        Err(ParseError::InsufficientData) => Ok(None),
-        Err(_) => {
-            *offset = buffer.len();
-            Ok(None)
-        }
-    }
-}
-
 fn parse_next_record(
     buffer: &[u8],
     offset: &mut usize,
@@ -536,7 +730,7 @@ fn parse_next_record(
     if *offset >= buffer.len() {
         return Ok(None);
     }
-    if buffer.len() - *offset < RECEIVE_LOG_RECORD_PREFIX_LEN {
+    if buffer.len() - *offset < RECEIVE_LOG_RECORD_WITH_EVENT_ID_PREFIX_LEN {
         return Ok(None);
     }
 
@@ -550,23 +744,28 @@ fn parse_next_record(
             .try_into()
             .map_err(|_| "receive log record blob length truncated".to_string())?,
     ) as usize;
-    let record_len = RECEIVE_LOG_RECORD_PREFIX_LEN
+    let event_id_start = *offset + RECEIVE_LOG_RECORD_PREFIX_LEN;
+    let event_id_end = event_id_start + RECEIVE_LOG_RECORD_EVENT_ID_LEN;
+    let record_len = RECEIVE_LOG_RECORD_WITH_EVENT_ID_PREFIX_LEN
         .saturating_add(blob_len)
         .saturating_add(RECEIVE_LOG_RECORD_SUFFIX_LEN);
     if buffer.len() - *offset < record_len {
         return Ok(None);
     }
 
-    let blob_start = *offset + RECEIVE_LOG_RECORD_PREFIX_LEN;
+    let blob_start = *offset + RECEIVE_LOG_RECORD_WITH_EVENT_ID_PREFIX_LEN;
     let blob_end = blob_start + blob_len;
     let first_stored_at_ms = i64::from_le_bytes(
         buffer[blob_end..blob_end + RECEIVE_LOG_RECORD_SUFFIX_LEN]
             .try_into()
             .map_err(|_| "receive log record stored_at truncated".to_string())?,
     );
+    let mut event_id = [0u8; RECEIVE_LOG_RECORD_EVENT_ID_LEN];
+    event_id.copy_from_slice(&buffer[event_id_start..event_id_end]);
     let blob = buffer[blob_start..blob_end].to_vec();
     *offset += record_len;
     Ok(Some(ReceiveLogRecord {
+        event_id,
         blob,
         received_at_ms,
         first_stored_at_ms,
@@ -581,6 +780,21 @@ mod tests {
     use crate::crypto::{event_id_to_base64, hash_event};
     use crate::db::{open_connection, schema::create_tables, timeline::EventTimeline};
 
+    fn write_record(
+        file: &mut File,
+        event_id: &EventId,
+        blob: &[u8],
+        received_at_ms: i64,
+        first_stored_at_ms: i64,
+    ) {
+        let blob_len = u32::try_from(blob.len()).unwrap();
+        file.write_all(&received_at_ms.to_le_bytes()).unwrap();
+        file.write_all(&blob_len.to_le_bytes()).unwrap();
+        file.write_all(event_id).unwrap();
+        file.write_all(blob).unwrap();
+        file.write_all(&first_stored_at_ms.to_le_bytes()).unwrap();
+    }
+
     #[test]
     fn receive_log_round_trips_and_ignores_truncated_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -594,8 +808,10 @@ mod tests {
             "quic_recv:peer-x@127.0.0.1:7777",
         )
         .unwrap();
-        writer.append_blob(b"one").unwrap();
-        writer.append_blob(b"two").unwrap();
+        let first_id = hash_event(b"one");
+        let second_id = hash_event(b"two");
+        writer.append_blob(&first_id, b"one").unwrap();
+        writer.append_blob(&second_id, b"two").unwrap();
         let path = writer.finish().unwrap().unwrap();
 
         {
@@ -604,20 +820,101 @@ mod tests {
         }
 
         let mut blobs = Vec::new();
-        let (mut file, _header, version) = open_receive_log(&path).unwrap();
-        let parsed = stream_receive_log(&mut file, &path, version, |record| {
+        let mut event_ids = Vec::new();
+        let (mut file, _header) = open_receive_log(&path).unwrap();
+        let parsed = stream_receive_log(&mut file, &path, |record| {
+            event_ids.push(record.event_id);
             blobs.push(record.blob);
             Ok(())
         })
         .unwrap();
         assert_eq!(parsed, 2);
         assert_eq!(blobs, vec![b"one".to_vec(), b"two".to_vec()]);
+        assert_eq!(event_ids, vec![first_id, second_id]);
 
-        let (_file, header, version) = open_receive_log(&path).unwrap();
+        let (_file, header) = open_receive_log(&path).unwrap();
         assert_eq!(header.recorded_by, "tenant-a");
         assert_eq!(header.session_id, 7);
         assert_eq!(header.source_tag, "quic_recv:peer-x@127.0.0.1:7777");
-        assert_eq!(version, ReceiveLogVersion::V2Records);
+    }
+
+    #[test]
+    fn receive_log_rejects_unsupported_header_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsupported-version.bin");
+        let header = ReceiveLogHeader {
+            recorded_by: "tenant-a".to_string(),
+            session_id: 17,
+            source_tag: "peer-x".to_string(),
+        };
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let payload = serde_json::to_vec(&header).unwrap();
+        file.write_all(RECEIVE_LOG_HEADER_MAGIC).unwrap();
+        file.write_all(&[2]).unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&payload).unwrap();
+        drop(file);
+
+        let error = open_receive_log(&path).unwrap_err();
+        assert!(
+            error.contains("unsupported receive log header version 2"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn receive_log_ingest_uses_stored_event_id_for_v3_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+
+        let log_dir = receive_log_dir(db_path.to_str().unwrap());
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let path = log_dir.join("manual-v3.bin");
+        let header = ReceiveLogHeader {
+            recorded_by: "tenant-a".to_string(),
+            session_id: 27,
+            source_tag: "peer-x".to_string(),
+        };
+        let blob = b"stored-id-is-authoritative".to_vec();
+        let hashed_id = hash_event(&blob);
+        let stored_id = [0x5Au8; 32];
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        write_receive_log_header(&mut file, &header).unwrap();
+        write_record(&mut file, &stored_id, &blob, 31, 32);
+        drop(file);
+
+        ingest_receive_log(db_path.to_str().unwrap(), &path).unwrap();
+
+        let timeline = EventTimeline::new(&conn);
+        assert!(
+            timeline
+                .load(&event_id_to_base64(&stored_id))
+                .unwrap()
+                .is_some(),
+            "ingest should trust stored event ids for v3 receive logs"
+        );
+        assert!(
+            timeline
+                .load(&event_id_to_base64(&hashed_id))
+                .unwrap()
+                .is_none(),
+            "v3 ingest should not re-hash blobs when replaying receive logs"
+        );
     }
 
     #[test]
@@ -628,10 +925,11 @@ mod tests {
         create_tables(&conn).unwrap();
 
         let blob = b"hello world".to_vec();
-        let event_id_b64 = event_id_to_base64(&hash_event(&blob));
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
         let mut writer =
             ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 8, "peer-x").unwrap();
-        writer.append_blob(&blob).unwrap();
+        writer.append_blob(&event_id, &blob).unwrap();
         let path = writer.finish().unwrap().unwrap();
 
         ingest_receive_log(db_path.to_str().unwrap(), &path).unwrap();
@@ -660,14 +958,15 @@ mod tests {
         create_tables(&conn).unwrap();
 
         let blob = b"queued while downloading".to_vec();
-        let event_id_b64 = event_id_to_base64(&hash_event(&blob));
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
         let mut writer =
             ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 9, "peer-x").unwrap();
-        writer.append_blob(&blob).unwrap();
+        writer.append_blob(&event_id, &blob).unwrap();
         let path = writer.finish().unwrap().unwrap();
 
         note_hot_receive_started(db_path.to_str().unwrap());
-        enqueue_receive_log_ingest(db_path.to_str().unwrap(), path.clone());
+        enqueue_receive_log_ingest(db_path.to_str().unwrap(), path.clone(), false);
         std::thread::sleep(Duration::from_millis(150));
 
         let timeline = EventTimeline::new(&conn);
@@ -690,5 +989,39 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn background_ingest_processes_priority_logs_during_active_hot_receives() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+
+        let blob = b"hot receive should not starve".to_vec();
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let mut writer =
+            ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 10, "peer-x").unwrap();
+        writer.append_blob(&event_id, &blob).unwrap();
+        let path = writer.finish().unwrap().unwrap();
+
+        note_hot_receive_started(db_path.to_str().unwrap());
+        enqueue_receive_log_ingest(db_path.to_str().unwrap(), path.clone(), true);
+
+        let timeline = EventTimeline::new(&conn);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if timeline.load(&event_id_b64).unwrap().is_some() && !path.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "priority receive log did not ingest while hot receives stayed active"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        note_hot_receive_finished(db_path.to_str().unwrap());
     }
 }

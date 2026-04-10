@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
-use crate::crypto::{EventId, event_id_from_base64, event_id_to_base64};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::dep_index::list_shared_event_deps;
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 
@@ -183,7 +183,7 @@ mod tests {
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
-    use crate::event_modules::{BenchDepEvent, ParsedEvent, encode_event, registry::ShareScope};
+    use crate::event_modules::{encode_event, registry::ShareScope, BenchDepEvent, ParsedEvent};
 
     fn insert_shared_bench_dep(
         conn: &Connection,

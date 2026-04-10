@@ -4,15 +4,21 @@
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
+use crate::db::open_connection;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::SyncConnectionHandler;
-use crate::transport::{accept_daemon_connection, load_daemon_identity_from_db, TransportEndpoint};
+use crate::transport::{
+    accept_daemon_connection, daemon_has_authorized_peer_route, load_daemon_identity_from_db,
+    TransportEndpoint,
+};
 
-use super::supervisor::{run_startup_preflight, supervise_inbound_daemon_connection};
+use super::supervisor::{
+    run_startup_preflight, supervise_inbound_daemon_connection, DaemonConnectionAdmission,
+};
 use super::{claim_live_daemon_connection_slot, SYNC_SESSION_TIMEOUT_SECS};
 
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
@@ -101,6 +107,12 @@ async fn accept_loop_until_cancel_inner(
         };
 
         let remote_daemon_peer_id = daemon_connection.remote_daemon_peer_id().to_string();
+        debug!(
+            target: "topo::connection",
+            "accept_loop accepted daemon={} remote_addr={:?}",
+            super::short_peer_id(&remote_daemon_peer_id),
+            daemon_connection.remote_addr(),
+        );
         let connection = daemon_connection.connection();
         let connection_lease = match claim_live_daemon_connection_slot(
             db_path,
@@ -111,6 +123,13 @@ async fn accept_loop_until_cancel_inner(
         ) {
             super::LiveDaemonConnectionClaim::Acquired(lease) => Some(lease),
             super::LiveDaemonConnectionClaim::Occupied(occupied) => {
+                debug!(
+                    target: "topo::connection",
+                    "accept_loop closing duplicate daemon={} active_direction={:?} preferred_direction={:?}",
+                    super::short_peer_id(&remote_daemon_peer_id),
+                    occupied.active_direction,
+                    occupied.preferred_direction,
+                );
                 info!(
                     "Closing duplicate inbound daemon connection from {} (active_direction={:?}, preferred_direction={:?})",
                     super::short_peer_id(&remote_daemon_peer_id),
@@ -127,6 +146,12 @@ async fn accept_loop_until_cancel_inner(
         let worker_shutdown = shutdown.child_token();
         let worker_cancel = worker_shutdown.clone();
         let sync_control_clone = sync_control.clone();
+        let initial_admission = open_connection(db_path)
+            .ok()
+            .and_then(|conn| daemon_has_authorized_peer_route(&conn, &remote_daemon_peer_id).ok())
+            .filter(|known_route| *known_route)
+            .map(|_| DaemonConnectionAdmission::KnownDaemonRoute)
+            .unwrap_or(DaemonConnectionAdmission::RequireFirstSessionAuth);
 
         let join = std::thread::spawn(move || {
             let _connection_lease = connection_lease;
@@ -147,6 +172,7 @@ async fn accept_loop_until_cancel_inner(
                     &daemon_connection_owned,
                     &responder_handler,
                     worker_shutdown,
+                    initial_admission,
                 )
                 .await;
             }));

@@ -2,6 +2,8 @@
 
 use std::time::{Duration, Instant};
 
+use tracing::debug;
+
 use crate::db::{open_connection, store::Store};
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::peering::loops::live_session_peer_ids;
@@ -9,10 +11,12 @@ use crate::runtime::sync_engine::session::admission::resolve_sync_admission;
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
-    load_shared_event_index_slice, send_have_events, spawn_receive_log_task,
+    load_shared_event_index_slice, open_live_suppression_session, send_have_events,
+    spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::{
-    enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
+    enqueue_receive_log_ingest, enqueue_receive_log_ingest_with_pending_overlay,
+    note_hot_receive_finished, note_hot_receive_started,
 };
 use crate::sync::session::windowing::{
     decode_sync_window_kind, encode_initial_neg_open, is_low_mem_allowed_window,
@@ -105,7 +109,7 @@ where
         &live_peer_ids,
         crate::db::queue::current_timestamp_ms(),
     );
-    let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
+    let storage = load_shared_event_index_slice(&db, db_path, &ws_id, range)?;
     let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
     let initial_msg = encode_initial_neg_open(range, neg.initiate()?);
 
@@ -170,6 +174,15 @@ where
     have_ids.dedup();
     need_ids.sort_unstable();
     need_ids.dedup();
+    debug!(
+        target: "topo::sync_operation",
+        session_id,
+        peer = %&peer_id[..peer_id.len().min(16)],
+        range = ?range.kind,
+        have_count = have_ids.len(),
+        need_count = need_ids.len(),
+        "initiator negentropy reconcile complete"
+    );
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
@@ -177,16 +190,33 @@ where
     if hot_receive {
         note_hot_receive_started(db_path);
     }
+    let settle_between_batches = live_peer_ids.len() > 1;
+    let (mut live_suppression, receive_live_suppression) = if let Some((session, receive_state)) =
+        open_live_suppression_session(
+            db_path,
+            recorded_by,
+            &ws_id,
+            peer_id,
+            settle_between_batches,
+            range,
+            session_id,
+        ) {
+        (Some(session), Some(receive_state))
+    } else {
+        (None, None)
+    };
     let receive_task = spawn_receive_log_task(
         data_recv,
         db_path.to_string(),
         recorded_by.to_string(),
+        ws_id.clone(),
+        range,
         session_id,
         ingress_source_tag.to_string(),
         activity_timeout,
         rx_capture,
+        receive_live_suppression,
     );
-
     let store = Store::new(&db);
     let (events_sent, bytes_sent) = send_have_events(
         &db,
@@ -196,17 +226,13 @@ where
         recorded_by,
         &ws_id,
         range,
+        live_suppression.as_mut(),
     )
     .await?;
     drop(data_send);
 
     let received = match receive_task.await {
-        Ok(result) => {
-            if hot_receive {
-                note_hot_receive_finished(db_path);
-            }
-            result.map_err(|e| format!("receive log task: {e}"))?
-        }
+        Ok(result) => result.map_err(|e| format!("receive log task: {e}"))?,
         Err(e) => {
             if hot_receive {
                 note_hot_receive_finished(db_path);
@@ -215,8 +241,31 @@ where
         }
     };
     if let Some(path) = received.path.clone() {
-        enqueue_receive_log_ingest(db_path, path);
+        if let Some(pending_overlay) = received.pending_overlay.clone() {
+            enqueue_receive_log_ingest_with_pending_overlay(
+                db_path,
+                path,
+                hot_receive,
+                pending_overlay,
+            );
+        } else {
+            enqueue_receive_log_ingest(db_path, path, hot_receive);
+        }
     }
+    if hot_receive {
+        note_hot_receive_finished(db_path);
+    }
+    debug!(
+        target: "topo::sync_operation",
+        session_id,
+        peer = %&peer_id[..peer_id.len().min(16)],
+        range = ?range.kind,
+        events_sent,
+        events_received = received.events_received,
+        bytes_sent,
+        bytes_received = received.bytes_received,
+        "initiator sync session complete"
+    );
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 

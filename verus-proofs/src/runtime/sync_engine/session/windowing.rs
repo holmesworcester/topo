@@ -21,9 +21,7 @@ pub struct ColdTierDecisionContext {
 
 pub enum SelectOutboundWindowPlan {
     LastDayOnly,
-    SinglePeer,
-    MultiPeerPriorityOwner,
-    MultiPeerCold,
+    PerPeerCadence,
 }
 
 pub struct SelectOutboundWindowRawRows {
@@ -70,12 +68,8 @@ pub open spec fn decide_select_outbound_window_plan(
 ) -> SelectOutboundWindowPlan {
     if context.last_day_only_mode {
         SelectOutboundWindowPlan::LastDayOnly
-    } else if context.normalized_live_peer_count <= 1 {
-        SelectOutboundWindowPlan::SinglePeer
-    } else if context.peer_is_priority_owner {
-        SelectOutboundWindowPlan::MultiPeerPriorityOwner
     } else {
-        SelectOutboundWindowPlan::MultiPeerCold
+        SelectOutboundWindowPlan::PerPeerCadence
     }
 }
 
@@ -157,44 +151,46 @@ proof fn last_day_only_mode_is_peer_state_noninterfering(
 {
 }
 
-proof fn single_peer_selects_single_peer_plan()
+proof fn single_peer_uses_per_peer_cadence()
     ensures
         decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
             last_day_only_mode: false,
             normalized_live_peer_count: 1,
             peer_is_priority_owner: false,
-        }) == SelectOutboundWindowPlan::SinglePeer,
+        }) == SelectOutboundWindowPlan::PerPeerCadence,
 {
 }
 
-proof fn non_last_day_single_peer_counts_select_single_peer(normalized_live_peer_count: nat)
-    requires normalized_live_peer_count <= 1
+proof fn non_last_day_mode_is_peer_state_noninterfering(
+    normalized_live_peer_count: nat,
+    peer_is_priority_owner: bool,
+)
     ensures
         decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
             last_day_only_mode: false,
             normalized_live_peer_count,
-            peer_is_priority_owner: true,
-        }) == SelectOutboundWindowPlan::SinglePeer,
+            peer_is_priority_owner,
+        }) == SelectOutboundWindowPlan::PerPeerCadence,
 {
 }
 
-proof fn multi_peer_owner_gets_priority_window()
+proof fn multi_peer_owner_uses_per_peer_cadence()
     ensures
         decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
             last_day_only_mode: false,
             normalized_live_peer_count: 3,
             peer_is_priority_owner: true,
-        }) == SelectOutboundWindowPlan::MultiPeerPriorityOwner,
+        }) == SelectOutboundWindowPlan::PerPeerCadence,
 {
 }
 
-proof fn multi_peer_non_owner_gets_cold_window()
+proof fn multi_peer_non_owner_uses_per_peer_cadence()
     ensures
         decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
             last_day_only_mode: false,
             normalized_live_peer_count: 3,
             peer_is_priority_owner: false,
-        }) == SelectOutboundWindowPlan::MultiPeerCold,
+        }) == SelectOutboundWindowPlan::PerPeerCadence,
 {
 }
 

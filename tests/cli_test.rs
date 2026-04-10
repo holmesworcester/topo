@@ -1258,6 +1258,53 @@ fn test_cli_bidirectional_sync() {
 }
 
 #[test]
+fn test_cli_known_peer_connection_survives_timeout_and_syncs_from_both_sides() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let timeout_ms = 60000;
+    let direct_opts = DaemonOptions {
+        disable_discovery: true,
+        ..Default::default()
+    };
+
+    create_workspace_with_details(&alice_db, "bidi-timeout", "alice", "alice-box");
+    let mut alice_daemon = start_daemon_with_options(&alice_db, &direct_opts);
+    let bootstrap_eid = send_message(&alice_db, "bidi-timeout/bootstrap");
+    let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
+
+    accept_invite_with_identity(&bob_db, &invite_link, "bob", "bob-box");
+    let mut bob_daemon = start_daemon_with_options(&bob_db, &direct_opts);
+    wait_for_active_tenant_ready(&alice_db, Duration::from_secs(60));
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
+
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    wait_for_live_connection_count_at_least(&alice_db, 1, Duration::from_secs(30));
+    wait_for_live_connection_count_at_least(&bob_db, 1, Duration::from_secs(30));
+
+    // Regresses the first-session timeout bug: a known daemon connection must
+    // not be dropped just because the peer is not also opening a fresh inbound
+    // logical session during this window.
+    std::thread::sleep(Duration::from_secs(7));
+    wait_for_live_connection_count_at_least(&alice_db, 1, Duration::from_secs(30));
+    wait_for_live_connection_count_at_least(&bob_db, 1, Duration::from_secs(30));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+
+    let alice_after_timeout_eid = send_message(&alice_db, "bidi-timeout/alice-after-timeout");
+    let bob_after_timeout_eid = send_message(&bob_db, "bidi-timeout/bob-after-timeout");
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    assert_event_visible_on_all(&[&bob_db], &alice_after_timeout_eid, timeout_ms);
+    assert_event_visible_on_all(&[&alice_db], &bob_after_timeout_eid, timeout_ms);
+
+    stop_daemon(&bob_db, &mut bob_daemon);
+    stop_daemon(&alice_db, &mut alice_daemon);
+}
+
+#[test]
 fn test_cli_invite_with_empty_bootstrap_addrs_has_no_relay_fallback() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -3413,6 +3460,87 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
     stop_daemon(&zeta_db, &mut zeta_daemon);
 }
 
+/// A daemon that is already known through one workspace must not become
+/// implicitly trusted for another workspace hosted by the same remote daemon.
+#[test]
+fn test_cli_known_daemon_does_not_authorize_uninvited_workspace_route() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 60000;
+
+    let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&owner_db, "alpha-space", "alpha", "alpha-root");
+    let mut owner_daemon = start_daemon(&owner_db);
+    let alpha_owner_peer_id =
+        tenant_peer_id_for_username(&owner_db, "alpha").expect("alpha owner peer id");
+    let owner_daemon_peer_id = daemon_identity_fingerprint(&owner_db);
+    let owner_remote: SocketAddr = daemon_listen_addr(&owner_db)
+        .parse()
+        .expect("owner listen addr");
+
+    let alpha_bootstrap_eid = send_message(&owner_db, "alpha-space/bootstrap");
+    let alpha_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
+    let bob = start_joined_cli_peer(&tmpdir, "bob.db", &alpha_invite, "bob-alpha", "bob-laptop");
+    assert_event_visible_on_all(&[&bob.db], &alpha_bootstrap_eid, timeout_ms);
+    let bob_alpha_peer_id = wait_for_username_peer_id(&bob.db, "bob-alpha", timeout_ms);
+
+    wait_for_direct_trust_dial(
+        &bob.db,
+        &bob_alpha_peer_id,
+        owner_remote,
+        &owner_daemon_peer_id,
+        &alpha_owner_peer_id,
+        &alpha_owner_peer_id,
+        timeout_ms,
+    );
+
+    let create_beta = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &owner_db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "beta-owner",
+            "--device-name",
+            "beta-root",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create_beta.status.success(),
+        "create-workspace beta failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create_beta.stdout),
+        String::from_utf8_lossy(&create_beta.stderr)
+    );
+    let beta_owner_peer_id = wait_for_username_peer_id(&owner_db, "beta-owner", timeout_ms);
+    let beta_secret = "beta-space/uninvited-secret";
+    let beta_secret_eid = send_message_as_username(&owner_db, "beta-owner", beta_secret);
+    assert_event_visible_for_username(&owner_db, "beta-owner", &beta_secret_eid, timeout_ms);
+
+    assert_direct_dial_never_succeeds(
+        &bob.db,
+        &bob_alpha_peer_id,
+        owner_remote,
+        &owner_daemon_peer_id,
+        &beta_owner_peer_id,
+        5000,
+    );
+
+    use_tenant_for_username(&owner_db, "alpha");
+    wait_for_live_sync_session(&owner_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob.db, Duration::from_secs(60));
+    use_tenant_for_username(&bob.db, "bob-alpha");
+    let bob_alpha_view = get_view_raw(&bob.db);
+    assert!(
+        !bob_alpha_view.contains(beta_secret),
+        "known daemon route for alpha should not leak beta workspace messages:\n{}",
+        bob_alpha_view
+    );
+
+    stop_daemon(&owner_db, &mut owner_daemon);
+}
+
 /// Live-daemon multitenant regression:
 /// if two daemons already share one workspace, accepting an invite into a
 /// second workspace hosted by that same remote daemon must succeed on the
@@ -3508,15 +3636,17 @@ fn test_cli_live_daemon_accept_second_workspace_from_same_remote_daemon_stays_is
 
     let beta_reply = "beta-space/bob-reply";
     let beta_reply_eid = send_message_as_username(&bob.db, "bob-beta", beta_reply);
-    sync_round_all(&bob.db, Duration::from_secs(30));
-    sync_round_all(&owner_db, Duration::from_secs(30));
+    wait_for_live_sync_session(&bob.db, Duration::from_secs(60));
+    use_tenant_for_username(&owner_db, "beta-owner");
+    wait_for_live_sync_session(&owner_db, Duration::from_secs(60));
     assert_event_visible_for_username(&owner_db, "beta-owner", &beta_reply_eid, timeout_ms);
 
     let beta_owner_followup = "beta-space/owner-second";
     let beta_owner_followup_eid =
         send_message_as_username(&owner_db, "beta-owner", beta_owner_followup);
-    sync_round_all(&owner_db, Duration::from_secs(30));
-    sync_round_all(&bob.db, Duration::from_secs(30));
+    wait_for_live_sync_session(&owner_db, Duration::from_secs(60));
+    use_tenant_for_username(&bob.db, "bob-beta");
+    wait_for_live_sync_session(&bob.db, Duration::from_secs(60));
     assert_event_visible_for_username(&bob.db, "bob-beta", &beta_owner_followup_eid, timeout_ms);
 
     use_tenant_for_username(&bob.db, "bob-alpha");

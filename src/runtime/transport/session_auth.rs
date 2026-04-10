@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{DaemonConnection, load_daemon_identity_from_db};
+use super::{load_daemon_identity_from_db, DaemonConnection};
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::crypto::{
     event_id_to_base64, sign_event_bytes, spki_fingerprint_from_ed25519_pubkey,
@@ -8,13 +8,13 @@ use crate::crypto::{
 };
 use crate::db::open_connection;
 use crate::db::transport_trust::is_authorized_for_tenant;
-use crate::event_modules::{ParsedEvent, parse_event};
+use crate::event_modules::{parse_event, ParsedEvent};
 use crate::protocol::{
-    Frame, OpenSessionAuthAck, OpenSessionAuthInvite, OpenSessionRoute, encode_frame, parse_frame,
+    encode_frame, parse_frame, Frame, OpenSessionAuthAck, OpenSessionAuthInvite, OpenSessionRoute,
 };
 use crate::runtime::repeated_warning::should_emit_globally;
 use ed25519_dalek::SigningKey;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use tracing::debug;
 
 pub const MAX_SESSION_AUTH_TTL_MS: u64 = 5 * 60 * 1000;
@@ -128,7 +128,6 @@ struct OutboundSessionAuthDecisionContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutboundSessionAuthDecision {
     KeepRequested,
-    KeepBootstrapWhileStillActiveWithSteadyStateBinding,
     UpgradeToPeerSharedAfterRouteAdmission,
     UpgradeToPeerSharedAfterBootstrapLapse,
 }
@@ -290,14 +289,11 @@ fn decide_outbound_session_auth_decision(
         OutboundSessionAuthPlan::PeerShared { .. } => OutboundSessionAuthDecision::KeepRequested,
         OutboundSessionAuthPlan::InviteBootstrap { .. } => {
             if context.bootstrap_auth_still_valid {
-                if context.daemon_connection_admits_route
-                    && context.bound_daemon_matches_remote
-                    && context.remote_session_peer_authorized
+                if context.remote_session_peer_authorized
+                    && (context.bound_daemon_matches_remote
+                        || context.daemon_connection_admits_route)
                 {
                     return OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission;
-                }
-                if context.bound_daemon_matches_remote {
-                    return OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding;
                 }
                 return OutboundSessionAuthDecision::KeepRequested;
             }
@@ -316,10 +312,7 @@ fn plan_for_outbound_session_auth_decision(
     decision: &OutboundSessionAuthDecision,
 ) -> OutboundSessionAuthPlan {
     match decision {
-        OutboundSessionAuthDecision::KeepRequested
-        | OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding => {
-            context.requested_plan.clone()
-        }
+        OutboundSessionAuthDecision::KeepRequested => context.requested_plan.clone(),
         OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
         | OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
             OutboundSessionAuthPlan::PeerShared {
@@ -971,6 +964,73 @@ pub fn resolve_bound_daemon_peer_id(
     Ok(endpoint_id)
 }
 
+pub(crate) fn daemon_has_authorized_peer_route(
+    conn: &Connection,
+    actual_remote_daemon_peer_id: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let remote_daemon_peer_id =
+        decode_hex32(actual_remote_daemon_peer_id, "actual remote daemon peer id")?;
+
+    let projected_route: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM peers_shared p
+             WHERE length(p.transport_fingerprint) = 32
+               AND (
+                   p.transport_fingerprint = ?1
+                   OR p.endpoint_id = ?2
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM removed_entities r
+                   WHERE r.recorded_by = p.recorded_by
+                     AND r.target_event_id = p.event_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM removed_entities r
+                   WHERE r.recorded_by = p.recorded_by
+                     AND p.user_event_id IS NOT NULL
+                     AND r.target_event_id = p.user_event_id
+                     AND r.removal_type = 'user'
+               )
+         )",
+        params![
+            remote_daemon_peer_id.as_slice(),
+            actual_remote_daemon_peer_id
+        ],
+        |row| row.get(0),
+    )?;
+    if projected_route {
+        return Ok(true);
+    }
+
+    let bound_route: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM peer_transport_bindings b
+             JOIN peers_shared p
+               ON p.recorded_by = b.recorded_by
+              AND lower(hex(p.transport_fingerprint)) = b.peer_id
+             WHERE b.spki_fingerprint = ?1
+               AND length(p.transport_fingerprint) = 32
+               AND NOT EXISTS (
+                   SELECT 1 FROM removed_entities r
+                   WHERE r.recorded_by = p.recorded_by
+                     AND r.target_event_id = p.event_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM removed_entities r
+                   WHERE r.recorded_by = p.recorded_by
+                     AND p.user_event_id IS NOT NULL
+                     AND r.target_event_id = p.user_event_id
+                     AND r.removal_type = 'user'
+               )
+         )",
+        params![remote_daemon_peer_id.as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(bound_route)
+}
+
 fn has_active_local_bootstrap_session_auth(
     conn: &Connection,
     recorded_by: &str,
@@ -1164,21 +1224,6 @@ pub fn resolve_outbound_session_auth_plan(
 
     match decision {
         OutboundSessionAuthDecision::KeepRequested => {}
-        OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding => {
-            let key = format!(
-                "outbound-auth-keep-bootstrap:{}:{}:{}",
-                recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
-            );
-            if should_emit_globally(key) {
-                debug!(
-                    "Outbound auth plan kept bootstrap tenant={} peer={} daemon={} requested={} because bootstrap trust is still active even though a steady-state daemon binding exists",
-                    short_value(recorded_by),
-                    short_value(remote_session_peer_id),
-                    short_value(actual_remote_daemon_peer_id),
-                    describe_outbound_session_auth_plan(requested_plan)
-                );
-            }
-        }
         OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission => {
             let key = format!(
                 "outbound-auth-upgrade-admitted:{}:{}:{}",
@@ -1186,7 +1231,7 @@ pub fn resolve_outbound_session_auth_plan(
             );
             if should_emit_globally(key) {
                 debug!(
-                    "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because this daemon connection already admitted the steady-state route",
+                    "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because the steady-state route is authorized",
                     short_value(recorded_by),
                     short_value(remote_session_peer_id),
                     short_value(actual_remote_daemon_peer_id),
@@ -1307,7 +1352,7 @@ pub fn resolve_bootstrap_inviter_peer_id(
 mod tests {
     use ed25519_dalek::SigningKey;
     use rusqlite::params;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     use crate::crypto::{event_id_to_base64, spki_fingerprint_from_ed25519_pubkey};
     use crate::db::open_connection;
@@ -1315,11 +1360,11 @@ mod tests {
         record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust,
         record_transport_binding,
     };
-    use crate::event_modules::{ParsedEvent, UserInviteEvent, encode_event};
+    use crate::event_modules::{encode_event, ParsedEvent, UserInviteEvent};
     use crate::transport::{
-        TransportEndpoint, accept_daemon_connection, create_runtime_endpoint_for_tenants,
-        dial_daemon_connection, ensure_daemon_identity_from_db, load_daemon_identity_from_db,
-        multi_workspace::transport_sni,
+        accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
+        ensure_daemon_identity_from_db, load_daemon_identity_from_db,
+        multi_workspace::transport_sni, TransportEndpoint,
     };
 
     use super::*;
@@ -1719,7 +1764,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_session_auth_planner_keeps_active_bootstrap_without_admitted_route() {
+    fn outbound_session_auth_planner_upgrades_active_bootstrap_when_route_is_authorized() {
         let decision_context = OutboundSessionAuthDecisionContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
@@ -1733,8 +1778,30 @@ mod tests {
         let decision = decide_outbound_session_auth_decision(&decision_context);
         assert_eq!(
             decision,
-            OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding
+            OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
         );
+        assert_eq!(
+            plan_for_outbound_session_auth_decision(&decision_context, &decision),
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: "peer-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn outbound_session_auth_planner_keeps_active_bootstrap_for_known_daemon_without_peer_route() {
+        let decision_context = OutboundSessionAuthDecisionContext {
+            requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite-1".to_string(),
+            },
+            remote_session_peer_id: "peer-1".to_string(),
+            bootstrap_auth_still_valid: true,
+            daemon_connection_admits_route: false,
+            bound_daemon_matches_remote: true,
+            remote_session_peer_authorized: false,
+        };
+        let decision = decide_outbound_session_auth_decision(&decision_context);
+        assert_eq!(decision, OutboundSessionAuthDecision::KeepRequested);
         assert_eq!(
             plan_for_outbound_session_auth_decision(&decision_context, &decision),
             OutboundSessionAuthPlan::InviteBootstrap {
@@ -1921,6 +1988,46 @@ mod tests {
         assert!(
             err.to_string().contains("session route not admitted"),
             "unexpected auth error: {err}"
+        );
+    }
+
+    #[test]
+    fn daemon_has_authorized_peer_route_is_workspace_specific() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("node.sqlite3");
+        let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
+
+        let alpha_tenant = hex::encode([0x21; 32]);
+        let alpha_peer_id = hex::encode([0x22; 32]);
+        let beta_tenant = hex::encode([0x23; 32]);
+        let daemon_peer_id = hex::encode([0x24; 32]);
+        let daemon_peer_id_raw = decode_hex32(&daemon_peer_id, "daemon peer id").unwrap();
+
+        insert_authorized_peer_shared(
+            db_path.to_str().unwrap(),
+            &alpha_tenant,
+            &[0x25; 32],
+            &[0x26; 32],
+            &[0x22; 32],
+        );
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        record_transport_binding(&db, &alpha_tenant, &alpha_peer_id, &daemon_peer_id_raw).unwrap();
+
+        assert!(
+            daemon_has_authorized_peer_route(&db, &daemon_peer_id).unwrap(),
+            "daemon should be known through the alpha tenant route"
+        );
+        assert!(
+            !peer_route_is_authorized_for_daemon(
+                &db,
+                None,
+                &beta_tenant,
+                &alpha_peer_id,
+                &daemon_peer_id
+            )
+            .unwrap(),
+            "knowing the daemon through alpha must not authorize beta"
         );
     }
 
