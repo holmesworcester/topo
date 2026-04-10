@@ -161,10 +161,8 @@ const DAEMON_START_RETRY_BASE_MS: u64 = 200;
 pub fn bin() -> String {
     hold_network_test_binary_lock();
     static DISABLE_RELAY_FOR_TESTS: OnceLock<()> = OnceLock::new();
-    DISABLE_RELAY_FOR_TESTS.get_or_init(|| {
-        unsafe {
-            std::env::set_var("TOPO_DISABLE_RELAY", "1");
-        }
+    DISABLE_RELAY_FOR_TESTS.get_or_init(|| unsafe {
+        std::env::set_var("TOPO_DISABLE_RELAY", "1");
     });
     env!("CARGO_BIN_EXE_topo").to_string()
 }

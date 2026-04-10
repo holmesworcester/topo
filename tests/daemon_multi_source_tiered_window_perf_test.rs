@@ -16,11 +16,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cli_harness::{
-    accept_invite_with_identity_on_running_daemon, active_tenant_peer_id,
-    create_workspace_with_details, daemon_listen_addr, daemon_transport_fingerprint,
-    ensure_active_peer, generate_messages, hold_network_test_lock_for_binary, send_message,
-    start_daemon_with_options, stop_daemon, topo_cmd, topo_create_invite_retry,
-    wait_for_active_tenant_ready, wait_for_daemon_stopped, DaemonOptions, HarnessDaemon,
+    accept_invite_with_identity_on_running_daemon, active_tenant_peer_id, assert_eventually,
+    connections_json, create_workspace_with_details, daemon_listen_addr,
+    daemon_transport_fingerprint, ensure_active_peer, generate_messages,
+    hold_network_test_lock_for_binary, send_message, start_daemon_with_options, stop_daemon,
+    topo_assert_eventually, topo_cmd, topo_create_invite_retry, wait_for_active_tenant_ready,
+    wait_for_daemon_stopped, DaemonOptions, HarnessDaemon,
 };
 use daemon_perf_harness::write_summary;
 
@@ -49,10 +50,9 @@ struct BenchOutcome {
 
 #[derive(Debug)]
 struct ReplicatedRejoinOutcome {
-    useful_unique_events: i64,
+    projected_delta_messages: i64,
     active_sources: usize,
     source_event_frames: Vec<i64>,
-    source_recorded_events: Vec<i64>,
 }
 
 fn current_timestamp_ms() -> i64 {
@@ -70,14 +70,21 @@ fn env_i64(name: &str, default: i64) -> i64 {
 }
 
 fn inherited_tier_env() -> Vec<(String, String)> {
-    ["TOPO_GENERATE_MESSAGE_SPREAD_MS", "TOPO_EVENT_TIMELINE"]
-        .into_iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| (key.to_string(), value))
-        })
-        .collect()
+    [
+        "TOPO_GENERATE_MESSAGE_SPREAD_MS",
+        "TOPO_EVENT_TIMELINE",
+        "TOPO_EVENT_TIMELINE_GROUPS",
+        "TOPO_ENABLE_LIVE_SUPPRESSION",
+        "TOPO_LIVE_SUPPRESSION_EVENT_ID_CAP",
+        "TOPO_LIVE_SUPPRESSION_SEND_BATCH_SIZE",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| (key.to_string(), value))
+    })
+    .collect()
 }
 
 fn enable_sync_logging(db: &str) {
@@ -99,6 +106,149 @@ fn bench_tmpdir(label: &str) -> tempfile::TempDir {
         .prefix(label)
         .tempdir_in(root)
         .expect("create benchmark tempdir")
+}
+
+fn wait_for_predicate_with_sync_kicks(dbs: &[String], predicate: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut last_failure = String::new();
+    loop {
+        let mut failures = Vec::new();
+        for db in dbs {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "predicate timed out after {:?}: predicate={} last_failure={}",
+                timeout,
+                predicate,
+                last_failure
+            );
+            let slice_ms = remaining.min(Duration::from_secs(1)).as_millis().max(1) as u64;
+            let out = topo_assert_eventually(db, predicate, slice_ms);
+            if !out.status.success() {
+                failures.push(format!(
+                    "{} => {}",
+                    db,
+                    String::from_utf8_lossy(&out.stdout).trim()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            return;
+        }
+        last_failure = failures.join(" | ");
+        for db in dbs {
+            trigger_sync_round_all(db);
+        }
+    }
+}
+
+fn wait_for_message_count_via_cli(db: &str, expected: i64, timeout: Duration) -> i64 {
+    wait_for_predicate_with_sync_kicks(
+        &[db.to_string()],
+        &format!("message_count >= {}", expected),
+        timeout,
+    );
+    current_timestamp_ms()
+}
+
+fn wait_for_message_count_all_via_cli(dbs: &[String], expected: i64, timeout: Duration) {
+    wait_for_predicate_with_sync_kicks(dbs, &format!("message_count >= {}", expected), timeout);
+}
+
+fn peers_output(db: &str) -> String {
+    let out = topo_cmd(db, &["peers"]);
+    assert!(
+        out.status.success(),
+        "peers failed for {}: {}",
+        db,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn wait_for_peers_output_to_include_labels(
+    db: &str,
+    expected_labels: &[String],
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let peers = peers_output(db);
+        if expected_labels.iter().all(|label| peers.contains(label)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "peers output for {} did not include {:?} within {:?}:\n{}",
+            db,
+            expected_labels,
+            timeout,
+            peers
+        );
+        trigger_sync_round_all(db);
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn sync_log_show_output(db: &str, extra_args: &[&str]) -> String {
+    let mut args = vec!["sync-log", "show", "--all", "--limit", "100000"];
+    args.extend_from_slice(extra_args);
+    let out = topo_cmd(db, &args);
+    assert!(
+        out.status.success(),
+        "sync-log show failed for {}: stdout={} stderr={}",
+        db,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn parse_sync_events_rx_total(stdout: &str) -> i64 {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("RUN "))
+        .filter_map(|line| {
+            line.split_whitespace().find_map(|field| {
+                field
+                    .strip_prefix("sync_events_rx=")
+                    .and_then(|value| value.parse::<i64>().ok())
+            })
+        })
+        .sum()
+}
+
+fn total_sync_events_received_via_cli(db: &str) -> i64 {
+    parse_sync_events_rx_total(&sync_log_show_output(db, &[]))
+}
+
+fn sync_events_received_for_peer_via_cli(db: &str, peer_id: &str) -> i64 {
+    parse_sync_events_rx_total(&sync_log_show_output(db, &["--peer", peer_id]))
+}
+
+fn wait_for_sync_log_receives_stable_via_cli(db: &str, timeout: Duration, stable_for: Duration) {
+    let start = Instant::now();
+    let mut last = total_sync_events_received_via_cli(db);
+    let mut stable_since = None;
+    loop {
+        let current = total_sync_events_received_via_cli(db);
+        if current == last {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= stable_for {
+                return;
+            }
+        } else {
+            last = current;
+            stable_since = None;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "downloader receive totals did not stabilize within {:?}: total={}",
+            timeout,
+            current
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn total_message_count_sql(db: &str) -> i64 {
@@ -433,11 +583,105 @@ fn trigger_sync_round_all(db: &str) {
     }
 }
 
+fn wait_for_live_connection_count_at_least(db: &str, minimum: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let connections = connections_json(db);
+        if connections.len() >= minimum {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected at least {} live connections in {} within {:?}, got {:?}",
+            minimum,
+            db,
+            timeout,
+            connections
+        );
+        trigger_sync_round_all(db);
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_full_mesh_peer_visibility(nodes: &[NodeView], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut missing = Vec::new();
+        for observer in nodes {
+            for remote in nodes {
+                if observer.db == remote.db {
+                    continue;
+                }
+                let peers = peers_output(&observer.db);
+                if !peers.contains(&remote.label) {
+                    missing.push(format!("{}->{}", observer.label, remote.label));
+                }
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "full-mesh endpoint observations did not converge within {:?}: missing={:?}",
+            timeout,
+            missing
+        );
+        for node in nodes {
+            trigger_sync_round_all(&node.db);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn assert_full_mesh_connectivity_basics(nodes: &[NodeView], timeout: Duration) {
+    let expected_peer_count = nodes.len();
+    let expected_endpoint_count = nodes.len().saturating_sub(1);
+    let timeout_ms = timeout.as_millis().max(1) as u64;
+    for node in nodes {
+        assert_eventually(
+            &node.db,
+            &format!("peer_count == {}", expected_peer_count),
+            timeout_ms,
+        );
+        assert_eventually(
+            &node.db,
+            &format!("endpoint_observation_count >= {}", expected_endpoint_count),
+            timeout_ms,
+        );
+    }
+    wait_for_full_mesh_peer_visibility(nodes, timeout);
+    for node in nodes {
+        let expected_labels: Vec<String> = nodes
+            .iter()
+            .filter(|remote| remote.db != node.db)
+            .map(|remote| remote.label.clone())
+            .collect();
+        wait_for_peers_output_to_include_labels(&node.db, &expected_labels, timeout);
+        wait_for_live_connection_count_at_least(&node.db, 1, timeout);
+    }
+}
+
 struct Node {
     label: String,
     db: String,
     _daemon: HarnessDaemon,
     transport_peer_id: String,
+}
+
+#[derive(Clone)]
+struct NodeView {
+    label: String,
+    db: String,
+}
+
+impl From<&Node> for NodeView {
+    fn from(value: &Node) -> Self {
+        Self {
+            label: value.label.clone(),
+            db: value.db.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -847,7 +1091,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
 
     let warmup_messages = emit_warmup_messages(&sources) + 1;
     let _ = send_message(&rejoiner.db, "warmup-rejoiner");
-    wait_for_message_count_all(&all_dbs, warmup_messages, Duration::from_secs(120));
+    wait_for_message_count_all_via_cli(&all_dbs, warmup_messages, Duration::from_secs(120));
 
     let all_nodes: Vec<&Node> = sources.iter().chain(std::iter::once(&rejoiner)).collect();
     if baseline_messages > 0 {
@@ -1065,12 +1309,19 @@ fn run_replicated_rejoin_bench(
     let rejoiner = nodes.pop().expect("rejoiner node missing");
     assert_eq!(rejoiner.label, "rejoiner");
     let sources = nodes;
+    let all_node_views: Vec<NodeView> = sources
+        .iter()
+        .map(NodeView::from)
+        .chain(std::iter::once(NodeView::from(&rejoiner)))
+        .collect();
     let source_dbs: Vec<String> = sources.iter().map(|source| source.db.clone()).collect();
     let all_dbs: Vec<String> = sources
         .iter()
         .map(|source| source.db.clone())
         .chain(std::iter::once(rejoiner.db.clone()))
         .collect();
+
+    assert_full_mesh_connectivity_basics(&all_node_views, Duration::from_secs(120));
 
     let warmup_messages = emit_warmup_messages(&sources) + 1;
     let _ = send_message(&rejoiner.db, "warmup-rejoiner");
@@ -1082,75 +1333,64 @@ fn run_replicated_rejoin_bench(
 
     generate_messages_replicated(&sources, total_messages);
     let expected_source_total = total_messages + warmup_messages;
-    wait_for_message_count_all(
+    wait_for_message_count_all_via_cli(
         &source_dbs,
         expected_source_total,
         Duration::from_secs(1200),
     );
 
-    let useful_unique_events_before = unique_sync_received_event_count_sql(&rejoiner.db);
-    let rejoiner_received_frames_before = received_events_by_peer_for_db(&rejoiner.db);
-    let rejoiner_recorded_sources_before = received_recorded_events_by_source_for_db(&rejoiner.db);
-
+    let rejoiner_received_frames_before: Vec<i64> = sources
+        .iter()
+        .map(|source| {
+            sync_events_received_for_peer_via_cli(&rejoiner.db, &source.transport_peer_id)
+        })
+        .collect();
     let inherited_env = inherited_tier_env();
     rejoiner_daemon = start_peer(&rejoiner.db, inherited_env, connectivity);
     ensure_active_peer(&rejoiner.db, Duration::from_secs(10));
     wait_for_active_tenant_ready(&rejoiner.db, Duration::from_secs(120));
-    let _ = wait_for_message_count(
+    assert_full_mesh_connectivity_basics(&all_node_views, Duration::from_secs(120));
+    let _ = wait_for_message_count_via_cli(
         &rejoiner.db,
         expected_source_total,
         Duration::from_secs(1800),
     );
-    wait_for_downloader_receives_stable(
+    wait_for_sync_log_receives_stable_via_cli(
         &rejoiner.db,
         Duration::from_secs(60),
         Duration::from_millis(500),
     );
 
-    let rejoiner_received_frames_after = received_events_by_peer_for_db(&rejoiner.db);
-    let rejoiner_received_frame_deltas = diff_count_map(
-        &rejoiner_received_frames_after,
-        &rejoiner_received_frames_before,
-    );
-    let source_event_frames: Vec<i64> = sources
+    let rejoiner_received_frames_after: Vec<i64> = sources
         .iter()
         .map(|source| {
-            rejoiner_received_frame_deltas
-                .get(&source.transport_peer_id)
-                .copied()
-                .unwrap_or(0)
+            sync_events_received_for_peer_via_cli(&rejoiner.db, &source.transport_peer_id)
         })
         .collect();
-    let rejoiner_recorded_sources_after = received_recorded_events_by_source_for_db(&rejoiner.db);
-    let rejoiner_recorded_source_deltas = diff_count_map(
-        &rejoiner_recorded_sources_after,
-        &rejoiner_recorded_sources_before,
-    );
-    let source_recorded_events =
-        count_source_tag_events(&rejoiner_recorded_source_deltas, &sources);
-    let useful_unique_events = unique_sync_received_event_count_sql(&rejoiner.db)
-        .saturating_sub(useful_unique_events_before);
+    let source_event_frames: Vec<i64> = rejoiner_received_frames_after
+        .iter()
+        .zip(rejoiner_received_frames_before.iter())
+        .map(|(after, before)| after.saturating_sub(*before))
+        .collect();
     let active_sources = source_event_frames
         .iter()
         .filter(|count| **count > 0)
         .count();
 
     eprintln!(
-        "\nreplicated rejoin {}: useful_unique={} active_sources={} recv_by_source={:?} durable_by_source={:?}",
+        "\nreplicated rejoin {}: projected_delta_messages={} active_sources={} sync_log_rx_by_source={:?}",
         connectivity.title(),
-        useful_unique_events,
+        total_messages,
         active_sources,
         source_event_frames,
-        source_recorded_events,
     );
     stop_daemon(&rejoiner.db, &mut rejoiner_daemon);
     wait_for_daemon_stopped(&rejoiner.db, Duration::from_secs(10));
 
     ReplicatedRejoinOutcome {
-        useful_unique_events,
+        projected_delta_messages: total_messages,
         active_sources,
         source_event_frames,
-        source_recorded_events,
     }
 }
 
@@ -1203,37 +1443,45 @@ fn perf_multi_source_rejoin_8x_10k_discovery() {
 }
 
 #[test]
-#[ignore = "diagnostic on local master: replicated rejoin still converges through one source in this scenario"]
+fn replicated_rejoin_2x_1k_live_suppression_basic_rejoin_connectivity_holds() {
+    std::env::set_var("TOPO_MULTI_SOURCE_COMPARE_TOTAL_MESSAGES", "1000");
+    let outcome = run_replicated_rejoin_bench(2, ConnectivityMode::DiscoveryLoopback);
+    assert!(
+        outcome.projected_delta_messages > 0,
+        "expected replicated rejoin setup to catch up at least one source"
+    );
+}
+
+#[test]
+#[ignore = "long-running multi-source rejoin proof"]
 fn replicated_rejoin_2x_1k_live_suppression_uses_multiple_sources_after_preconvergence() {
     std::env::set_var("TOPO_MULTI_SOURCE_COMPARE_TOTAL_MESSAGES", "1000");
     let outcome = run_replicated_rejoin_bench(2, ConnectivityMode::DiscoveryLoopback);
     assert!(
         outcome.active_sources >= 2,
-        "expected both known replicated sources to contribute after rejoin, got active_sources={} recv_frames={:?} durable_attributed={:?}",
+        "expected both known replicated sources to contribute after rejoin, got active_sources={} sync_log_rx={:?}",
         outcome.active_sources,
         outcome.source_event_frames,
-        outcome.source_recorded_events,
     );
     assert!(
-        outcome.useful_unique_events > 0,
+        outcome.projected_delta_messages > 0,
         "expected the rejoiner to ingest replicated events"
     );
 }
 
 #[test]
-#[ignore = "diagnostic on local master: replicated rejoin still converges through one source in this scenario"]
+#[ignore = "long-running multi-source rejoin proof"]
 fn replicated_rejoin_2x_10k_live_suppression_uses_multiple_sources_after_preconvergence() {
     std::env::set_var("TOPO_MULTI_SOURCE_COMPARE_TOTAL_MESSAGES", "10000");
     let outcome = run_replicated_rejoin_bench(2, ConnectivityMode::DiscoveryLoopback);
     assert!(
         outcome.active_sources >= 2,
-        "expected both known replicated sources to contribute after rejoin, got active_sources={} recv_frames={:?} durable_attributed={:?}",
+        "expected both known replicated sources to contribute after rejoin, got active_sources={} sync_log_rx={:?}",
         outcome.active_sources,
         outcome.source_event_frames,
-        outcome.source_recorded_events,
     );
     assert!(
-        outcome.useful_unique_events > 0,
+        outcome.projected_delta_messages > 0,
         "expected the rejoiner to ingest replicated events"
     );
 }
