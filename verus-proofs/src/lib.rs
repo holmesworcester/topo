@@ -1,48 +1,23 @@
-//! Formal verification proofs for the Topo event-sourced pipeline.
+//! Formal verification proofs for Topo, organized to mirror runtime/state ownership.
 //!
-//! Core: projection decisions, pipeline, projectors, cascade, dispatch, commands
-//! Extended: context loading, project_one algorithm, tenant isolation, files, idempotency
-//! Security: session auth, transport trust, sync protocol, connections, data ingestion
+//! - `pipeline/`: projection-pipeline and ingestion proofs
+//! - `runtime/`: transport, peering, and sync-session proofs
+//! - `state/`: state-selection and purge/fanout proofs
+//! - `bug_hunt.rs`: intentionally cross-cutting counterexample-oriented proofs
 
 use vstd::prelude::*;
 
-// Core pipeline proofs
-pub mod decision;
-pub mod contract;
 pub mod pipeline;
-pub mod projectors;
-pub mod cascade;
-pub mod dispatch;
-pub mod commands;
-
-// Extended proofs
-pub mod context_loading;
-pub mod project_one;
-pub mod tenant_isolation;
-pub mod file_projectors;
-pub mod idempotency;
-pub mod persist_phase;
-
-// Security proofs
-pub mod session_auth;
-pub mod transport_trust;
-pub mod bootstrap_dialer;
-pub mod bootstrap_auth;
-pub mod sync_admission;
-pub mod sync_protocol;
-pub mod connection_security;
-pub mod data_ingestion;
-pub mod sync_security;
-pub mod connection_lifecycle;
-pub mod target_dispatch;
-pub mod inbound_session_auth;
-pub mod range_session;
-pub mod shared_workspace_fanout;
-pub mod projection_stages;
-pub mod deletion_purge;
+pub mod runtime;
+pub mod state;
 
 // Bug-hunting proofs
 pub mod bug_hunt;
+
+// Keep the most commonly imported proof helpers available at the crate root
+// while the proof tree moves to mirrored module ownership.
+pub use pipeline::contract;
+pub use pipeline::decision;
 
 verus! {
     proof fn system_invariants_hold() { }
