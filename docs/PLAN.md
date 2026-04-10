@@ -242,6 +242,13 @@ Definition of done for a covered seam:
 5. any touched temporal property is covered in TLA rather than hand-waved,
 6. the seam is mapped to one or more repo-wide composition invariants above.
 
+The execution plan for finishing the remaining single-node coverage work lives
+in
+`docs/planning/SINGLE_NODE_FORMAL_COVERAGE_EXECUTION_PLAN.md`. That document
+adds per-area success criteria, required checks, and end-to-end validation so
+the remaining work can be tracked as completion criteria instead of open-ended
+proof intent.
+
 ## 2.1 Strict Endpoint/Auth Target
 
 Before more transport/auth work lands, the intended authority model is:

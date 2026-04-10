@@ -57,4 +57,5 @@ When adding or changing a proof-bearing seam:
 - Keep the runtime shape explicit: `RawRows -> DecisionContext -> Plan -> executor`.
 - Keep SQL/query correctness in runtime tests; keep normalizer/planner invariants in Verus.
 - Add at least one targeted runtime check for the raw-row edge cases the Verus model abstracts.
+- Run `python3 scripts/check_formal_seam_coverage.py` after touching this map or a proof-bearing seam.
 - Update this coverage map when a seam is added, renamed, or moved.
