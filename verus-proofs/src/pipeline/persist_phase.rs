@@ -25,6 +25,22 @@ pub enum WorkspaceTarget {
     WorkspaceBinding,
 }
 
+pub struct PersistEventRawRows {
+    pub share_scope: ShareScope,
+    pub type_name_is_endpoint_shared: bool,
+    pub type_name_is_workspace: bool,
+    pub is_file_slice: bool,
+    pub has_workspace_binding: bool,
+}
+
+pub struct PersistEventDecisionContext {
+    pub share_scope: ShareScope,
+    pub type_name_is_endpoint_shared: bool,
+    pub type_name_is_workspace: bool,
+    pub is_file_slice: bool,
+    pub has_workspace_binding: bool,
+}
+
 /// Model of per-event persist phase decisions.
 pub struct PersistDecisions {
     pub write_shared_index: bool,
@@ -33,6 +49,30 @@ pub struct PersistDecisions {
     pub emit_live_hint: bool,
     pub emit_fanout: bool,
     pub fanout_workspace: WorkspaceTarget,
+}
+
+pub open spec fn normalize_persist_event(
+    raw_rows: PersistEventRawRows,
+) -> PersistEventDecisionContext {
+    PersistEventDecisionContext {
+        share_scope: raw_rows.share_scope,
+        type_name_is_endpoint_shared: raw_rows.type_name_is_endpoint_shared,
+        type_name_is_workspace: raw_rows.type_name_is_workspace,
+        is_file_slice: raw_rows.is_file_slice,
+        has_workspace_binding: raw_rows.has_workspace_binding,
+    }
+}
+
+pub open spec fn decide_persist_event_plan(
+    context: &PersistEventDecisionContext,
+) -> PersistDecisions {
+    persist_decisions_for_event(
+        context.share_scope,
+        context.type_name_is_endpoint_shared,
+        context.type_name_is_workspace,
+        context.is_file_slice,
+        context.has_workspace_binding,
+    )
 }
 
 /// Persist phase decision model for a single event.
@@ -68,6 +108,54 @@ pub open spec fn persist_decisions_for_event(
         emit_fanout: matches!(share_scope, ShareScope::Shared) && !type_name_is_endpoint_shared,
         fanout_workspace: workspace_target,
     }
+}
+
+proof fn persist_event_normalizer_preserves_query_facts(
+    share_scope: ShareScope,
+    type_name_is_endpoint_shared: bool,
+    type_name_is_workspace: bool,
+    is_file_slice: bool,
+    has_workspace_binding: bool,
+)
+    ensures
+        normalize_persist_event(PersistEventRawRows {
+            share_scope,
+            type_name_is_endpoint_shared,
+            type_name_is_workspace,
+            is_file_slice,
+            has_workspace_binding,
+        }) == (PersistEventDecisionContext {
+            share_scope,
+            type_name_is_endpoint_shared,
+            type_name_is_workspace,
+            is_file_slice,
+            has_workspace_binding,
+        }),
+{
+}
+
+proof fn persist_event_plan_matches_legacy_model(
+    share_scope: ShareScope,
+    type_name_is_endpoint_shared: bool,
+    type_name_is_workspace: bool,
+    is_file_slice: bool,
+    has_workspace_binding: bool,
+)
+    ensures
+        decide_persist_event_plan(&normalize_persist_event(PersistEventRawRows {
+            share_scope,
+            type_name_is_endpoint_shared,
+            type_name_is_workspace,
+            is_file_slice,
+            has_workspace_binding,
+        })) == persist_decisions_for_event(
+            share_scope,
+            type_name_is_endpoint_shared,
+            type_name_is_workspace,
+            is_file_slice,
+            has_workspace_binding,
+        ),
+{
 }
 
 // ═══════════════════════════════════════════════════════════════════
