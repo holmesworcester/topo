@@ -184,6 +184,45 @@ mod tests {
     }
 
     #[test]
+    fn resolve_sync_admission_starts_when_distinct_query_collapses_duplicate_workspace_rows() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        for (event_id, created_at) in [("accepted-a", 1i64), ("accepted-b", 2i64)] {
+            conn.execute(
+                "INSERT INTO invites_accepted
+                     (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "tenant-a",
+                    event_id,
+                    format!("tenant-event-{event_id}"),
+                    format!("invite-{event_id}"),
+                    "workspace-a",
+                    created_at
+                ],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            resolve_sync_admission(&conn, "tenant-a").unwrap(),
+            "workspace-a"
+        );
+    }
+
+    #[test]
+    fn resolve_sync_admission_rejects_missing_workspace_binding() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let err = resolve_sync_admission(&conn, "tenant-a").unwrap_err();
+        assert!(
+            err.to_string().contains("no accepted workspace binding"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn resolve_sync_admission_rejects_ambiguous_workspace_binding() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
