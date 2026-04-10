@@ -34,6 +34,22 @@ runtime seams, Verus mirrors, and targeted checks aligned.
 | Persist-phase validation | `src/state/pipeline/phases.rs` | `verus-proofs/src/pipeline/validation_inputs.rs` | prefix/type extraction is trusted to read bytes as specified | `AMF`, `ECP` | `cargo test -j1 --lib persist_validation -- --nocapture`; `cargo test -j1 --lib run_persist_phase -- --nocapture`; `cargo-verus verify` |
 | Persist event fanout/index planning | `src/state/pipeline/phases.rs` | `verus-proofs/src/pipeline/persist_phase.rs` | workspace cache/query returns the tenant's accepted workspace binding; missing workspace binding suppresses index and fanout targets | `WC`, `ECP` | `cargo test -j1 --lib run_persist_phase -- --nocapture`; `cargo-verus verify` |
 
+## Supporting Proof Modules
+
+These modules are verified by `cargo-verus verify`, but they are not themselves
+`RawRows -> DecisionContext -> Plan` seams. They provide abstract protocol,
+composition, and pipeline obligations that the seam-local proofs can cite or
+mirror. They are not standalone claims that SQL or runtime I/O conforms without
+the runtime tests named above.
+
+| Area | Verus Mirror | Role | Check |
+| --- | --- | --- | --- |
+| Cross-seam composition | `verus-proofs/src/composition.rs` | Abstract obligations for `UCA`, `ALB`, `WC`, `AMF`, and `ECP` across planner/executor seams. | `cargo-verus verify` |
+| Bug-hunt models | `verus-proofs/src/bug_hunt.rs` | Counterexample-oriented models for known or suspected security edges. | `cargo-verus verify` |
+| Projection pipeline support | `verus-proofs/src/pipeline/batch.rs`; `verus-proofs/src/pipeline/cascade.rs`; `verus-proofs/src/pipeline/commands.rs`; `verus-proofs/src/pipeline/data_ingestion.rs`; `verus-proofs/src/pipeline/decision.rs`; `verus-proofs/src/pipeline/dispatch.rs`; `verus-proofs/src/pipeline/idempotency.rs` | Abstract stage ordering, effect policy, idempotency, cascade, and command precondition models. | `cargo-verus verify` |
+| Core transport/session support | `verus-proofs/src/runtime/transport/connection_lifecycle.rs`; `verus-proofs/src/runtime/transport/connection_security.rs`; `verus-proofs/src/runtime/transport/session_auth.rs`; `verus-proofs/src/runtime/transport/transport_trust.rs` | Abstract connection lifecycle, auth TTL/binding, route-admission, and trust-source models. | `cargo-verus verify` |
+| Sync protocol support | `verus-proofs/src/runtime/sync_engine/session/sync_protocol.rs`; `verus-proofs/src/runtime/sync_engine/session/sync_security.rs` | Abstract stream-pairing, auth-before-data, bounded-frame, shared-only-send, and sync-window security models. | `cargo-verus verify` |
+
 ## Maintenance Rules
 
 When adding or changing a proof-bearing seam:
