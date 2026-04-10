@@ -1,6 +1,7 @@
 mod harness;
 
 mod device_invite_projector_tests;
+mod envelope_projector_tests;
 mod file_slice_projector_tests;
 mod invite_accepted_projector_tests;
 mod key_request_projector_tests;
