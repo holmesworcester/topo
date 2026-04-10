@@ -12,6 +12,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DEPS_01 | InvDeps | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::core_projection::test_project_reaction_blocked | break |
 | SPEC_DEPS_01 | InvDeps | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::cascade::test_multi_dep_event_projects_only_when_all_resolve | break |
 | SPEC_DEPS_02 | InvDeps | CHK_DEP_TYPE | pipeline_integration | apply::tests::invite::test_dep_type_mismatch_rejects | break |
+| SPEC_DEPS_02 | InvDeps | CHK_DEP_TYPE | pipeline_integration | apply::tests::invite::test_dep_type_out_of_range_rejects | break |
+| SPEC_DEPS_02 | InvDeps | CHK_DEP_TYPE | pipeline_integration | apply::tests::invite::test_dep_type_malformed_row_rejects | break |
 | SPEC_DEPS_02 | InvDeps | CHK_DEP_TYPE | pipeline_integration | apply::tests::core_projection::test_project_message_valid | pass |
 | SPEC_DEPS_03 | InvDeps (cascade) | CHK_CASCADE_UNBLOCK | pipeline_integration | apply::tests::core_projection::test_project_unblock_cascade | pass |
 | SPEC_DEPS_03 | InvDeps (cascade) | CHK_CASCADE_UNBLOCK | pipeline_integration | apply::tests::core_projection::test_project_reaction_blocked | break |

@@ -100,7 +100,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | check_id | owner | tla_guard_id | category |
 |----------|-------|-------------|----------|
 | CHK_DEP_PRESENCE | projection/apply/stages::check_deps_and_block | InvDeps | pipeline_shared |
-| CHK_DEP_TYPE | projection/apply/stages::check_dep_types | InvDeps | pipeline_shared |
+| CHK_DEP_TYPE | state/projection/queries::decide_semantic_type_plan + projection/apply/stages::load_context_with_prereqs | InvDeps | projector_context |
 | CHK_FILE_TOMBSTONE_DEP_OK | projection/apply/stages::load_context_with_prereqs + apply_projection_frame | InvAttachmentTombstoneBypass | pipeline_shared |
 | CHK_RXN_TOMBSTONE_DEP_OK | projection/apply/stages::load_context_with_prereqs + apply_projection_frame | InvReactionTombstoneBypass | pipeline_shared |
 | CHK_SIGNER_RESOLVE | projection/signer::resolve_signer_key | InvSigner | pipeline_shared |

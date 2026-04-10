@@ -56,18 +56,41 @@ impl ContextLoadResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DepLoadResult {
-    Ready { semantic_type_code: Option<u8> },
+    Ready {
+        semantic_type_rows: SemanticTypeRawRows,
+    },
     Missing,
-    Purge { message_event_id: String },
+    Reject {
+        reason: String,
+    },
+    Purge {
+        message_event_id: String,
+    },
 }
 
 impl DepLoadResult {
     pub fn ready(semantic_type_code: Option<u8>) -> Self {
-        Self::Ready { semantic_type_code }
+        Self::Ready {
+            semantic_type_rows: SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: semantic_type_code.map(i64::from),
+            },
+        }
+    }
+
+    pub fn ready_raw(semantic_type_code: Option<i64>) -> Self {
+        Self::Ready {
+            semantic_type_rows: SemanticTypeRawRows::UniqueKnown { semantic_type_code },
+        }
     }
 
     pub fn missing() -> Self {
         Self::Missing
+    }
+
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self::Reject {
+            reason: reason.into(),
+        }
     }
 
     pub fn purge(message_event_id: impl Into<String>) -> Self {
@@ -145,6 +168,32 @@ pub enum ContentAuthorityDecisionContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentAuthorityPlan {
     Ready,
+    Reject { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticTypeRawRows {
+    Missing,
+    UniqueKnown { semantic_type_code: Option<i64> },
+    Ambiguous,
+    Malformed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticTypeDecisionContext {
+    Missing,
+    UniqueReady { semantic_type_code: Option<u8> },
+    RejectMissingType,
+    RejectWrongType { actual: u8, allowed: Vec<u8> },
+    RejectOutOfRange { semantic_type_code: i64 },
+    RejectAmbiguous,
+    RejectMalformed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticTypePlan {
+    DepMissing,
+    DepReady { semantic_type_code: Option<u8> },
     Reject { reason: String },
 }
 
@@ -238,6 +287,42 @@ pub fn normalize_content_authority(
     }
 }
 
+pub fn normalize_semantic_type(
+    raw_rows: &SemanticTypeRawRows,
+    allowed_type_codes: &[u8],
+) -> SemanticTypeDecisionContext {
+    match raw_rows {
+        SemanticTypeRawRows::Missing => SemanticTypeDecisionContext::Missing,
+        SemanticTypeRawRows::UniqueKnown { semantic_type_code } => {
+            let Some(semantic_type_code) = semantic_type_code else {
+                if allowed_type_codes.is_empty() {
+                    return SemanticTypeDecisionContext::UniqueReady {
+                        semantic_type_code: None,
+                    };
+                }
+                return SemanticTypeDecisionContext::RejectMissingType;
+            };
+            let Ok(actual) = u8::try_from(*semantic_type_code) else {
+                return SemanticTypeDecisionContext::RejectOutOfRange {
+                    semantic_type_code: *semantic_type_code,
+                };
+            };
+            if allowed_type_codes.is_empty() || allowed_type_codes.contains(&actual) {
+                SemanticTypeDecisionContext::UniqueReady {
+                    semantic_type_code: Some(actual),
+                }
+            } else {
+                SemanticTypeDecisionContext::RejectWrongType {
+                    actual,
+                    allowed: allowed_type_codes.to_vec(),
+                }
+            }
+        }
+        SemanticTypeRawRows::Ambiguous => SemanticTypeDecisionContext::RejectAmbiguous,
+        SemanticTypeRawRows::Malformed => SemanticTypeDecisionContext::RejectMalformed,
+    }
+}
+
 pub fn build_workspace_projector_decision_context(
     context: &WorkspaceDecisionContext,
 ) -> ProjectorDecisionContext {
@@ -284,6 +369,51 @@ pub fn decide_workspace_context_plan(
                 reason: "malformed accepted invite workspace binding".to_string(),
             }
         }
+    }
+}
+
+pub fn decide_semantic_type_plan(
+    context: &SemanticTypeDecisionContext,
+    field_name: &str,
+) -> SemanticTypePlan {
+    match context {
+        SemanticTypeDecisionContext::Missing => SemanticTypePlan::DepMissing,
+        SemanticTypeDecisionContext::UniqueReady { semantic_type_code } => {
+            SemanticTypePlan::DepReady {
+                semantic_type_code: *semantic_type_code,
+            }
+        }
+        SemanticTypeDecisionContext::RejectMissingType => SemanticTypePlan::Reject {
+            reason: format!(
+                "dep {} missing tenant-scoped semantic type record",
+                field_name
+            ),
+        },
+        SemanticTypeDecisionContext::RejectWrongType { actual, allowed } => {
+            SemanticTypePlan::Reject {
+                reason: format!(
+                    "dep {} has semantic type code {} but expected one of {:?}",
+                    field_name, actual, allowed
+                ),
+            }
+        }
+        SemanticTypeDecisionContext::RejectOutOfRange { semantic_type_code } => {
+            SemanticTypePlan::Reject {
+                reason: format!(
+                    "dep {} has out-of-range semantic type code {}",
+                    field_name, semantic_type_code
+                ),
+            }
+        }
+        SemanticTypeDecisionContext::RejectAmbiguous => SemanticTypePlan::Reject {
+            reason: format!("dep {} has ambiguous semantic type rows", field_name),
+        },
+        SemanticTypeDecisionContext::RejectMalformed => SemanticTypePlan::Reject {
+            reason: format!(
+                "dep {} has malformed tenant-scoped semantic type record",
+                field_name
+            ),
+        },
     }
 }
 
@@ -554,44 +684,54 @@ fn global_endpoint_shared_is_valid(
     Ok(present)
 }
 
-fn load_valid_semantic_type_code(
+fn semantic_type_row_error_is_malformed(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+    )
+}
+
+fn load_semantic_type_raw_rows(
     conn: &Connection,
     recorded_by: &str,
     dep_b64: &str,
-) -> Result<Option<u8>, Box<dyn std::error::Error>> {
-    let stored: Option<Option<i64>> = conn
-        .query_row(
-            "SELECT semantic_type_code
-             FROM valid_events
-             WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, dep_b64],
-            |row| row.get(0),
-        )
-        .optional()?;
-
-    match stored {
-        Some(Some(code)) => {
-            let code = u8::try_from(code).map_err(|_| {
-                format!(
-                    "semantic_type_code {} out of range for event {}",
-                    code, dep_b64
-                )
-            })?;
-            Ok(Some(code))
-        }
-        Some(None) => {
-            let blob: Option<Vec<u8>> = conn
+) -> ProjectionQueryResult<SemanticTypeRawRows> {
+    match conn.query_row(
+        "SELECT semantic_type_code
+         FROM valid_events
+         WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, dep_b64],
+        |row| row.get::<_, Option<i64>>(0),
+    ) {
+        Ok(Some(code)) => Ok(SemanticTypeRawRows::UniqueKnown {
+            semantic_type_code: Some(code),
+        }),
+        Ok(None) => {
+            let blob_result = conn
                 .query_row(
                     "SELECT blob FROM events WHERE event_id = ?1",
                     rusqlite::params![dep_b64],
                     |row| crate::db::sql_types::get_blob(row, 0),
                 )
-                .optional()?;
+                .optional();
+            let blob = match blob_result {
+                Ok(blob) => blob,
+                Err(err) if semantic_type_row_error_is_malformed(&err) => {
+                    return Ok(SemanticTypeRawRows::Malformed);
+                }
+                Err(err) => return Err(err.into()),
+            };
             let Some(blob) = blob else {
-                return Ok(None);
+                return Ok(SemanticTypeRawRows::UniqueKnown {
+                    semantic_type_code: None,
+                });
             };
             let Some(code) = derive_semantic_type_code_from_blob(&blob)? else {
-                return Ok(None);
+                return Ok(SemanticTypeRawRows::UniqueKnown {
+                    semantic_type_code: None,
+                });
             };
             conn.execute(
                 "UPDATE valid_events
@@ -599,31 +739,25 @@ fn load_valid_semantic_type_code(
                  WHERE peer_id = ?1 AND event_id = ?2 AND semantic_type_code IS NULL",
                 rusqlite::params![recorded_by, dep_b64, i64::from(code)],
             )?;
-            Ok(Some(code))
+            Ok(SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: Some(i64::from(code)),
+            })
         }
-        None => {
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
             if global_endpoint_shared_is_valid(conn, dep_b64)? {
-                return Ok(Some(crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED));
+                return Ok(SemanticTypeRawRows::UniqueKnown {
+                    semantic_type_code: Some(i64::from(
+                        crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
+                    )),
+                });
             }
-            Ok(None)
+            Ok(SemanticTypeRawRows::Missing)
         }
+        Err(err) if semantic_type_row_error_is_malformed(&err) => {
+            Ok(SemanticTypeRawRows::Malformed)
+        }
+        Err(err) => Err(err.into()),
     }
-}
-
-fn dep_is_satisfied_for_scope(
-    conn: &Connection,
-    recorded_by: &str,
-    dep_b64: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let dep_valid: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, dep_b64],
-        |row| row.get(0),
-    )?;
-    if dep_valid {
-        return Ok(true);
-    }
-    global_endpoint_shared_is_valid(conn, dep_b64)
 }
 
 fn deleted_message_purges_dep(
@@ -935,12 +1069,9 @@ impl ProjectionQueries for Connection {
         dep_id: &EventId,
     ) -> ProjectionQueryResult<DepLoadResult> {
         let dep_b64 = event_id_to_base64(dep_id);
-        if dep_is_satisfied_for_scope(self, recorded_by, &dep_b64)? {
-            return Ok(DepLoadResult::ready(load_valid_semantic_type_code(
-                self,
-                recorded_by,
-                &dep_b64,
-            )?));
+        let semantic_type_rows = load_semantic_type_raw_rows(self, recorded_by, &dep_b64)?;
+        if semantic_type_rows != SemanticTypeRawRows::Missing {
+            return Ok(DepLoadResult::Ready { semantic_type_rows });
         }
         if let Some(message_event_id) =
             deleted_message_purges_dep(self, recorded_by, parsed, field_name, &dep_b64)?
@@ -1554,6 +1685,7 @@ impl ProjectionQueries for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_modules::EVENT_TYPE_MESSAGE;
 
     fn workspace_id(byte: u8) -> String {
         event_id_to_base64(&[byte; 32])
@@ -1762,6 +1894,97 @@ mod tests {
         assert!(matches!(
             decide_content_authority_plan(&context),
             ContentAuthorityPlan::Reject { reason } if reason.contains("must be peer_shared")
+        ));
+    }
+
+    #[test]
+    fn semantic_type_allowed_is_ready() {
+        let context = normalize_semantic_type(
+            &SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: Some(i64::from(EVENT_TYPE_WORKSPACE)),
+            },
+            &[EVENT_TYPE_WORKSPACE],
+        );
+
+        assert_eq!(
+            decide_semantic_type_plan(&context, "workspace_id"),
+            SemanticTypePlan::DepReady {
+                semantic_type_code: Some(EVENT_TYPE_WORKSPACE)
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_type_no_allowed_list_accepts_missing_type_code() {
+        let context = normalize_semantic_type(
+            &SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: None,
+            },
+            &[],
+        );
+
+        assert_eq!(
+            decide_semantic_type_plan(&context, "parent_1"),
+            SemanticTypePlan::DepReady {
+                semantic_type_code: None
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_type_rejects_missing_type_code_when_typed() {
+        let context = normalize_semantic_type(
+            &SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: None,
+            },
+            &[EVENT_TYPE_WORKSPACE],
+        );
+
+        assert!(matches!(
+            decide_semantic_type_plan(&context, "workspace_id"),
+            SemanticTypePlan::Reject { reason } if reason.contains("missing tenant-scoped")
+        ));
+    }
+
+    #[test]
+    fn semantic_type_wrong_type_rejects() {
+        let context = normalize_semantic_type(
+            &SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: Some(i64::from(EVENT_TYPE_WORKSPACE)),
+            },
+            &[EVENT_TYPE_MESSAGE],
+        );
+
+        assert!(matches!(
+            decide_semantic_type_plan(&context, "target_event_id"),
+            SemanticTypePlan::Reject { reason }
+                if reason.contains("semantic type code") && reason.contains("expected")
+        ));
+    }
+
+    #[test]
+    fn semantic_type_out_of_range_rejects() {
+        let context = normalize_semantic_type(
+            &SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: Some(300),
+            },
+            &[EVENT_TYPE_MESSAGE],
+        );
+
+        assert!(matches!(
+            decide_semantic_type_plan(&context, "target_event_id"),
+            SemanticTypePlan::Reject { reason } if reason.contains("out-of-range")
+        ));
+    }
+
+    #[test]
+    fn semantic_type_malformed_rows_reject() {
+        let context =
+            normalize_semantic_type(&SemanticTypeRawRows::Malformed, &[EVENT_TYPE_MESSAGE]);
+
+        assert!(matches!(
+            decide_semantic_type_plan(&context, "target_event_id"),
+            SemanticTypePlan::Reject { reason } if reason.contains("malformed")
         ));
     }
 }

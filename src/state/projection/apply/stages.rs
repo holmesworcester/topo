@@ -7,7 +7,10 @@ use crate::db::timeline::EventTimeline;
 use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
 use crate::projection::contract::EmitCommand;
-use crate::projection::queries::{ContextLoadResult, DepLoadResult, ProjectionFrameContext};
+use crate::projection::queries::{
+    decide_semantic_type_plan, normalize_semantic_type, ContextLoadResult, DepLoadResult,
+    ProjectionFrameContext, SemanticTypePlan,
+};
 use rusqlite::Connection;
 
 use super::dispatch::dispatch_pure_projector;
@@ -123,8 +126,11 @@ fn load_context_with_prereqs<B: ProjectionBackend>(
     for (idx, (field_name, dep_id)) in deps.iter().enumerate() {
         match backend.load_dep_result(recorded_by, parsed, field_name, dep_id)? {
             DepLoadResult::Missing => missing.push(*dep_id),
-            DepLoadResult::Ready { semantic_type_code } => {
-                ready_deps.push((idx, *field_name, semantic_type_code))
+            DepLoadResult::Ready { semantic_type_rows } => {
+                ready_deps.push((idx, *field_name, *dep_id, semantic_type_rows))
+            }
+            DepLoadResult::Reject { reason } => {
+                return Ok(ContextLoadResult::reject(reason));
             }
             DepLoadResult::Purge { message_event_id } => {
                 purge_message_event_id.get_or_insert(message_event_id);
@@ -136,22 +142,15 @@ fn load_context_with_prereqs<B: ProjectionBackend>(
         return Ok(ContextLoadResult::purge(message_event_id));
     }
 
-    for (idx, field_name, semantic_type_code) in ready_deps {
+    for (idx, field_name, dep_id, semantic_type_rows) in ready_deps {
         let allowed = meta.dep_field_type_codes.get(idx).copied().unwrap_or(&[]);
-        if allowed.is_empty() {
-            continue;
-        }
-        let Some(actual) = semantic_type_code else {
-            return Ok(ContextLoadResult::reject(format!(
-                "dep {} missing tenant-scoped semantic type record",
-                field_name
-            )));
-        };
-        if !allowed.contains(&actual) {
-            return Ok(ContextLoadResult::reject(format!(
-                "dep {} has semantic type code {} but expected one of {:?}",
-                field_name, actual, allowed
-            )));
+        let context = normalize_semantic_type(&semantic_type_rows, allowed);
+        match decide_semantic_type_plan(&context, field_name) {
+            SemanticTypePlan::DepMissing => missing.push(dep_id),
+            SemanticTypePlan::DepReady { .. } => {}
+            SemanticTypePlan::Reject { reason } => {
+                return Ok(ContextLoadResult::reject(reason));
+            }
         }
     }
 

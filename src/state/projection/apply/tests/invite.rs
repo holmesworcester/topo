@@ -128,6 +128,74 @@ fn test_dep_type_mismatch_rejects() {
     );
 }
 
+#[test]
+fn test_dep_type_out_of_range_rejects() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    let ws = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: now_ms(),
+        public_key: [0xBC; 32],
+        name: "dep-out-of-range-target".to_string(),
+    });
+    let ws_blob = events::encode_event(&ws).unwrap();
+    let wrong_target_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
+    let wrong_target_b64 = event_id_to_base64(&wrong_target_eid);
+    conn.execute(
+        "INSERT OR REPLACE INTO valid_events (peer_id, event_id, semantic_type_code)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![recorded_by, &wrong_target_b64, 300_i64],
+    )
+    .unwrap();
+
+    let (_rxn, rxn_blob) =
+        make_reaction_signed(&signing_key, &signer_eid, &wrong_target_eid, "\u{1f44d}");
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+
+    let decision = project_one(&conn, recorded_by, &rxn_eid).unwrap();
+    assert!(
+        matches!(decision, ProjectionDecision::Reject { ref reason } if reason.contains("out-of-range")),
+        "expected out-of-range dep type rejection, got {:?}",
+        decision
+    );
+}
+
+#[test]
+fn test_dep_type_malformed_row_rejects() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    let ws = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: now_ms(),
+        public_key: [0xBD; 32],
+        name: "dep-malformed-target".to_string(),
+    });
+    let ws_blob = events::encode_event(&ws).unwrap();
+    let wrong_target_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
+    let wrong_target_b64 = event_id_to_base64(&wrong_target_eid);
+    conn.execute(
+        "INSERT OR REPLACE INTO valid_events (peer_id, event_id, semantic_type_code)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![recorded_by, &wrong_target_b64, "not-an-integer"],
+    )
+    .unwrap();
+
+    let (_rxn, rxn_blob) =
+        make_reaction_signed(&signing_key, &signer_eid, &wrong_target_eid, "\u{1f44d}");
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+
+    let decision = project_one(&conn, recorded_by, &rxn_eid).unwrap();
+    assert!(
+        matches!(decision, ProjectionDecision::Reject { ref reason } if reason.contains("malformed")),
+        "expected malformed dep type rejection, got {:?}",
+        decision
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Stage 1: Bootstrap-projection-peering target semantics tests
 // ══════════════════════════════════════════════════════════════════════

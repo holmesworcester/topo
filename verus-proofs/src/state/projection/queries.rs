@@ -235,14 +235,20 @@ proof fn content_authority_malformation_fails_closed()
 
 pub enum SemanticTypeRows {
     Missing,
-    UniqueKnown { code_in_range: bool, allowed_by_dep_field: bool },
+    UniqueKnown {
+        type_check_required: bool,
+        code_present: bool,
+        code_in_range: bool,
+        allowed_by_dep_field: bool,
+    },
     Ambiguous,
     Malformed,
 }
 
 pub enum SemanticTypeDecisionContext {
     Missing,
-    UniqueAllowed,
+    UniqueReady,
+    RejectMissingType,
     RejectWrongType,
     RejectOutOfRange,
     RejectAmbiguous,
@@ -260,11 +266,20 @@ pub open spec fn normalize_semantic_type(
 ) -> SemanticTypeDecisionContext {
     match rows {
         SemanticTypeRows::Missing => SemanticTypeDecisionContext::Missing,
-        SemanticTypeRows::UniqueKnown { code_in_range, allowed_by_dep_field } => {
-            if !code_in_range {
+        SemanticTypeRows::UniqueKnown {
+            type_check_required,
+            code_present,
+            code_in_range,
+            allowed_by_dep_field,
+        } => {
+            if !code_present && type_check_required {
+                SemanticTypeDecisionContext::RejectMissingType
+            } else if !code_present {
+                SemanticTypeDecisionContext::UniqueReady
+            } else if !code_in_range {
                 SemanticTypeDecisionContext::RejectOutOfRange
-            } else if allowed_by_dep_field {
-                SemanticTypeDecisionContext::UniqueAllowed
+            } else if !type_check_required || allowed_by_dep_field {
+                SemanticTypeDecisionContext::UniqueReady
             } else {
                 SemanticTypeDecisionContext::RejectWrongType
             }
@@ -279,8 +294,9 @@ pub open spec fn decide_semantic_type_plan(
 ) -> SemanticTypePlan {
     match context {
         SemanticTypeDecisionContext::Missing => SemanticTypePlan::DepMissing,
-        SemanticTypeDecisionContext::UniqueAllowed => SemanticTypePlan::DepReady,
-        SemanticTypeDecisionContext::RejectWrongType
+        SemanticTypeDecisionContext::UniqueReady => SemanticTypePlan::DepReady,
+        SemanticTypeDecisionContext::RejectMissingType
+        | SemanticTypeDecisionContext::RejectWrongType
         | SemanticTypeDecisionContext::RejectOutOfRange
         | SemanticTypeDecisionContext::RejectAmbiguous
         | SemanticTypeDecisionContext::RejectMalformed => SemanticTypePlan::Reject,
@@ -290,15 +306,41 @@ pub open spec fn decide_semantic_type_plan(
 proof fn semantic_type_allowed_is_ready()
     ensures
         decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
+            type_check_required: true,
+            code_present: true,
             code_in_range: true,
             allowed_by_dep_field: true,
         })) == SemanticTypePlan::DepReady,
 {
 }
 
+proof fn semantic_type_untyped_missing_code_is_ready()
+    ensures
+        decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
+            type_check_required: false,
+            code_present: false,
+            code_in_range: true,
+            allowed_by_dep_field: false,
+        })) == SemanticTypePlan::DepReady,
+{
+}
+
+proof fn semantic_type_typed_missing_code_rejects()
+    ensures
+        decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
+            type_check_required: true,
+            code_present: false,
+            code_in_range: true,
+            allowed_by_dep_field: false,
+        })) == SemanticTypePlan::Reject,
+{
+}
+
 proof fn semantic_type_wrong_type_rejects()
     ensures
         decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
+            type_check_required: true,
+            code_present: true,
             code_in_range: true,
             allowed_by_dep_field: false,
         })) == SemanticTypePlan::Reject,
@@ -308,6 +350,8 @@ proof fn semantic_type_wrong_type_rejects()
 proof fn semantic_type_out_of_range_rejects()
     ensures
         decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
+            type_check_required: true,
+            code_present: true,
             code_in_range: false,
             allowed_by_dep_field: true,
         })) == SemanticTypePlan::Reject,

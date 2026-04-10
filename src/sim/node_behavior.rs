@@ -20,7 +20,7 @@ use crate::projection::queries::{
     content_authority_plan_to_signer_user_mismatch_reason, decide_content_authority_plan,
     normalize_content_authority, normalize_workspace_acceptance, ContentAuthorityRawRows,
     DepLoadResult, ProjectionFrameContext, ProjectionQueries, ProjectionQueryResult,
-    WorkspaceAcceptedRawRows, WorkspaceDecisionContext,
+    SemanticTypeRawRows, WorkspaceAcceptedRawRows, WorkspaceDecisionContext,
 };
 use crate::projection::signer::{ResolvedSigner, SignerResolution};
 use crate::sim::query_snapshot::ImportedPeerState;
@@ -1100,19 +1100,20 @@ impl ProjectionQueries for NodeBehaviorEngine {
         }
         let dep_b64 = event_id_to_base64(dep_id);
         if state.valid_events.contains_key(&dep_b64) {
-            let semantic_type_code = state
-                .valid_events
-                .get(&dep_b64)
-                .and_then(|value| value.and_then(|code| u8::try_from(code).ok()));
-            return Ok(DepLoadResult::ready(semantic_type_code));
+            let semantic_type_code = state.valid_events.get(&dep_b64).and_then(|value| *value);
+            return Ok(DepLoadResult::ready_raw(semantic_type_code));
         }
         if state.tables.get("endpoints_shared").is_some_and(|rows| {
             rows.iter()
                 .any(|row| row_text(row, "event_id") == Some(&dep_b64))
         }) {
-            return Ok(DepLoadResult::ready(Some(
-                crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
-            )));
+            return Ok(DepLoadResult::Ready {
+                semantic_type_rows: SemanticTypeRawRows::UniqueKnown {
+                    semantic_type_code: Some(i64::from(
+                        crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
+                    )),
+                },
+            });
         }
         if let Some(message_event_id) =
             deleted_message_purges_dep_behavior(&state, recorded_by, parsed, field_name, &dep_b64)
