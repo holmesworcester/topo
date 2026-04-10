@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-use crate::crypto::{event_id_to_base64, EventId};
+use crate::crypto::{EventId, event_id_to_base64};
 use crate::db::store::{insert_recorded_event, lookup_workspace_id};
 use crate::event_modules::ShareScope;
 use crate::projection::apply::project_one;
@@ -112,7 +112,7 @@ struct SharedFanoutRawRows {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SharedFanoutSiblingContext {
+struct SharedFanoutSiblingDecisionContext {
     sibling_peer_id: String,
     sibling_removed: bool,
     event_predates_removal: bool,
@@ -120,11 +120,11 @@ struct SharedFanoutSiblingContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SharedFanoutContext {
+struct SharedFanoutDecisionContext {
     origin_rejected: bool,
     origin_removed: bool,
     removal_event: bool,
-    siblings: Vec<SharedFanoutSiblingContext>,
+    siblings: Vec<SharedFanoutSiblingDecisionContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,15 +135,15 @@ enum SharedFanoutPlan {
     FanoutTo { sibling_peer_ids: Vec<String> },
 }
 
-fn normalize_shared_fanout(raw_rows: SharedFanoutRawRows) -> SharedFanoutContext {
-    SharedFanoutContext {
+fn normalize_shared_fanout(raw_rows: SharedFanoutRawRows) -> SharedFanoutDecisionContext {
+    SharedFanoutDecisionContext {
         origin_rejected: raw_rows.origin_rejected,
         origin_removed: raw_rows.origin_removed,
         removal_event: raw_rows.removal_event,
         siblings: raw_rows
             .siblings
             .into_iter()
-            .map(|sibling| SharedFanoutSiblingContext {
+            .map(|sibling| SharedFanoutSiblingDecisionContext {
                 sibling_peer_id: sibling.sibling_peer_id,
                 sibling_removed: sibling.sibling_removed,
                 event_predates_removal: sibling.event_predates_removal,
@@ -153,7 +153,7 @@ fn normalize_shared_fanout(raw_rows: SharedFanoutRawRows) -> SharedFanoutContext
     }
 }
 
-fn decide_shared_fanout_plan(context: &SharedFanoutContext) -> SharedFanoutPlan {
+fn decide_shared_fanout_plan(context: &SharedFanoutDecisionContext) -> SharedFanoutPlan {
     if context.origin_rejected {
         return SharedFanoutPlan::SkipOriginRejected;
     }
@@ -569,11 +569,11 @@ mod tests {
 
     #[test]
     fn shared_fanout_plan_skips_removed_origin_for_non_removal_events() {
-        let plan = decide_shared_fanout_plan(&SharedFanoutContext {
+        let plan = decide_shared_fanout_plan(&SharedFanoutDecisionContext {
             origin_rejected: false,
             origin_removed: true,
             removal_event: false,
-            siblings: vec![SharedFanoutSiblingContext {
+            siblings: vec![SharedFanoutSiblingDecisionContext {
                 sibling_peer_id: "sibling".to_string(),
                 sibling_removed: false,
                 event_predates_removal: false,
@@ -585,11 +585,11 @@ mod tests {
 
     #[test]
     fn shared_fanout_plan_keeps_targeted_removal_for_removed_sibling() {
-        let plan = decide_shared_fanout_plan(&SharedFanoutContext {
+        let plan = decide_shared_fanout_plan(&SharedFanoutDecisionContext {
             origin_rejected: false,
             origin_removed: false,
             removal_event: true,
-            siblings: vec![SharedFanoutSiblingContext {
+            siblings: vec![SharedFanoutSiblingDecisionContext {
                 sibling_peer_id: "sibling".to_string(),
                 sibling_removed: true,
                 event_predates_removal: false,
@@ -663,9 +663,11 @@ mod tests {
             sibling_tenants_in_workspace(&conn, "tenant-b", "ws-1").unwrap(),
             vec!["tenant-a".to_string()]
         );
-        assert!(sibling_tenants_in_workspace(&conn, "tenant-c", "ws-2")
-            .unwrap()
-            .is_empty());
+        assert!(
+            sibling_tenants_in_workspace(&conn, "tenant-c", "ws-2")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
