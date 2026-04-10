@@ -233,6 +233,131 @@ proof fn content_authority_malformation_fails_closed()
 {
 }
 
+pub enum AdminAuthorityRows {
+    MissingCurrentSigner,
+    UnsupportedSignerType,
+    UniqueUserKey { admin_key_matches_user_key: bool },
+    MissingUser,
+    AmbiguousUser,
+    MalformedUserKey,
+}
+
+pub enum AdminAuthorityDecisionContext {
+    UniqueUserKey { admin_key_matches_user_key: bool },
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType,
+    RejectMissingUser,
+    RejectAmbiguousUser,
+    RejectMalformedUserKey,
+}
+
+pub enum AdminAuthorityPlan {
+    Ready,
+    Reject,
+}
+
+pub open spec fn normalize_admin_authority(
+    rows: AdminAuthorityRows,
+) -> AdminAuthorityDecisionContext {
+    match rows {
+        AdminAuthorityRows::MissingCurrentSigner => {
+            AdminAuthorityDecisionContext::RejectMissingCurrentSigner
+        }
+        AdminAuthorityRows::UnsupportedSignerType => {
+            AdminAuthorityDecisionContext::RejectUnsupportedSignerType
+        }
+        AdminAuthorityRows::UniqueUserKey { admin_key_matches_user_key } => {
+            AdminAuthorityDecisionContext::UniqueUserKey {
+                admin_key_matches_user_key,
+            }
+        }
+        AdminAuthorityRows::MissingUser => AdminAuthorityDecisionContext::RejectMissingUser,
+        AdminAuthorityRows::AmbiguousUser => {
+            AdminAuthorityDecisionContext::RejectAmbiguousUser
+        }
+        AdminAuthorityRows::MalformedUserKey => {
+            AdminAuthorityDecisionContext::RejectMalformedUserKey
+        }
+    }
+}
+
+pub open spec fn decide_admin_authority_plan(
+    context: AdminAuthorityDecisionContext,
+) -> AdminAuthorityPlan {
+    match context {
+        AdminAuthorityDecisionContext::UniqueUserKey { admin_key_matches_user_key } => {
+            if admin_key_matches_user_key {
+                AdminAuthorityPlan::Ready
+            } else {
+                AdminAuthorityPlan::Reject
+            }
+        }
+        AdminAuthorityDecisionContext::RejectMissingCurrentSigner
+        | AdminAuthorityDecisionContext::RejectUnsupportedSignerType
+        | AdminAuthorityDecisionContext::RejectMissingUser
+        | AdminAuthorityDecisionContext::RejectAmbiguousUser
+        | AdminAuthorityDecisionContext::RejectMalformedUserKey => {
+            AdminAuthorityPlan::Reject
+        }
+    }
+}
+
+proof fn admin_authority_matching_key_is_ready()
+    ensures
+        decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::UniqueUserKey { admin_key_matches_user_key: true },
+        )) == AdminAuthorityPlan::Ready,
+{
+}
+
+proof fn admin_authority_key_mismatch_rejects()
+    ensures
+        decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::UniqueUserKey { admin_key_matches_user_key: false },
+        )) == AdminAuthorityPlan::Reject,
+{
+}
+
+proof fn admin_authority_missing_current_signer_rejects()
+    ensures
+        decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::MissingCurrentSigner,
+        )) == AdminAuthorityPlan::Reject,
+{
+}
+
+proof fn admin_authority_unsupported_signer_type_rejects()
+    ensures
+        decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::UnsupportedSignerType,
+        )) == AdminAuthorityPlan::Reject,
+{
+}
+
+proof fn admin_authority_missing_user_rejects()
+    ensures
+        decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::MissingUser,
+        )) == AdminAuthorityPlan::Reject,
+{
+}
+
+proof fn admin_authority_ambiguous_user_rejects()
+    ensures
+        decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::AmbiguousUser,
+        )) == AdminAuthorityPlan::Reject,
+{
+}
+
+proof fn admin_authority_malformed_user_key_rejects()
+    ensures
+        decide_admin_authority_plan(normalize_admin_authority(
+            AdminAuthorityRows::MalformedUserKey,
+        )) == AdminAuthorityPlan::Reject,
+{
+}
+
 pub enum DeletionSignerRows {
     MissingCurrentSigner,
     AdminSigner,

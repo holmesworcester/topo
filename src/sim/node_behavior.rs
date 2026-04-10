@@ -16,10 +16,11 @@ use crate::projection::contract::{
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::queries::{
-    build_workspace_projector_decision_context,
-    content_authority_plan_to_signer_user_mismatch_reason, decide_content_authority_plan,
-    decide_deletion_signer_plan, deletion_signer_plan_to_context_fields,
-    normalize_content_authority, normalize_deletion_signer, normalize_workspace_acceptance,
+    admin_authority_plan_to_mismatch_reason, build_workspace_projector_decision_context,
+    content_authority_plan_to_signer_user_mismatch_reason, decide_admin_authority_plan,
+    decide_content_authority_plan, decide_deletion_signer_plan,
+    deletion_signer_plan_to_context_fields, normalize_admin_authority, normalize_content_authority,
+    normalize_deletion_signer, normalize_workspace_acceptance, AdminAuthorityRawRows,
     ContentAuthorityRawRows, DeletionSignerRawRows, DepLoadResult, ProjectionFrameContext,
     ProjectionQueries, ProjectionQueryResult, SemanticTypeRawRows, WorkspaceAcceptedRawRows,
     WorkspaceDecisionContext,
@@ -1140,43 +1141,37 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_admin_context(
         &self,
-        _frame: &ProjectionFrameContext,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         admin: &events::AdminEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let user_event_id_b64 = event_id_to_base64(&admin.user_event_id);
-        let admin_user_key_mismatch_reason = match first_row_for_recorded(
-            &state,
-            "users",
-            recorded_by,
-            "event_id",
-            &user_event_id_b64,
-        ) {
-            None => Some(format!(
-                "no users row for user_event_id {}",
-                user_event_id_b64
-            )),
-            Some(row) => match row_blob(row, "public_key") {
-                Some(user_public_key) if user_public_key.len() != 32 => Some(format!(
-                    "user {} has invalid public_key length {}",
-                    user_event_id_b64,
-                    user_public_key.len()
-                )),
-                Some(user_public_key) if user_public_key != admin.public_key => Some(format!(
-                    "admin public_key does not match user public_key for {}",
-                    user_event_id_b64
-                )),
-                Some(_) => None,
-                None => Some(format!(
-                    "no users row for user_event_id {}",
-                    user_event_id_b64
-                )),
+        let raw_rows = match frame.current_signer.as_ref() {
+            None => AdminAuthorityRawRows::MissingCurrentSigner,
+            Some(current_signer)
+                if current_signer.semantic_type_code != events::EVENT_TYPE_WORKSPACE =>
+            {
+                AdminAuthorityRawRows::UnsupportedSignerType {
+                    semantic_type_code: current_signer.semantic_type_code,
+                }
+            }
+            Some(_) => AdminAuthorityRawRows::WorkspaceSigner {
+                user_event_id: user_event_id_b64.clone(),
+                user_public_keys: table_rows_for_recorded(&state, "users", recorded_by)
+                    .into_iter()
+                    .filter(|row| row_text(row, "event_id") == Some(&user_event_id_b64))
+                    .map(|row| row_blob(row, "public_key").map(ToOwned::to_owned))
+                    .collect(),
+                malformed: false,
             },
         };
+        let context = normalize_admin_authority(&raw_rows, &admin.public_key);
         Ok(ProjectorDecisionContext {
-            admin_user_key_mismatch_reason,
+            admin_user_key_mismatch_reason: admin_authority_plan_to_mismatch_reason(
+                decide_admin_authority_plan(&context),
+            ),
             ..ProjectorDecisionContext::default()
         })
     }

@@ -105,6 +105,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_admin_rejects_wrong_signer_family_at_projection | break |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | projector_unit | event_modules::admin::projector::projector_tests::test_admin_valid_with_matching_user_binding | pass |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | pipeline_integration | apply::tests::identity::test_admin_rejects_public_key_that_does_not_match_user | break |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | pipeline_integration | apply::tests::identity::test_admin_rejects_malformed_user_public_key_at_projection | break |
 | SPEC_MSG_WORKSPACE_01 | InvMessageWorkspace | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::core_projection::test_project_message_valid | pass |
 | SPEC_MSG_WORKSPACE_01 | InvMessageWorkspace | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::core_projection::test_project_reaction_blocked | break |
 | SPEC_MSG_SIGNER_01 | InvSigner (message) | CHK_MSG_SIGNER_USER_MISMATCH | projector_unit | message_projector_tests::tests::test_message_rejects_signer_user_mismatch | break |

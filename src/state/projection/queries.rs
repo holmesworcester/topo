@@ -172,6 +172,47 @@ pub enum ContentAuthorityPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuthorityRawRows {
+    MissingCurrentSigner,
+    UnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    WorkspaceSigner {
+        user_event_id: String,
+        user_public_keys: Vec<Option<Vec<u8>>>,
+        malformed: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuthorityDecisionContext {
+    UniqueUserKey {
+        user_event_id: String,
+        user_public_key: Vec<u8>,
+        admin_public_key: Vec<u8>,
+    },
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    RejectMissingUser {
+        user_event_id: String,
+    },
+    RejectAmbiguousUser {
+        user_event_id: String,
+    },
+    RejectMalformedUserKey {
+        user_event_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuthorityPlan {
+    Ready,
+    Reject { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeletionSignerRawRows {
     MissingCurrentSigner,
     AdminSigner,
@@ -366,6 +407,64 @@ pub fn normalize_semantic_type(
     }
 }
 
+pub fn normalize_admin_authority(
+    raw_rows: &AdminAuthorityRawRows,
+    admin_public_key: &[u8; 32],
+) -> AdminAuthorityDecisionContext {
+    match raw_rows {
+        AdminAuthorityRawRows::MissingCurrentSigner => {
+            AdminAuthorityDecisionContext::RejectMissingCurrentSigner
+        }
+        AdminAuthorityRawRows::UnsupportedSignerType { semantic_type_code } => {
+            AdminAuthorityDecisionContext::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            }
+        }
+        AdminAuthorityRawRows::WorkspaceSigner {
+            user_event_id,
+            user_public_keys,
+            malformed,
+        } => {
+            if *malformed || event_id_from_base64(user_event_id).is_none() {
+                return AdminAuthorityDecisionContext::RejectMalformedUserKey {
+                    user_event_id: user_event_id.clone(),
+                };
+            }
+
+            let mut keys = Vec::with_capacity(user_public_keys.len());
+            for public_key in user_public_keys {
+                let Some(public_key) = public_key.as_ref() else {
+                    return AdminAuthorityDecisionContext::RejectMalformedUserKey {
+                        user_event_id: user_event_id.clone(),
+                    };
+                };
+                if public_key.len() != 32 {
+                    return AdminAuthorityDecisionContext::RejectMalformedUserKey {
+                        user_event_id: user_event_id.clone(),
+                    };
+                }
+                keys.push(public_key.clone());
+            }
+
+            keys.sort();
+            keys.dedup();
+            match keys.as_slice() {
+                [] => AdminAuthorityDecisionContext::RejectMissingUser {
+                    user_event_id: user_event_id.clone(),
+                },
+                [user_public_key] => AdminAuthorityDecisionContext::UniqueUserKey {
+                    user_event_id: user_event_id.clone(),
+                    user_public_key: user_public_key.clone(),
+                    admin_public_key: admin_public_key.to_vec(),
+                },
+                _ => AdminAuthorityDecisionContext::RejectAmbiguousUser {
+                    user_event_id: user_event_id.clone(),
+                },
+            }
+        }
+    }
+}
+
 pub fn normalize_deletion_signer(
     raw_rows: &DeletionSignerRawRows,
 ) -> DeletionSignerDecisionContext {
@@ -514,6 +613,62 @@ pub fn decide_semantic_type_plan(
                 field_name
             ),
         },
+    }
+}
+
+pub fn decide_admin_authority_plan(context: &AdminAuthorityDecisionContext) -> AdminAuthorityPlan {
+    match context {
+        AdminAuthorityDecisionContext::UniqueUserKey {
+            user_event_id: _,
+            user_public_key,
+            admin_public_key,
+        } if user_public_key == admin_public_key => AdminAuthorityPlan::Ready,
+        AdminAuthorityDecisionContext::UniqueUserKey {
+            user_event_id,
+            user_public_key: _,
+            admin_public_key: _,
+        } => AdminAuthorityPlan::Reject {
+            reason: format!(
+                "admin public_key does not match user public_key for {}",
+                user_event_id
+            ),
+        },
+        AdminAuthorityDecisionContext::RejectMissingCurrentSigner => AdminAuthorityPlan::Reject {
+            reason: "admin event missing current signer envelope".to_string(),
+        },
+        AdminAuthorityDecisionContext::RejectUnsupportedSignerType { semantic_type_code } => {
+            AdminAuthorityPlan::Reject {
+                reason: format!(
+                    "admin signer must be workspace, got semantic type {}",
+                    semantic_type_code
+                ),
+            }
+        }
+        AdminAuthorityDecisionContext::RejectMissingUser { user_event_id } => {
+            AdminAuthorityPlan::Reject {
+                reason: format!("no users row for user_event_id {}", user_event_id),
+            }
+        }
+        AdminAuthorityDecisionContext::RejectAmbiguousUser { user_event_id } => {
+            AdminAuthorityPlan::Reject {
+                reason: format!("ambiguous users rows for user_event_id {}", user_event_id),
+            }
+        }
+        AdminAuthorityDecisionContext::RejectMalformedUserKey { user_event_id } => {
+            AdminAuthorityPlan::Reject {
+                reason: format!(
+                    "user {} has invalid public_key length or type",
+                    user_event_id
+                ),
+            }
+        }
+    }
+}
+
+pub fn admin_authority_plan_to_mismatch_reason(plan: AdminAuthorityPlan) -> Option<String> {
+    match plan {
+        AdminAuthorityPlan::Ready => None,
+        AdminAuthorityPlan::Reject { reason } => Some(reason),
     }
 }
 
@@ -1163,6 +1318,46 @@ fn load_content_authority_raw_rows(
     })
 }
 
+fn load_admin_authority_raw_rows(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    admin: &AdminEvent,
+) -> rusqlite::Result<AdminAuthorityRawRows> {
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(AdminAuthorityRawRows::MissingCurrentSigner);
+    };
+    if current_signer.semantic_type_code != EVENT_TYPE_WORKSPACE {
+        return Ok(AdminAuthorityRawRows::UnsupportedSignerType {
+            semantic_type_code: current_signer.semantic_type_code,
+        });
+    }
+
+    let user_event_id = event_id_to_base64(&admin.user_event_id);
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT public_key
+         FROM users
+         WHERE recorded_by = ?1 AND event_id = ?2
+         ORDER BY public_key
+         LIMIT 2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![recorded_by, &user_event_id])?;
+    let mut user_public_keys = Vec::new();
+    let mut malformed = false;
+    while let Some(row) = rows.next()? {
+        match crate::db::sql_types::get_blob(row, 0) {
+            Ok(public_key) => user_public_keys.push(Some(public_key)),
+            Err(_) => malformed = true,
+        }
+    }
+
+    Ok(AdminAuthorityRawRows::WorkspaceSigner {
+        user_event_id,
+        user_public_keys,
+        malformed,
+    })
+}
+
 fn load_deletion_signer_raw_rows(
     conn: &Connection,
     frame: &ProjectionFrameContext,
@@ -1284,58 +1479,14 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         admin: &AdminEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let mut ctx = ProjectorDecisionContext::default();
-        match frame.current_signer.as_ref() {
-            Some(current_signer) if current_signer.semantic_type_code == EVENT_TYPE_WORKSPACE => {}
-            Some(current_signer) => {
-                return Ok(ProjectorDecisionContext {
-                    admin_user_key_mismatch_reason: Some(format!(
-                        "admin signer must be workspace, got semantic type {}",
-                        current_signer.semantic_type_code
-                    )),
-                    ..ProjectorDecisionContext::default()
-                });
-            }
-            None => {
-                return Ok(ProjectorDecisionContext {
-                    admin_user_key_mismatch_reason: Some(
-                        "admin event missing current signer envelope".to_string(),
-                    ),
-                    ..ProjectorDecisionContext::default()
-                });
-            }
-        }
-
-        let user_event_id_b64 = event_id_to_base64(&admin.user_event_id);
-        let user_public_key: Option<Vec<u8>> = self
-            .query_row(
-                "SELECT public_key FROM users WHERE recorded_by = ?1 AND event_id = ?2",
-                rusqlite::params![recorded_by, &user_event_id_b64],
-                |row| crate::db::sql_types::get_blob(row, 0),
-            )
-            .optional()?;
-
-        let admin_user_key_mismatch_reason = match user_public_key {
-            None => Some(format!(
-                "no users row for user_event_id {}",
-                user_event_id_b64
-            )),
-            Some(user_public_key) if user_public_key.len() != 32 => Some(format!(
-                "user {} has invalid public_key length {}",
-                user_event_id_b64,
-                user_public_key.len()
-            )),
-            Some(user_public_key) if user_public_key.as_slice() != admin.public_key => {
-                Some(format!(
-                    "admin public_key does not match user public_key for {}",
-                    user_event_id_b64
-                ))
-            }
-            Some(_) => None,
-        };
-
-        ctx.admin_user_key_mismatch_reason = admin_user_key_mismatch_reason;
-        Ok(ctx)
+        let raw_rows = load_admin_authority_raw_rows(self, frame, recorded_by, admin)?;
+        let context = normalize_admin_authority(&raw_rows, &admin.public_key);
+        Ok(ProjectorDecisionContext {
+            admin_user_key_mismatch_reason: admin_authority_plan_to_mismatch_reason(
+                decide_admin_authority_plan(&context),
+            ),
+            ..ProjectorDecisionContext::default()
+        })
     }
 
     fn load_peer_shared_context(
@@ -1857,6 +2008,17 @@ mod tests {
         }
     }
 
+    fn admin_authority_raw(
+        user_event_id: String,
+        user_public_keys: Vec<Option<Vec<u8>>>,
+    ) -> AdminAuthorityRawRows {
+        AdminAuthorityRawRows::WorkspaceSigner {
+            user_event_id,
+            user_public_keys,
+            malformed: false,
+        }
+    }
+
     fn deletion_signer_raw(
         signer_event_id: String,
         signer_user_ids: Vec<Option<String>>,
@@ -2056,6 +2218,110 @@ mod tests {
         assert!(matches!(
             decide_content_authority_plan(&context),
             ContentAuthorityPlan::Reject { reason } if reason.contains("must be peer_shared")
+        ));
+    }
+
+    #[test]
+    fn admin_authority_allows_matching_workspace_signed_user_key() {
+        let user_id = event_id_b64(1);
+        let admin_key = [2u8; 32];
+        let context = normalize_admin_authority(
+            &admin_authority_raw(user_id.clone(), vec![Some(admin_key.to_vec())]),
+            &admin_key,
+        );
+
+        assert_eq!(
+            context,
+            AdminAuthorityDecisionContext::UniqueUserKey {
+                user_event_id: user_id,
+                user_public_key: admin_key.to_vec(),
+                admin_public_key: admin_key.to_vec()
+            }
+        );
+        assert_eq!(
+            decide_admin_authority_plan(&context),
+            AdminAuthorityPlan::Ready
+        );
+    }
+
+    #[test]
+    fn admin_authority_rejects_missing_current_signer() {
+        let context =
+            normalize_admin_authority(&AdminAuthorityRawRows::MissingCurrentSigner, &[2u8; 32]);
+
+        assert!(matches!(
+            decide_admin_authority_plan(&context),
+            AdminAuthorityPlan::Reject { reason } if reason.contains("missing current signer")
+        ));
+    }
+
+    #[test]
+    fn admin_authority_rejects_unsupported_signer_type() {
+        let context = normalize_admin_authority(
+            &AdminAuthorityRawRows::UnsupportedSignerType {
+                semantic_type_code: EVENT_TYPE_PEER_SHARED,
+            },
+            &[2u8; 32],
+        );
+
+        assert!(matches!(
+            decide_admin_authority_plan(&context),
+            AdminAuthorityPlan::Reject { reason } if reason.contains("must be workspace")
+        ));
+    }
+
+    #[test]
+    fn admin_authority_rejects_missing_user_key() {
+        let context = normalize_admin_authority(
+            &admin_authority_raw(event_id_b64(1), Vec::new()),
+            &[2u8; 32],
+        );
+
+        assert!(matches!(
+            decide_admin_authority_plan(&context),
+            AdminAuthorityPlan::Reject { reason } if reason.contains("no users row")
+        ));
+    }
+
+    #[test]
+    fn admin_authority_rejects_mismatched_user_key() {
+        let context = normalize_admin_authority(
+            &admin_authority_raw(event_id_b64(1), vec![Some(vec![3u8; 32])]),
+            &[2u8; 32],
+        );
+
+        assert!(matches!(
+            decide_admin_authority_plan(&context),
+            AdminAuthorityPlan::Reject { reason } if reason.contains("does not match user public_key")
+        ));
+    }
+
+    #[test]
+    fn admin_authority_rejects_ambiguous_user_keys() {
+        let context = normalize_admin_authority(
+            &admin_authority_raw(
+                event_id_b64(1),
+                vec![Some(vec![2u8; 32]), Some(vec![3u8; 32])],
+            ),
+            &[2u8; 32],
+        );
+
+        assert!(matches!(
+            decide_admin_authority_plan(&context),
+            AdminAuthorityPlan::Reject { reason } if reason.contains("ambiguous")
+        ));
+    }
+
+    #[test]
+    fn admin_authority_rejects_malformed_user_key() {
+        let context = normalize_admin_authority(
+            &admin_authority_raw(event_id_b64(1), vec![Some(vec![2u8; 31])]),
+            &[2u8; 32],
+        );
+
+        assert!(matches!(
+            decide_admin_authority_plan(&context),
+            AdminAuthorityPlan::Reject { reason } if reason.contains("invalid public_key")
         ));
     }
 

@@ -813,6 +813,36 @@ fn test_admin_rejects_public_key_that_does_not_match_user() {
 }
 
 #[test]
+fn test_admin_rejects_malformed_user_public_key_at_projection() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
+    let (invite_eid, invite_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (user_eid, user_key) =
+        project_valid_user_from_invite(&conn, recorded_by, invite_eid, &invite_key, "alice");
+    let user_b64 = event_id_to_base64(&user_eid);
+
+    conn.execute(
+        "UPDATE users
+         SET public_key = ?1
+         WHERE recorded_by = ?2 AND event_id = ?3",
+        rusqlite::params![vec![0xBBu8; 31], recorded_by, &user_b64],
+    )
+    .unwrap();
+
+    let admin = ParsedEvent::Admin(crate::event_modules::AdminEvent {
+        created_at_ms: now_ms(),
+        public_key: user_key.verifying_key().to_bytes(),
+        user_event_id: user_eid,
+    });
+    let admin_blob = sign_blob(&workspace_key, &workspace_eid, &admin);
+
+    assert_projection_rejection_contains(&conn, recorded_by, &admin_blob, "invalid public_key");
+}
+
+#[test]
 fn test_peer_shared_rejects_bootstrap_user_mismatch() {
     let conn = setup();
     let recorded_by = "peer1";
