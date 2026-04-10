@@ -872,6 +872,65 @@ mod tests {
     }
 
     #[test]
+    fn connection_lost_classifier_accepts_transport_close_messages() {
+        for message in [
+            "connection lost during session open",
+            "closed by peer while authenticating",
+            "application closed by remote daemon",
+            "broken pipe while writing auth frame",
+            "reset by peer during range sync",
+        ] {
+            assert!(
+                is_connection_lost_message(message),
+                "expected transport-close classifier hit for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_lost_classifier_rejects_nontransport_failures() {
+        for message in [
+            "permission denied by remote peer",
+            "certificate mismatch for daemon fingerprint",
+            "session auth rejected by policy",
+        ] {
+            assert!(
+                !is_connection_lost_message(message),
+                "unexpected transport-close classifier hit for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_dial_classifier_accepts_unreachable_dial_errors() {
+        for err in [
+            ConnectionLifecycleError::Dial("timed out".to_string()),
+            ConnectionLifecycleError::Dial("connection refused".to_string()),
+            ConnectionLifecycleError::Dial("network is unreachable".to_string()),
+            ConnectionLifecycleError::Dial("no route to host".to_string()),
+        ] {
+            assert!(
+                is_stale_dial_failure(&err),
+                "expected stale dial classifier hit for: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_dial_classifier_rejects_nonstale_failures() {
+        for err in [
+            ConnectionLifecycleError::Dial("certificate mismatch".to_string()),
+            ConnectionLifecycleError::Accept("listener closed".to_string()),
+            ConnectionLifecycleError::MissingPeerIdentity,
+        ] {
+            assert!(
+                !is_stale_dial_failure(&err),
+                "unexpected stale dial classifier hit for: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn dial_failure_normalizer_preserves_raw_rows_for_planner() {
         let raw = DialFailureRawRows {
             has_connected_once: true,
