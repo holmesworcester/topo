@@ -834,6 +834,17 @@ pub enum SemanticTypePlan {
     Reject,
 }
 
+pub struct DepLoadDecisionContext {
+    pub purge_sensitive_dep_is_tombstoned: bool,
+    pub semantic_type_rows: SemanticTypeRows,
+}
+
+pub enum DepLoadPlan {
+    Purge,
+    SemanticRowsReady,
+    Missing,
+}
+
 pub open spec fn normalize_semantic_type(
     rows: SemanticTypeRows,
 ) -> SemanticTypeDecisionContext {
@@ -935,6 +946,100 @@ proof fn semantic_type_malformed_rows_reject()
     ensures
         decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::Malformed))
             == SemanticTypePlan::Reject,
+{
+}
+
+pub open spec fn decide_dep_load_plan(
+    context: DepLoadDecisionContext,
+) -> DepLoadPlan {
+    if context.purge_sensitive_dep_is_tombstoned {
+        DepLoadPlan::Purge
+    } else {
+        match context.semantic_type_rows {
+            SemanticTypeRows::Missing => DepLoadPlan::Missing,
+            SemanticTypeRows::UniqueKnown { .. }
+            | SemanticTypeRows::Ambiguous
+            | SemanticTypeRows::Malformed => DepLoadPlan::SemanticRowsReady,
+        }
+    }
+}
+
+proof fn dep_load_tombstone_precedes_missing_semantic()
+    ensures
+        decide_dep_load_plan(DepLoadDecisionContext {
+            purge_sensitive_dep_is_tombstoned: true,
+            semantic_type_rows: SemanticTypeRows::Missing,
+        }) == DepLoadPlan::Purge,
+{
+}
+
+proof fn dep_load_tombstone_precedes_unique_semantic()
+    ensures
+        decide_dep_load_plan(DepLoadDecisionContext {
+            purge_sensitive_dep_is_tombstoned: true,
+            semantic_type_rows: SemanticTypeRows::UniqueKnown {
+                type_check_required: true,
+                code_present: true,
+                code_in_range: true,
+                allowed_by_dep_field: true,
+            },
+        }) == DepLoadPlan::Purge,
+{
+}
+
+proof fn dep_load_tombstone_precedes_ambiguous_semantic()
+    ensures
+        decide_dep_load_plan(DepLoadDecisionContext {
+            purge_sensitive_dep_is_tombstoned: true,
+            semantic_type_rows: SemanticTypeRows::Ambiguous,
+        }) == DepLoadPlan::Purge,
+{
+}
+
+proof fn dep_load_tombstone_precedes_malformed_semantic()
+    ensures
+        decide_dep_load_plan(DepLoadDecisionContext {
+            purge_sensitive_dep_is_tombstoned: true,
+            semantic_type_rows: SemanticTypeRows::Malformed,
+        }) == DepLoadPlan::Purge,
+{
+}
+
+proof fn dep_load_tombstone_noninterference_with_semantic_rows(
+    rows_a: SemanticTypeRows,
+    rows_b: SemanticTypeRows,
+)
+    ensures
+        decide_dep_load_plan(DepLoadDecisionContext {
+            purge_sensitive_dep_is_tombstoned: true,
+            semantic_type_rows: rows_a,
+        }) == decide_dep_load_plan(DepLoadDecisionContext {
+            purge_sensitive_dep_is_tombstoned: true,
+            semantic_type_rows: rows_b,
+        }),
+{
+}
+
+proof fn dep_load_missing_without_tombstone()
+    ensures
+        decide_dep_load_plan(DepLoadDecisionContext {
+            purge_sensitive_dep_is_tombstoned: false,
+            semantic_type_rows: SemanticTypeRows::Missing,
+        }) == DepLoadPlan::Missing,
+{
+}
+
+proof fn dep_load_unique_semantic_ready_without_tombstone()
+    ensures
+        decide_dep_load_plan(DepLoadDecisionContext {
+            purge_sensitive_dep_is_tombstoned: false,
+            semantic_type_rows: SemanticTypeRows::UniqueKnown {
+                type_check_required: true,
+                code_present: true,
+                code_in_range: true,
+                allowed_by_dep_field: true,
+            },
+        }) == DepLoadPlan::SemanticRowsReady,
 {
 }
 

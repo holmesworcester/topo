@@ -326,6 +326,12 @@ pub enum SemanticTypePlan {
     Reject { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepLoadDecisionContext {
+    pub deleted_message_purge: Option<String>,
+    pub semantic_type_rows: SemanticTypeRawRows,
+}
+
 pub fn normalize_workspace_acceptance(
     raw_rows: &WorkspaceAcceptedRawRows,
 ) -> WorkspaceDecisionContext {
@@ -709,6 +715,18 @@ pub fn decide_semantic_type_plan(
             ),
         },
     }
+}
+
+pub fn decide_dep_load_plan(context: &DepLoadDecisionContext) -> DepLoadResult {
+    if let Some(message_event_id) = &context.deleted_message_purge {
+        return DepLoadResult::purge(message_event_id.clone());
+    }
+    if context.semantic_type_rows != SemanticTypeRawRows::Missing {
+        return DepLoadResult::Ready {
+            semantic_type_rows: context.semantic_type_rows.clone(),
+        };
+    }
+    DepLoadResult::missing()
 }
 
 pub fn decide_admin_authority_plan(context: &AdminAuthorityDecisionContext) -> AdminAuthorityPlan {
@@ -1549,17 +1567,18 @@ impl ProjectionQueries for Connection {
         dep_id: &EventId,
     ) -> ProjectionQueryResult<DepLoadResult> {
         let dep_b64 = event_id_to_base64(dep_id);
-        // For purge-sensitive dependents, tombstone state wins over semantic readiness.
-        if let Some(message_event_id) =
-            deleted_message_purges_dep(self, recorded_by, parsed, field_name, &dep_b64)?
-        {
-            return Ok(DepLoadResult::purge(message_event_id));
-        }
-        let semantic_type_rows = load_semantic_type_raw_rows(self, recorded_by, &dep_b64)?;
-        if semantic_type_rows != SemanticTypeRawRows::Missing {
-            return Ok(DepLoadResult::Ready { semantic_type_rows });
-        }
-        Ok(DepLoadResult::missing())
+        let deleted_message_purge =
+            deleted_message_purges_dep(self, recorded_by, parsed, field_name, &dep_b64)?;
+        let semantic_type_rows = if deleted_message_purge.is_some() {
+            SemanticTypeRawRows::Missing
+        } else {
+            load_semantic_type_raw_rows(self, recorded_by, &dep_b64)?
+        };
+
+        Ok(decide_dep_load_plan(&DepLoadDecisionContext {
+            deleted_message_purge,
+            semantic_type_rows,
+        }))
     }
 
     fn load_key_secret_bytes(
@@ -2744,5 +2763,58 @@ mod tests {
             decide_semantic_type_plan(&context, "target_event_id"),
             SemanticTypePlan::Reject { reason } if reason.contains("malformed")
         ));
+    }
+
+    #[test]
+    fn dep_load_plan_tombstone_wins_over_all_semantic_rows() {
+        let semantic_rows = [
+            SemanticTypeRawRows::Missing,
+            SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: Some(i64::from(EVENT_TYPE_MESSAGE)),
+            },
+            SemanticTypeRawRows::UniqueKnown {
+                semantic_type_code: None,
+            },
+            SemanticTypeRawRows::Ambiguous,
+            SemanticTypeRawRows::Malformed,
+        ];
+
+        for semantic_type_rows in semantic_rows {
+            assert_eq!(
+                decide_dep_load_plan(&DepLoadDecisionContext {
+                    deleted_message_purge: Some("deleted-message".to_string()),
+                    semantic_type_rows,
+                }),
+                DepLoadResult::Purge {
+                    message_event_id: "deleted-message".to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn dep_load_plan_uses_semantic_rows_when_not_tombstoned() {
+        let semantic_type_rows = SemanticTypeRawRows::UniqueKnown {
+            semantic_type_code: Some(i64::from(EVENT_TYPE_MESSAGE)),
+        };
+
+        assert_eq!(
+            decide_dep_load_plan(&DepLoadDecisionContext {
+                deleted_message_purge: None,
+                semantic_type_rows: semantic_type_rows.clone(),
+            }),
+            DepLoadResult::Ready { semantic_type_rows }
+        );
+    }
+
+    #[test]
+    fn dep_load_plan_missing_when_not_tombstoned_and_semantic_missing() {
+        assert_eq!(
+            decide_dep_load_plan(&DepLoadDecisionContext {
+                deleted_message_purge: None,
+                semantic_type_rows: SemanticTypeRawRows::Missing,
+            }),
+            DepLoadResult::Missing
+        );
     }
 }
