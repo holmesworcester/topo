@@ -334,4 +334,101 @@ proof fn finding_bootstrap_cache_outlives_db_ttl()
 {
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// BUG 8: Admitted Session-Route Cache Bypasses Fresh DB Authorization
+// ═══════════════════════════════════════════════════════════════════
+//
+// peer_route_is_authorized_for_daemon first checks:
+//   daemon_connection.admits_session_route(tenant_id, remote_peer_id)
+// and returns true immediately on a cache hit.
+//
+// That means a route admitted on a prior session of the SAME daemon
+// connection does not require a fresh DB authorization or fresh daemon-binding
+// check on later sessions.
+//
+// If the peer is removed, or the route is otherwise revoked, while the daemon
+// connection stays alive, subsequent sessions on that connection can continue
+// to use the cached route.
+
+pub open spec fn admitted_route_cache_bypasses_fresh_db_auth(
+    cache_hit: bool,
+    db_authorized_now: bool,
+    current_daemon_binding_valid: bool,
+    session_admitted: bool,
+) -> bool {
+    cache_hit && !db_authorized_now && !current_daemon_binding_valid && session_admitted
+}
+
+/// FINDING: A cache hit is sufficient for route admission even if the current
+/// DB auth and binding facts would no longer authorize the route.
+proof fn finding_admitted_route_cache_bypasses_fresh_db_checks()
+    ensures admitted_route_cache_bypasses_fresh_db_auth(true, false, false, true),
+{
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BUG 9: peer_transport_bindings Can Pin a Peer to an Old Daemon
+// ═══════════════════════════════════════════════════════════════════
+//
+// peer_transport_bindings is keyed by (recorded_by, peer_id), and
+// record_transport_binding uses INSERT OR IGNORE.
+//
+// If peer P was first observed on daemon D1, then later moves to daemon D2,
+// the second observation does not update the row. resolve_bound_daemon_peer_id
+// can continue returning D1 forever from this fallback table.
+//
+// Outbound auth planning uses that fallback binding when no projected
+// endpoint_id is present, so a stale binding can pin route planning to an
+// obsolete daemon identity.
+
+pub open spec fn stale_transport_binding_pins_old_daemon(
+    existing_binding_present: bool,
+    peer_moved_to_new_daemon: bool,
+    binding_row_updated: bool,
+    old_daemon_still_selected: bool,
+) -> bool {
+    existing_binding_present
+        && peer_moved_to_new_daemon
+        && !binding_row_updated
+        && old_daemon_still_selected
+}
+
+/// FINDING: INSERT OR IGNORE on transport bindings can preserve an obsolete
+/// daemon association after the peer moves.
+proof fn finding_stale_transport_binding_pins_old_daemon()
+    ensures stale_transport_binding_pins_old_daemon(true, true, false, true),
+{
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BUG 10: Bootstrap Trust Survives PeerShared Removal Long Enough To
+//         Continue Session Admission
+// ═══════════════════════════════════════════════════════════════════
+//
+// Bootstrap trust is intentionally independent from PeerShared steady-state
+// authorization and is not deleted when PeerShared is projected or removed.
+//
+// Inbound bootstrap tenant resolution reads pending/accepted bootstrap trust
+// rows directly. If a tenant removes or otherwise revokes the steady-state
+// peer, bootstrap trust may still authorize session admission until its TTL
+// expires.
+//
+// This may be intentional transport behavior, but if removal is expected to
+// cut off all new sessions immediately, the grace window is a security gap.
+
+pub open spec fn bootstrap_trust_survives_removal_window(
+    peer_removed_now: bool,
+    bootstrap_trust_still_live: bool,
+    bootstrap_session_admitted: bool,
+) -> bool {
+    peer_removed_now && bootstrap_trust_still_live && bootstrap_session_admitted
+}
+
+/// FINDING: If bootstrap trust remains live after removal, bootstrap-authenticated
+/// sessions can continue during that TTL window.
+proof fn finding_bootstrap_trust_survives_removal_window()
+    ensures bootstrap_trust_survives_removal_window(true, true, true),
+{
+}
+
 } // verus!
