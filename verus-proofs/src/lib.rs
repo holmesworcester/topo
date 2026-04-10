@@ -10,6 +10,7 @@ use vstd::prelude::*;
 pub mod pipeline;
 pub mod runtime;
 pub mod state;
+pub mod composition;
 
 // Bug-hunting proofs
 pub mod bug_hunt;
