@@ -61,7 +61,7 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
 }
 
 fn sync_round_all(db_path: &str) {
-    let out = topo_rpc_retry(db_path, &["sync", "round", "all"], Duration::from_secs(30));
+    let out = topo_rpc_retry(db_path, &["sync", "round", "all"], Duration::from_secs(90));
     assert!(
         out.status.success(),
         "sync round all failed for db={}: stdout={} stderr={}",

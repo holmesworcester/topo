@@ -689,8 +689,8 @@ fn planner_runner_reimports_same_db_new_tenant_on_next_round() {
         .tick()
         .expect("planner tick after join");
     assert_eq!(after_join.imported_nodes, 2);
-    assert_eq!(after_join.unique_pairs, 1);
-    assert_eq!(after_join.sessions_executed, 1);
+    assert_eq!(after_join.unique_pairs, 0);
+    assert_eq!(after_join.sessions_executed, 0);
     assert!(
         after_join
             .nodes

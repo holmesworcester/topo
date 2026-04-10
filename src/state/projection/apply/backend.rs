@@ -101,7 +101,7 @@ fn collect_associated_key_shared_dep_ids(
             recorded_by,
             crate::crypto::event_id_to_base64(&key_event_id)
         ],
-        |row| row.get::<_, String>(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )?;
     let mut dep_ids = Vec::new();
     for row in rows {
@@ -132,7 +132,7 @@ fn persist_shared_dep_edges(
              WHERE event_id = ?1
                AND share_scope = 'shared'",
             rusqlite::params![event_id_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .optional()?;
     let Some(outer_blob) = outer_blob else {
@@ -234,7 +234,7 @@ impl ProjectionBackend for Connection {
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![event_id_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .map(Some)
             .or_else(|err| match err {

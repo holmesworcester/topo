@@ -14,6 +14,13 @@ When creating instructions for an assistant in this repo:
 2. Include explicit tests/checks that prove each SC is satisfied.
 3. Include end-to-end validation checks showing all delivered functionality works as expected, not only SC-specific checks.
 
+## Test Surface Preference
+
+Prefer CLI end-to-end tests for new user-visible or runtime behavior. When a
+test needs data that is not available through the CLI/RPC surface, add a
+first-class daemon/CLI observability or query surface instead of reaching into
+internal SQL tables from the test.
+
 ## Model Conformance Gate
 
 When changing event schemas, signer-family rules, dependency checks, projector

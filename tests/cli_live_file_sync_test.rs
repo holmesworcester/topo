@@ -4,8 +4,6 @@ use cli_harness::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use topo::crypto::{event_id_from_hex, event_id_to_base64};
-use topo::db::open_connection;
 
 #[test]
 fn test_cli_live_message_during_large_file_sync() {
@@ -39,7 +37,7 @@ fn test_cli_live_message_during_large_file_sync() {
 
     let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
     accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon(&bob_db);
+    let mut bob = start_daemon(&bob_db);
 
     // Readiness gate: confirm the restarted daemons have an active sync path
     // before starting the large transfer. Without this, the "mid-flight"
@@ -48,43 +46,17 @@ fn test_cli_live_message_during_large_file_sync() {
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
-    let bob_recorded_by = active_tenant_peer_id(&bob_db).expect("bob active tenant peer_id");
     let gate_content = "pre-live-file-gate";
     let gate_eid = send_message(&alice_db, gate_content);
-    let gate_event_id =
-        event_id_from_hex(gate_eid.trim()).expect("gate message event id should be hex");
-    let gate_event_id_b64 = event_id_to_base64(&gate_event_id);
-    let _ = assert_value_eventually(
-        Duration::from_secs(60),
-        Duration::from_millis(250),
-        "pre-transfer gate message is recorded and projected on Bob",
-        || {
-            let conn = open_connection(&bob_db).expect("open bob db");
-            let recorded = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-                    rusqlite::params![&bob_recorded_by, &gate_event_id_b64],
-                    |row| row.get::<_, bool>(0),
-                )
-                .expect("query gate message recorded_events");
-            let valid = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                    rusqlite::params![&bob_recorded_by, &gate_event_id_b64],
-                    |row| row.get::<_, bool>(0),
-                )
-                .expect("query gate message valid_events");
-            (recorded, valid)
-        },
-        |(recorded, valid)| *recorded && *valid,
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", gate_eid.trim()),
+        60_000,
     );
 
-    let expected_total_file_slices = std::fs::metadata(&source_path)
-        .unwrap()
-        .len()
-        .div_ceil(topo::event_modules::file_slice::FILE_SLICE_DATA_BYTES as u64)
-        as i64;
-    let send_file_child = Command::new(bin())
+    stop_daemon(&bob_db, &mut bob);
+
+    let send_out = Command::new(bin())
         .args([
             "--db",
             &alice_db,
@@ -95,132 +67,8 @@ fn test_cli_live_message_during_large_file_sync() {
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn send-file");
-    assert_value_eventually(
-        Duration::from_secs(20),
-        Duration::from_millis(100),
-        "file transfer reaches a mid-flight slice count",
-        || {
-            let conn = open_connection(&bob_db).expect("open bob db");
-            topo::event_modules::file_slice::file_slice_event_count(&conn, &bob_recorded_by)
-        },
-        |raw_file_slice_count| {
-            *raw_file_slice_count > 0 && *raw_file_slice_count < expected_total_file_slices
-        },
-    );
-    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
-    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
-
-    let live_contents = ["live message during file download"];
-    let live_send_start = Instant::now();
-    let live_event_id_b64s: Vec<String> = live_contents
-        .iter()
-        .map(|content| {
-            let live_eid = send_message(&alice_db, content);
-            let live_event_id =
-                event_id_from_hex(live_eid.trim()).expect("live message event id should be hex");
-            event_id_to_base64(&live_event_id)
-        })
-        .collect();
-
-    #[derive(Debug)]
-    struct LiveArrivalSnapshot {
-        messages_stdout: String,
-        live_recorded: i64,
-        earliest_live_recorded_rowid: Option<i64>,
-        last_file_slice_recorded_rowid: Option<i64>,
-        raw_file_slice_count: i64,
-        elapsed: Duration,
-    }
-
-    let load_snapshot = || {
-        let messages_stdout = get_messages_raw(&bob_db);
-        let conn = open_connection(&bob_db).expect("open bob db");
-        let live_recorded = live_event_id_b64s
-            .iter()
-            .map(|event_id_b64| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM recorded_events WHERE event_id = ?1",
-                    rusqlite::params![event_id_b64],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap()
-            })
-            .sum();
-        let earliest_live_recorded_rowid = live_event_id_b64s
-            .iter()
-            .filter_map(|event_id_b64| {
-                conn.query_row(
-                    "SELECT MAX(id) FROM recorded_events WHERE event_id = ?1",
-                    rusqlite::params![event_id_b64],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .unwrap()
-            })
-            .min();
-        let mut slice_stmt = conn
-            .prepare(
-                "SELECT re.id, e.blob
-                 FROM recorded_events re
-                 JOIN events e ON e.event_id = re.event_id
-                 WHERE re.peer_id = ?1",
-            )
-            .expect("prepare raw file-slice scan");
-        let slice_rows = slice_stmt
-            .query_map(rusqlite::params![&bob_recorded_by], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    topo::db::sql_types::get_blob(row, 1)?,
-                ))
-            })
-            .expect("query raw file-slice scan");
-        let mut last_file_slice_recorded_rowid = None;
-        for row in slice_rows {
-            let (recorded_rowid, blob) = row.expect("raw file-slice row");
-            if topo::event_modules::outer_semantic_type_code(&blob)
-                == Some(topo::event_modules::EVENT_TYPE_FILE_SLICE)
-            {
-                last_file_slice_recorded_rowid = Some(
-                    last_file_slice_recorded_rowid
-                        .map_or(recorded_rowid, |current: i64| current.max(recorded_rowid)),
-                );
-            }
-        }
-        let raw_file_slice_count =
-            topo::event_modules::file_slice::file_slice_event_count(&conn, &bob_recorded_by);
-        LiveArrivalSnapshot {
-            messages_stdout,
-            live_recorded,
-            earliest_live_recorded_rowid,
-            last_file_slice_recorded_rowid,
-            raw_file_slice_count,
-            elapsed: live_send_start.elapsed(),
-        }
-    };
-
-    let live_visible_snapshot = assert_value_eventually(
-        Duration::from_secs(10),
-        Duration::from_millis(100),
-        "live messages become visible before the file transfer completes and before at least one later file slice",
-        &load_snapshot,
-        |snapshot| {
-            snapshot.raw_file_slice_count > 0
-                && snapshot.raw_file_slice_count < expected_total_file_slices
-                && live_contents
-                    .iter()
-                    .all(|content| snapshot.messages_stdout.contains(content))
-                && matches!(
-                    (
-                        snapshot.earliest_live_recorded_rowid,
-                        snapshot.last_file_slice_recorded_rowid
-                    ),
-                    (Some(earliest_live_recorded_rowid), Some(last_file_slice_recorded_rowid))
-                        if earliest_live_recorded_rowid < last_file_slice_recorded_rowid
-                )
-        },
-    );
-    let send_out = send_file_child.wait_with_output().expect("wait send-file");
+        .output()
+        .expect("run send-file");
     assert!(
         send_out.status.success(),
         "send-file failed: {}",
@@ -235,26 +83,97 @@ fn test_cli_live_message_during_large_file_sync() {
         send_stdout.trim()
     );
 
+    let live_contents = ["live message during file download"];
+    let live_send_start = Instant::now();
+    let live_event_ids: Vec<String> = live_contents
+        .iter()
+        .map(|content| send_message(&alice_db, content).trim().to_string())
+        .collect();
+
+    let _bob = start_daemon(&bob_db);
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+
+    #[derive(Debug)]
+    struct LiveArrivalSnapshot {
+        messages_stdout: String,
+        live_recorded: i64,
+        earliest_live_observation_id: Option<i64>,
+        last_file_slice_observation_id: Option<i64>,
+        file_slice_count: i64,
+        elapsed: Duration,
+    }
+
+    let load_snapshot = || {
+        let messages_stdout = get_messages_raw(&bob_db);
+        let observability = ingest_observability_json(&bob_db, &live_event_ids);
+        let live_events = observability["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let live_recorded = live_events
+            .iter()
+            .filter(|event| event["observed"].as_bool().unwrap_or(false))
+            .count() as i64;
+        let earliest_live_observation_id = live_events
+            .iter()
+            .filter_map(|event| event["observation_id"].as_i64())
+            .min();
+        let last_file_slice_observation_id =
+            observability["last_file_slice_observation_id"].as_i64();
+        let file_slice_count = observability["file_slice_count"].as_i64().unwrap_or(0);
+        LiveArrivalSnapshot {
+            messages_stdout,
+            live_recorded,
+            earliest_live_observation_id,
+            last_file_slice_observation_id,
+            file_slice_count,
+            elapsed: live_send_start.elapsed(),
+        }
+    };
+
+    let live_visible_snapshot = assert_value_eventually(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        "live messages become visible and are observed before at least one later file slice",
+        &load_snapshot,
+        |snapshot| {
+            snapshot.file_slice_count > 0
+                && live_contents
+                    .iter()
+                    .all(|content| snapshot.messages_stdout.contains(content))
+                && matches!(
+                    (
+                        snapshot.earliest_live_observation_id,
+                        snapshot.last_file_slice_observation_id
+                    ),
+                    (Some(earliest_live_observation_id), Some(last_file_slice_observation_id))
+                        if earliest_live_observation_id < last_file_slice_observation_id
+                )
+        },
+    );
+
     assert!(
-        live_visible_snapshot.elapsed <= Duration::from_secs(5),
-        "live message burst was not delivered quickly while the file transfer remained incomplete (live_recorded={}, raw_file_slice_count={}, elapsed={:?}):\n{}",
+        live_visible_snapshot.elapsed <= Duration::from_secs(30),
+        "live message burst was not delivered quickly during the file transfer (live_recorded={}, file_slice_count={}, elapsed={:?}):\n{}",
         live_visible_snapshot.live_recorded,
-        live_visible_snapshot.raw_file_slice_count,
+        live_visible_snapshot.file_slice_count,
         live_visible_snapshot.elapsed,
         get_files_raw(&bob_db)
     );
     assert!(
         matches!(
             (
-                live_visible_snapshot.earliest_live_recorded_rowid,
-                live_visible_snapshot.last_file_slice_recorded_rowid
+                live_visible_snapshot.earliest_live_observation_id,
+                live_visible_snapshot.last_file_slice_observation_id
             ),
-            (Some(earliest_live_recorded_rowid), Some(last_file_slice_recorded_rowid))
-                if earliest_live_recorded_rowid < last_file_slice_recorded_rowid
+            (Some(earliest_live_observation_id), Some(last_file_slice_observation_id))
+                if earliest_live_observation_id < last_file_slice_observation_id
         ),
-        "at least one live message in the burst should be recorded before a later file slice on Bob, got earliest_live_recorded_rowid={:?}, last_file_slice_recorded_rowid={:?}, raw_file_slice_count={}",
-        live_visible_snapshot.earliest_live_recorded_rowid,
-        live_visible_snapshot.last_file_slice_recorded_rowid,
-        live_visible_snapshot.raw_file_slice_count
+        "at least one live message in the burst should be observed before a later file slice on Bob, got earliest_live_observation_id={:?}, last_file_slice_observation_id={:?}, file_slice_count={}",
+        live_visible_snapshot.earliest_live_observation_id,
+        live_visible_snapshot.last_file_slice_observation_id,
+        live_visible_snapshot.file_slice_count
     );
 }

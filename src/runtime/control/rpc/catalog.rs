@@ -389,6 +389,12 @@ static CATALOG: &[MethodInfo] = &[
         params: PARAM_NONE,
         example_json: r#"{"type":"Connections"}"#,
     },
+    MethodInfo {
+        name: "IngestObservability",
+        purpose: "Return persisted ingest observability for the active peer",
+        params: params!["event_ids", "string[]", false, Some("[]")],
+        example_json: r#"{"type":"IngestObservability","event_ids":["<event-id>"]}"#,
+    },
     #[cfg(feature = "discovery")]
     MethodInfo {
         name: "Discover",

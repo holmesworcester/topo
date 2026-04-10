@@ -2485,6 +2485,8 @@ pub fn is_transient_rpc_startup_error(stderr: &str) -> bool {
         || stderr.contains("no identity — run `topo create-workspace` first")
         || stderr.contains("workspace has not completed initial sync yet")
         || stderr.contains("no active tenant — run `topo tenant use <N>`")
+        || stderr.contains("no live sessions")
+        || stderr.contains("timeout waiting for round reply")
         || stderr.contains("blocked on")
 }
 
@@ -2921,6 +2923,48 @@ pub fn stats_json(db: &str) -> serde_json::Value {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str(stdout.trim()).expect("failed to parse stats JSON")
+}
+
+/// Run `topo observability ingest --json` and parse the result as a JSON Value.
+pub fn ingest_observability_json(db: &str, event_ids: &[String]) -> serde_json::Value {
+    let mut args = vec![
+        "--db".to_string(),
+        db.to_string(),
+        "observability".to_string(),
+        "ingest".to_string(),
+        "--json".to_string(),
+    ];
+    for event_id in event_ids {
+        args.push("--event".to_string());
+        args.push(event_id.clone());
+    }
+    let out = Command::new(bin())
+        .args(args)
+        .output()
+        .expect("failed to run topo observability ingest --json");
+    assert!(
+        out.status.success(),
+        "topo observability ingest --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).expect("failed to parse observability ingest JSON")
+}
+
+/// Run `topo sync-log --json --all` and parse the result as a JSON Value.
+pub fn sync_log_json(db: &str, limit: usize) -> serde_json::Value {
+    let limit = limit.to_string();
+    let out = Command::new(bin())
+        .args(["--db", db, "sync-log", "--json", "--all", "--limit", &limit])
+        .output()
+        .expect("failed to run topo sync-log --json");
+    assert!(
+        out.status.success(),
+        "topo sync-log --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).expect("failed to parse sync-log JSON")
 }
 
 /// Run all 4 replay passes and assert fingerprints match.

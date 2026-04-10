@@ -274,6 +274,9 @@ fn rpc_all_methods_serialize() {
         RpcMethod::SubState {
             subscription_id: "sub_1".into(),
         },
+        RpcMethod::IngestObservability {
+            event_ids: vec!["event".into()],
+        },
     ];
 
     for method in methods {
@@ -2180,6 +2183,7 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "Stats",
         "Replay",
         "Connections",
+        "IngestObservability",
     ];
     #[cfg(feature = "discovery")]
     known_methods.push("Discover");

@@ -103,9 +103,8 @@ fn load_shared_sync_entries(
             .ts_max_exclusive()
             .unwrap_or_else(crate::db::queue::current_timestamp_ms);
         let week_starts = week_starts_for_window(range, now_ms);
-        for (created_at_ms, event_id) in
-            list_hot_week_dep_entries(conn, workspace_id, &week_starts)
-                .map_err(|e| format!("load hot week dep entries: {e}"))?
+        for (created_at_ms, event_id) in list_hot_week_dep_entries(conn, workspace_id, &week_starts)
+            .map_err(|e| format!("load hot week dep entries: {e}"))?
         {
             if seen.insert(event_id) {
                 entries.push((created_at_ms, event_id));
@@ -427,8 +426,8 @@ mod tests {
     use super::*;
     use crate::contracts::event_pipeline_contract::IngestItem;
     use crate::crypto::hash_event;
-    use crate::db::queue::current_timestamp_ms;
     use crate::db::dep_index::replace_shared_event_deps;
+    use crate::db::queue::current_timestamp_ms;
     use crate::db::schema::create_tables;
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
     use crate::db::{open_connection, open_in_memory};

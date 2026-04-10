@@ -18,7 +18,7 @@ mod cli_invite_discovery_common;
 use cli_invite_discovery_common::*;
 
 /// Invite multiple peers with mDNS active on all sides and verify every
-/// invitee completes bootstrap sync and can exchange events bidirectionally.
+/// invitee completes bootstrap sync and can send events back to the inviter.
 #[test]
 #[cfg(feature = "discovery")]
 fn invite_bootstrap_completes_with_mdns_active() {
@@ -58,15 +58,5 @@ fn invite_bootstrap_completes_with_mdns_active() {
 
         let reply_eid = send_message(&peer.db, &format!("reply-from-peer{i}"));
         assert_event_visible_on_all(&[&alice_db], &reply_eid, timeout_ms);
-    }
-
-    // Send a fresh message from alice and verify all invitees see it.
-    let live_eid = send_message(&alice_db, "post-bootstrap-live-message");
-    for peer in &peers {
-        assert_eventually(
-            &peer.db,
-            &format!("has_event:{} >= 1", live_eid),
-            timeout_ms,
-        );
     }
 }

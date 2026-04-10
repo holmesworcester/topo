@@ -7,19 +7,14 @@
 
 use std::time::Instant;
 
-use ed25519_dalek::SigningKey;
-use rusqlite::Connection;
-use tempfile::NamedTempFile;
-use topo::crypto::{event_id_to_base64, hash_event, EventId};
-use topo::db::{open_connection, schema::create_tables};
+use topo::crypto::event_id_to_base64;
+use topo::db::open_connection;
 use topo::event_modules::{
-    self as events,
     file_slice::{FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES},
-    FileEvent, FileSliceEvent, KeySecretEvent, MessageEvent, ParsedEvent, PeerSharedEvent,
-    UserEvent, WorkspaceEvent,
+    FileEvent, FileSliceEvent, ParsedEvent,
 };
-use topo::projection::apply::project_one;
 use topo::projection::create::create_encrypted_event_synchronous;
+use topo::testutil::Peer;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -28,156 +23,20 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn setup() -> (Connection, NamedTempFile) {
-    let tmp = NamedTempFile::new().unwrap();
-    let conn = open_connection(tmp.path()).unwrap();
-    create_tables(&conn).unwrap();
-    (conn, tmp)
-}
-
-/// Insert a blob into events + optional shared_event_index + recorded_events.
-fn insert_event_raw(
-    conn: &Connection,
-    recorded_by: &str,
-    blob: &[u8],
-    workspace_id: Option<&str>,
-) -> EventId {
-    let event_id = hash_event(blob);
-    let event_id_b64 = event_id_to_base64(&event_id);
-    let ts = now_ms();
-    let type_code = blob[0];
-    let meta = events::registry()
-        .lookup(type_code)
-        .expect("unknown event type for raw insert");
-
-    conn.execute(
-        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            &event_id_b64,
-            meta.type_name,
-            blob,
-            meta.share_scope.as_str(),
-            ts as i64,
-            ts as i64
-        ],
-    )
-    .unwrap();
-    if meta.share_scope == events::ShareScope::Shared {
-        let ws_id = if meta.type_name == "workspace" {
-            event_id_b64.as_str()
-        } else {
-            workspace_id.expect("shared event insert requires workspace_id")
-        };
-        conn.execute(
-            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
-            rusqlite::params![ws_id, ts as i64, event_id.as_slice()],
-        )
-        .unwrap();
-    }
-    conn.execute(
-        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-         VALUES (?1, ?2, ?3, 'test')",
-        rusqlite::params![recorded_by, &event_id_b64, ts as i64],
-    )
-    .unwrap();
-
-    event_id
-}
-
-/// Bootstrap a minimal workspace bootstrap path. Returns
-/// (peer_shared_id, peer_shared_key, user_id, workspace_id).
-fn make_identity_chain(
-    conn: &Connection,
-    recorded_by: &str,
-) -> (EventId, SigningKey, EventId, EventId) {
-    let mut rng = rand::thread_rng();
-
-    let workspace_key = SigningKey::generate(&mut rng);
-    let net = ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms: now_ms(),
-        public_key: workspace_key.verifying_key().to_bytes(),
-        name: "bench".to_string(),
-    });
-    let net_blob = events::encode_event(&net).unwrap();
-    let net_eid = hash_event(&net_blob);
-    let workspace_id_b64 = event_id_to_base64(&net_eid);
-    let net_eid = insert_event_raw(conn, recorded_by, &net_blob, Some(&workspace_id_b64));
-    let workspace_id = net_eid;
-
-    let user_key = SigningKey::generate(&mut rng);
-    let ub = ParsedEvent::User(UserEvent {
-        created_at_ms: now_ms(),
-        public_key: user_key.verifying_key().to_bytes(),
-        username: "bench-user".to_string(),
-    });
-    let ub_blob = events::encode_event(&ub).unwrap();
-    let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob, Some(&workspace_id_b64));
-    project_one(conn, recorded_by, &ub_eid).unwrap();
-
-    let endpoint_key = SigningKey::generate(&mut rng);
-    let endpoint_event = topo::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
-        endpoint_key.to_bytes(),
-    );
-    let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
-    let endpoint_blob = events::encode_event(&endpoint_event).unwrap();
-    let endpoint_eid =
-        insert_event_raw(conn, &endpoint_id, &endpoint_blob, Some(&workspace_id_b64));
-    project_one(conn, &endpoint_id, &endpoint_eid).unwrap();
-
-    let peer_shared_key = SigningKey::generate(&mut rng);
-    let psf = ParsedEvent::PeerShared(PeerSharedEvent {
-        created_at_ms: now_ms(),
-        public_key: peer_shared_key.verifying_key().to_bytes(),
-        user_event_id: ub_eid,
-        endpoint_shared_event_id: endpoint_eid,
-        device_name: "bench-device".to_string(),
-    });
-    let psf_blob = events::encode_event(&psf).unwrap();
-    let psf_eid = insert_event_raw(conn, recorded_by, &psf_blob, Some(&workspace_id_b64));
-    project_one(conn, recorded_by, &psf_eid).unwrap();
-
-    (psf_eid, peer_shared_key, ub_eid, workspace_id)
-}
-
-/// Create prerequisite events (identity chain, signed message, secret key) and return IDs + signing key.
-fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, EventId, SigningKey) {
-    let (signer_eid, signing_key, _user_event_id, workspace_id) =
-        make_identity_chain(conn, recorded_by);
-
-    // Secret key (for attachment key_event_id dep)
-    let sk = ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: now_ms(),
-        key_bytes: [0xBB; 32],
-    });
-    let sk_blob = events::encode_event(&sk).unwrap();
-    let sk_eid = insert_event_raw(conn, recorded_by, &sk_blob, None);
-    project_one(conn, recorded_by, &sk_eid).unwrap();
-
-    // Signed message inside the current encrypted-wrapper path.
-    let msg_eid = create_encrypted_event_synchronous(
-        conn,
-        recorded_by,
-        &sk_eid,
-        &ParsedEvent::Message(MessageEvent {
-            created_at_ms: now_ms(),
-            workspace_id,
-            author_id: signer_eid,
-            content: "file parent".to_string(),
-        }),
-        Some((&signer_eid, &signing_key)),
-    )
-    .unwrap();
-
-    // Return signer_eid from the PeerShared chain.
-    (msg_eid, sk_eid, signer_eid, signing_key)
-}
-
 fn run_file_throughput(file_size_bytes: usize) {
-    let (conn, _tmp) = setup();
-    let recorded_by = "peer1";
-
-    let (msg_eid, sk_eid, signer_eid, signing_key) = create_prereqs(&conn, recorded_by);
+    let peer = Peer::new_with_identity("file-throughput");
+    let conn = open_connection(&peer.db_path).unwrap();
+    let recorded_by = peer.identity.as_str();
+    let sk_eid = peer.create_key_secret([0xBB; 32]);
+    let msg_eid = peer.create_encrypted_message(&sk_eid, "file parent");
+    let signer_eid = peer
+        .peer_shared_event_id
+        .expect("peer should have peer_shared signer");
+    let signing_key = peer
+        .peer_shared_signing_key
+        .as_ref()
+        .expect("peer should have peer_shared signing key")
+        .clone();
 
     // Each file slice carries 256 KiB of logical file data in a larger fixed payload.
     let slice_size = FILE_SLICE_DATA_BYTES;

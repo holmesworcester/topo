@@ -1428,6 +1428,8 @@ Exceptions where direct DB access is acceptable:
 
 When adding a new CLI command, always add a corresponding `RpcMethod` variant, catalog entry, and server dispatch handler. The CLI handler should call `rpc_require_daemon()` and format the response for display.
 
+New user-visible and runtime behavior should prefer CLI end-to-end tests. If a test needs metadata that is not already available through CLI/RPC, add a first-class daemon/CLI observability or query surface instead of querying internal SQL tables directly from the test.
+
 RPC and locality flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) section `0` ("RPC Dispatch And Event Locality").
 
 ### RPC wire contract
@@ -1480,6 +1482,8 @@ Assertion-first commands are first-class:
 3. low-memory realism/perf harnesses: `scripts/run_lowmem.sh`, `scripts/run_perf_serial.sh lowmem` (Linux-only).
 
 `assert-eventually` is preferred over ad-hoc sleeps for both deterministic tests and agent self-play loops.
+
+For new integration coverage, prefer daemon-backed CLI tests over direct database assertions. Low-level SQL assertions remain appropriate for focused module/unit coverage and adversarial property tests, but end-to-end behavior should be proven through the same CLI/RPC surface used by operators and frontends.
 
 Low-memory Linux-only note:
 1. harness scripts sample `/proc/<pid>/status` and `/proc/<pid>/smaps`,

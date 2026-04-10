@@ -15,6 +15,9 @@ Done:
 5. Username-based tenant selection in CLI tests now uses the tenant display/query surface instead of the `users` table.
 6. Discovery-heavy device-link coverage was split out of `cli_test.rs` into its own binary.
 7. Realism tests now only rely on the temporary accept daemon for durable acceptance; writability is asserted later through normal runtime behavior.
+8. The remaining hybrid-style CLI/perf tests now consume first-class observability surfaces instead of correctness-sensitive SQL:
+   - `tests/daemon_multi_source_tiered_window_perf_test.rs` uses persisted per-source receive attribution and structured sync-run JSON through CLI/RPC.
+   - `tests/cli_live_file_sync_test.rs` uses persisted ingest observation ordering through CLI/RPC instead of low-level `recorded_events.id` queries.
 
 Remaining:
 

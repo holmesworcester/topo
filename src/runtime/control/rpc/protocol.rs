@@ -209,6 +209,12 @@ pub enum RpcMethod {
     /// List recent/active peer connections from endpoint observations.
     Connections,
 
+    /// Return persisted ingest observability for the active peer.
+    IngestObservability {
+        #[serde(default)]
+        event_ids: Vec<String>,
+    },
+
     /// Browse for peers via mDNS discovery.
     #[cfg(feature = "discovery")]
     Discover {

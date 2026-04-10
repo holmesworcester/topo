@@ -1144,6 +1144,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             run,
             peer,
             all,
+            json,
             action,
         } => {
             let action = action.unwrap_or(SyncLogAction::Show {
@@ -1151,6 +1152,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 run,
                 peer,
                 all,
+                json,
             });
             run_sync_log_action(db, action)?;
         }
@@ -1348,6 +1350,46 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
+
+        Commands::Observability { action } => match action {
+            ObservabilityAction::Ingest { json, events } => {
+                let data = rpc_require_daemon(
+                    db,
+                    socket_override.as_deref(),
+                    RpcMethod::IngestObservability { event_ids: events },
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&data).unwrap_or_default()
+                    );
+                } else {
+                    println!("INGEST OBSERVABILITY ({db}):");
+                    println!(
+                        "  File slices: {}",
+                        data["file_slice_count"].as_i64().unwrap_or(0)
+                    );
+                    println!(
+                        "  QUIC events: {}",
+                        data["quic_received_unique_event_count"]
+                            .as_i64()
+                            .unwrap_or(0)
+                    );
+                    if let Some(sources) = data["sources"].as_array() {
+                        for source in sources {
+                            println!(
+                                "  {} events from {}",
+                                source["event_count"].as_i64().unwrap_or(0),
+                                source["source_peer_id"]
+                                    .as_str()
+                                    .or_else(|| source["source"].as_str())
+                                    .unwrap_or("unknown")
+                            );
+                        }
+                    }
+                }
+            }
+        },
 
         #[cfg(feature = "discovery")]
         Commands::Discover { timeout_ms, json } => {

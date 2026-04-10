@@ -756,18 +756,18 @@ mod tests {
             "joiner should import real accepted-bootstrap auth rows"
         );
         assert!(
-            joiner_import.connect_targets.iter().any(|target| {
+            !joiner_import.connect_targets.iter().any(|target| {
                 target.source == "bootstrap"
                     && target.transport_peer_id == creator_transport_peer_id
                     && target.remote == "lookup"
             }),
-            "joiner should import the Iroh bootstrap lookup target"
+            "same-db joiner should not import bootstrap lookup targets for an already-local workspace"
         );
         assert!(
-            joiner_import
+            !joiner_import
                 .connectable_transport_peer_ids()
                 .contains(&creator_transport_peer_id),
-            "joiner outgoing connect set should include the creator transport peer"
+            "same-db joiner outgoing connect set should not include the already-local creator transport peer"
         );
 
         let joiner_snapshot = snapshot_replayed_peer(export_db.to_str().unwrap(), &joiner_peer_id)

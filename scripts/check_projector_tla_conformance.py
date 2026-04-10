@@ -15,6 +15,7 @@ Exit 0 if all rules pass, exit 1 with details on failure.
 
 import re
 import sys
+import os
 from pathlib import Path
 from collections import defaultdict
 
@@ -24,10 +25,18 @@ CATALOG_PATH = REPO_ROOT / "docs" / "tla" / "runtime_check_catalog.md"
 
 
 def extract_test_functions(source: str) -> set[str]:
-    return {
+    test_functions = {
         m.group(1)
         for m in re.finditer(r"^\s*(?:async\s+)?fn\s+(test_\w+)\s*\(", source, re.MULTILINE)
     }
+    test_functions.update(
+        m.group(1)
+        for m in re.finditer(
+            r"(?ms)^\s*#\[(?:tokio::)?test[^\]]*\]\s*(?:#\[[^\]]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(",
+            source,
+        )
+    )
+    return test_functions
 
 
 def collect_integration_test_paths() -> set[str]:
@@ -187,18 +196,19 @@ def main() -> int:
     real_test_paths: set[str] = set()
     cargo_available = False
     # Try listing lib tests, then integration tests (which may fail to compile).
-    for cargo_args in [["--lib"], ["--tests"]]:
-        try:
-            out = subprocess.check_output(
-                ["cargo", "test"] + cargo_args + ["--", "--list"],
-                cwd=str(REPO_ROOT), text=True, stderr=subprocess.DEVNULL,
-            )
-            cargo_available = True
-            for line in out.splitlines():
-                if line.endswith(": test"):
-                    real_test_paths.add(line[:-6])  # strip ": test"
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
+    if os.environ.get("TOPO_SKIP_CARGO_TEST_DISCOVERY") != "1":
+        for cargo_args in [["--lib"], ["--tests"]]:
+            try:
+                out = subprocess.check_output(
+                    ["cargo", "test"] + cargo_args + ["--", "--list"],
+                    cwd=str(REPO_ROOT), text=True, stderr=subprocess.DEVNULL,
+                )
+                cargo_available = True
+                for line in out.splitlines():
+                    if line.endswith(": test"):
+                        real_test_paths.add(line[:-6])  # strip ": test"
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                pass
 
     # Always supplement with source-derived integration test paths so valid test
     # trees remain discoverable even when unrelated integration crates fail.
@@ -212,8 +222,7 @@ def main() -> int:
             if not search_dir.exists():
                 continue
             for rs_file in search_dir.rglob("*.rs"):
-                for m in re.finditer(r'fn\s+(test_\w+)\s*\(', rs_file.read_text()):
-                    real_test_paths.add(m.group(1))
+                real_test_paths.update(extract_test_functions(rs_file.read_text()))
 
     for row in matrix_rows:
         tid = row.get("test_id", "")

@@ -109,7 +109,7 @@ pub(super) fn run_persist_phase(
                     }
 
                     let recorded_at = current_timestamp_ms();
-                    match recorded_stmt.execute(rusqlite::params![
+                    let recorded_inserted = match recorded_stmt.execute(rusqlite::params![
                         &effective_recorded_by,
                         &event_id_b64,
                         recorded_at,
@@ -125,6 +125,26 @@ pub(super) fn run_persist_phase(
                             continue;
                         }
                     };
+                    if recorded_inserted {
+                        let semantic_type_code =
+                            events::outer_semantic_type_code(blob).map(i64::from);
+                        if let Err(e) = crate::db::observability::insert_event_ingest_observation(
+                            db,
+                            &effective_recorded_by,
+                            &event_id_b64,
+                            source_tag,
+                            semantic_type_code,
+                            *received_at_ms,
+                            *first_stored_at_ms,
+                            recorded_at,
+                        ) {
+                            tracing::warn!(
+                                "event_ingest_observations insert error for {}: {}",
+                                event_id_b64,
+                                e
+                            );
+                        }
+                    }
                     // Enqueue for durable projection (atomicity boundary 1)
                     let priority_lane = if events::outer_semantic_type_code(blob)
                         == Some(events::EVENT_TYPE_FILE_SLICE)

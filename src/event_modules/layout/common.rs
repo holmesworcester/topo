@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(USER_WIRE_SIZE, 105);
         assert_eq!(PEER_SHARED_WIRE_SIZE, 169);
         assert_eq!(KEY_SECRET_WIRE_SIZE, 41);
-        assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 73);
+        assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 41);
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 105);
         assert_eq!(USER_INVITE_WIRE_SIZE, 105);
         assert_eq!(DEVICE_INVITE_WIRE_SIZE, 73);
@@ -301,7 +301,7 @@ mod tests {
     fn test_encrypted_wire_size_message() {
         use super::super::super::message::wire::MESSAGE_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
-        assert_eq!(encrypted_wire_size(MESSAGE_WIRE_SIZE), 1167);
-        assert_eq!(encrypted_wire_size(REACTION_WIRE_SIZE), 207);
+        assert_eq!(encrypted_wire_size(MESSAGE_WIRE_SIZE), 1199);
+        assert_eq!(encrypted_wire_size(REACTION_WIRE_SIZE), 239);
     }
 }

@@ -330,6 +330,9 @@ pub(crate) enum Commands {
         /// Include runs that matched with no data transfer (shorthand for `sync-log show --all`)
         #[arg(long)]
         all: bool,
+        /// Output as JSON (shorthand for `sync-log show --json`)
+        #[arg(long)]
+        json: bool,
         #[command(subcommand)]
         action: Option<SyncLogAction>,
     },
@@ -368,6 +371,17 @@ pub(crate) enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Inspect persisted runtime observability
+    #[command(
+        name = "observability",
+        visible_alias = "obs",
+        after_help = "Examples:\n  topo observability ingest --json\n  topo observability ingest --json --event <event-id>"
+    )]
+    Observability {
+        #[command(subcommand)]
+        action: ObservabilityAction,
     },
 
     /// Browse for peers via mDNS discovery
@@ -626,6 +640,9 @@ pub(crate) enum SyncLogAction {
         /// Include runs that matched with no data transfer
         #[arg(long)]
         all: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Show sync history in tree form
     Tree {
@@ -655,6 +672,19 @@ pub(crate) enum SyncLogAction {
     Disable,
     /// Show sync logging configuration
     Config,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ObservabilityAction {
+    /// Show persisted ingest observations for the active peer
+    Ingest {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Event ID to include in the event observation list. Accepts hex or base64.
+        #[arg(long = "event")]
+        events: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]

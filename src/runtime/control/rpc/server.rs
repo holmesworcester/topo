@@ -207,6 +207,16 @@ where
     }
 }
 
+fn normalize_event_id_selector(selector: &str) -> String {
+    let trimmed = selector.trim();
+    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Some(event_id) = crate::crypto::event_id_from_hex(trimmed) {
+            return crate::crypto::event_id_to_base64(&event_id);
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Tenant info returned by the Tenants command.
 #[derive(Debug, Serialize)]
 struct TenantItem {
@@ -1410,6 +1420,23 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
+
+        RpcMethod::IngestObservability { event_ids } => {
+            with_active_peer_db(state, |_peer_id, recorded_by, db| {
+                let normalized_event_ids = event_ids
+                    .iter()
+                    .map(|event_id| normalize_event_id_selector(event_id))
+                    .collect::<Vec<_>>();
+                match crate::db::observability::ingest_observability(
+                    db,
+                    recorded_by,
+                    &normalized_event_ids,
+                ) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
+            })
+        }
 
         #[cfg(feature = "discovery")]
         RpcMethod::Discover { timeout_ms } => {

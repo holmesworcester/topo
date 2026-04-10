@@ -237,6 +237,18 @@ fn source_event_ids_in_dependency_order(
     source_db_path: &str,
     event_ids: &[EventId],
 ) -> Vec<EventId> {
+    fn recursive_dep_field_values(
+        parsed: &topo::event_modules::ParsedEvent,
+    ) -> Vec<(&'static str, EventId)> {
+        let mut deps = parsed.dep_field_values();
+        if let topo::event_modules::ParsedEvent::Signed(signed) = parsed {
+            if let Ok(inner) = topo::event_modules::parse_event(&signed.payload) {
+                deps.extend(recursive_dep_field_values(&inner));
+            }
+        }
+        deps
+    }
+
     fn visit(
         conn: &rusqlite::Connection,
         event_id: EventId,
@@ -258,7 +270,7 @@ fn source_event_ids_in_dependency_order(
             return;
         };
         let parsed = topo::event_modules::parse_event(&blob).expect("parse source event");
-        for (_, dep_id) in parsed.dep_field_values() {
+        for (_, dep_id) in recursive_dep_field_values(&parsed) {
             visit(conn, dep_id, visited, ordered);
         }
         ordered.push(event_id);

@@ -153,6 +153,7 @@ Every CLI instance is a real peer-to-peer device. All user-facing commands go th
 2. **Real networking**: invite acceptance uses real QUIC bootstrap sync, not in-process event copying. The daemon manages ongoing sync with discovered peers.
 3. **Testing equivalence**: CLI integration tests exercise the full path (CLI binary → RPC → service → DB/sync). No separate interactive surface exists; the daemon-backed CLI is the single command interface.
 4. **No synthetic shortcuts**: no `copy_event_chain`, no direct DB-to-DB event transfers, no bypass of the sync/projection pipeline. Every event flows through the same ingest path it would in production.
+5. **New test preference**: new user-visible and runtime behavior should prefer CLI end-to-end coverage. If a test needs metadata not already exposed by CLI/RPC, add first-class daemon/CLI observability instead of directly querying internal tables from the test.
 
 ## 2.3 Device Architecture
 

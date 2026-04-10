@@ -878,11 +878,42 @@ pub(crate) fn run_sync_log_action(
             run,
             peer,
             all,
+            json,
         } => {
             let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
             create_tables(&conn)?;
             let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
-            if runs.is_empty() {
+            if json {
+                let runs = runs
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "run_id": r.run_id,
+                            "started_at_ms": r.started_at_ms,
+                            "ended_at_ms": r.ended_at_ms,
+                            "session_id": r.session_id,
+                            "tenant_id": r.tenant_id,
+                            "peer_id": r.peer_id,
+                            "direction": r.direction,
+                            "remote_addr": r.remote_addr,
+                            "role": r.role,
+                            "rounds": r.rounds,
+                            "events_sent": r.events_sent,
+                            "events_received": r.events_received,
+                            "bytes_sent": r.bytes_sent,
+                            "bytes_received": r.bytes_received,
+                            "changed": r.changed,
+                            "outcome": r.outcome,
+                            "error": r.error,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "runs": runs }))
+                        .unwrap_or_default()
+                );
+            } else if runs.is_empty() {
                 println!("No sync runs logged.");
             } else {
                 if !all {

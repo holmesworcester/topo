@@ -156,7 +156,10 @@ pub fn list_hot_week_dep_entries(
 
     for week_start_ms in week_starts_ms {
         let rows = stmt.query_map(params![workspace_id, week_start_ms], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                crate::db::sql_types::get_text(row, 1)?,
+            ))
         })?;
         for row in rows {
             let (created_at_ms, event_id_b64) = row?;
@@ -312,7 +315,16 @@ mod tests {
         };
 
         let last_day_weeks = week_starts_for_window(last_day, now_ms);
-        assert_eq!(last_day_weeks.len(), 2);
+        assert_eq!(last_day_weeks.len(), 1);
+
+        let boundary_now_ms = 11 * DAY_MS + (6 * 60 * 60 * 1000);
+        let boundary_last_day = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(boundary_now_ms - DAY_MS),
+            ts_max_exclusive_ms: Some(boundary_now_ms),
+        };
+        let boundary_last_day_weeks = week_starts_for_window(boundary_last_day, boundary_now_ms);
+        assert_eq!(boundary_last_day_weeks.len(), 2);
 
         let last_week_weeks = week_starts_for_window(last_week, now_ms);
         assert_eq!(last_week_weeks.len(), 2);

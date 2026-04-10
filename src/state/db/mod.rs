@@ -6,6 +6,7 @@ pub mod hot_week_deps;
 pub mod iroh_log;
 pub mod local_client_ops;
 pub mod need_queue;
+pub mod observability;
 pub mod project_queue;
 pub mod queue;
 pub mod schema;
@@ -121,6 +122,7 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     transport_creds::ensure_schema(conn)?;
     need_queue::ensure_schema(conn)?;
     local_client_ops::ensure_schema(conn)?;
+    observability::ensure_schema(conn)?;
     crate::state::shared_workspace_fanout::ensure_schema(conn)?;
     Ok(())
 }

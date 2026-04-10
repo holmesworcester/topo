@@ -1854,8 +1854,7 @@ fn test_cli_three_peer_sequential_invites_deliver_live_messages_bidirectionally_
             .expect("parse bob invite")
             .invite_event_id,
     );
-    let mut bob =
-        start_joined_discovery_cli_peer(&tmpdir, "bob.db", &bob_invite, "bob", "bob-box");
+    let mut bob = start_joined_discovery_cli_peer(&tmpdir, "bob.db", &bob_invite, "bob", "bob-box");
     let _alice_peer_event_for_bob = wait_for_workspace_peer_id_with_sync_rounds(
         &bob.db,
         "alice",
@@ -1975,8 +1974,7 @@ fn test_cli_three_peer_rejoin_catches_offline_one_k_delta_after_sequential_invit
             .expect("parse bob invite")
             .invite_event_id,
     );
-    let mut bob =
-        start_joined_discovery_cli_peer(&tmpdir, "bob.db", &bob_invite, "bob", "bob-box");
+    let mut bob = start_joined_discovery_cli_peer(&tmpdir, "bob.db", &bob_invite, "bob", "bob-box");
     let _alice_peer_event_for_bob = wait_for_workspace_peer_id_with_sync_rounds(
         &bob.db,
         "alice",
@@ -2801,6 +2799,13 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         "bob-terminal",
         Duration::from_secs(10),
     );
+    wait_for_active_tenant_ready(&shared_db, Duration::from_millis(timeout_ms));
+    let bob_alpha_peer_id = wait_for_username_peer_id(&shared_db, "bob-alpha", timeout_ms);
+    wait_for_tenant_transport_converged(
+        &shared_db,
+        &bob_alpha_peer_id,
+        Duration::from_millis(timeout_ms),
+    );
     accept_invite_with_identity_on_running_daemon(
         &shared_db,
         &zeta_invite_fresh,
@@ -2808,12 +2813,26 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         "yuki-terminal",
         Duration::from_secs(10),
     );
+    wait_for_active_tenant_ready(&shared_db, Duration::from_millis(timeout_ms));
+    let yuki_zeta_peer_id = wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
+    wait_for_tenant_transport_converged(
+        &shared_db,
+        &yuki_zeta_peer_id,
+        Duration::from_millis(timeout_ms),
+    );
     accept_invite_with_identity_on_running_daemon(
         &shared_db,
         &alpha_invite_reused,
         "carol-alpha",
         "carol-terminal",
         Duration::from_secs(10),
+    );
+    wait_for_active_tenant_ready(&shared_db, Duration::from_millis(timeout_ms));
+    let carol_alpha_peer_id = wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
+    wait_for_tenant_transport_converged(
+        &shared_db,
+        &carol_alpha_peer_id,
+        Duration::from_millis(timeout_ms),
     );
     assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_base_eid, timeout_ms);
     assert_event_visible_for_username(&shared_db, "carol-alpha", &alpha_base_eid, timeout_ms);

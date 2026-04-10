@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use daemon_perf_harness::{
     run_bidirectional_sync, run_continuous_sync, run_one_way_sync, write_summary, BenchNetworkPath,
-    PerfMeasurement, SharedWorkspaceBench,
+    PerfMeasurement,
 };
 use perf_network_shaper::{
     clear_realistic_network_env, repeat_count_from_env, selected_profiles_from_env, NetworkProfile,
@@ -263,21 +263,31 @@ fn perf_sync_500k_realistic_profiles() {
 #[test]
 fn realistic_network_bench_construction_smoke() {
     clear_realistic_network_env();
-    let _bench = SharedWorkspaceBench::new_with_network(|alice_direct_addr, bob_direct_addr| {
-        shaped_network_path(
-            NetworkProfile {
-                slug: "smoke",
-                title: "Smoke",
-                note: "construction smoke",
-                bandwidth_mbps_per_direction: 2.0,
-                rtt_ms: 0,
-                jitter_ms: 0,
-                loss_percent: 0.0,
-            },
-            alice_direct_addr,
-            bob_direct_addr,
-        )
-    });
+    let mut path = shaped_network_path(
+        NetworkProfile {
+            slug: "smoke",
+            title: "Smoke",
+            note: "construction smoke",
+            bandwidth_mbps_per_direction: 2.0,
+            rtt_ms: 0,
+            jitter_ms: 0,
+            loss_percent: 0.0,
+        },
+        "127.0.0.1:1".to_string(),
+        "127.0.0.1:2".to_string(),
+    );
+
+    path.bootstrap_addr
+        .parse::<SocketAddr>()
+        .expect("bootstrap shaper address parses");
+    assert!(path.guard.is_some(), "shaped path should own shaper guard");
+    assert!(
+        path.reseed_bob_bootstrap_after_activate,
+        "shaped paths must reseed Bob's bootstrap row after profile activation"
+    );
+    path.activate_after_ready
+        .take()
+        .expect("shaped path has activation hook")();
 }
 
 #[test]
