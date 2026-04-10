@@ -254,6 +254,43 @@ fn test_deletion_wrong_author_rejects() {
 }
 
 #[test]
+fn test_deletion_rejects_malformed_signer_user_binding_at_projection() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let signer_b64 = event_id_to_base64(&signer_eid);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "delete target");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &msg_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    conn.execute(
+        "UPDATE peers_shared
+         SET user_event_id = ?1
+         WHERE recorded_by = ?2 AND event_id = ?3",
+        rusqlite::params!["not-base64", recorded_by, &signer_b64],
+    )
+    .unwrap();
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+
+    match project_one(&conn, recorded_by, &del_eid).unwrap() {
+        ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("malformed peers_shared user binding"),
+                "unexpected rejection reason: {reason}"
+            );
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_deletion_idempotent() {
     let conn = setup();
     let recorded_by = "peer1";

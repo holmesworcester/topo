@@ -172,6 +172,49 @@ pub enum ContentAuthorityPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionSignerRawRows {
+    MissingCurrentSigner,
+    AdminSigner,
+    UnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    PeerSharedSigner {
+        signer_event_id: String,
+        signer_user_ids: Vec<Option<String>>,
+        malformed: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionSignerDecisionContext {
+    AdminSigner,
+    UniquePeerSharedSignerUser {
+        signer_event_id: String,
+        signer_user_id: String,
+    },
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    RejectMissingSignerUser {
+        signer_event_id: String,
+    },
+    RejectAmbiguousSignerUser {
+        signer_event_id: String,
+    },
+    RejectMalformedSignerUser {
+        signer_event_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeletionSignerPlan {
+    ReadyAdmin,
+    ReadyPeerSharedUser { signer_user_id: String },
+    Reject { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticTypeRawRows {
     Missing,
     UniqueKnown { semantic_type_code: Option<i64> },
@@ -323,6 +366,63 @@ pub fn normalize_semantic_type(
     }
 }
 
+pub fn normalize_deletion_signer(
+    raw_rows: &DeletionSignerRawRows,
+) -> DeletionSignerDecisionContext {
+    match raw_rows {
+        DeletionSignerRawRows::MissingCurrentSigner => {
+            DeletionSignerDecisionContext::RejectMissingCurrentSigner
+        }
+        DeletionSignerRawRows::AdminSigner => DeletionSignerDecisionContext::AdminSigner,
+        DeletionSignerRawRows::UnsupportedSignerType { semantic_type_code } => {
+            DeletionSignerDecisionContext::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            }
+        }
+        DeletionSignerRawRows::PeerSharedSigner {
+            signer_event_id,
+            signer_user_ids,
+            malformed,
+        } => {
+            if *malformed || event_id_from_base64(signer_event_id).is_none() {
+                return DeletionSignerDecisionContext::RejectMalformedSignerUser {
+                    signer_event_id: signer_event_id.clone(),
+                };
+            }
+
+            let mut user_ids = Vec::with_capacity(signer_user_ids.len());
+            for user_id in signer_user_ids {
+                let Some(user_id) = user_id.as_ref() else {
+                    return DeletionSignerDecisionContext::RejectMalformedSignerUser {
+                        signer_event_id: signer_event_id.clone(),
+                    };
+                };
+                if user_id.is_empty() || event_id_from_base64(user_id).is_none() {
+                    return DeletionSignerDecisionContext::RejectMalformedSignerUser {
+                        signer_event_id: signer_event_id.clone(),
+                    };
+                }
+                user_ids.push(user_id.clone());
+            }
+
+            user_ids.sort();
+            user_ids.dedup();
+            match user_ids.as_slice() {
+                [] => DeletionSignerDecisionContext::RejectMissingSignerUser {
+                    signer_event_id: signer_event_id.clone(),
+                },
+                [signer_user_id] => DeletionSignerDecisionContext::UniquePeerSharedSignerUser {
+                    signer_event_id: signer_event_id.clone(),
+                    signer_user_id: signer_user_id.clone(),
+                },
+                _ => DeletionSignerDecisionContext::RejectAmbiguousSignerUser {
+                    signer_event_id: signer_event_id.clone(),
+                },
+            }
+        }
+    }
+}
+
 pub fn build_workspace_projector_decision_context(
     context: &WorkspaceDecisionContext,
 ) -> ProjectorDecisionContext {
@@ -414,6 +514,62 @@ pub fn decide_semantic_type_plan(
                 field_name
             ),
         },
+    }
+}
+
+pub fn decide_deletion_signer_plan(context: &DeletionSignerDecisionContext) -> DeletionSignerPlan {
+    match context {
+        DeletionSignerDecisionContext::AdminSigner => DeletionSignerPlan::ReadyAdmin,
+        DeletionSignerDecisionContext::UniquePeerSharedSignerUser {
+            signer_event_id: _,
+            signer_user_id,
+        } => DeletionSignerPlan::ReadyPeerSharedUser {
+            signer_user_id: signer_user_id.clone(),
+        },
+        DeletionSignerDecisionContext::RejectMissingCurrentSigner => DeletionSignerPlan::Reject {
+            reason: "missing current signer envelope".to_string(),
+        },
+        DeletionSignerDecisionContext::RejectUnsupportedSignerType { semantic_type_code } => {
+            DeletionSignerPlan::Reject {
+                reason: format!(
+                    "message_deletion signer must be peer_shared or admin, got semantic type {}",
+                    semantic_type_code
+                ),
+            }
+        }
+        DeletionSignerDecisionContext::RejectMissingSignerUser { signer_event_id } => {
+            DeletionSignerPlan::Reject {
+                reason: format!("no peers_shared entry for signer {}", signer_event_id),
+            }
+        }
+        DeletionSignerDecisionContext::RejectAmbiguousSignerUser { signer_event_id } => {
+            DeletionSignerPlan::Reject {
+                reason: format!(
+                    "ambiguous peers_shared user binding for message_deletion signer {}",
+                    signer_event_id
+                ),
+            }
+        }
+        DeletionSignerDecisionContext::RejectMalformedSignerUser { signer_event_id } => {
+            DeletionSignerPlan::Reject {
+                reason: format!(
+                    "malformed peers_shared user binding for message_deletion signer {}",
+                    signer_event_id
+                ),
+            }
+        }
+    }
+}
+
+pub fn deletion_signer_plan_to_context_fields(
+    plan: DeletionSignerPlan,
+) -> (Option<String>, bool, Option<String>) {
+    match plan {
+        DeletionSignerPlan::ReadyAdmin => (None, true, None),
+        DeletionSignerPlan::ReadyPeerSharedUser { signer_user_id } => {
+            (Some(signer_user_id), false, None)
+        }
+        DeletionSignerPlan::Reject { reason } => (None, false, Some(reason)),
     }
 }
 
@@ -820,56 +976,11 @@ fn deletion_signer_context(
     frame: &ProjectionFrameContext,
     recorded_by: &str,
 ) -> Result<(Option<String>, bool, Option<String>), rusqlite::Error> {
-    let Some(current_signer) = frame.current_signer.as_ref() else {
-        return Ok((
-            None,
-            false,
-            Some("missing current signer envelope".to_string()),
-        ));
-    };
-
-    match current_signer.semantic_type_code {
-        EVENT_TYPE_ADMIN => Ok((None, true, None)),
-        EVENT_TYPE_PEER_SHARED => {
-            let signed_by_b64 = current_signer.event_id.clone();
-            let peer_user_eid: String = match conn.query_row(
-                "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
-                rusqlite::params![recorded_by, &signed_by_b64],
-                |row| crate::db::sql_types::get_text(row, 0),
-            ) {
-                Ok(v) => v,
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Ok((
-                        None,
-                        false,
-                        Some(format!("no peers_shared entry for signer {}", signed_by_b64)),
-                    ))
-                }
-                Err(e) => return Err(e),
-            };
-
-            if peer_user_eid.is_empty() {
-                return Ok((
-                    None,
-                    false,
-                    Some(format!(
-                        "peers_shared entry for signer {} has no user_event_id (legacy row)",
-                        signed_by_b64
-                    )),
-                ));
-            }
-
-            Ok((Some(peer_user_eid), false, None))
-        }
-        other => Ok((
-            None,
-            false,
-            Some(format!(
-                "message_deletion signer must be peer_shared or admin, got semantic type {}",
-                other
-            )),
-        )),
-    }
+    let raw_rows = load_deletion_signer_raw_rows(conn, frame, recorded_by)?;
+    let context = normalize_deletion_signer(&raw_rows);
+    Ok(deletion_signer_plan_to_context_fields(
+        decide_deletion_signer_plan(&context),
+    ))
 }
 
 fn load_valid_event_blob(
@@ -1050,6 +1161,46 @@ fn load_content_authority_raw_rows(
         signer_user_ids,
         malformed,
     })
+}
+
+fn load_deletion_signer_raw_rows(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> rusqlite::Result<DeletionSignerRawRows> {
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(DeletionSignerRawRows::MissingCurrentSigner);
+    };
+    match current_signer.semantic_type_code {
+        EVENT_TYPE_ADMIN => Ok(DeletionSignerRawRows::AdminSigner),
+        EVENT_TYPE_PEER_SHARED => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT user_event_id
+                 FROM peers_shared
+                 WHERE recorded_by = ?1 AND event_id = ?2
+                 ORDER BY user_event_id
+                 LIMIT 2",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![recorded_by, &current_signer.event_id])?;
+            let mut signer_user_ids = Vec::new();
+            let mut malformed = false;
+            while let Some(row) = rows.next()? {
+                match crate::db::sql_types::get_opt_text(row, 0) {
+                    Ok(user_id) => signer_user_ids.push(user_id),
+                    Err(_) => malformed = true,
+                }
+            }
+
+            Ok(DeletionSignerRawRows::PeerSharedSigner {
+                signer_event_id: current_signer.event_id.clone(),
+                signer_user_ids,
+                malformed,
+            })
+        }
+        semantic_type_code => {
+            Ok(DeletionSignerRawRows::UnsupportedSignerType { semantic_type_code })
+        }
+    }
 }
 
 fn load_workspace_decision_context_from_db(
@@ -1706,6 +1857,17 @@ mod tests {
         }
     }
 
+    fn deletion_signer_raw(
+        signer_event_id: String,
+        signer_user_ids: Vec<Option<String>>,
+    ) -> DeletionSignerRawRows {
+        DeletionSignerRawRows::PeerSharedSigner {
+            signer_event_id,
+            signer_user_ids,
+            malformed: false,
+        }
+    }
+
     #[test]
     fn workspace_acceptance_blocks_when_missing() {
         let context = normalize_workspace_acceptance(&WorkspaceAcceptedRawRows {
@@ -1894,6 +2056,98 @@ mod tests {
         assert!(matches!(
             decide_content_authority_plan(&context),
             ContentAuthorityPlan::Reject { reason } if reason.contains("must be peer_shared")
+        ));
+    }
+
+    #[test]
+    fn deletion_signer_allows_admin_signer() {
+        let context = normalize_deletion_signer(&DeletionSignerRawRows::AdminSigner);
+
+        assert_eq!(
+            decide_deletion_signer_plan(&context),
+            DeletionSignerPlan::ReadyAdmin
+        );
+    }
+
+    #[test]
+    fn deletion_signer_allows_unique_peer_user() {
+        let signer_id = event_id_b64(1);
+        let user_id = event_id_b64(2);
+        let context = normalize_deletion_signer(&deletion_signer_raw(
+            signer_id.clone(),
+            vec![Some(user_id.clone())],
+        ));
+
+        assert_eq!(
+            context,
+            DeletionSignerDecisionContext::UniquePeerSharedSignerUser {
+                signer_event_id: signer_id,
+                signer_user_id: user_id.clone()
+            }
+        );
+        assert_eq!(
+            decide_deletion_signer_plan(&context),
+            DeletionSignerPlan::ReadyPeerSharedUser {
+                signer_user_id: user_id
+            }
+        );
+    }
+
+    #[test]
+    fn deletion_signer_rejects_missing_current_signer() {
+        let context = normalize_deletion_signer(&DeletionSignerRawRows::MissingCurrentSigner);
+
+        assert!(matches!(
+            decide_deletion_signer_plan(&context),
+            DeletionSignerPlan::Reject { reason } if reason.contains("missing current signer")
+        ));
+    }
+
+    #[test]
+    fn deletion_signer_rejects_unsupported_signer_type() {
+        let context = normalize_deletion_signer(&DeletionSignerRawRows::UnsupportedSignerType {
+            semantic_type_code: EVENT_TYPE_WORKSPACE,
+        });
+
+        assert!(matches!(
+            decide_deletion_signer_plan(&context),
+            DeletionSignerPlan::Reject { reason } if reason.contains("peer_shared or admin")
+        ));
+    }
+
+    #[test]
+    fn deletion_signer_rejects_missing_peer_user() {
+        let signer_id = event_id_b64(1);
+        let context = normalize_deletion_signer(&deletion_signer_raw(signer_id, Vec::new()));
+
+        assert!(matches!(
+            decide_deletion_signer_plan(&context),
+            DeletionSignerPlan::Reject { reason } if reason.contains("no peers_shared entry")
+        ));
+    }
+
+    #[test]
+    fn deletion_signer_rejects_ambiguous_peer_user() {
+        let signer_id = event_id_b64(1);
+        let context = normalize_deletion_signer(&deletion_signer_raw(
+            signer_id,
+            vec![Some(event_id_b64(2)), Some(event_id_b64(3))],
+        ));
+
+        assert!(matches!(
+            decide_deletion_signer_plan(&context),
+            DeletionSignerPlan::Reject { reason } if reason.contains("ambiguous")
+        ));
+    }
+
+    #[test]
+    fn deletion_signer_rejects_malformed_peer_user() {
+        let signer_id = event_id_b64(1);
+        let context = normalize_deletion_signer(&deletion_signer_raw(signer_id, vec![None]));
+
+        assert!(matches!(
+            decide_deletion_signer_plan(&context),
+            DeletionSignerPlan::Reject { reason } if reason.contains("malformed")
         ));
     }
 

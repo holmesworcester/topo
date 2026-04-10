@@ -233,6 +233,131 @@ proof fn content_authority_malformation_fails_closed()
 {
 }
 
+pub enum DeletionSignerRows {
+    MissingCurrentSigner,
+    AdminSigner,
+    UnsupportedSignerType,
+    UniquePeerSharedSigner,
+    MissingSignerUser,
+    AmbiguousSignerUser,
+    Malformed,
+}
+
+pub enum DeletionSignerDecisionContext {
+    AdminSigner,
+    UniquePeerSharedSignerUser,
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType,
+    RejectMissingSignerUser,
+    RejectAmbiguousSignerUser,
+    RejectMalformedSignerUser,
+}
+
+pub enum DeletionSignerPlan {
+    ReadyAdmin,
+    ReadyPeerSharedUser,
+    Reject,
+}
+
+pub open spec fn normalize_deletion_signer(
+    rows: DeletionSignerRows,
+) -> DeletionSignerDecisionContext {
+    match rows {
+        DeletionSignerRows::MissingCurrentSigner => {
+            DeletionSignerDecisionContext::RejectMissingCurrentSigner
+        }
+        DeletionSignerRows::AdminSigner => DeletionSignerDecisionContext::AdminSigner,
+        DeletionSignerRows::UnsupportedSignerType => {
+            DeletionSignerDecisionContext::RejectUnsupportedSignerType
+        }
+        DeletionSignerRows::UniquePeerSharedSigner => {
+            DeletionSignerDecisionContext::UniquePeerSharedSignerUser
+        }
+        DeletionSignerRows::MissingSignerUser => {
+            DeletionSignerDecisionContext::RejectMissingSignerUser
+        }
+        DeletionSignerRows::AmbiguousSignerUser => {
+            DeletionSignerDecisionContext::RejectAmbiguousSignerUser
+        }
+        DeletionSignerRows::Malformed => {
+            DeletionSignerDecisionContext::RejectMalformedSignerUser
+        }
+    }
+}
+
+pub open spec fn decide_deletion_signer_plan(
+    context: DeletionSignerDecisionContext,
+) -> DeletionSignerPlan {
+    match context {
+        DeletionSignerDecisionContext::AdminSigner => DeletionSignerPlan::ReadyAdmin,
+        DeletionSignerDecisionContext::UniquePeerSharedSignerUser => {
+            DeletionSignerPlan::ReadyPeerSharedUser
+        }
+        DeletionSignerDecisionContext::RejectMissingCurrentSigner
+        | DeletionSignerDecisionContext::RejectUnsupportedSignerType
+        | DeletionSignerDecisionContext::RejectMissingSignerUser
+        | DeletionSignerDecisionContext::RejectAmbiguousSignerUser
+        | DeletionSignerDecisionContext::RejectMalformedSignerUser => {
+            DeletionSignerPlan::Reject
+        }
+    }
+}
+
+proof fn deletion_signer_admin_is_ready()
+    ensures
+        decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::AdminSigner,
+        )) == DeletionSignerPlan::ReadyAdmin,
+{
+}
+
+proof fn deletion_signer_peer_user_is_ready()
+    ensures
+        decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::UniquePeerSharedSigner,
+        )) == DeletionSignerPlan::ReadyPeerSharedUser,
+{
+}
+
+proof fn deletion_signer_missing_current_signer_rejects()
+    ensures
+        decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::MissingCurrentSigner,
+        )) == DeletionSignerPlan::Reject,
+{
+}
+
+proof fn deletion_signer_unsupported_type_rejects()
+    ensures
+        decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::UnsupportedSignerType,
+        )) == DeletionSignerPlan::Reject,
+{
+}
+
+proof fn deletion_signer_missing_user_rejects()
+    ensures
+        decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::MissingSignerUser,
+        )) == DeletionSignerPlan::Reject,
+{
+}
+
+proof fn deletion_signer_ambiguous_user_rejects()
+    ensures
+        decide_deletion_signer_plan(normalize_deletion_signer(
+            DeletionSignerRows::AmbiguousSignerUser,
+        )) == DeletionSignerPlan::Reject,
+{
+}
+
+proof fn deletion_signer_malformed_user_rejects()
+    ensures
+        decide_deletion_signer_plan(normalize_deletion_signer(DeletionSignerRows::Malformed))
+            == DeletionSignerPlan::Reject,
+{
+}
+
 pub enum SemanticTypeRows {
     Missing,
     UniqueKnown {

@@ -18,9 +18,11 @@ use crate::projection::decision::ProjectionDecision;
 use crate::projection::queries::{
     build_workspace_projector_decision_context,
     content_authority_plan_to_signer_user_mismatch_reason, decide_content_authority_plan,
-    normalize_content_authority, normalize_workspace_acceptance, ContentAuthorityRawRows,
-    DepLoadResult, ProjectionFrameContext, ProjectionQueries, ProjectionQueryResult,
-    SemanticTypeRawRows, WorkspaceAcceptedRawRows, WorkspaceDecisionContext,
+    decide_deletion_signer_plan, deletion_signer_plan_to_context_fields,
+    normalize_content_authority, normalize_deletion_signer, normalize_workspace_acceptance,
+    ContentAuthorityRawRows, DeletionSignerRawRows, DepLoadResult, ProjectionFrameContext,
+    ProjectionQueries, ProjectionQueryResult, SemanticTypeRawRows, WorkspaceAcceptedRawRows,
+    WorkspaceDecisionContext,
 };
 use crate::projection::signer::{ResolvedSigner, SignerResolution};
 use crate::sim::query_snapshot::ImportedPeerState;
@@ -939,65 +941,32 @@ fn deletion_signer_context_behavior(
     frame: &ProjectionFrameContext,
     recorded_by: &str,
 ) -> (Option<String>, bool, Option<String>) {
-    let Some(current_signer) = frame.current_signer.as_ref() else {
-        return (
-            None,
-            false,
-            Some("missing current signer envelope".to_string()),
-        );
-    };
-
-    match current_signer.semantic_type_code {
-        events::EVENT_TYPE_ADMIN => (None, true, None),
-        events::EVENT_TYPE_PEER_SHARED => {
-            let signed_by_b64 = current_signer.event_id.clone();
-            let Some(peer_row) = first_row_for_recorded(
-                state,
-                "peers_shared",
-                recorded_by,
-                "event_id",
-                &signed_by_b64,
-            ) else {
-                return (
-                    None,
-                    false,
-                    Some(format!(
-                        "no peers_shared entry for signer {}",
-                        signed_by_b64
-                    )),
-                );
-            };
-            let Some(peer_user_eid) = row_text(peer_row, "user_event_id") else {
-                return (
-                    None,
-                    false,
-                    Some(format!(
-                        "peers_shared entry for signer {} has no user_event_id (legacy row)",
-                        signed_by_b64
-                    )),
-                );
-            };
-            if peer_user_eid.is_empty() {
-                return (
-                    None,
-                    false,
-                    Some(format!(
-                        "peers_shared entry for signer {} has no user_event_id (legacy row)",
-                        signed_by_b64
-                    )),
-                );
-            }
-            (Some(peer_user_eid.to_string()), false, None)
+    let raw_rows = match frame.current_signer.as_ref() {
+        None => DeletionSignerRawRows::MissingCurrentSigner,
+        Some(current_signer) if current_signer.semantic_type_code == events::EVENT_TYPE_ADMIN => {
+            DeletionSignerRawRows::AdminSigner
         }
-        other => (
-            None,
-            false,
-            Some(format!(
-                "message_deletion signer must be peer_shared or admin, got semantic type {}",
-                other
-            )),
-        ),
-    }
+        Some(current_signer)
+            if current_signer.semantic_type_code == events::EVENT_TYPE_PEER_SHARED =>
+        {
+            DeletionSignerRawRows::PeerSharedSigner {
+                signer_event_id: current_signer.event_id.clone(),
+                signer_user_ids: table_rows_for_recorded(state, "peers_shared", recorded_by)
+                    .into_iter()
+                    .filter(|row| {
+                        row_text(row, "event_id") == Some(current_signer.event_id.as_str())
+                    })
+                    .map(|row| row_text(row, "user_event_id").map(ToOwned::to_owned))
+                    .collect(),
+                malformed: false,
+            }
+        }
+        Some(current_signer) => DeletionSignerRawRows::UnsupportedSignerType {
+            semantic_type_code: current_signer.semantic_type_code,
+        },
+    };
+    let context = normalize_deletion_signer(&raw_rows);
+    deletion_signer_plan_to_context_fields(decide_deletion_signer_plan(&context))
 }
 
 fn deleted_message_purges_dep_behavior(

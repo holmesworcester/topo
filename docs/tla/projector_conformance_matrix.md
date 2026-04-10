@@ -191,6 +191,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_FILE_OWNER_01 | (owner wrapper) | CHK_FILE_OWNER_MATCH | projector_unit | simple_projector_tests::tests::test_file_rejects_owner_mismatch | break |
 | SPEC_DEL_SIGNER_01 | InvSigner (deletion) | CHK_DEL_SIGNER_AUTH | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_invalid_signer_auth | break |
 | SPEC_DEL_SIGNER_01 | InvSigner (deletion) | CHK_DEL_SIGNER_AUTH | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid_for_admin_signer | pass |
+| SPEC_DEL_SIGNER_01 | InvSigner (deletion) | CHK_DEL_SIGNER_AUTH | pipeline_integration | apply::tests::deletion::test_deletion_rejects_malformed_signer_user_binding_at_projection | break |
 | SPEC_DEL_OWNER_01 | (owner wrapper) | CHK_DEL_OUTER_OWNER_ABSENT | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
 | SPEC_DEL_OWNER_01 | (owner wrapper) | CHK_DEL_OUTER_OWNER_ABSENT | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_outer_owner_event_id | break |
 | SPEC_DEL_NON_MSG_01 | (type constraint) | CHK_DEL_NON_MESSAGE | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_non_message_target | break |
