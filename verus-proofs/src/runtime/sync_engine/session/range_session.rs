@@ -16,6 +16,12 @@ pub enum SharedSendOrderPolicy {
     NewestFirst,
 }
 
+pub struct SharedSyncEntryRawRows {
+    pub window_kind: SyncWindowKind,
+    pub base_entry_count: nat,
+    pub hot_week_dep_entry_count: nat,
+}
+
 pub struct SharedSyncEntryDecisionContext {
     pub window_kind: SyncWindowKind,
     pub base_entry_count: nat,
@@ -25,6 +31,12 @@ pub struct SharedSyncEntryDecisionContext {
 pub struct SharedSyncEntryPlan {
     pub include_hot_week_deps: bool,
     pub candidate_entry_count: nat,
+}
+
+pub struct SelectedDepOrderRawRows {
+    pub dep_is_selected: bool,
+    pub dep_already_emitted: bool,
+    pub dep_currently_visiting: bool,
 }
 
 pub struct SelectedDepOrderDecisionContext {
@@ -58,6 +70,16 @@ pub open spec fn should_include_hot_week_deps(kind: SyncWindowKind) -> bool {
     }
 }
 
+pub open spec fn normalize_shared_sync_entry_context(
+    raw_rows: SharedSyncEntryRawRows,
+) -> SharedSyncEntryDecisionContext {
+    SharedSyncEntryDecisionContext {
+        window_kind: raw_rows.window_kind,
+        base_entry_count: raw_rows.base_entry_count,
+        hot_week_dep_entry_count: raw_rows.hot_week_dep_entry_count,
+    }
+}
+
 pub open spec fn decide_shared_sync_entry_plan(
     context: &SharedSyncEntryDecisionContext,
 ) -> SharedSyncEntryPlan {
@@ -69,6 +91,16 @@ pub open spec fn decide_shared_sync_entry_plan(
         } else {
             context.base_entry_count
         },
+    }
+}
+
+pub open spec fn normalize_selected_dep_order_context(
+    raw_rows: SelectedDepOrderRawRows,
+) -> SelectedDepOrderDecisionContext {
+    SelectedDepOrderDecisionContext {
+        dep_is_selected: raw_rows.dep_is_selected,
+        dep_already_emitted: raw_rows.dep_already_emitted,
+        dep_currently_visiting: raw_rows.dep_currently_visiting,
     }
 }
 
@@ -91,6 +123,41 @@ proof fn send_order_policy_matches_window_kind()
             == SharedSendOrderPolicy::NewestFirst,
         decide_shared_send_order_policy(SyncWindowKind::Full)
             == SharedSendOrderPolicy::PreserveInput,
+{
+}
+
+proof fn shared_sync_entry_normalizer_preserves_query_facts(
+    base_count: nat,
+    hot_dep_count: nat,
+)
+    ensures
+        normalize_shared_sync_entry_context(SharedSyncEntryRawRows {
+            window_kind: SyncWindowKind::LastDay,
+            base_entry_count: base_count,
+            hot_week_dep_entry_count: hot_dep_count,
+        }) == (SharedSyncEntryDecisionContext {
+            window_kind: SyncWindowKind::LastDay,
+            base_entry_count: base_count,
+            hot_week_dep_entry_count: hot_dep_count,
+        }),
+{
+}
+
+proof fn selected_dep_order_normalizer_preserves_query_facts(
+    dep_is_selected: bool,
+    dep_already_emitted: bool,
+    dep_currently_visiting: bool,
+)
+    ensures
+        normalize_selected_dep_order_context(SelectedDepOrderRawRows {
+            dep_is_selected,
+            dep_already_emitted,
+            dep_currently_visiting,
+        }) == (SelectedDepOrderDecisionContext {
+            dep_is_selected,
+            dep_already_emitted,
+            dep_currently_visiting,
+        }),
 {
 }
 

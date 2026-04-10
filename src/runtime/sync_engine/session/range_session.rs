@@ -31,12 +31,56 @@ enum SharedSendOrderPolicy {
     NewestFirst,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedSyncEntryDecisionContext {
+    window_kind: SyncWindowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedSyncEntryPlan {
+    include_hot_week_deps: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedDepOrderDecisionContext {
+    dep_is_selected: bool,
+    dep_already_emitted: bool,
+    dep_currently_visiting: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedDepOrderPlan {
+    EmitDepBeforeRoot,
+    SkipDepEdge,
+}
+
 fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
     match kind {
         SyncWindowKind::LastDay => SharedSendOrderPolicy::NewestFirst,
         SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
             SharedSendOrderPolicy::PreserveInput
         }
+    }
+}
+
+fn decide_shared_sync_entry_plan(
+    context: &SharedSyncEntryDecisionContext,
+) -> SharedSyncEntryPlan {
+    SharedSyncEntryPlan {
+        include_hot_week_deps: should_include_week_deps(context.window_kind),
+    }
+}
+
+fn decide_selected_dep_order_plan(
+    context: &SelectedDepOrderDecisionContext,
+) -> SelectedDepOrderPlan {
+    if context.dep_is_selected
+        && !context.dep_already_emitted
+        && !context.dep_currently_visiting
+    {
+        SelectedDepOrderPlan::EmitDepBeforeRoot
+    } else {
+        SelectedDepOrderPlan::SkipDepEdge
     }
 }
 
@@ -98,7 +142,10 @@ fn load_shared_sync_entries(
         }
     }
 
-    if should_include_week_deps(range.kind) {
+    let sync_entry_plan = decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
+        window_kind: range.kind,
+    });
+    if sync_entry_plan.include_hot_week_deps {
         let now_ms = range
             .ts_max_exclusive()
             .unwrap_or_else(crate::db::queue::current_timestamp_ms);
@@ -239,20 +286,27 @@ fn visit_selected_send_order(
         created_at_by_id,
         dep_cache,
     )? {
-        if emitted.contains(&dep_id) || visiting.contains(&dep_id) {
-            continue;
+        let dep_plan = decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
+            dep_is_selected: selected_ids.contains(&dep_id),
+            dep_already_emitted: emitted.contains(&dep_id),
+            dep_currently_visiting: visiting.contains(&dep_id),
+        });
+        match dep_plan {
+            SelectedDepOrderPlan::EmitDepBeforeRoot => {
+                visit_selected_send_order(
+                    conn,
+                    workspace_id,
+                    dep_id,
+                    selected_ids,
+                    created_at_by_id,
+                    dep_cache,
+                    emitted,
+                    visiting,
+                    ordered,
+                )?;
+            }
+            SelectedDepOrderPlan::SkipDepEdge => continue,
         }
-        visit_selected_send_order(
-            conn,
-            workspace_id,
-            dep_id,
-            selected_ids,
-            created_at_by_id,
-            dep_cache,
-            emitted,
-            visiting,
-            ordered,
-        )?;
     }
 
     visiting.remove(&event_id);
@@ -670,6 +724,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(hot_order, vec![second_id, first_id]);
+    }
+
+    #[test]
+    fn shared_sync_entry_plan_matches_hot_week_dep_policy() {
+        assert_eq!(
+            decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
+                window_kind: SyncWindowKind::Full,
+            }),
+            SharedSyncEntryPlan {
+                include_hot_week_deps: false,
+            }
+        );
+        assert_eq!(
+            decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
+                window_kind: SyncWindowKind::LastDay,
+            }),
+            SharedSyncEntryPlan {
+                include_hot_week_deps: true,
+            }
+        );
+        assert_eq!(
+            decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
+                window_kind: SyncWindowKind::LastWeek,
+            }),
+            SharedSyncEntryPlan {
+                include_hot_week_deps: true,
+            }
+        );
+    }
+
+    #[test]
+    fn selected_dep_order_plan_emits_only_selected_unvisited_deps() {
+        assert_eq!(
+            decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
+                dep_is_selected: true,
+                dep_already_emitted: false,
+                dep_currently_visiting: false,
+            }),
+            SelectedDepOrderPlan::EmitDepBeforeRoot
+        );
+        assert_eq!(
+            decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
+                dep_is_selected: false,
+                dep_already_emitted: false,
+                dep_currently_visiting: false,
+            }),
+            SelectedDepOrderPlan::SkipDepEdge
+        );
+        assert_eq!(
+            decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
+                dep_is_selected: true,
+                dep_already_emitted: true,
+                dep_currently_visiting: false,
+            }),
+            SelectedDepOrderPlan::SkipDepEdge
+        );
+        assert_eq!(
+            decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
+                dep_is_selected: true,
+                dep_already_emitted: false,
+                dep_currently_visiting: true,
+            }),
+            SelectedDepOrderPlan::SkipDepEdge
+        );
     }
 
     #[test]
