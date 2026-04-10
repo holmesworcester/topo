@@ -6,6 +6,7 @@ pub mod contract;
 pub mod data_ingestion;
 pub mod decision;
 pub mod dispatch;
+pub mod event_projectors;
 pub mod file_projectors;
 pub mod idempotency;
 pub mod persist_phase;

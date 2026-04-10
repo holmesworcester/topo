@@ -577,4 +577,79 @@ mod tests {
             }
         }
     }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FormalProjectorFamily {
+        BasicInsert,
+        Content,
+        EnvelopeOnlyReject,
+        InviteBootstrap,
+        InviteAccepted,
+        PeerShared,
+        KeyDelivery,
+        SignerFrontier,
+        FileSlice,
+        EndpointRoot,
+        NoWrite,
+    }
+
+    fn formal_projector_family(type_code: u8) -> Option<FormalProjectorFamily> {
+        match type_code {
+            EVENT_TYPE_MESSAGE | EVENT_TYPE_REACTION | EVENT_TYPE_MESSAGE_DELETION => {
+                Some(FormalProjectorFamily::Content)
+            }
+            EVENT_TYPE_SIGNED | EVENT_TYPE_ENCRYPTED => {
+                Some(FormalProjectorFamily::EnvelopeOnlyReject)
+            }
+            EVENT_TYPE_WORKSPACE
+            | EVENT_TYPE_USER
+            | EVENT_TYPE_ADMIN
+            | EVENT_TYPE_KEY_SECRET
+            | EVENT_TYPE_INVITE_SECRET
+            | EVENT_TYPE_TENANT
+            | EVENT_TYPE_FILE => Some(FormalProjectorFamily::BasicInsert),
+            EVENT_TYPE_USER_INVITE | EVENT_TYPE_DEVICE_INVITE => {
+                Some(FormalProjectorFamily::InviteBootstrap)
+            }
+            EVENT_TYPE_INVITE_ACCEPTED => Some(FormalProjectorFamily::InviteAccepted),
+            EVENT_TYPE_PEER_SHARED => Some(FormalProjectorFamily::PeerShared),
+            EVENT_TYPE_KEY_REQUEST | EVENT_TYPE_KEY_SHARED => {
+                Some(FormalProjectorFamily::KeyDelivery)
+            }
+            EVENT_TYPE_REMOVAL | EVENT_TYPE_KEY_ROTATION => {
+                Some(FormalProjectorFamily::SignerFrontier)
+            }
+            EVENT_TYPE_FILE_SLICE => Some(FormalProjectorFamily::FileSlice),
+            EVENT_TYPE_PEER_SECRET | EVENT_TYPE_ENDPOINT_SECRET | EVENT_TYPE_ENDPOINT_SHARED => {
+                Some(FormalProjectorFamily::EndpointRoot)
+            }
+            EVENT_TYPE_BENCH_DEP => Some(FormalProjectorFamily::NoWrite),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_registry_formal_projector_coverage() {
+        let reg = registry();
+        let registered_codes: Vec<u8> = (1..=35u8)
+            .filter(|code| reg.lookup(*code).is_some())
+            .collect();
+        let formally_covered_codes: Vec<u8> = (1..=35u8)
+            .filter(|code| formal_projector_family(*code).is_some())
+            .collect();
+
+        assert_eq!(
+            formally_covered_codes, registered_codes,
+            "every registered event projector must be assigned to a Verus-covered basic projector family; update verus-proofs/src/pipeline/event_projectors.rs with any new family"
+        );
+
+        for code in registered_codes {
+            let meta = reg.lookup(code).expect("registered meta");
+            let family = formal_projector_family(code).expect("formal family");
+            assert!(
+                !meta.type_name.is_empty(),
+                "covered projector type {code} in family {family:?} must have a stable type name"
+            );
+        }
+    }
 }

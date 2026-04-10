@@ -1549,14 +1549,15 @@ impl ProjectionQueries for Connection {
         dep_id: &EventId,
     ) -> ProjectionQueryResult<DepLoadResult> {
         let dep_b64 = event_id_to_base64(dep_id);
-        let semantic_type_rows = load_semantic_type_raw_rows(self, recorded_by, &dep_b64)?;
-        if semantic_type_rows != SemanticTypeRawRows::Missing {
-            return Ok(DepLoadResult::Ready { semantic_type_rows });
-        }
+        // For purge-sensitive dependents, tombstone state wins over semantic readiness.
         if let Some(message_event_id) =
             deleted_message_purges_dep(self, recorded_by, parsed, field_name, &dep_b64)?
         {
             return Ok(DepLoadResult::purge(message_event_id));
+        }
+        let semantic_type_rows = load_semantic_type_raw_rows(self, recorded_by, &dep_b64)?;
+        if semantic_type_rows != SemanticTypeRawRows::Missing {
+            return Ok(DepLoadResult::Ready { semantic_type_rows });
         }
         Ok(DepLoadResult::missing())
     }

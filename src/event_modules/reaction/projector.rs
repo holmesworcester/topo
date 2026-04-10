@@ -24,8 +24,8 @@ pub fn build_projector_context(
 
 /// Pure projector: Reaction → reactions table insert.
 ///
-/// If the target message has been deleted, the
-/// reaction is structurally valid but no row is written.
+/// Tombstoned targets are handled by dependency context loading before this
+/// projector runs; the resulting hard purge is valid but writes no reaction row.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
