@@ -30,7 +30,7 @@ runtime seams, Verus mirrors, and targeted checks aligned.
 | Projection stage effects | `src/state/projection/apply/stages.rs` | `verus-proofs/src/state/projection/stages.rs` | projector has already produced a typed `ProjectionDecision`; the effect plan forbids write ops for block/reject/already-processed decisions | `ECP` | `cargo test -j1 --lib context_load_disposition -- --nocapture`; `cargo test -j1 --lib projection_decision_effect_plan -- --nocapture`; `cargo-verus verify` |
 | Hard purge planning | `src/state/projection/purge.rs` | `verus-proofs/src/state/projection/purge.rs` | purge candidate rows are scoped to one event | `WC`, `ECP` | `cargo test -j1 --lib hard_purge_plan -- --nocapture`; `cargo-verus verify` |
 | Persist-phase validation | `src/state/pipeline/phases.rs` | `verus-proofs/src/pipeline/validation_inputs.rs` | prefix/type extraction is trusted to read bytes as specified | `AMF`, `ECP` | `cargo test -j1 --lib persist_validation -- --nocapture`; `cargo test -j1 --lib run_persist_phase -- --nocapture`; `cargo-verus verify` |
-| Persist event fanout/index planning | `src/state/pipeline/phases.rs` | `verus-proofs/src/pipeline/persist_phase.rs` | workspace cache/query returns the tenant's accepted workspace binding | `WC`, `ECP` | `cargo test -j1 --lib run_persist_phase -- --nocapture`; `cargo-verus verify` |
+| Persist event fanout/index planning | `src/state/pipeline/phases.rs` | `verus-proofs/src/pipeline/persist_phase.rs` | workspace cache/query returns the tenant's accepted workspace binding; missing workspace binding suppresses index and fanout targets | `WC`, `ECP` | `cargo test -j1 --lib run_persist_phase -- --nocapture`; `cargo-verus verify` |
 
 ## Maintenance Rules
 

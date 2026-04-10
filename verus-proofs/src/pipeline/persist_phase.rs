@@ -105,7 +105,8 @@ pub open spec fn persist_decisions_for_event(
         // endpoint_shared events don't get live hints
         emit_live_hint: matches!(share_scope, ShareScope::Shared) && !type_name_is_endpoint_shared,
         // endpoint_shared events don't get fanouts
-        emit_fanout: matches!(share_scope, ShareScope::Shared) && !type_name_is_endpoint_shared,
+        emit_fanout: matches!(workspace_target, WorkspaceTarget::EventId)
+            || matches!(workspace_target, WorkspaceTarget::WorkspaceBinding),
         fanout_workspace: workspace_target,
     }
 }
@@ -260,6 +261,21 @@ proof fn proof_regular_shared_gets_hints_and_fanouts()
         ({
             let d = persist_decisions_for_event(ShareScope::Shared, false, false, false, true);
             d.emit_live_hint && d.emit_fanout && d.write_shared_index
+        }),
+{
+}
+
+/// Proof: a shared non-workspace event without an accepted workspace binding
+/// does not get indexed or fanned out because there is no concrete workspace
+/// target for either executor effect.
+proof fn proof_missing_workspace_binding_has_no_index_or_fanout()
+    ensures
+        ({
+            let d = persist_decisions_for_event(ShareScope::Shared, false, false, false, false);
+            !d.write_shared_index
+                && d.shared_index_workspace == WorkspaceTarget::MissingBinding
+                && !d.emit_fanout
+                && d.fanout_workspace == WorkspaceTarget::MissingBinding
         }),
 {
 }

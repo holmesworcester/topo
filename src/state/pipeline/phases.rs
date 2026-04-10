@@ -517,6 +517,34 @@ mod tests {
     }
 
     #[test]
+    fn persist_event_plan_missing_workspace_binding_suppresses_index_and_fanout() {
+        let context = normalize_persist_event(PersistEventRawRows {
+            share_scope: ShareScope::Shared,
+            event_kind: PersistEventKind::Other,
+            is_file_slice: false,
+            workspace_binding: None,
+        });
+
+        let plan = decide_persist_event_plan(&context);
+        assert_eq!(
+            plan,
+            PersistEventPlan {
+                shared_index_workspace: PersistWorkspaceTarget::MissingBinding,
+                priority_lane: 1,
+                fanout_workspace: PersistWorkspaceTarget::MissingBinding,
+            }
+        );
+        assert_eq!(
+            resolve_persist_workspace_target(&plan.shared_index_workspace, "event-a"),
+            None
+        );
+        assert_eq!(
+            resolve_persist_workspace_target(&plan.fanout_workspace, "event-a"),
+            None
+        );
+    }
+
+    #[test]
     fn run_persist_phase_enqueues_encrypted_file_slice_as_bulk() {
         let db = open_in_memory().unwrap();
         create_tables(&db).unwrap();
