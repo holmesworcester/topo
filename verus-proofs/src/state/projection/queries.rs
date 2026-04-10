@@ -358,6 +358,125 @@ proof fn admin_authority_malformed_user_key_rejects()
 {
 }
 
+pub enum PeerSharedAuthorityRows {
+    MissingCurrentSigner,
+    UnsupportedSignerType,
+    MissingDeviceInviteBlob,
+    MalformedDeviceInvite,
+    UniqueAuthorizedUser { claimed_user_matches_authorized_user: bool },
+}
+
+pub enum PeerSharedAuthorityDecisionContext {
+    UniqueAuthorizedUser { claimed_user_matches_authorized_user: bool },
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType,
+    RejectMissingDeviceInviteBlob,
+    RejectMalformedDeviceInvite,
+}
+
+pub enum PeerSharedAuthorityPlan {
+    Ready,
+    Reject,
+}
+
+pub open spec fn normalize_peer_shared_authority(
+    rows: PeerSharedAuthorityRows,
+) -> PeerSharedAuthorityDecisionContext {
+    match rows {
+        PeerSharedAuthorityRows::MissingCurrentSigner => {
+            PeerSharedAuthorityDecisionContext::RejectMissingCurrentSigner
+        }
+        PeerSharedAuthorityRows::UnsupportedSignerType => {
+            PeerSharedAuthorityDecisionContext::RejectUnsupportedSignerType
+        }
+        PeerSharedAuthorityRows::MissingDeviceInviteBlob => {
+            PeerSharedAuthorityDecisionContext::RejectMissingDeviceInviteBlob
+        }
+        PeerSharedAuthorityRows::MalformedDeviceInvite => {
+            PeerSharedAuthorityDecisionContext::RejectMalformedDeviceInvite
+        }
+        PeerSharedAuthorityRows::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user,
+        } => PeerSharedAuthorityDecisionContext::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user,
+        },
+    }
+}
+
+pub open spec fn decide_peer_shared_authority_plan(
+    context: PeerSharedAuthorityDecisionContext,
+) -> PeerSharedAuthorityPlan {
+    match context {
+        PeerSharedAuthorityDecisionContext::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user,
+        } => {
+            if claimed_user_matches_authorized_user {
+                PeerSharedAuthorityPlan::Ready
+            } else {
+                PeerSharedAuthorityPlan::Reject
+            }
+        }
+        PeerSharedAuthorityDecisionContext::RejectMissingCurrentSigner
+        | PeerSharedAuthorityDecisionContext::RejectUnsupportedSignerType
+        | PeerSharedAuthorityDecisionContext::RejectMissingDeviceInviteBlob
+        | PeerSharedAuthorityDecisionContext::RejectMalformedDeviceInvite => {
+            PeerSharedAuthorityPlan::Reject
+        }
+    }
+}
+
+proof fn peer_shared_authority_matching_user_is_ready()
+    ensures
+        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
+            PeerSharedAuthorityRows::UniqueAuthorizedUser {
+                claimed_user_matches_authorized_user: true,
+            },
+        )) == PeerSharedAuthorityPlan::Ready,
+{
+}
+
+proof fn peer_shared_authority_user_mismatch_rejects()
+    ensures
+        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
+            PeerSharedAuthorityRows::UniqueAuthorizedUser {
+                claimed_user_matches_authorized_user: false,
+            },
+        )) == PeerSharedAuthorityPlan::Reject,
+{
+}
+
+proof fn peer_shared_authority_missing_current_signer_rejects()
+    ensures
+        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
+            PeerSharedAuthorityRows::MissingCurrentSigner,
+        )) == PeerSharedAuthorityPlan::Reject,
+{
+}
+
+proof fn peer_shared_authority_unsupported_signer_type_rejects()
+    ensures
+        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
+            PeerSharedAuthorityRows::UnsupportedSignerType,
+        )) == PeerSharedAuthorityPlan::Reject,
+{
+}
+
+proof fn peer_shared_authority_missing_device_invite_rejects()
+    ensures
+        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
+            PeerSharedAuthorityRows::MissingDeviceInviteBlob,
+        )) == PeerSharedAuthorityPlan::Reject,
+{
+}
+
+proof fn peer_shared_authority_malformed_device_invite_rejects()
+    ensures
+        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
+            PeerSharedAuthorityRows::MalformedDeviceInvite,
+        )) == PeerSharedAuthorityPlan::Reject,
+{
+}
+
 pub enum DeletionSignerRows {
     MissingCurrentSigner,
     AdminSigner,

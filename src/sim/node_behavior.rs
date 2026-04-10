@@ -18,10 +18,11 @@ use crate::projection::decision::ProjectionDecision;
 use crate::projection::queries::{
     admin_authority_plan_to_mismatch_reason, build_workspace_projector_decision_context,
     content_authority_plan_to_signer_user_mismatch_reason, decide_admin_authority_plan,
-    decide_content_authority_plan, decide_deletion_signer_plan,
+    decide_content_authority_plan, decide_deletion_signer_plan, decide_peer_shared_authority_plan,
     deletion_signer_plan_to_context_fields, normalize_admin_authority, normalize_content_authority,
-    normalize_deletion_signer, normalize_workspace_acceptance, AdminAuthorityRawRows,
-    ContentAuthorityRawRows, DeletionSignerRawRows, DepLoadResult, ProjectionFrameContext,
+    normalize_deletion_signer, normalize_peer_shared_authority, normalize_workspace_acceptance,
+    peer_shared_authority_plan_to_mismatch_reason, AdminAuthorityRawRows, ContentAuthorityRawRows,
+    DeletionSignerRawRows, DepLoadResult, PeerSharedAuthorityRawRows, ProjectionFrameContext,
     ProjectionQueries, ProjectionQueryResult, SemanticTypeRawRows, WorkspaceAcceptedRawRows,
     WorkspaceDecisionContext,
 };
@@ -1184,100 +1185,76 @@ impl ProjectionQueries for NodeBehaviorEngine {
         peer_shared: &events::PeerSharedEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
-        let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ProjectorDecisionContext {
-                peer_shared_user_mismatch_reason: Some(
-                    "peer_shared missing current signer envelope".to_string(),
-                ),
-                ..ProjectorDecisionContext::default()
-            });
-        };
-        if current_signer.semantic_type_code != events::EVENT_TYPE_DEVICE_INVITE {
-            return Ok(ProjectorDecisionContext {
-                peer_shared_user_mismatch_reason: Some(format!(
-                    "peer_shared signer must be device_invite, got semantic type {}",
-                    current_signer.semantic_type_code
-                )),
-                ..ProjectorDecisionContext::default()
-            });
-        }
-        let signed_by_b64 = current_signer.event_id.clone();
-        let Some(blob) = valid_event_blob(&state, recorded_by, &signed_by_b64) else {
-            return Ok(ProjectorDecisionContext {
-                peer_shared_user_mismatch_reason: Some(format!(
-                    "no valid device_invite blob for signer {}",
-                    signed_by_b64
-                )),
-                ..ProjectorDecisionContext::default()
-            });
-        };
-
-        let parsed_signer = match parse_event(&blob) {
-            Ok(parsed_signer) => parsed_signer,
-            Err(err) => {
-                return Ok(ProjectorDecisionContext {
-                    peer_shared_user_mismatch_reason: Some(format!(
-                        "failed to parse device_invite signer {}: {}",
-                        signed_by_b64, err
-                    )),
-                    ..ProjectorDecisionContext::default()
-                })
-            }
-        };
-
-        let device_invite = match parsed_signer {
-            ParsedEvent::DeviceInvite(device_invite) => device_invite,
-            ParsedEvent::Signed(signed) => match parse_event(&signed.payload) {
-                Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
-                Ok(other) => {
-                    return Ok(ProjectorDecisionContext {
-                        peer_shared_user_mismatch_reason: Some(format!(
-                            "peer_shared signer {} resolved to unexpected event type {}",
-                            signed_by_b64,
-                            other.event_type_code()
-                        )),
-                        ..ProjectorDecisionContext::default()
-                    })
+        let raw_rows = match frame.current_signer.as_ref() {
+            None => PeerSharedAuthorityRawRows::MissingCurrentSigner,
+            Some(current_signer)
+                if current_signer.semantic_type_code != events::EVENT_TYPE_DEVICE_INVITE =>
+            {
+                PeerSharedAuthorityRawRows::UnsupportedSignerType {
+                    semantic_type_code: current_signer.semantic_type_code,
                 }
-                Err(err) => {
-                    return Ok(ProjectorDecisionContext {
-                        peer_shared_user_mismatch_reason: Some(format!(
-                            "failed to parse signed device_invite signer {}: {}",
-                            signed_by_b64, err
-                        )),
-                        ..ProjectorDecisionContext::default()
-                    })
-                }
-            },
-            other => {
-                return Ok(ProjectorDecisionContext {
-                    peer_shared_user_mismatch_reason: Some(format!(
-                        "peer_shared signer {} resolved to unexpected event type {}",
-                        signed_by_b64,
-                        other.event_type_code()
-                    )),
-                    ..ProjectorDecisionContext::default()
-                })
             }
-        };
-        let expected_user = Some(event_id_to_base64(&device_invite.authority_event_id));
-
-        let peer_shared_user_mismatch_reason = match expected_user {
-            None => None,
-            Some(expected_user) => {
-                if let Some(detail) = expected_user.strip_prefix("__ERROR__:") {
-                    Some(detail.to_string())
-                } else {
-                    let claimed_user_b64 = event_id_to_base64(&peer_shared.user_event_id);
-                    (expected_user != claimed_user_b64).then(|| {
-                        format!(
-                            "peer_shared signer authorizes user {} but event claims {}",
-                            expected_user, claimed_user_b64
-                        )
-                    })
+            Some(current_signer) => {
+                let signed_by_b64 = current_signer.event_id.clone();
+                match valid_event_blob(&state, recorded_by, &signed_by_b64) {
+                    None => PeerSharedAuthorityRawRows::MissingDeviceInviteBlob {
+                        signer_event_id: signed_by_b64,
+                    },
+                    Some(blob) => match parse_event(&blob) {
+                        Ok(ParsedEvent::DeviceInvite(device_invite)) => {
+                            PeerSharedAuthorityRawRows::DeviceInviteSigner {
+                                signer_event_id: signed_by_b64,
+                                authorized_user_id: event_id_to_base64(
+                                    &device_invite.authority_event_id,
+                                ),
+                            }
+                        }
+                        Ok(ParsedEvent::Signed(signed)) => match parse_event(&signed.payload) {
+                            Ok(ParsedEvent::DeviceInvite(device_invite)) => {
+                                PeerSharedAuthorityRawRows::DeviceInviteSigner {
+                                    signer_event_id: signed_by_b64,
+                                    authorized_user_id: event_id_to_base64(
+                                        &device_invite.authority_event_id,
+                                    ),
+                                }
+                            }
+                            Ok(other) => PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                                signer_event_id: signed_by_b64.clone(),
+                                reason: format!(
+                                    "peer_shared signer {} resolved to unexpected event type {}",
+                                    signed_by_b64,
+                                    other.event_type_code()
+                                ),
+                            },
+                            Err(err) => PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                                signer_event_id: signed_by_b64.clone(),
+                                reason: format!(
+                                    "failed to parse signed device_invite signer {}: {}",
+                                    signed_by_b64, err
+                                ),
+                            },
+                        },
+                        Ok(other) => PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                            signer_event_id: signed_by_b64.clone(),
+                            reason: format!(
+                                "peer_shared signer {} resolved to unexpected event type {}",
+                                signed_by_b64,
+                                other.event_type_code()
+                            ),
+                        },
+                        Err(err) => PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                            signer_event_id: signed_by_b64.clone(),
+                            reason: format!(
+                                "failed to parse device_invite signer {}: {}",
+                                signed_by_b64, err
+                            ),
+                        },
+                    },
                 }
             }
         };
+        let claimed_user_b64 = event_id_to_base64(&peer_shared.user_event_id);
+        let authority_context = normalize_peer_shared_authority(&raw_rows, &claimed_user_b64);
 
         let endpoint_shared_event_id_b64 =
             event_id_to_base64(&peer_shared.endpoint_shared_event_id);
@@ -1289,7 +1266,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
         );
 
         Ok(ProjectorDecisionContext {
-            peer_shared_user_mismatch_reason,
+            peer_shared_user_mismatch_reason: peer_shared_authority_plan_to_mismatch_reason(
+                decide_peer_shared_authority_plan(&authority_context),
+            ),
             peer_shared_endpoint_id: endpoint_shared_row
                 .and_then(|row| row_text(row, "endpoint_id").map(ToOwned::to_owned)),
             peer_shared_endpoint_binding_reason: match endpoint_shared_row {

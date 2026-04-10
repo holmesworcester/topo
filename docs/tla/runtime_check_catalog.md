@@ -67,7 +67,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_DI_PENDING_BOOTSTRAP_SRC | event_modules/device_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
 | CHK_USR_INSERT | event_modules/user::project_pure | InvDeps | projector_local |
 | CHK_PS_INSERT | event_modules/peer_shared::project_pure | InvPeerSharedTrustSource | projector_local |
-| CHK_PS_AUTHORIZED_USER | event_modules/peer_shared::build_projector_context | InvDeviceInviteChain | projector_local |
+| CHK_PS_AUTHORIZED_USER | state/projection/queries::decide_peer_shared_authority_plan + event_modules/peer_shared::build_projector_context | InvDeviceInviteChain | projector_context |
 | CHK_PS_MATCH_CARRIED | event_modules/peer_shared::project_pure | InvPeerSharedTrustMatchesCarried | projector_local |
 | CHK_PS_SUPERSEDE | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvBootstrapConsumedByPeerShared | transport_credential |
 | CHK_ADM_INSERT | event_modules/admin::project_pure | InvAdminChain | projector_local |
@@ -92,7 +92,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 |----------|-------|-------------|----------|
 | CHK_UI_SIGNER_FAMILY | event_modules/user_invite::build_projector_context | InvUserInviteChain | projector_local |
 | CHK_DI_SIGNER_FAMILY | event_modules/device_invite::build_projector_context | InvDeviceInviteChain | projector_local |
-| CHK_PS_SIGNER_FAMILY | event_modules/peer_shared::build_projector_context | InvDeviceInviteChain | projector_local |
+| CHK_PS_SIGNER_FAMILY | state/projection/queries::decide_peer_shared_authority_plan + event_modules/peer_shared::build_projector_context | InvDeviceInviteChain | projector_context |
 | CHK_ADM_SIGNER_FAMILY | state/projection/queries::decide_admin_authority_plan + event_modules/admin::build_projector_context | InvAdminChain | projector_context |
 
 ## Pipeline-Shared Checks

@@ -213,6 +213,51 @@ pub enum AdminAuthorityPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerSharedAuthorityRawRows {
+    MissingCurrentSigner,
+    UnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    MissingDeviceInviteBlob {
+        signer_event_id: String,
+    },
+    MalformedDeviceInvite {
+        signer_event_id: String,
+        reason: String,
+    },
+    DeviceInviteSigner {
+        signer_event_id: String,
+        authorized_user_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerSharedAuthorityDecisionContext {
+    UniqueAuthorizedUser {
+        signer_event_id: String,
+        authorized_user_id: String,
+        claimed_user_id: String,
+    },
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    RejectMissingDeviceInviteBlob {
+        signer_event_id: String,
+    },
+    RejectMalformedDeviceInvite {
+        signer_event_id: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerSharedAuthorityPlan {
+    Ready,
+    Reject { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeletionSignerRawRows {
     MissingCurrentSigner,
     AdminSigner,
@@ -465,6 +510,56 @@ pub fn normalize_admin_authority(
     }
 }
 
+pub fn normalize_peer_shared_authority(
+    raw_rows: &PeerSharedAuthorityRawRows,
+    claimed_user_id: &str,
+) -> PeerSharedAuthorityDecisionContext {
+    match raw_rows {
+        PeerSharedAuthorityRawRows::MissingCurrentSigner => {
+            PeerSharedAuthorityDecisionContext::RejectMissingCurrentSigner
+        }
+        PeerSharedAuthorityRawRows::UnsupportedSignerType { semantic_type_code } => {
+            PeerSharedAuthorityDecisionContext::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            }
+        }
+        PeerSharedAuthorityRawRows::MissingDeviceInviteBlob { signer_event_id } => {
+            PeerSharedAuthorityDecisionContext::RejectMissingDeviceInviteBlob {
+                signer_event_id: signer_event_id.clone(),
+            }
+        }
+        PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+            signer_event_id,
+            reason,
+        } => PeerSharedAuthorityDecisionContext::RejectMalformedDeviceInvite {
+            signer_event_id: signer_event_id.clone(),
+            reason: reason.clone(),
+        },
+        PeerSharedAuthorityRawRows::DeviceInviteSigner {
+            signer_event_id,
+            authorized_user_id,
+        } => {
+            if event_id_from_base64(signer_event_id).is_none()
+                || event_id_from_base64(authorized_user_id).is_none()
+                || event_id_from_base64(claimed_user_id).is_none()
+            {
+                return PeerSharedAuthorityDecisionContext::RejectMalformedDeviceInvite {
+                    signer_event_id: signer_event_id.clone(),
+                    reason: format!(
+                        "malformed peer_shared device_invite authorization for signer {}",
+                        signer_event_id
+                    ),
+                };
+            }
+            PeerSharedAuthorityDecisionContext::UniqueAuthorizedUser {
+                signer_event_id: signer_event_id.clone(),
+                authorized_user_id: authorized_user_id.clone(),
+                claimed_user_id: claimed_user_id.to_string(),
+            }
+        }
+    }
+}
+
 pub fn normalize_deletion_signer(
     raw_rows: &DeletionSignerRawRows,
 ) -> DeletionSignerDecisionContext {
@@ -669,6 +764,61 @@ pub fn admin_authority_plan_to_mismatch_reason(plan: AdminAuthorityPlan) -> Opti
     match plan {
         AdminAuthorityPlan::Ready => None,
         AdminAuthorityPlan::Reject { reason } => Some(reason),
+    }
+}
+
+pub fn decide_peer_shared_authority_plan(
+    context: &PeerSharedAuthorityDecisionContext,
+) -> PeerSharedAuthorityPlan {
+    match context {
+        PeerSharedAuthorityDecisionContext::UniqueAuthorizedUser {
+            signer_event_id: _,
+            authorized_user_id,
+            claimed_user_id,
+        } if authorized_user_id == claimed_user_id => PeerSharedAuthorityPlan::Ready,
+        PeerSharedAuthorityDecisionContext::UniqueAuthorizedUser {
+            signer_event_id: _,
+            authorized_user_id,
+            claimed_user_id,
+        } => PeerSharedAuthorityPlan::Reject {
+            reason: format!(
+                "peer_shared signer authorizes user {} but event claims {}",
+                authorized_user_id, claimed_user_id
+            ),
+        },
+        PeerSharedAuthorityDecisionContext::RejectMissingCurrentSigner => {
+            PeerSharedAuthorityPlan::Reject {
+                reason: "peer_shared missing current signer envelope".to_string(),
+            }
+        }
+        PeerSharedAuthorityDecisionContext::RejectUnsupportedSignerType { semantic_type_code } => {
+            PeerSharedAuthorityPlan::Reject {
+                reason: format!(
+                    "peer_shared signer must be device_invite, got semantic type {}",
+                    semantic_type_code
+                ),
+            }
+        }
+        PeerSharedAuthorityDecisionContext::RejectMissingDeviceInviteBlob { signer_event_id } => {
+            PeerSharedAuthorityPlan::Reject {
+                reason: format!("no valid device_invite blob for signer {}", signer_event_id),
+            }
+        }
+        PeerSharedAuthorityDecisionContext::RejectMalformedDeviceInvite {
+            signer_event_id: _,
+            reason,
+        } => PeerSharedAuthorityPlan::Reject {
+            reason: reason.clone(),
+        },
+    }
+}
+
+pub fn peer_shared_authority_plan_to_mismatch_reason(
+    plan: PeerSharedAuthorityPlan,
+) -> Option<String> {
+    match plan {
+        PeerSharedAuthorityPlan::Ready => None,
+        PeerSharedAuthorityPlan::Reject { reason } => Some(reason),
     }
 }
 
@@ -1154,29 +1304,25 @@ fn load_valid_event_blob(
     .optional()
 }
 
-fn authorized_user_for_device_invite(
+fn load_peer_shared_authority_raw_rows(
     conn: &Connection,
     frame: &ProjectionFrameContext,
     recorded_by: &str,
-) -> Result<Option<String>, rusqlite::Error> {
+) -> Result<PeerSharedAuthorityRawRows, rusqlite::Error> {
     let Some(current_signer) = frame.current_signer.as_ref() else {
-        return Ok(Some(
-            "__ERROR__:missing current signer envelope for device_invite".to_string(),
-        ));
+        return Ok(PeerSharedAuthorityRawRows::MissingCurrentSigner);
     };
     if current_signer.semantic_type_code != EVENT_TYPE_DEVICE_INVITE {
-        return Ok(Some(format!(
-            "__ERROR__:unsupported device_invite signer semantic type {} for peer_shared authorization",
-            current_signer.semantic_type_code
-        )));
+        return Ok(PeerSharedAuthorityRawRows::UnsupportedSignerType {
+            semantic_type_code: current_signer.semantic_type_code,
+        });
     }
 
     let signer_b64 = current_signer.event_id.clone();
     let Some(blob) = load_valid_event_blob(conn, recorded_by, &signer_b64)? else {
-        return Ok(Some(format!(
-            "__ERROR__:no valid device_invite blob for signer {}",
-            signer_b64
-        )));
+        return Ok(PeerSharedAuthorityRawRows::MissingDeviceInviteBlob {
+            signer_event_id: signer_b64,
+        });
     };
 
     let device_invite = match parse_event(&blob) {
@@ -1184,62 +1330,50 @@ fn authorized_user_for_device_invite(
         Ok(ParsedEvent::Signed(signed)) => match parse_event(&signed.payload) {
             Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
             Ok(other) => {
-                return Ok(Some(format!(
-                    "__ERROR__:peer_shared signer {} resolved to unexpected event type {}",
-                    signer_b64,
-                    other.event_type_code()
-                )))
+                return Ok(PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                    signer_event_id: signer_b64.clone(),
+                    reason: format!(
+                        "peer_shared signer {} resolved to unexpected event type {}",
+                        signer_b64,
+                        other.event_type_code()
+                    ),
+                })
             }
             Err(err) => {
-                return Ok(Some(format!(
-                    "__ERROR__:failed to parse signed device_invite signer {}: {}",
-                    signer_b64, err
-                )))
+                return Ok(PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                    signer_event_id: signer_b64.clone(),
+                    reason: format!(
+                        "failed to parse signed device_invite signer {}: {}",
+                        signer_b64, err
+                    ),
+                })
             }
         },
         Ok(other) => {
-            return Ok(Some(format!(
-                "__ERROR__:peer_shared signer {} resolved to unexpected event type {}",
-                signer_b64,
-                other.event_type_code()
-            )))
+            return Ok(PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                signer_event_id: signer_b64.clone(),
+                reason: format!(
+                    "peer_shared signer {} resolved to unexpected event type {}",
+                    signer_b64,
+                    other.event_type_code()
+                ),
+            })
         }
         Err(err) => {
-            return Ok(Some(format!(
-                "__ERROR__:failed to parse device_invite signer {}: {}",
-                signer_b64, err
-            )))
+            return Ok(PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                signer_event_id: signer_b64.clone(),
+                reason: format!(
+                    "failed to parse device_invite signer {}: {}",
+                    signer_b64, err
+                ),
+            })
         }
     };
 
-    Ok(Some(event_id_to_base64(&device_invite.authority_event_id)))
-}
-
-fn peer_shared_user_mismatch_reason(
-    conn: &Connection,
-    frame: &ProjectionFrameContext,
-    recorded_by: &str,
-    user_event_id: &[u8; 32],
-) -> Result<Option<String>, rusqlite::Error> {
-    let claimed_user_b64 = event_id_to_base64(user_event_id);
-    let expected_user = authorized_user_for_device_invite(conn, frame, recorded_by)?;
-
-    let Some(expected_user) = expected_user else {
-        return Ok(None);
-    };
-
-    if let Some(detail) = expected_user.strip_prefix("__ERROR__:") {
-        return Ok(Some(detail.to_string()));
-    }
-
-    if expected_user != claimed_user_b64 {
-        return Ok(Some(format!(
-            "peer_shared signer authorizes user {} but event claims {}",
-            expected_user, claimed_user_b64
-        )));
-    }
-
-    Ok(None)
+    Ok(PeerSharedAuthorityRawRows::DeviceInviteSigner {
+        signer_event_id: signer_b64,
+        authorized_user_id: event_id_to_base64(&device_invite.authority_event_id),
+    })
 }
 
 fn bootstrap_spki_already_peer_shared(
@@ -1496,80 +1630,9 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         peer_shared: &PeerSharedEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ProjectorDecisionContext {
-                peer_shared_user_mismatch_reason: Some(
-                    "peer_shared missing current signer envelope".to_string(),
-                ),
-                ..ProjectorDecisionContext::default()
-            });
-        };
-        if current_signer.semantic_type_code != EVENT_TYPE_DEVICE_INVITE {
-            return Ok(ProjectorDecisionContext {
-                peer_shared_user_mismatch_reason: Some(format!(
-                    "peer_shared signer must be device_invite, got semantic type {}",
-                    current_signer.semantic_type_code
-                )),
-                ..ProjectorDecisionContext::default()
-            });
-        }
-
-        let signed_by_b64 = current_signer.event_id.clone();
-        let blob = load_valid_event_blob(self, recorded_by, &signed_by_b64)?;
-        let Some(blob) = blob else {
-            return Ok(ProjectorDecisionContext {
-                peer_shared_user_mismatch_reason: Some(format!(
-                    "no valid device_invite blob for signer {}",
-                    signed_by_b64
-                )),
-                ..ProjectorDecisionContext::default()
-            });
-        };
-
-        let _device_invite = match parse_event(&blob) {
-            Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
-            Ok(ParsedEvent::Signed(signed)) => match parse_event(&signed.payload) {
-                Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
-                Ok(other) => {
-                    return Ok(ProjectorDecisionContext {
-                        peer_shared_user_mismatch_reason: Some(format!(
-                            "peer_shared signer {} resolved to unexpected event type {}",
-                            signed_by_b64,
-                            other.event_type_code()
-                        )),
-                        ..ProjectorDecisionContext::default()
-                    })
-                }
-                Err(err) => {
-                    return Ok(ProjectorDecisionContext {
-                        peer_shared_user_mismatch_reason: Some(format!(
-                            "failed to parse signed device_invite signer {}: {}",
-                            signed_by_b64, err
-                        )),
-                        ..ProjectorDecisionContext::default()
-                    })
-                }
-            },
-            Ok(other) => {
-                return Ok(ProjectorDecisionContext {
-                    peer_shared_user_mismatch_reason: Some(format!(
-                        "peer_shared signer {} resolved to unexpected event type {}",
-                        signed_by_b64,
-                        other.event_type_code()
-                    )),
-                    ..ProjectorDecisionContext::default()
-                })
-            }
-            Err(err) => {
-                return Ok(ProjectorDecisionContext {
-                    peer_shared_user_mismatch_reason: Some(format!(
-                        "failed to parse device_invite signer {}: {}",
-                        signed_by_b64, err
-                    )),
-                    ..ProjectorDecisionContext::default()
-                })
-            }
-        };
+        let raw_rows = load_peer_shared_authority_raw_rows(self, frame, recorded_by)?;
+        let claimed_user_id = event_id_to_base64(&peer_shared.user_event_id);
+        let authority_context = normalize_peer_shared_authority(&raw_rows, &claimed_user_id);
 
         let endpoint_shared_event_id_b64 =
             event_id_to_base64(&peer_shared.endpoint_shared_event_id);
@@ -1578,12 +1641,9 @@ impl ProjectionQueries for Connection {
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
         Ok(ProjectorDecisionContext {
-            peer_shared_user_mismatch_reason: peer_shared_user_mismatch_reason(
-                self,
-                frame,
-                recorded_by,
-                &peer_shared.user_event_id,
-            )?,
+            peer_shared_user_mismatch_reason: peer_shared_authority_plan_to_mismatch_reason(
+                decide_peer_shared_authority_plan(&authority_context),
+            ),
             peer_shared_endpoint_id: endpoint_shared_row
                 .as_ref()
                 .map(|row| row.endpoint_id.clone()),
@@ -2322,6 +2382,107 @@ mod tests {
         assert!(matches!(
             decide_admin_authority_plan(&context),
             AdminAuthorityPlan::Reject { reason } if reason.contains("invalid public_key")
+        ));
+    }
+
+    #[test]
+    fn peer_shared_authority_allows_matching_device_invite_user() {
+        let signer_id = event_id_b64(1);
+        let user_id = event_id_b64(2);
+        let context = normalize_peer_shared_authority(
+            &PeerSharedAuthorityRawRows::DeviceInviteSigner {
+                signer_event_id: signer_id.clone(),
+                authorized_user_id: user_id.clone(),
+            },
+            &user_id,
+        );
+
+        assert_eq!(
+            context,
+            PeerSharedAuthorityDecisionContext::UniqueAuthorizedUser {
+                signer_event_id: signer_id,
+                authorized_user_id: user_id.clone(),
+                claimed_user_id: user_id
+            }
+        );
+        assert_eq!(
+            decide_peer_shared_authority_plan(&context),
+            PeerSharedAuthorityPlan::Ready
+        );
+    }
+
+    #[test]
+    fn peer_shared_authority_rejects_missing_current_signer() {
+        let context = normalize_peer_shared_authority(
+            &PeerSharedAuthorityRawRows::MissingCurrentSigner,
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_peer_shared_authority_plan(&context),
+            PeerSharedAuthorityPlan::Reject { reason } if reason.contains("missing current signer")
+        ));
+    }
+
+    #[test]
+    fn peer_shared_authority_rejects_unsupported_signer_type() {
+        let context = normalize_peer_shared_authority(
+            &PeerSharedAuthorityRawRows::UnsupportedSignerType {
+                semantic_type_code: EVENT_TYPE_PEER_SHARED,
+            },
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_peer_shared_authority_plan(&context),
+            PeerSharedAuthorityPlan::Reject { reason } if reason.contains("must be device_invite")
+        ));
+    }
+
+    #[test]
+    fn peer_shared_authority_rejects_missing_device_invite_blob() {
+        let context = normalize_peer_shared_authority(
+            &PeerSharedAuthorityRawRows::MissingDeviceInviteBlob {
+                signer_event_id: event_id_b64(1),
+            },
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_peer_shared_authority_plan(&context),
+            PeerSharedAuthorityPlan::Reject { reason } if reason.contains("no valid device_invite")
+        ));
+    }
+
+    #[test]
+    fn peer_shared_authority_rejects_malformed_device_invite() {
+        let context = normalize_peer_shared_authority(
+            &PeerSharedAuthorityRawRows::MalformedDeviceInvite {
+                signer_event_id: event_id_b64(1),
+                reason: "failed to parse device_invite signer".to_string(),
+            },
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_peer_shared_authority_plan(&context),
+            PeerSharedAuthorityPlan::Reject { reason } if reason.contains("failed to parse")
+        ));
+    }
+
+    #[test]
+    fn peer_shared_authority_rejects_claimed_user_mismatch() {
+        let context = normalize_peer_shared_authority(
+            &PeerSharedAuthorityRawRows::DeviceInviteSigner {
+                signer_event_id: event_id_b64(1),
+                authorized_user_id: event_id_b64(2),
+            },
+            &event_id_b64(3),
+        );
+
+        assert!(matches!(
+            decide_peer_shared_authority_plan(&context),
+            PeerSharedAuthorityPlan::Reject { reason } if reason.contains("event claims")
         ));
     }
 
