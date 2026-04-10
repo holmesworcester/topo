@@ -62,6 +62,33 @@ struct PlannerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColdTierDecisionContext {
+    global_low_mem_mode: bool,
+    restrict_to_low_mem_windows: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdTierPlan {
+    Default,
+    LowMemOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectOutboundWindowDecisionContext {
+    last_day_only_mode: bool,
+    normalized_live_peer_count: usize,
+    peer_is_priority_owner: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectOutboundWindowPlan {
+    LastDayOnly,
+    SinglePeer,
+    MultiPeerPriorityOwner,
+    MultiPeerCold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TenantPriorityState {
     owner_idx: usize,
     cycle_anchor_now_ms: Option<i64>,
@@ -119,10 +146,38 @@ fn tenant_state_for<'a>(
 }
 
 fn cold_tier_order(planner: &PlannerState) -> &'static [SyncWindowKind] {
-    if low_mem_mode() || planner.restrict_to_low_mem_windows {
-        &LOW_MEM_COLD_TIER_ORDER
+    cold_tier_order_for_plan(decide_cold_tier_plan(&ColdTierDecisionContext {
+        global_low_mem_mode: low_mem_mode(),
+        restrict_to_low_mem_windows: planner.restrict_to_low_mem_windows,
+    }))
+}
+
+fn decide_cold_tier_plan(context: &ColdTierDecisionContext) -> ColdTierPlan {
+    if context.global_low_mem_mode || context.restrict_to_low_mem_windows {
+        ColdTierPlan::LowMemOnly
     } else {
-        &DEFAULT_COLD_TIER_ORDER
+        ColdTierPlan::Default
+    }
+}
+
+fn cold_tier_order_for_plan(plan: ColdTierPlan) -> &'static [SyncWindowKind] {
+    match plan {
+        ColdTierPlan::Default => &DEFAULT_COLD_TIER_ORDER,
+        ColdTierPlan::LowMemOnly => &LOW_MEM_COLD_TIER_ORDER,
+    }
+}
+
+fn decide_select_outbound_window_plan(
+    context: &SelectOutboundWindowDecisionContext,
+) -> SelectOutboundWindowPlan {
+    if context.last_day_only_mode {
+        SelectOutboundWindowPlan::LastDayOnly
+    } else if context.normalized_live_peer_count <= 1 {
+        SelectOutboundWindowPlan::SinglePeer
+    } else if context.peer_is_priority_owner {
+        SelectOutboundWindowPlan::MultiPeerPriorityOwner
+    } else {
+        SelectOutboundWindowPlan::MultiPeerCold
     }
 }
 
@@ -224,11 +279,26 @@ pub fn select_outbound_window(
     live_peer_ids: &[String],
     now_ms: i64,
 ) -> SyncWindow {
-    if sync_last_day_only_mode() {
+    let last_day_only_mode = sync_last_day_only_mode();
+    if matches!(
+        decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
+            last_day_only_mode,
+            normalized_live_peer_count: 0,
+            peer_is_priority_owner: false,
+        }),
+        SelectOutboundWindowPlan::LastDayOnly
+    ) {
         return window_for_kind(SyncWindowKind::LastDay, now_ms);
     }
     let live_peers = normalized_live_peers(peer_id, live_peer_ids);
-    if live_peers.len() <= 1 {
+    if matches!(
+        decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
+            last_day_only_mode,
+            normalized_live_peer_count: live_peers.len(),
+            peer_is_priority_owner: false,
+        }),
+        SelectOutboundWindowPlan::SinglePeer
+    ) {
         return select_single_peer_window(db_path, recorded_by, peer_id, now_ms);
     }
 
@@ -248,7 +318,15 @@ pub fn select_outbound_window(
         (owner_peer_id, owner_kind)
     };
 
-    if let Some(kind) = owner_kind {
+    if matches!(
+        decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
+            last_day_only_mode,
+            normalized_live_peer_count: live_peers.len(),
+            peer_is_priority_owner: owner_kind.is_some(),
+        }),
+        SelectOutboundWindowPlan::MultiPeerPriorityOwner
+    ) {
+        let kind = owner_kind.expect("priority-owner plan requires owner window kind");
         let mut state = tenant_priority_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -523,6 +601,67 @@ mod tests {
                 None => std::env::remove_var("TOPO_SYNC_LAST_DAY_ONLY"),
             }
         }
+    }
+
+    #[test]
+    fn cold_tier_decision_context_selects_lowmem_tier_for_global_or_peer_restriction() {
+        assert_eq!(
+            decide_cold_tier_plan(&ColdTierDecisionContext {
+                global_low_mem_mode: true,
+                restrict_to_low_mem_windows: false,
+            }),
+            ColdTierPlan::LowMemOnly
+        );
+        assert_eq!(
+            decide_cold_tier_plan(&ColdTierDecisionContext {
+                global_low_mem_mode: false,
+                restrict_to_low_mem_windows: true,
+            }),
+            ColdTierPlan::LowMemOnly
+        );
+        assert_eq!(
+            decide_cold_tier_plan(&ColdTierDecisionContext {
+                global_low_mem_mode: false,
+                restrict_to_low_mem_windows: false,
+            }),
+            ColdTierPlan::Default
+        );
+    }
+
+    #[test]
+    fn select_outbound_window_decision_context_prioritizes_hot_window_owner() {
+        assert_eq!(
+            decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
+                last_day_only_mode: true,
+                normalized_live_peer_count: 3,
+                peer_is_priority_owner: false,
+            }),
+            SelectOutboundWindowPlan::LastDayOnly
+        );
+        assert_eq!(
+            decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
+                last_day_only_mode: false,
+                normalized_live_peer_count: 1,
+                peer_is_priority_owner: false,
+            }),
+            SelectOutboundWindowPlan::SinglePeer
+        );
+        assert_eq!(
+            decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
+                last_day_only_mode: false,
+                normalized_live_peer_count: 3,
+                peer_is_priority_owner: true,
+            }),
+            SelectOutboundWindowPlan::MultiPeerPriorityOwner
+        );
+        assert_eq!(
+            decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
+                last_day_only_mode: false,
+                normalized_live_peer_count: 3,
+                peer_is_priority_owner: false,
+            }),
+            SelectOutboundWindowPlan::MultiPeerCold
+        );
     }
 
     #[test]
