@@ -4,6 +4,13 @@ use vstd::prelude::*;
 
 verus! {
 
+pub enum ContextLoadDispositionRawRows {
+    Ready,
+    Block,
+    Reject,
+    Purge,
+}
+
 pub enum ContextLoadDispositionDecisionContext {
     Ready,
     Block,
@@ -29,6 +36,17 @@ pub enum ProjectionDecisionEffectPlan {
     ApplyWriteOpsAndEmitCommands,
     EmitCommandsOnly,
     NoEffects,
+}
+
+pub open spec fn normalize_context_load_disposition(
+    raw_rows: ContextLoadDispositionRawRows,
+) -> ContextLoadDispositionDecisionContext {
+    match raw_rows {
+        ContextLoadDispositionRawRows::Ready => ContextLoadDispositionDecisionContext::Ready,
+        ContextLoadDispositionRawRows::Block => ContextLoadDispositionDecisionContext::Block,
+        ContextLoadDispositionRawRows::Reject => ContextLoadDispositionDecisionContext::Reject,
+        ContextLoadDispositionRawRows::Purge => ContextLoadDispositionDecisionContext::Purge,
+    }
 }
 
 pub open spec fn decide_context_load_disposition(
@@ -58,23 +76,42 @@ pub open spec fn decide_projection_decision_effect_plan(
     }
 }
 
+proof fn context_load_disposition_normalizer_preserves_query_facts()
+    ensures
+        normalize_context_load_disposition(ContextLoadDispositionRawRows::Ready)
+            == ContextLoadDispositionDecisionContext::Ready,
+        normalize_context_load_disposition(ContextLoadDispositionRawRows::Block)
+            == ContextLoadDispositionDecisionContext::Block,
+        normalize_context_load_disposition(ContextLoadDispositionRawRows::Reject)
+            == ContextLoadDispositionDecisionContext::Reject,
+        normalize_context_load_disposition(ContextLoadDispositionRawRows::Purge)
+            == ContextLoadDispositionDecisionContext::Purge,
+{
+}
+
 proof fn ready_context_continues_to_projector()
     ensures
-        decide_context_load_disposition(ContextLoadDispositionDecisionContext::Ready)
+        decide_context_load_disposition(normalize_context_load_disposition(
+            ContextLoadDispositionRawRows::Ready,
+        ))
             == ContextLoadDispositionPlan::Continue,
 {
 }
 
 proof fn blocked_context_records_block_and_returns()
     ensures
-        decide_context_load_disposition(ContextLoadDispositionDecisionContext::Block)
+        decide_context_load_disposition(normalize_context_load_disposition(
+            ContextLoadDispositionRawRows::Block,
+        ))
             == ContextLoadDispositionPlan::RecordBlockAndReturn,
 {
 }
 
 proof fn purged_context_emits_only_hard_purge()
     ensures
-        decide_context_load_disposition(ContextLoadDispositionDecisionContext::Purge)
+        decide_context_load_disposition(normalize_context_load_disposition(
+            ContextLoadDispositionRawRows::Purge,
+        ))
             == ContextLoadDispositionPlan::EmitHardPurgeAndReturn,
 {
 }

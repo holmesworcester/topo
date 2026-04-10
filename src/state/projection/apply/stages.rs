@@ -1,21 +1,37 @@
 use super::super::decision::ProjectionDecision;
-use super::super::signer::{verify_ed25519_signature, SignerResolution};
+use super::super::signer::{SignerResolution, verify_ed25519_signature};
 use super::backend::{ProjectionApplyResult, ProjectionBackend};
-use crate::crypto::{event_id_to_base64, EventId};
+use crate::crypto::{EventId, event_id_to_base64};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
-use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
+use crate::event_modules::{ParsedEvent, TransportPrivacy, registry};
 use crate::projection::contract::EmitCommand;
 use crate::projection::queries::{
-    decide_semantic_type_plan, normalize_semantic_type, ContextLoadResult, DepLoadResult,
-    ProjectionFrameContext, SemanticTypePlan,
+    ContextLoadResult, DepLoadResult, ProjectionFrameContext, SemanticTypePlan,
+    decide_semantic_type_plan, normalize_semantic_type,
 };
 use rusqlite::Connection;
 
 use super::dispatch::dispatch_pure_projector;
 
 const MAX_PROJECTION_ENVELOPE_DEPTH: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextLoadDispositionRawRows {
+    Ready,
+    Block { missing: Vec<EventId> },
+    Reject { reason: String },
+    Purge { message_event_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextLoadDispositionDecisionContext {
+    Ready,
+    Block { missing: Vec<EventId> },
+    Reject { reason: String },
+    Purge { message_event_id: String },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ContextLoadDispositionPlan {
@@ -163,16 +179,56 @@ fn load_context_with_prereqs<B: ProjectionBackend>(
     (meta.context_loader)(backend, frame, recorded_by, event_id_b64, parsed)
 }
 
-fn decide_context_load_disposition(result: &ContextLoadResult) -> ContextLoadDispositionPlan {
+fn load_context_load_disposition_raw_rows(
+    result: &ContextLoadResult,
+) -> ContextLoadDispositionRawRows {
     match result {
-        ContextLoadResult::Ready(_) => ContextLoadDispositionPlan::Continue,
-        ContextLoadResult::Block { missing } => ContextLoadDispositionPlan::RecordBlockAndReturn {
+        ContextLoadResult::Ready(_) => ContextLoadDispositionRawRows::Ready,
+        ContextLoadResult::Block { missing } => ContextLoadDispositionRawRows::Block {
             missing: missing.clone(),
         },
-        ContextLoadResult::Reject { reason } => ContextLoadDispositionPlan::Reject {
+        ContextLoadResult::Reject { reason } => ContextLoadDispositionRawRows::Reject {
             reason: reason.clone(),
         },
-        ContextLoadResult::Purge { message_event_id } => {
+        ContextLoadResult::Purge { message_event_id } => ContextLoadDispositionRawRows::Purge {
+            message_event_id: message_event_id.clone(),
+        },
+    }
+}
+
+fn normalize_context_load_disposition(
+    raw_rows: ContextLoadDispositionRawRows,
+) -> ContextLoadDispositionDecisionContext {
+    match raw_rows {
+        ContextLoadDispositionRawRows::Ready => ContextLoadDispositionDecisionContext::Ready,
+        ContextLoadDispositionRawRows::Block { missing } => {
+            ContextLoadDispositionDecisionContext::Block { missing }
+        }
+        ContextLoadDispositionRawRows::Reject { reason } => {
+            ContextLoadDispositionDecisionContext::Reject { reason }
+        }
+        ContextLoadDispositionRawRows::Purge { message_event_id } => {
+            ContextLoadDispositionDecisionContext::Purge { message_event_id }
+        }
+    }
+}
+
+fn decide_context_load_disposition(
+    context: &ContextLoadDispositionDecisionContext,
+) -> ContextLoadDispositionPlan {
+    match context {
+        ContextLoadDispositionDecisionContext::Ready => ContextLoadDispositionPlan::Continue,
+        ContextLoadDispositionDecisionContext::Block { missing } => {
+            ContextLoadDispositionPlan::RecordBlockAndReturn {
+                missing: missing.clone(),
+            }
+        }
+        ContextLoadDispositionDecisionContext::Reject { reason } => {
+            ContextLoadDispositionPlan::Reject {
+                reason: reason.clone(),
+            }
+        }
+        ContextLoadDispositionDecisionContext::Purge { message_event_id } => {
             ContextLoadDispositionPlan::EmitHardPurgeAndReturn {
                 message_event_id: message_event_id.clone(),
             }
@@ -295,7 +351,9 @@ fn apply_projection_frame<B: ProjectionBackend>(
     // through the same tri-state result.
     let context_result =
         load_context_with_prereqs(backend, &frame, recorded_by, event_id_b64, parsed)?;
-    let mut ctx = match decide_context_load_disposition(&context_result) {
+    let context_load_disposition_context =
+        normalize_context_load_disposition(load_context_load_disposition_raw_rows(&context_result));
+    let mut ctx = match decide_context_load_disposition(&context_load_disposition_context) {
         ContextLoadDispositionPlan::Continue => match context_result {
             ContextLoadResult::Ready(ctx) => ctx,
             _ => unreachable!("continue plan requires ready context"),
@@ -378,7 +436,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         reason: format!("inner event parse error: {}", err),
                     },
                     None,
-                ))
+                ));
             }
         };
         if inner_parsed.event_type_code() != signed.inner_type_code {
@@ -447,7 +505,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         reason: "decryption failed (wrong key or corrupted)".to_string(),
                     },
                     None,
-                ))
+                ));
             }
         };
         let inner_parsed = match crate::event_modules::parse_event(&plaintext) {
@@ -458,7 +516,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         reason: format!("inner event parse error: {}", err),
                     },
                     None,
-                ))
+                ));
             }
         };
         if inner_parsed.event_type_code() != enc.inner_type_code {
@@ -579,8 +637,17 @@ mod tests {
     #[test]
     fn context_load_disposition_maps_block_to_block_recording_plan() {
         let missing = vec![[0x11; 32]];
+        let context = normalize_context_load_disposition(load_context_load_disposition_raw_rows(
+            &ContextLoadResult::block(missing.clone()),
+        ));
         assert_eq!(
-            decide_context_load_disposition(&ContextLoadResult::block(missing.clone())),
+            context,
+            ContextLoadDispositionDecisionContext::Block {
+                missing: missing.clone(),
+            }
+        );
+        assert_eq!(
+            decide_context_load_disposition(&context),
             ContextLoadDispositionPlan::RecordBlockAndReturn { missing }
         );
     }
