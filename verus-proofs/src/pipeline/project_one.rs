@@ -9,6 +9,50 @@ spec const ZERO: nat = 0;
 spec const THREE: nat = 3;
 spec const FIVE: nat = 5;
 
+pub enum ContextLoadDispositionPlan {
+    Continue,
+    RecordBlockAndReturn,
+    Reject,
+    EmitHardPurgeAndReturn,
+}
+
+pub struct ProjectOneApplyDecisionContext {
+    pub already_valid: bool,
+    pub already_rejected: bool,
+    pub blob_exists: bool,
+    pub parse_succeeds: bool,
+    pub context_load_plan: ContextLoadDispositionPlan,
+}
+
+pub enum ProjectOneApplyPlan {
+    AlreadyProcessed,
+    RejectBeforeProjector,
+    RecordBlockAndReturn,
+    EmitHardPurgeAndReturn,
+    RunProjector,
+}
+
+pub open spec fn decide_project_one_apply_plan(
+    context: ProjectOneApplyDecisionContext,
+) -> ProjectOneApplyPlan {
+    if context.already_valid || context.already_rejected {
+        ProjectOneApplyPlan::AlreadyProcessed
+    } else if !context.blob_exists || !context.parse_succeeds {
+        ProjectOneApplyPlan::RejectBeforeProjector
+    } else {
+        match context.context_load_plan {
+            ContextLoadDispositionPlan::Continue => ProjectOneApplyPlan::RunProjector,
+            ContextLoadDispositionPlan::RecordBlockAndReturn => {
+                ProjectOneApplyPlan::RecordBlockAndReturn
+            }
+            ContextLoadDispositionPlan::Reject => ProjectOneApplyPlan::RejectBeforeProjector,
+            ContextLoadDispositionPlan::EmitHardPurgeAndReturn => {
+                ProjectOneApplyPlan::EmitHardPurgeAndReturn
+            }
+        }
+    }
+}
+
 /// The full 7-step algorithm.
 pub open spec fn project_one_step_model(
     already_valid: bool,
@@ -90,6 +134,54 @@ proof fn proof_dep_type_mismatch_rejects()
 proof fn proof_all_checks_pass_returns_projection_decision(d: ProjectionDecision)
     ensures
         project_one_step_model(false, false, true, true, true, ZERO, true, d) == d,
+{
+}
+
+proof fn proof_context_purge_prevents_projector()
+    ensures
+        decide_project_one_apply_plan(ProjectOneApplyDecisionContext {
+            already_valid: false,
+            already_rejected: false,
+            blob_exists: true,
+            parse_succeeds: true,
+            context_load_plan: ContextLoadDispositionPlan::EmitHardPurgeAndReturn,
+        }) == ProjectOneApplyPlan::EmitHardPurgeAndReturn,
+{
+}
+
+proof fn proof_context_block_prevents_projector_at_project_one()
+    ensures
+        decide_project_one_apply_plan(ProjectOneApplyDecisionContext {
+            already_valid: false,
+            already_rejected: false,
+            blob_exists: true,
+            parse_succeeds: true,
+            context_load_plan: ContextLoadDispositionPlan::RecordBlockAndReturn,
+        }) == ProjectOneApplyPlan::RecordBlockAndReturn,
+{
+}
+
+proof fn proof_context_continue_is_only_projector_entry()
+    ensures
+        decide_project_one_apply_plan(ProjectOneApplyDecisionContext {
+            already_valid: false,
+            already_rejected: false,
+            blob_exists: true,
+            parse_succeeds: true,
+            context_load_plan: ContextLoadDispositionPlan::Continue,
+        }) == ProjectOneApplyPlan::RunProjector,
+{
+}
+
+proof fn proof_early_terminal_preempts_context_plan(plan: ContextLoadDispositionPlan)
+    ensures
+        decide_project_one_apply_plan(ProjectOneApplyDecisionContext {
+            already_valid: true,
+            already_rejected: false,
+            blob_exists: true,
+            parse_succeeds: true,
+            context_load_plan: plan,
+        }) == ProjectOneApplyPlan::AlreadyProcessed,
 {
 }
 

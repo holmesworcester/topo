@@ -705,6 +705,24 @@ mod tests {
     }
 
     #[test]
+    fn context_load_disposition_maps_purge_to_hard_purge_plan() {
+        let message_event_id = "deleted-message".to_string();
+        let context = normalize_context_load_disposition(load_context_load_disposition_raw_rows(
+            &ContextLoadResult::purge(message_event_id.clone()),
+        ));
+        assert_eq!(
+            context,
+            ContextLoadDispositionDecisionContext::Purge {
+                message_event_id: message_event_id.clone(),
+            }
+        );
+        assert_eq!(
+            decide_context_load_disposition(&context),
+            ContextLoadDispositionPlan::EmitHardPurgeAndReturn { message_event_id }
+        );
+    }
+
+    #[test]
     fn projection_decision_effect_plan_disables_effects_for_rejects() {
         let context = normalize_projection_decision_effect_context(
             load_projection_decision_effect_raw_rows(&ProjectionDecision::Reject {
