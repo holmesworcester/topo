@@ -111,6 +111,8 @@ proof fn workspace_query_malformation_fails_closed()
 
 pub enum SignerUserRows {
     NoAuthorCheckNeeded,
+    MissingCurrentSigner,
+    UnsupportedSignerType,
     Unique { signer_matches_author: bool },
     MissingSignerUser,
     AmbiguousSignerUser,
@@ -119,6 +121,8 @@ pub enum SignerUserRows {
 
 pub enum ContentAuthorityDecisionContext {
     NoAuthorCheckNeeded,
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType,
     UniqueSignerUser { signer_matches_author: bool },
     RejectMissingSignerUser,
     RejectAmbiguousSignerUser,
@@ -136,6 +140,12 @@ pub open spec fn normalize_content_authority(
     match rows {
         SignerUserRows::NoAuthorCheckNeeded => {
             ContentAuthorityDecisionContext::NoAuthorCheckNeeded
+        }
+        SignerUserRows::MissingCurrentSigner => {
+            ContentAuthorityDecisionContext::RejectMissingCurrentSigner
+        }
+        SignerUserRows::UnsupportedSignerType => {
+            ContentAuthorityDecisionContext::RejectUnsupportedSignerType
         }
         SignerUserRows::Unique { signer_matches_author } => {
             ContentAuthorityDecisionContext::UniqueSignerUser {
@@ -166,12 +176,30 @@ pub open spec fn decide_content_authority_plan(
                 ContentAuthorityPlan::Reject
             }
         }
-        ContentAuthorityDecisionContext::RejectMissingSignerUser
+        ContentAuthorityDecisionContext::RejectMissingCurrentSigner
+        | ContentAuthorityDecisionContext::RejectUnsupportedSignerType
+        | ContentAuthorityDecisionContext::RejectMissingSignerUser
         | ContentAuthorityDecisionContext::RejectAmbiguousSignerUser
         | ContentAuthorityDecisionContext::RejectMalformedSignerUser => {
             ContentAuthorityPlan::Reject
         }
     }
+}
+
+proof fn content_authority_missing_current_signer_rejects()
+    ensures
+        decide_content_authority_plan(normalize_content_authority(
+            SignerUserRows::MissingCurrentSigner,
+        )) == ContentAuthorityPlan::Reject,
+{
+}
+
+proof fn content_authority_unsupported_signer_type_rejects()
+    ensures
+        decide_content_authority_plan(normalize_content_authority(
+            SignerUserRows::UnsupportedSignerType,
+        )) == ContentAuthorityPlan::Reject,
+{
 }
 
 proof fn content_authority_unique_match_is_ready()

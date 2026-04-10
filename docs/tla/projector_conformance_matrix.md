@@ -107,6 +107,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_MSG_WORKSPACE_01 | InvMessageWorkspace | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::core_projection::test_project_reaction_blocked | break |
 | SPEC_MSG_SIGNER_01 | InvSigner (message) | CHK_MSG_SIGNER_USER_MISMATCH | projector_unit | message_projector_tests::tests::test_message_rejects_signer_user_mismatch | break |
 | SPEC_MSG_SIGNER_01 | InvSigner (message) | CHK_MSG_SIGNER_USER_MISMATCH | projector_unit | message_projector_tests::tests::test_message_valid | pass |
+| SPEC_MSG_SIGNER_01 | InvSigner (message) | CHK_MSG_SIGNER_USER_MISMATCH | pipeline_integration | apply::tests::tenant::test_message_rejects_malformed_signer_user_binding_at_projection | break |
+| SPEC_MSG_SIGNER_01 | InvSigner (message) | CHK_MSG_SIGNER_USER_MISMATCH | pipeline_integration | apply::tests::tenant::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_ENCRYPTED_KEY_01 | InvEncryptedKey | CHK_ENCRYPTED_KEY_RESOLVE | pipeline_integration | apply::tests::encryption::test_encrypted_blocks_on_missing_key | break |
 | SPEC_ENCRYPTED_KEY_01 | InvEncryptedKey | CHK_ENCRYPTED_KEY_RESOLVE | pipeline_integration | apply::tests::encryption::test_encrypted_message_valid | pass |
 | SPEC_ENCRYPTED_DECRYPT_01 | InvEncryptedKey | CHK_ENCRYPTED_DECRYPT | pipeline_integration | apply::tests::encryption::test_encrypted_wrong_key_rejects | break |
@@ -165,6 +167,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DEL_AUTHOR_01 | InvDeletedMessageSource | CHK_DEL_TOMBSTONE | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
 | SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_SIGNER_USER_MISMATCH | projector_unit | reaction_projector_tests::tests::test_reaction_rejects_signer_user_mismatch | break |
 | SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_INSERT | projector_unit | reaction_projector_tests::tests::test_reaction_valid | pass |
+| SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_SIGNER_USER_MISMATCH | pipeline_integration | apply::tests::tenant::test_reaction_rejects_signer_user_mismatch_at_projection | break |
+| SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_SIGNER_USER_MISMATCH | pipeline_integration | apply::tests::tenant::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_SKIP_DELETED | pipeline_integration | apply::tests::deletion::test_reaction_arriving_after_tombstone_is_hard_purged | pass |
 | SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_SKIP_DELETED | pipeline_integration | apply::tests::core_projection::test_project_reaction_valid | break |
 | SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_HARD_PURGE | pipeline_integration | apply::tests::deletion::test_reaction_arriving_after_tombstone_is_hard_purged | pass |

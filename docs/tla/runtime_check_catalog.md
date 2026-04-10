@@ -17,14 +17,14 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_IA_WINNER_ORDER | state/db/store::lookup_workspace_id | InvTrustAnchorImmutable | projection_read_model |
 | CHK_IA_RETRY_GUARDS | event_modules/invite_accepted::project_pure | InvWorkspaceAnchor | projector_local |
 | CHK_IA_BOOTSTRAP_TRUST | event_modules/invite_accepted::project_pure | InvBootstrapTrustSource | projector_local |
-| CHK_MSG_SIGNER_USER_MISMATCH | event_modules/message::project_pure | InvSigner | projector_local |
+| CHK_MSG_SIGNER_USER_MISMATCH | state/projection/queries::decide_content_authority_plan + event_modules/message::build_projector_context | InvSigner | projector_context |
 | CHK_MSG_OUTER_OWNER_ABSENT | event_modules/message::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
 | CHK_MSG_DELETE_BEFORE_CREATE | event_modules/message::project_pure | InvDeleteIntentNoLiveMessage | projector_local |
 | CHK_MSG_HARD_PURGE | event_modules/message::project_pure | InvDeletePurgeAtomic | projector_local |
 | CHK_MSG_INSERT | event_modules/message::project_pure | InvMessageWorkspace | projector_local |
 | CHK_FILE_HARD_PURGE | projection/apply/stages::load_context_with_prereqs + apply_projection_frame | InvDeletedMessagePurgesLiveGraph | pipeline_shared |
 | CHK_FILE_OWNER_MATCH | event_modules/file::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
-| CHK_RXN_SIGNER_USER_MISMATCH | event_modules/reaction::project_pure | InvSigner | projector_local |
+| CHK_RXN_SIGNER_USER_MISMATCH | state/projection/queries::decide_content_authority_plan + event_modules/reaction::build_projector_context | InvSigner | projector_context |
 | CHK_RXN_SKIP_DELETED | projection/apply/stages::load_context_with_prereqs + apply_projection_frame | InvDeletedMessagePurgesLiveGraph | pipeline_shared |
 | CHK_RXN_HARD_PURGE | projection/apply/stages::load_context_with_prereqs + apply_projection_frame | InvDeletedMessagePurgesLiveGraph | pipeline_shared |
 | CHK_RXN_OWNER_MATCH | event_modules/reaction::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |

@@ -16,9 +16,11 @@ use crate::projection::contract::{
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::queries::{
-    build_workspace_projector_decision_context, normalize_workspace_acceptance, DepLoadResult,
-    ProjectionFrameContext, ProjectionQueries, ProjectionQueryResult, WorkspaceAcceptedRawRows,
-    WorkspaceDecisionContext,
+    build_workspace_projector_decision_context,
+    content_authority_plan_to_signer_user_mismatch_reason, decide_content_authority_plan,
+    normalize_content_authority, normalize_workspace_acceptance, ContentAuthorityRawRows,
+    DepLoadResult, ProjectionFrameContext, ProjectionQueries, ProjectionQueryResult,
+    WorkspaceAcceptedRawRows, WorkspaceDecisionContext,
 };
 use crate::projection::signer::{ResolvedSigner, SignerResolution};
 use crate::sim::query_snapshot::ImportedPeerState;
@@ -909,48 +911,27 @@ fn signer_user_mismatch_reason_behavior(
     recorded_by: &str,
     author_id: &[u8; 32],
 ) -> Option<String> {
-    let Some(current_signer) = frame.current_signer.as_ref() else {
-        return Some("missing current signer envelope".to_string());
+    let raw_rows = match frame.current_signer.as_ref() {
+        None => ContentAuthorityRawRows::MissingCurrentSigner,
+        Some(current_signer)
+            if current_signer.semantic_type_code != events::EVENT_TYPE_PEER_SHARED =>
+        {
+            ContentAuthorityRawRows::UnsupportedSignerType {
+                semantic_type_code: current_signer.semantic_type_code,
+            }
+        }
+        Some(current_signer) => ContentAuthorityRawRows::PeerSharedSigner {
+            signer_event_id: current_signer.event_id.clone(),
+            signer_user_ids: table_rows_for_recorded(state, "peers_shared", recorded_by)
+                .into_iter()
+                .filter(|row| row_text(row, "event_id") == Some(current_signer.event_id.as_str()))
+                .map(|row| row_text(row, "user_event_id").map(ToOwned::to_owned))
+                .collect(),
+            malformed: false,
+        },
     };
-    if current_signer.semantic_type_code != events::EVENT_TYPE_PEER_SHARED {
-        return Some(format!(
-            "content signer must be peer_shared, got semantic type {}",
-            current_signer.semantic_type_code
-        ));
-    }
-    let signed_by_b64 = current_signer.event_id.clone();
-    let author_id_b64 = event_id_to_base64(author_id);
-    let Some(peer_row) = first_row_for_recorded(
-        state,
-        "peers_shared",
-        recorded_by,
-        "event_id",
-        &signed_by_b64,
-    ) else {
-        return Some(format!(
-            "no peers_shared entry for signer {}",
-            signed_by_b64
-        ));
-    };
-    let Some(peer_user_eid) = row_text(peer_row, "user_event_id") else {
-        return Some(format!(
-            "peers_shared entry for signer {} has no user_event_id (legacy row)",
-            signed_by_b64
-        ));
-    };
-    if peer_user_eid.is_empty() {
-        return Some(format!(
-            "peers_shared entry for signer {} has no user_event_id (legacy row)",
-            signed_by_b64
-        ));
-    }
-    if peer_user_eid != author_id_b64 {
-        return Some(format!(
-            "signer {} belongs to user {} but author_id claims {}",
-            signed_by_b64, peer_user_eid, author_id_b64
-        ));
-    }
-    None
+    let context = normalize_content_authority(&raw_rows, &event_id_to_base64(author_id));
+    content_authority_plan_to_signer_user_mismatch_reason(decide_content_authority_plan(&context))
 }
 
 fn deletion_signer_context_behavior(

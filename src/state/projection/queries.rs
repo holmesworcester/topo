@@ -105,6 +105,49 @@ pub enum WorkspaceContextPlan {
     Reject { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentAuthorityRawRows {
+    NoAuthorCheckNeeded,
+    MissingCurrentSigner,
+    UnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    PeerSharedSigner {
+        signer_event_id: String,
+        signer_user_ids: Vec<Option<String>>,
+        malformed: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentAuthorityDecisionContext {
+    NoAuthorCheckNeeded,
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    UniqueSignerUser {
+        signer_event_id: String,
+        signer_user_id: String,
+        author_id: String,
+    },
+    RejectMissingSignerUser {
+        signer_event_id: String,
+    },
+    RejectAmbiguousSignerUser {
+        signer_event_id: String,
+    },
+    RejectMalformedSignerUser {
+        signer_event_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentAuthorityPlan {
+    Ready,
+    Reject { reason: String },
+}
+
 pub fn normalize_workspace_acceptance(
     raw_rows: &WorkspaceAcceptedRawRows,
 ) -> WorkspaceDecisionContext {
@@ -128,6 +171,70 @@ pub fn normalize_workspace_acceptance(
             workspace_id: workspace_id.clone(),
         },
         _ => WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace,
+    }
+}
+
+pub fn normalize_content_authority(
+    raw_rows: &ContentAuthorityRawRows,
+    author_id_b64: &str,
+) -> ContentAuthorityDecisionContext {
+    match raw_rows {
+        ContentAuthorityRawRows::NoAuthorCheckNeeded => {
+            ContentAuthorityDecisionContext::NoAuthorCheckNeeded
+        }
+        ContentAuthorityRawRows::MissingCurrentSigner => {
+            ContentAuthorityDecisionContext::RejectMissingCurrentSigner
+        }
+        ContentAuthorityRawRows::UnsupportedSignerType { semantic_type_code } => {
+            ContentAuthorityDecisionContext::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            }
+        }
+        ContentAuthorityRawRows::PeerSharedSigner {
+            signer_event_id,
+            signer_user_ids,
+            malformed,
+        } => {
+            if *malformed
+                || event_id_from_base64(signer_event_id).is_none()
+                || event_id_from_base64(author_id_b64).is_none()
+            {
+                return ContentAuthorityDecisionContext::RejectMalformedSignerUser {
+                    signer_event_id: signer_event_id.clone(),
+                };
+            }
+
+            let mut user_ids = Vec::with_capacity(signer_user_ids.len());
+            for user_id in signer_user_ids {
+                let Some(user_id) = user_id.as_ref() else {
+                    return ContentAuthorityDecisionContext::RejectMalformedSignerUser {
+                        signer_event_id: signer_event_id.clone(),
+                    };
+                };
+                if user_id.is_empty() || event_id_from_base64(user_id).is_none() {
+                    return ContentAuthorityDecisionContext::RejectMalformedSignerUser {
+                        signer_event_id: signer_event_id.clone(),
+                    };
+                }
+                user_ids.push(user_id.clone());
+            }
+
+            user_ids.sort();
+            user_ids.dedup();
+            match user_ids.as_slice() {
+                [] => ContentAuthorityDecisionContext::RejectMissingSignerUser {
+                    signer_event_id: signer_event_id.clone(),
+                },
+                [signer_user_id] => ContentAuthorityDecisionContext::UniqueSignerUser {
+                    signer_event_id: signer_event_id.clone(),
+                    signer_user_id: signer_user_id.clone(),
+                    author_id: author_id_b64.to_string(),
+                },
+                _ => ContentAuthorityDecisionContext::RejectAmbiguousSignerUser {
+                    signer_event_id: signer_event_id.clone(),
+                },
+            }
+        }
     }
 }
 
@@ -177,6 +284,72 @@ pub fn decide_workspace_context_plan(
                 reason: "malformed accepted invite workspace binding".to_string(),
             }
         }
+    }
+}
+
+pub fn decide_content_authority_plan(
+    context: &ContentAuthorityDecisionContext,
+) -> ContentAuthorityPlan {
+    match context {
+        ContentAuthorityDecisionContext::NoAuthorCheckNeeded => ContentAuthorityPlan::Ready,
+        ContentAuthorityDecisionContext::RejectMissingCurrentSigner => {
+            ContentAuthorityPlan::Reject {
+                reason: "missing current signer envelope".to_string(),
+            }
+        }
+        ContentAuthorityDecisionContext::RejectUnsupportedSignerType { semantic_type_code } => {
+            ContentAuthorityPlan::Reject {
+                reason: format!(
+                    "content signer must be peer_shared, got semantic type {}",
+                    semantic_type_code
+                ),
+            }
+        }
+        ContentAuthorityDecisionContext::UniqueSignerUser {
+            signer_event_id: _,
+            signer_user_id,
+            author_id,
+        } if signer_user_id == author_id => ContentAuthorityPlan::Ready,
+        ContentAuthorityDecisionContext::UniqueSignerUser {
+            signer_event_id,
+            signer_user_id,
+            author_id,
+        } => ContentAuthorityPlan::Reject {
+            reason: format!(
+                "signer {} belongs to user {} but author_id claims {}",
+                signer_event_id, signer_user_id, author_id
+            ),
+        },
+        ContentAuthorityDecisionContext::RejectMissingSignerUser { signer_event_id } => {
+            ContentAuthorityPlan::Reject {
+                reason: format!("no peers_shared entry for signer {}", signer_event_id),
+            }
+        }
+        ContentAuthorityDecisionContext::RejectAmbiguousSignerUser { signer_event_id } => {
+            ContentAuthorityPlan::Reject {
+                reason: format!(
+                    "ambiguous peers_shared user binding for signer {}",
+                    signer_event_id
+                ),
+            }
+        }
+        ContentAuthorityDecisionContext::RejectMalformedSignerUser { signer_event_id } => {
+            ContentAuthorityPlan::Reject {
+                reason: format!(
+                    "malformed peers_shared user binding for signer {}",
+                    signer_event_id
+                ),
+            }
+        }
+    }
+}
+
+pub fn content_authority_plan_to_signer_user_mismatch_reason(
+    plan: ContentAuthorityPlan,
+) -> Option<String> {
+    match plan {
+        ContentAuthorityPlan::Ready => None,
+        ContentAuthorityPlan::Reject { reason } => Some(reason),
     }
 }
 
@@ -501,48 +674,11 @@ fn signer_user_mismatch_reason(
     recorded_by: &str,
     author_id: &[u8; 32],
 ) -> Result<Option<String>, rusqlite::Error> {
-    let Some(current_signer) = frame.current_signer.as_ref() else {
-        return Ok(Some("missing current signer envelope".to_string()));
-    };
-    if current_signer.semantic_type_code != EVENT_TYPE_PEER_SHARED {
-        return Ok(Some(format!(
-            "content signer must be peer_shared, got semantic type {}",
-            current_signer.semantic_type_code
-        )));
-    }
-    let signed_by_b64 = current_signer.event_id.clone();
-    let author_id_b64 = event_id_to_base64(author_id);
-
-    let peer_user_eid: String = match conn.query_row(
-        "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, &signed_by_b64],
-        |row| crate::db::sql_types::get_text(row, 0),
-    ) {
-        Ok(v) => v,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Ok(Some(format!(
-                "no peers_shared entry for signer {}",
-                signed_by_b64
-            )));
-        }
-        Err(e) => return Err(e),
-    };
-
-    if peer_user_eid.is_empty() {
-        return Ok(Some(format!(
-            "peers_shared entry for signer {} has no user_event_id (legacy row)",
-            signed_by_b64
-        )));
-    }
-
-    if peer_user_eid != author_id_b64 {
-        return Ok(Some(format!(
-            "signer {} belongs to user {} but author_id claims {}",
-            signed_by_b64, peer_user_eid, author_id_b64
-        )));
-    }
-
-    Ok(None)
+    let raw_rows = load_content_authority_raw_rows(conn, frame, recorded_by)?;
+    let context = normalize_content_authority(&raw_rows, &event_id_to_base64(author_id));
+    Ok(content_authority_plan_to_signer_user_mismatch_reason(
+        decide_content_authority_plan(&context),
+    ))
 }
 
 fn deletion_signer_context(
@@ -741,6 +877,44 @@ fn load_workspace_accepted_raw_rows(
     Ok(WorkspaceAcceptedRawRows {
         workspace_ids,
         malformed: false,
+    })
+}
+
+fn load_content_authority_raw_rows(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> rusqlite::Result<ContentAuthorityRawRows> {
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(ContentAuthorityRawRows::MissingCurrentSigner);
+    };
+    if current_signer.semantic_type_code != EVENT_TYPE_PEER_SHARED {
+        return Ok(ContentAuthorityRawRows::UnsupportedSignerType {
+            semantic_type_code: current_signer.semantic_type_code,
+        });
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT user_event_id
+         FROM peers_shared
+         WHERE recorded_by = ?1 AND event_id = ?2
+         ORDER BY user_event_id
+         LIMIT 2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![recorded_by, &current_signer.event_id])?;
+    let mut signer_user_ids = Vec::new();
+    let mut malformed = false;
+    while let Some(row) = rows.next()? {
+        match crate::db::sql_types::get_opt_text(row, 0) {
+            Ok(user_id) => signer_user_ids.push(user_id),
+            Err(_) => malformed = true,
+        }
+    }
+
+    Ok(ContentAuthorityRawRows::PeerSharedSigner {
+        signer_event_id: current_signer.event_id.clone(),
+        signer_user_ids,
+        malformed,
     })
 }
 
@@ -1385,6 +1559,21 @@ mod tests {
         event_id_to_base64(&[byte; 32])
     }
 
+    fn event_id_b64(byte: u8) -> String {
+        event_id_to_base64(&[byte; 32])
+    }
+
+    fn content_authority_raw(
+        signer_event_id: String,
+        signer_user_ids: Vec<Option<String>>,
+    ) -> ContentAuthorityRawRows {
+        ContentAuthorityRawRows::PeerSharedSigner {
+            signer_event_id,
+            signer_user_ids,
+            malformed: false,
+        }
+    }
+
     #[test]
     fn workspace_acceptance_blocks_when_missing() {
         let context = normalize_workspace_acceptance(&WorkspaceAcceptedRawRows {
@@ -1463,6 +1652,116 @@ mod tests {
         assert!(matches!(
             decide_workspace_context_plan(&context, &workspace_id(2)),
             WorkspaceContextPlan::Reject { reason } if reason.contains("does not match")
+        ));
+    }
+
+    #[test]
+    fn content_authority_allows_unique_matching_signer_user() {
+        let signer_id = event_id_b64(1);
+        let author_id = event_id_b64(2);
+        let context = normalize_content_authority(
+            &content_authority_raw(signer_id.clone(), vec![Some(author_id.clone())]),
+            &author_id,
+        );
+
+        assert_eq!(
+            context,
+            ContentAuthorityDecisionContext::UniqueSignerUser {
+                signer_event_id: signer_id,
+                signer_user_id: author_id.clone(),
+                author_id
+            }
+        );
+        assert_eq!(
+            decide_content_authority_plan(&context),
+            ContentAuthorityPlan::Ready
+        );
+    }
+
+    #[test]
+    fn content_authority_rejects_mismatched_signer_user() {
+        let signer_id = event_id_b64(1);
+        let context = normalize_content_authority(
+            &content_authority_raw(signer_id, vec![Some(event_id_b64(2))]),
+            &event_id_b64(3),
+        );
+
+        assert!(matches!(
+            decide_content_authority_plan(&context),
+            ContentAuthorityPlan::Reject { reason } if reason.contains("author_id claims")
+        ));
+    }
+
+    #[test]
+    fn content_authority_rejects_missing_signer_user() {
+        let signer_id = event_id_b64(1);
+        let context = normalize_content_authority(
+            &content_authority_raw(signer_id, Vec::new()),
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_content_authority_plan(&context),
+            ContentAuthorityPlan::Reject { reason } if reason.contains("no peers_shared entry")
+        ));
+    }
+
+    #[test]
+    fn content_authority_rejects_ambiguous_signer_user() {
+        let signer_id = event_id_b64(1);
+        let context = normalize_content_authority(
+            &content_authority_raw(
+                signer_id,
+                vec![Some(event_id_b64(2)), Some(event_id_b64(3))],
+            ),
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_content_authority_plan(&context),
+            ContentAuthorityPlan::Reject { reason } if reason.contains("ambiguous")
+        ));
+    }
+
+    #[test]
+    fn content_authority_rejects_malformed_signer_user() {
+        let signer_id = event_id_b64(1);
+        let context = normalize_content_authority(
+            &content_authority_raw(signer_id, vec![Some("not-base64".to_string())]),
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_content_authority_plan(&context),
+            ContentAuthorityPlan::Reject { reason } if reason.contains("malformed")
+        ));
+    }
+
+    #[test]
+    fn content_authority_rejects_missing_current_signer() {
+        let context = normalize_content_authority(
+            &ContentAuthorityRawRows::MissingCurrentSigner,
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_content_authority_plan(&context),
+            ContentAuthorityPlan::Reject { reason } if reason.contains("missing current signer")
+        ));
+    }
+
+    #[test]
+    fn content_authority_rejects_unsupported_signer_type() {
+        let context = normalize_content_authority(
+            &ContentAuthorityRawRows::UnsupportedSignerType {
+                semantic_type_code: EVENT_TYPE_WORKSPACE,
+            },
+            &event_id_b64(2),
+        );
+
+        assert!(matches!(
+            decide_content_authority_plan(&context),
+            ContentAuthorityPlan::Reject { reason } if reason.contains("must be peer_shared")
         ));
     }
 }

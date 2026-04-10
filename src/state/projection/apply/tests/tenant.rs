@@ -23,6 +23,74 @@ fn test_signed_content_events_project_with_identity_chain() {
 }
 
 #[test]
+fn test_message_rejects_malformed_signer_user_binding_at_projection() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let signer_b64 = event_id_to_base64(&signer_eid);
+
+    conn.execute(
+        "UPDATE peers_shared
+         SET user_event_id = ?1
+         WHERE recorded_by = ?2 AND event_id = ?3",
+        rusqlite::params!["not-base64", recorded_by, &signer_b64],
+    )
+    .unwrap();
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "malformed signer");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+
+    match project_one(&conn, recorded_by, &msg_eid).unwrap() {
+        ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("malformed peers_shared user binding"),
+                "unexpected rejection reason: {reason}"
+            );
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_reaction_rejects_signer_user_mismatch_at_projection() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let signer_b64 = event_id_to_base64(&signer_eid);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "reaction target");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &msg_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let wrong_user = event_id_to_base64(&[0x99; 32]);
+    conn.execute(
+        "UPDATE peers_shared
+         SET user_event_id = ?1
+         WHERE recorded_by = ?2 AND event_id = ?3",
+        rusqlite::params![wrong_user, recorded_by, &signer_b64],
+    )
+    .unwrap();
+
+    let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "bad");
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+
+    match project_one(&conn, recorded_by, &rxn_eid).unwrap() {
+        ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("author_id claims"),
+                "unexpected rejection reason: {reason}"
+            );
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_dep_global_existence_not_sufficient() {
     // A dep existing globally (for tenant_a) must NOT satisfy tenant_b's dep check
     let conn = setup();
