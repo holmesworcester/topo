@@ -109,7 +109,14 @@ enum BootstrapFallbackInvitePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct OutboundSessionAuthContext {
+struct OutboundSessionAuthRawRows {
+    bootstrap_auth_still_valid: bool,
+    bound_daemon_peer_id: Option<String>,
+    remote_session_peer_authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutboundSessionAuthDecisionContext {
     requested_plan: OutboundSessionAuthPlan,
     remote_session_peer_id: String,
     bootstrap_auth_still_valid: bool,
@@ -127,7 +134,7 @@ enum OutboundSessionAuthDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct InboundRouteAuthContext {
+struct InboundRouteAuthDecisionContext {
     route_authorized: bool,
 }
 
@@ -138,9 +145,8 @@ enum InboundRouteAuthDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct InboundBootstrapAuthContext {
+struct InboundBootstrapAuthDecisionContext {
     tenant_resolution: BootstrapSessionTenantDecisionContext,
-    tenant_resolution_error: Option<String>,
     cached_tenant_id: Option<String>,
     expiry_valid: bool,
     daemon_binding_valid: bool,
@@ -241,8 +247,29 @@ fn decide_bootstrap_fallback_invite_plan(
     }
 }
 
+fn normalize_outbound_session_auth_decision_context(
+    raw_rows: &OutboundSessionAuthRawRows,
+    requested_plan: &OutboundSessionAuthPlan,
+    remote_session_peer_id: &str,
+    actual_remote_daemon_peer_id: &str,
+    daemon_connection_admits_route: bool,
+) -> OutboundSessionAuthDecisionContext {
+    OutboundSessionAuthDecisionContext {
+        requested_plan: requested_plan.clone(),
+        remote_session_peer_id: remote_session_peer_id.to_string(),
+        bootstrap_auth_still_valid: raw_rows.bootstrap_auth_still_valid,
+        daemon_connection_admits_route,
+        bound_daemon_matches_remote: raw_rows
+            .bound_daemon_peer_id
+            .as_deref()
+            .map(|bound| bound == actual_remote_daemon_peer_id)
+            .unwrap_or(false),
+        remote_session_peer_authorized: raw_rows.remote_session_peer_authorized,
+    }
+}
+
 fn decide_outbound_session_auth_decision(
-    context: &OutboundSessionAuthContext,
+    context: &OutboundSessionAuthDecisionContext,
 ) -> OutboundSessionAuthDecision {
     match &context.requested_plan {
         OutboundSessionAuthPlan::PeerShared { .. } => OutboundSessionAuthDecision::KeepRequested,
@@ -270,7 +297,7 @@ fn decide_outbound_session_auth_decision(
 }
 
 fn plan_for_outbound_session_auth_decision(
-    context: &OutboundSessionAuthContext,
+    context: &OutboundSessionAuthDecisionContext,
     decision: &OutboundSessionAuthDecision,
 ) -> OutboundSessionAuthPlan {
     match decision {
@@ -287,7 +314,9 @@ fn plan_for_outbound_session_auth_decision(
     }
 }
 
-fn decide_inbound_route_auth(context: &InboundRouteAuthContext) -> InboundRouteAuthDecision {
+fn decide_inbound_route_auth(
+    context: &InboundRouteAuthDecisionContext,
+) -> InboundRouteAuthDecision {
     if context.route_authorized {
         InboundRouteAuthDecision::Accept
     } else {
@@ -296,7 +325,7 @@ fn decide_inbound_route_auth(context: &InboundRouteAuthContext) -> InboundRouteA
 }
 
 fn decide_inbound_bootstrap_auth(
-    context: &InboundBootstrapAuthContext,
+    context: &InboundBootstrapAuthDecisionContext,
 ) -> InboundBootstrapAuthDecision {
     if !context.expiry_valid
         || !context.daemon_binding_valid
@@ -322,6 +351,24 @@ fn decide_inbound_bootstrap_auth(
                 InboundBootstrapAuthDecision::RejectTenantResolution
             }
         }
+    }
+}
+
+fn describe_bootstrap_session_tenant_rejection(
+    plan: &BootstrapSessionTenantPlan,
+    invite_event_id_b64: &str,
+    actual_remote_daemon_peer_id: &str,
+) -> Option<String> {
+    match plan {
+        BootstrapSessionTenantPlan::Accept { .. } => None,
+        BootstrapSessionTenantPlan::RejectMissingTenantBinding => Some(format!(
+            "no active bootstrap trust for invite {} and daemon {}",
+            invite_event_id_b64, actual_remote_daemon_peer_id
+        )),
+        BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding => Some(format!(
+            "invite {} and daemon {} resolve to multiple local tenants; bootstrap auth is ambiguous",
+            invite_event_id_b64, actual_remote_daemon_peer_id
+        )),
     }
 }
 
@@ -722,7 +769,8 @@ async fn read_inbound_session_auth_inner(
                 &remote_peer_id,
                 actual_remote_daemon_peer_id,
             )?;
-            let decision = decide_inbound_route_auth(&InboundRouteAuthContext { route_authorized });
+            let decision =
+                decide_inbound_route_auth(&InboundRouteAuthDecisionContext { route_authorized });
             if matches!(decision, InboundRouteAuthDecision::RejectUnauthorized) {
                 return Err(format!(
                     "session route not admitted for tenant {} peer {} on daemon {}",
@@ -760,18 +808,12 @@ async fn read_inbound_session_auth_inner(
                 &actual_remote_daemon_peer_id_raw,
             )?;
             let tenant_resolution = normalize_bootstrap_session_tenant_decision_context(&raw_rows);
-            let tenant_resolution_error =
-                match decide_bootstrap_session_tenant_plan(&tenant_resolution) {
-                    BootstrapSessionTenantPlan::Accept { .. } => None,
-                    BootstrapSessionTenantPlan::RejectMissingTenantBinding => Some(format!(
-                        "no active bootstrap trust for invite {} and daemon {}",
-                        invite_event_id_b64, actual_remote_daemon_peer_id
-                    )),
-                    BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding => Some(format!(
-                        "invite {} and daemon {} resolve to multiple local tenants; bootstrap auth is ambiguous",
-                        invite_event_id_b64, actual_remote_daemon_peer_id
-                    )),
-                };
+            let tenant_resolution_plan = decide_bootstrap_session_tenant_plan(&tenant_resolution);
+            let tenant_resolution_error = describe_bootstrap_session_tenant_rejection(
+                &tenant_resolution_plan,
+                &invite_event_id_b64,
+                actual_remote_daemon_peer_id,
+            );
             let invite_public_key = load_invite_public_key(&db, &invite_event_id_b64)?;
             let signing_bytes = encode_invite_signing_bytes(&auth);
             let invite_signature_valid =
@@ -779,9 +821,8 @@ async fn read_inbound_session_auth_inner(
             let cached_tenant_id = daemon_connection.and_then(|conn| {
                 conn.accepted_bootstrap_tenant(&invite_event_id_b64, &remote_peer_id)
             });
-            let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthContext {
+            let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
                 tenant_resolution,
-                tenant_resolution_error: tenant_resolution_error.clone(),
                 cached_tenant_id,
                 expiry_valid,
                 daemon_binding_valid,
@@ -1018,14 +1059,13 @@ pub fn resolve_bootstrap_fallback_invite_for_daemon(
     )
 }
 
-fn load_outbound_session_auth_context(
+fn load_outbound_session_auth_raw_rows(
     conn: &Connection,
-    daemon_connection: Option<&DaemonConnection>,
     recorded_by: &str,
     remote_session_peer_id: &str,
     actual_remote_daemon_peer_id: &str,
     requested_plan: &OutboundSessionAuthPlan,
-) -> Result<OutboundSessionAuthContext, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<OutboundSessionAuthRawRows, Box<dyn std::error::Error + Send + Sync>> {
     let bootstrap_auth_still_valid = match requested_plan {
         OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } => {
             has_active_local_bootstrap_session_auth(
@@ -1037,14 +1077,8 @@ fn load_outbound_session_auth_context(
         }
         OutboundSessionAuthPlan::PeerShared { .. } => false,
     };
-    let daemon_connection_admits_route = daemon_connection
-        .map(|conn| conn.admits_session_route(recorded_by, remote_session_peer_id))
-        .unwrap_or(false);
-
-    let bound_daemon_matches_remote =
-        resolve_bound_daemon_peer_id(conn, recorded_by, remote_session_peer_id)?
-            .map(|bound| bound == actual_remote_daemon_peer_id)
-            .unwrap_or(false);
+    let bound_daemon_peer_id =
+        resolve_bound_daemon_peer_id(conn, recorded_by, remote_session_peer_id)?;
 
     let remote_session_peer_authorized =
         match decode_hex32(remote_session_peer_id, "remote session peer id") {
@@ -1054,12 +1088,9 @@ fn load_outbound_session_auth_context(
             Err(_) => false,
         };
 
-    Ok(OutboundSessionAuthContext {
-        requested_plan: requested_plan.clone(),
-        remote_session_peer_id: remote_session_peer_id.to_string(),
+    Ok(OutboundSessionAuthRawRows {
         bootstrap_auth_still_valid,
-        daemon_connection_admits_route,
-        bound_daemon_matches_remote,
+        bound_daemon_peer_id,
         remote_session_peer_authorized,
     })
 }
@@ -1072,16 +1103,24 @@ pub fn resolve_outbound_session_auth_plan(
     actual_remote_daemon_peer_id: &str,
     requested_plan: &OutboundSessionAuthPlan,
 ) -> Result<OutboundSessionAuthPlan, Box<dyn std::error::Error + Send + Sync>> {
-    let context = load_outbound_session_auth_context(
+    let raw_rows = load_outbound_session_auth_raw_rows(
         conn,
-        daemon_connection,
         recorded_by,
         remote_session_peer_id,
         actual_remote_daemon_peer_id,
         requested_plan,
     )?;
-    let decision = decide_outbound_session_auth_decision(&context);
-    let resolved_plan = plan_for_outbound_session_auth_decision(&context, &decision);
+    let decision_context = normalize_outbound_session_auth_decision_context(
+        &raw_rows,
+        requested_plan,
+        remote_session_peer_id,
+        actual_remote_daemon_peer_id,
+        daemon_connection
+            .map(|conn| conn.admits_session_route(recorded_by, remote_session_peer_id))
+            .unwrap_or(false),
+    );
+    let decision = decide_outbound_session_auth_decision(&decision_context);
+    let resolved_plan = plan_for_outbound_session_auth_decision(&decision_context, &decision);
 
     match decision {
         OutboundSessionAuthDecision::KeepRequested => {}
@@ -1511,7 +1550,7 @@ mod tests {
     #[test]
     fn inbound_route_auth_decision_rejects_unauthorized_routes() {
         assert_eq!(
-            decide_inbound_route_auth(&InboundRouteAuthContext {
+            decide_inbound_route_auth(&InboundRouteAuthDecisionContext {
                 route_authorized: false,
             }),
             InboundRouteAuthDecision::RejectUnauthorized
@@ -1520,9 +1559,8 @@ mod tests {
 
     #[test]
     fn inbound_bootstrap_auth_decision_accepts_cached_tenant_after_resolution_loss() {
-        let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthContext {
+        let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
             tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
-            tenant_resolution_error: None,
             cached_tenant_id: Some("tenant-a".to_string()),
             expiry_valid: true,
             daemon_binding_valid: true,
@@ -1539,9 +1577,8 @@ mod tests {
 
     #[test]
     fn inbound_bootstrap_auth_decision_rejects_invalid_auth_before_cache_use() {
-        let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthContext {
+        let decision = decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
             tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
-            tenant_resolution_error: None,
             cached_tenant_id: Some("tenant-a".to_string()),
             expiry_valid: false,
             daemon_binding_valid: true,
@@ -1552,8 +1589,38 @@ mod tests {
     }
 
     #[test]
+    fn outbound_session_auth_normalization_marks_matching_bound_daemon() {
+        let decision_context = normalize_outbound_session_auth_decision_context(
+            &OutboundSessionAuthRawRows {
+                bootstrap_auth_still_valid: true,
+                bound_daemon_peer_id: Some("daemon-1".to_string()),
+                remote_session_peer_authorized: true,
+            },
+            &OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite-1".to_string(),
+            },
+            "peer-1",
+            "daemon-1",
+            false,
+        );
+        assert_eq!(
+            decision_context,
+            OutboundSessionAuthDecisionContext {
+                requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
+                    invite_event_id: "invite-1".to_string(),
+                },
+                remote_session_peer_id: "peer-1".to_string(),
+                bootstrap_auth_still_valid: true,
+                daemon_connection_admits_route: false,
+                bound_daemon_matches_remote: true,
+                remote_session_peer_authorized: true,
+            }
+        );
+    }
+
+    #[test]
     fn outbound_session_auth_planner_keeps_active_bootstrap_without_admitted_route() {
-        let context = OutboundSessionAuthContext {
+        let decision_context = OutboundSessionAuthDecisionContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
@@ -1563,13 +1630,13 @@ mod tests {
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
         };
-        let decision = decide_outbound_session_auth_decision(&context);
+        let decision = decide_outbound_session_auth_decision(&decision_context);
         assert_eq!(
             decision,
             OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding
         );
         assert_eq!(
-            plan_for_outbound_session_auth_decision(&context, &decision),
+            plan_for_outbound_session_auth_decision(&decision_context, &decision),
             OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             }
@@ -1578,7 +1645,7 @@ mod tests {
 
     #[test]
     fn outbound_session_auth_planner_upgrades_only_when_binding_and_auth_hold() {
-        let context = OutboundSessionAuthContext {
+        let decision_context = OutboundSessionAuthDecisionContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
@@ -1588,19 +1655,19 @@ mod tests {
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
         };
-        let decision = decide_outbound_session_auth_decision(&context);
+        let decision = decide_outbound_session_auth_decision(&decision_context);
         assert_eq!(
             decision,
             OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse
         );
         assert_eq!(
-            plan_for_outbound_session_auth_decision(&context, &decision),
+            plan_for_outbound_session_auth_decision(&decision_context, &decision),
             OutboundSessionAuthPlan::PeerShared {
                 target_peer_id: "peer-1".to_string(),
             }
         );
 
-        let no_upgrade_context = OutboundSessionAuthContext {
+        let no_upgrade_context = OutboundSessionAuthDecisionContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
@@ -1622,7 +1689,7 @@ mod tests {
 
     #[test]
     fn outbound_session_auth_planner_upgrades_active_bootstrap_after_route_admission() {
-        let context = OutboundSessionAuthContext {
+        let decision_context = OutboundSessionAuthDecisionContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
@@ -1632,13 +1699,13 @@ mod tests {
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
         };
-        let decision = decide_outbound_session_auth_decision(&context);
+        let decision = decide_outbound_session_auth_decision(&decision_context);
         assert_eq!(
             decision,
             OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
         );
         assert_eq!(
-            plan_for_outbound_session_auth_decision(&context, &decision),
+            plan_for_outbound_session_auth_decision(&decision_context, &decision),
             OutboundSessionAuthPlan::PeerShared {
                 target_peer_id: "peer-1".to_string(),
             }
