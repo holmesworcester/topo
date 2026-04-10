@@ -1,8 +1,9 @@
-//! Formal verification of command/wire validation input normalization.
+//! Formal verification of persist-phase ingress validation normalization.
 //!
-//! This models the first event-pipeline seam:
-//! external command or wire input becomes raw typed validation state, then a
-//! normalized `DecisionContext`, then a bounded pipeline plan.
+//! This models the runtime boundary in `state::pipeline::phases`: cheap
+//! prefix/type validation becomes raw typed validation state, then a normalized
+//! `DecisionContext`, then a bounded persist-phase plan. Full dependency and
+//! signer authority validation remains in projection-context seams.
 
 use vstd::prelude::*;
 
@@ -15,60 +16,55 @@ pub enum ValidationSource {
 }
 
 pub enum RawValidationInput {
-    MissingBlob,
-    ParseFailed,
-    Parsed {
-        source: ValidationSource,
-        known_type: bool,
-        signer_required: bool,
-        signer_present: bool,
-        deps_well_formed: bool,
-    },
+    MissingCreatedAt { source: ValidationSource },
+    MissingTypeCode { source: ValidationSource },
+    UnknownType { source: ValidationSource },
+    KnownType { source: ValidationSource },
 }
 
 pub enum ValidationDecisionContext {
-    RejectMissingBlob,
-    RejectParse,
+    RejectMissingCreatedAt,
+    RejectMissingTypeCode,
     RejectUnknownType,
-    RejectMissingSigner,
-    RejectMalformedDeps,
-    Ready {
-        signer_required: bool,
-        signer_present: bool,
-    },
+    Ready,
 }
 
 pub enum ValidationPlan {
     Reject,
-    ContinueToProjection,
+    ContinueToPersist,
+}
+
+pub open spec fn raw_validation_input(
+    source: ValidationSource,
+    has_created_at: bool,
+    has_type_code: bool,
+    known_type: bool,
+) -> RawValidationInput {
+    if !has_created_at {
+        RawValidationInput::MissingCreatedAt { source }
+    } else if !has_type_code {
+        RawValidationInput::MissingTypeCode { source }
+    } else if !known_type {
+        RawValidationInput::UnknownType { source }
+    } else {
+        RawValidationInput::KnownType { source }
+    }
 }
 
 pub open spec fn normalize_validation_input(
     input: RawValidationInput,
 ) -> ValidationDecisionContext {
     match input {
-        RawValidationInput::MissingBlob => ValidationDecisionContext::RejectMissingBlob,
-        RawValidationInput::ParseFailed => ValidationDecisionContext::RejectParse,
-        RawValidationInput::Parsed {
-            source: _source,
-            known_type,
-            signer_required,
-            signer_present,
-            deps_well_formed,
-        } => {
-            if !known_type {
-                ValidationDecisionContext::RejectUnknownType
-            } else if signer_required && !signer_present {
-                ValidationDecisionContext::RejectMissingSigner
-            } else if !deps_well_formed {
-                ValidationDecisionContext::RejectMalformedDeps
-            } else {
-                ValidationDecisionContext::Ready {
-                    signer_required,
-                    signer_present,
-                }
-            }
+        RawValidationInput::MissingCreatedAt { source: _ } => {
+            ValidationDecisionContext::RejectMissingCreatedAt
         }
+        RawValidationInput::MissingTypeCode { source: _ } => {
+            ValidationDecisionContext::RejectMissingTypeCode
+        }
+        RawValidationInput::UnknownType { source: _ } => {
+            ValidationDecisionContext::RejectUnknownType
+        }
+        RawValidationInput::KnownType { source: _ } => ValidationDecisionContext::Ready,
     }
 }
 
@@ -76,93 +72,102 @@ pub open spec fn decide_validation_plan(
     context: ValidationDecisionContext,
 ) -> ValidationPlan {
     match context {
-        ValidationDecisionContext::Ready { .. } => ValidationPlan::ContinueToProjection,
-        _ => ValidationPlan::Reject,
+        ValidationDecisionContext::Ready => ValidationPlan::ContinueToPersist,
+        ValidationDecisionContext::RejectMissingCreatedAt
+        | ValidationDecisionContext::RejectMissingTypeCode
+        | ValidationDecisionContext::RejectUnknownType => ValidationPlan::Reject,
     }
 }
 
-proof fn missing_blob_rejects()
+proof fn missing_created_at_rejects(source: ValidationSource)
     ensures
-        decide_validation_plan(normalize_validation_input(RawValidationInput::MissingBlob))
-            == ValidationPlan::Reject,
+        decide_validation_plan(normalize_validation_input(
+            RawValidationInput::MissingCreatedAt { source },
+        )) == ValidationPlan::Reject,
 {
 }
 
-proof fn parse_failure_rejects()
+proof fn missing_type_code_rejects(source: ValidationSource)
     ensures
-        decide_validation_plan(normalize_validation_input(RawValidationInput::ParseFailed))
-            == ValidationPlan::Reject,
+        decide_validation_plan(normalize_validation_input(
+            RawValidationInput::MissingTypeCode { source },
+        )) == ValidationPlan::Reject,
 {
 }
 
-proof fn unknown_type_rejects()
+proof fn unknown_type_rejects(source: ValidationSource)
     ensures
-        decide_validation_plan(normalize_validation_input(RawValidationInput::Parsed {
-            source: ValidationSource::Wire,
-            known_type: false,
-            signer_required: false,
-            signer_present: false,
-            deps_well_formed: true,
-        })) == ValidationPlan::Reject,
+        decide_validation_plan(normalize_validation_input(
+            RawValidationInput::UnknownType { source },
+        )) == ValidationPlan::Reject,
 {
 }
 
-proof fn missing_required_signer_rejects()
+proof fn known_type_continues(source: ValidationSource)
     ensures
-        decide_validation_plan(normalize_validation_input(RawValidationInput::Parsed {
-            source: ValidationSource::Wire,
-            known_type: true,
-            signer_required: true,
-            signer_present: false,
-            deps_well_formed: true,
-        })) == ValidationPlan::Reject,
-{
-}
-
-proof fn malformed_deps_reject()
-    ensures
-        decide_validation_plan(normalize_validation_input(RawValidationInput::Parsed {
-            source: ValidationSource::Wire,
-            known_type: true,
-            signer_required: false,
-            signer_present: false,
-            deps_well_formed: false,
-        })) == ValidationPlan::Reject,
-{
-}
-
-proof fn well_formed_known_input_continues(signer_required: bool, signer_present: bool)
-    requires signer_required ==> signer_present
-    ensures
-        decide_validation_plan(normalize_validation_input(RawValidationInput::Parsed {
-            source: ValidationSource::Command,
-            known_type: true,
-            signer_required,
-            signer_present,
-            deps_well_formed: true,
-        })) == ValidationPlan::ContinueToProjection,
+        decide_validation_plan(normalize_validation_input(
+            RawValidationInput::KnownType { source },
+        )) == ValidationPlan::ContinueToPersist,
 {
 }
 
 proof fn validation_plan_is_source_noninterfering(
-    signer_required: bool,
-    signer_present: bool,
-    deps_well_formed: bool,
+    has_created_at: bool,
+    has_type_code: bool,
+    known_type: bool,
 )
     ensures
-        decide_validation_plan(normalize_validation_input(RawValidationInput::Parsed {
-            source: ValidationSource::Command,
-            known_type: true,
-            signer_required,
-            signer_present,
-            deps_well_formed,
-        })) == decide_validation_plan(normalize_validation_input(RawValidationInput::Parsed {
-            source: ValidationSource::Wire,
-            known_type: true,
-            signer_required,
-            signer_present,
-            deps_well_formed,
-        })),
+        decide_validation_plan(normalize_validation_input(raw_validation_input(
+            ValidationSource::Command,
+            has_created_at,
+            has_type_code,
+            known_type,
+        ))) == decide_validation_plan(normalize_validation_input(raw_validation_input(
+            ValidationSource::Wire,
+            has_created_at,
+            has_type_code,
+            known_type,
+        ))),
+{
+}
+
+proof fn missing_created_at_rejects_regardless_of_later_fields(
+    source: ValidationSource,
+    has_type_code: bool,
+    known_type: bool,
+)
+    ensures
+        decide_validation_plan(normalize_validation_input(raw_validation_input(
+            source,
+            false,
+            has_type_code,
+            known_type,
+        ))) == ValidationPlan::Reject,
+{
+}
+
+proof fn missing_type_code_rejects_regardless_of_known_type(
+    source: ValidationSource,
+    known_type: bool,
+)
+    ensures
+        decide_validation_plan(normalize_validation_input(raw_validation_input(
+            source,
+            true,
+            false,
+            known_type,
+        ))) == ValidationPlan::Reject,
+{
+}
+
+proof fn known_type_builder_continues(source: ValidationSource)
+    ensures
+        decide_validation_plan(normalize_validation_input(raw_validation_input(
+            source,
+            true,
+            true,
+            true,
+        ))) == ValidationPlan::ContinueToPersist,
 {
 }
 

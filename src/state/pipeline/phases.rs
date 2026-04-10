@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
-use crate::crypto::{event_id_to_base64, EventId};
+use crate::crypto::{EventId, event_id_to_base64};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
-use crate::event_modules::{self as events, registry::EventRegistry, ShareScope};
+use crate::event_modules::{self as events, EventTypeMeta, ShareScope, registry::EventRegistry};
 use crate::state::shared_workspace_fanout::SharedEventFanout;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -22,6 +22,28 @@ enum PersistEventKind {
     Workspace,
     EndpointShared,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistValidationRawRows {
+    MissingCreatedAt,
+    MissingTypeCode,
+    UnknownType { type_code: u8 },
+    KnownType { created_at_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistValidationDecisionContext {
+    RejectMissingCreatedAt,
+    RejectMissingTypeCode,
+    RejectUnknownType,
+    Ready { created_at_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistValidationPlan {
+    Skip,
+    Continue { created_at_ms: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +75,61 @@ struct PersistEventPlan {
     shared_index_workspace: PersistWorkspaceTarget,
     priority_lane: i64,
     fanout_workspace: PersistWorkspaceTarget,
+}
+
+#[inline]
+fn load_persist_validation_raw_rows(
+    blob: &[u8],
+    reg: &'static EventRegistry,
+) -> (PersistValidationRawRows, Option<&'static EventTypeMeta>) {
+    let Some(created_at_ms) = events::extract_created_at_ms(blob) else {
+        return (PersistValidationRawRows::MissingCreatedAt, None);
+    };
+    let Some(type_code) = events::extract_event_type(blob) else {
+        return (PersistValidationRawRows::MissingTypeCode, None);
+    };
+    let meta = reg.lookup(type_code);
+    let raw_rows = match meta {
+        Some(_) => PersistValidationRawRows::KnownType { created_at_ms },
+        None => PersistValidationRawRows::UnknownType { type_code },
+    };
+    (raw_rows, meta)
+}
+
+#[inline]
+fn normalize_persist_validation(
+    raw_rows: PersistValidationRawRows,
+) -> PersistValidationDecisionContext {
+    match raw_rows {
+        PersistValidationRawRows::MissingCreatedAt => {
+            PersistValidationDecisionContext::RejectMissingCreatedAt
+        }
+        PersistValidationRawRows::MissingTypeCode => {
+            PersistValidationDecisionContext::RejectMissingTypeCode
+        }
+        PersistValidationRawRows::UnknownType { .. } => {
+            PersistValidationDecisionContext::RejectUnknownType
+        }
+        PersistValidationRawRows::KnownType { created_at_ms } => {
+            PersistValidationDecisionContext::Ready { created_at_ms }
+        }
+    }
+}
+
+#[inline]
+fn decide_persist_validation_plan(
+    context: &PersistValidationDecisionContext,
+) -> PersistValidationPlan {
+    match context {
+        PersistValidationDecisionContext::Ready { created_at_ms } => {
+            PersistValidationPlan::Continue {
+                created_at_ms: *created_at_ms,
+            }
+        }
+        PersistValidationDecisionContext::RejectMissingCreatedAt
+        | PersistValidationDecisionContext::RejectMissingTypeCode
+        | PersistValidationDecisionContext::RejectUnknownType => PersistValidationPlan::Skip,
+    }
 }
 
 fn persist_event_kind(type_name: &str) -> PersistEventKind {
@@ -139,147 +216,142 @@ pub(super) fn run_persist_phase(
             *first_stored_at_ms,
         );
 
-        if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
-            if let Some(type_code) = events::extract_event_type(blob) {
-                if let Some(meta) = reg.lookup(type_code) {
-                    let event_kind = persist_event_kind(meta.type_name);
-                    let is_file_slice = events::outer_semantic_type_code(blob)
-                        == Some(events::EVENT_TYPE_FILE_SLICE);
-                    let workspace_binding = if meta.share_scope == ShareScope::Shared
-                        && matches!(event_kind, PersistEventKind::Other)
-                    {
-                        if let Some(cached) = workspace_cache.get(&effective_recorded_by) {
-                            Some(cached.clone())
-                        } else if let Some(ws) = lookup_workspace_id(db, &effective_recorded_by) {
-                            workspace_cache.insert(effective_recorded_by.clone(), ws.clone());
-                            Some(ws)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    let persist_plan =
-                        decide_persist_event_plan(&normalize_persist_event(PersistEventRawRows {
-                            share_scope: meta.share_scope,
-                            event_kind,
-                            is_file_slice,
-                            workspace_binding,
-                        }));
+        let (validation_raw_rows, maybe_meta) = load_persist_validation_raw_rows(blob, reg);
+        let validation_plan =
+            decide_persist_validation_plan(&normalize_persist_validation(validation_raw_rows));
+        let PersistValidationPlan::Continue { created_at_ms } = validation_plan else {
+            continue;
+        };
+        let Some(meta) = maybe_meta else {
+            debug_assert!(false, "known validation plan without registry metadata");
+            continue;
+        };
 
-                    // Only insert into shared_event_index when the pure persist
-                    // plan selects a workspace target.
-                    match &persist_plan.shared_index_workspace {
-                        PersistWorkspaceTarget::Skip => {}
-                        PersistWorkspaceTarget::MissingBinding => {
-                            tracing::warn!(
-                                "no accepted workspace binding for {}, skipping shared_event_index for {}",
-                                effective_recorded_by,
-                                event_id_b64
-                            );
-                        }
-                        PersistWorkspaceTarget::EventId
-                        | PersistWorkspaceTarget::WorkspaceBinding(_) => {
-                            let ws_id = resolve_persist_workspace_target(
-                                &persist_plan.shared_index_workspace,
-                                &event_id_b64,
-                            )
-                            .expect("workspace target selected");
-                            if let Err(e) = shared_event_index_stmt.execute(rusqlite::params![
-                                &ws_id,
-                                created_at_ms as i64,
-                                event_id.as_slice()
-                            ]) {
-                                // Non-fatal: shared_event_index is a reconciliation cache;
-                                // event will be re-added on next sync session.
-                                tracing::warn!(
-                                    "shared_event_index insert error for {}: {}",
-                                    event_id_b64,
-                                    e
-                                );
-                            }
-                        }
-                    }
-
-                    if let Err(e) = events_stmt.execute(rusqlite::params![
-                        &event_id_b64,
-                        meta.type_name,
-                        blob.as_slice(),
-                        meta.share_scope.as_str(),
-                        created_at_ms as i64,
-                        current_timestamp_ms()
-                    ]) {
-                        tracing::warn!("events insert error for {}: {}", event_id_b64, e);
-                        continue;
-                    }
-
-                    let recorded_at = current_timestamp_ms();
-                    let recorded_inserted = match recorded_stmt.execute(rusqlite::params![
-                        &effective_recorded_by,
-                        &event_id_b64,
-                        recorded_at,
-                        source_tag
-                    ]) {
-                        Ok(rows) => rows > 0,
-                        Err(e) => {
-                            tracing::warn!(
-                                "recorded_events insert error for {}: {}",
-                                event_id_b64,
-                                e
-                            );
-                            continue;
-                        }
-                    };
-                    if recorded_inserted {
-                        let semantic_type_code =
-                            events::outer_semantic_type_code(blob).map(i64::from);
-                        if let Err(e) = crate::db::observability::insert_event_ingest_observation(
-                            db,
-                            &effective_recorded_by,
-                            &event_id_b64,
-                            source_tag,
-                            semantic_type_code,
-                            *received_at_ms,
-                            *first_stored_at_ms,
-                            recorded_at,
-                        ) {
-                            tracing::warn!(
-                                "event_ingest_observations insert error for {}: {}",
-                                event_id_b64,
-                                e
-                            );
-                        }
-                    }
-                    // Enqueue for durable projection (atomicity boundary 1)
-                    if let Err(e) = enqueue_stmt.execute(rusqlite::params![
-                        &effective_recorded_by,
-                        &event_id_b64,
-                        current_timestamp_ms(),
-                        persist_plan.priority_lane,
-                        created_at_ms as i64
-                    ]) {
-                        tracing::warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
-                    }
-
-                    persist_output
-                        .tenants_seen
-                        .insert(effective_recorded_by.clone());
-                    persist_output.persisted_event_ids.push(*event_id);
-                    if let Some(workspace_id) = resolve_persist_workspace_target(
-                        &persist_plan.fanout_workspace,
-                        &event_id_b64,
-                    ) {
-                        persist_output.shared_event_fanouts.push(SharedEventFanout {
-                            origin_peer_id: effective_recorded_by.clone(),
-                            workspace_id,
-                            event_id: *event_id,
-                        });
-                    }
-                } else {
-                }
+        let event_kind = persist_event_kind(meta.type_name);
+        let is_file_slice =
+            events::outer_semantic_type_code(blob) == Some(events::EVENT_TYPE_FILE_SLICE);
+        let workspace_binding = if meta.share_scope == ShareScope::Shared
+            && matches!(event_kind, PersistEventKind::Other)
+        {
+            if let Some(cached) = workspace_cache.get(&effective_recorded_by) {
+                Some(cached.clone())
+            } else if let Some(ws) = lookup_workspace_id(db, &effective_recorded_by) {
+                workspace_cache.insert(effective_recorded_by.clone(), ws.clone());
+                Some(ws)
             } else {
+                None
             }
         } else {
+            None
+        };
+        let persist_plan =
+            decide_persist_event_plan(&normalize_persist_event(PersistEventRawRows {
+                share_scope: meta.share_scope,
+                event_kind,
+                is_file_slice,
+                workspace_binding,
+            }));
+
+        // Only insert into shared_event_index when the pure persist
+        // plan selects a workspace target.
+        match &persist_plan.shared_index_workspace {
+            PersistWorkspaceTarget::Skip => {}
+            PersistWorkspaceTarget::MissingBinding => {
+                tracing::warn!(
+                    "no accepted workspace binding for {}, skipping shared_event_index for {}",
+                    effective_recorded_by,
+                    event_id_b64
+                );
+            }
+            PersistWorkspaceTarget::EventId | PersistWorkspaceTarget::WorkspaceBinding(_) => {
+                let ws_id = resolve_persist_workspace_target(
+                    &persist_plan.shared_index_workspace,
+                    &event_id_b64,
+                )
+                .expect("workspace target selected");
+                if let Err(e) = shared_event_index_stmt.execute(rusqlite::params![
+                    &ws_id,
+                    created_at_ms as i64,
+                    event_id.as_slice()
+                ]) {
+                    // Non-fatal: shared_event_index is a reconciliation cache;
+                    // event will be re-added on next sync session.
+                    tracing::warn!(
+                        "shared_event_index insert error for {}: {}",
+                        event_id_b64,
+                        e
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = events_stmt.execute(rusqlite::params![
+            &event_id_b64,
+            meta.type_name,
+            blob.as_slice(),
+            meta.share_scope.as_str(),
+            created_at_ms as i64,
+            current_timestamp_ms()
+        ]) {
+            tracing::warn!("events insert error for {}: {}", event_id_b64, e);
+            continue;
+        }
+
+        let recorded_at = current_timestamp_ms();
+        let recorded_inserted = match recorded_stmt.execute(rusqlite::params![
+            &effective_recorded_by,
+            &event_id_b64,
+            recorded_at,
+            source_tag
+        ]) {
+            Ok(rows) => rows > 0,
+            Err(e) => {
+                tracing::warn!("recorded_events insert error for {}: {}", event_id_b64, e);
+                continue;
+            }
+        };
+        if recorded_inserted {
+            let semantic_type_code = events::outer_semantic_type_code(blob).map(i64::from);
+            if let Err(e) = crate::db::observability::insert_event_ingest_observation(
+                db,
+                &effective_recorded_by,
+                &event_id_b64,
+                source_tag,
+                semantic_type_code,
+                *received_at_ms,
+                *first_stored_at_ms,
+                recorded_at,
+            ) {
+                tracing::warn!(
+                    "event_ingest_observations insert error for {}: {}",
+                    event_id_b64,
+                    e
+                );
+            }
+        }
+        // Enqueue for durable projection (atomicity boundary 1)
+        if let Err(e) = enqueue_stmt.execute(rusqlite::params![
+            &effective_recorded_by,
+            &event_id_b64,
+            current_timestamp_ms(),
+            persist_plan.priority_lane,
+            created_at_ms as i64
+        ]) {
+            tracing::warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
+        }
+
+        persist_output
+            .tenants_seen
+            .insert(effective_recorded_by.clone());
+        persist_output.persisted_event_ids.push(*event_id);
+        if let Some(workspace_id) =
+            resolve_persist_workspace_target(&persist_plan.fanout_workspace, &event_id_b64)
+        {
+            persist_output.shared_event_fanouts.push(SharedEventFanout {
+                origin_peer_id: effective_recorded_by.clone(),
+                workspace_id,
+                event_id: *event_id,
+            });
         }
     }
 
@@ -308,7 +380,7 @@ mod tests {
         schema::create_tables,
         store::{SQL_INSERT_EVENT, SQL_INSERT_RECORDED_EVENT, SQL_INSERT_SHARED_EVENT_INDEX_ENTRY},
     };
-    use crate::event_modules::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_FILE_SLICE};
+    use crate::event_modules::{self, EVENT_TYPE_FILE_SLICE, EncryptedEvent, ParsedEvent};
 
     fn run_persist_phase_for_test(
         db: &rusqlite::Connection,
@@ -339,6 +411,71 @@ mod tests {
             &mut events_stmt,
             &mut enqueue_stmt,
         )
+    }
+
+    #[test]
+    fn persist_validation_rejects_missing_created_at() {
+        let context = normalize_persist_validation(PersistValidationRawRows::MissingCreatedAt);
+
+        assert_eq!(
+            decide_persist_validation_plan(&context),
+            PersistValidationPlan::Skip
+        );
+    }
+
+    #[test]
+    fn persist_validation_rejects_unknown_type() {
+        let blob = {
+            let mut blob = vec![0xff];
+            blob.extend_from_slice(&123u64.to_le_bytes());
+            blob
+        };
+        let (raw_rows, meta) = load_persist_validation_raw_rows(&blob, event_modules::registry());
+
+        assert_eq!(
+            raw_rows,
+            PersistValidationRawRows::UnknownType { type_code: 0xff }
+        );
+        assert!(meta.is_none());
+        assert_eq!(
+            decide_persist_validation_plan(&normalize_persist_validation(raw_rows)),
+            PersistValidationPlan::Skip
+        );
+    }
+
+    #[test]
+    fn run_persist_phase_skips_unknown_type() {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
+        let mut workspace_cache = HashMap::new();
+        let blob = {
+            let mut blob = vec![0xff];
+            blob.extend_from_slice(&123u64.to_le_bytes());
+            blob
+        };
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let batch = vec![(
+            event_id,
+            blob,
+            "peer-alpha".to_string(),
+            "sync".to_string(),
+            0,
+            0,
+        )];
+
+        let output = run_persist_phase_for_test(&db, &batch, &mut workspace_cache);
+
+        assert!(output.persisted_event_ids.is_empty());
+        let event_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id = ?1",
+                rusqlite::params![event_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0);
     }
 
     #[test]
