@@ -153,6 +153,19 @@ proof fn dispatcher_skip_produces_no_spawn(
 {
 }
 
+proof fn spawn_requires_preferred_runnable_non_suppressed_source(
+    context: TargetDispatchDecisionContext,
+)
+    ensures
+        matches!(decide_target_dispatch_plan(&context), TargetDispatchPlan::Spawn { .. })
+            ==> context.should_initiate_connect
+                && !matches!(context.dispatch_action, DispatchAction::Skip)
+                && !(matches!(context.incoming_source, TargetSourceKind::Bootstrap)
+                    && context.has_active_higher_precedence_worker
+                    && !context.bootstrap_phase),
+{
+}
+
 proof fn known_peer_outside_bootstrap_phase_cancels_bootstrap_prefix(
     cancel_existing_dispatch_key: bool,
 )

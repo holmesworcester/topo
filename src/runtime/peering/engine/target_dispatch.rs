@@ -757,6 +757,48 @@ mod tests {
     }
 
     #[test]
+    fn target_dispatch_spawn_requires_preferred_runnable_non_suppressed_source() {
+        for incoming_source in [
+            TargetIngressSourceKind::Bootstrap,
+            TargetIngressSourceKind::KnownPeer,
+        ] {
+            for should_initiate_connect in [false, true] {
+                for bootstrap_phase in [false, true] {
+                    for has_active_higher_precedence_worker in [false, true] {
+                        for dispatch_action in [
+                            DispatchAction::Skip,
+                            DispatchAction::Connect,
+                            DispatchAction::Reconnect,
+                        ] {
+                            let context = TargetDispatchDecisionContext {
+                                incoming_source,
+                                should_initiate_connect,
+                                bootstrap_phase,
+                                has_active_higher_precedence_worker,
+                                dispatch_action,
+                            };
+                            if matches!(
+                                decide_target_dispatch_plan(&context),
+                                TargetDispatchPlan::Spawn(_)
+                            ) {
+                                assert!(should_initiate_connect);
+                                assert_ne!(dispatch_action, DispatchAction::Skip);
+                                assert!(
+                                    !(matches!(
+                                        incoming_source,
+                                        TargetIngressSourceKind::Bootstrap
+                                    ) && has_active_higher_precedence_worker
+                                        && !bootstrap_phase)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bootstrap_source_uses_invite_bootstrap_auth() {
         let fallback = BootstrapSessionFallback {
             daemon_peer_id: "daemon".to_string(),
