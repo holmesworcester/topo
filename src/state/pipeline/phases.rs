@@ -17,6 +17,91 @@ pub(super) struct PersistPhaseOutput {
     pub shared_event_fanouts: Vec<SharedEventFanout>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistEventKind {
+    Workspace,
+    EndpointShared,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistEventRawRows {
+    share_scope: ShareScope,
+    event_kind: PersistEventKind,
+    is_file_slice: bool,
+    workspace_binding: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistEventDecisionContext {
+    share_scope: ShareScope,
+    event_kind: PersistEventKind,
+    is_file_slice: bool,
+    workspace_binding: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PersistWorkspaceTarget {
+    Skip,
+    MissingBinding,
+    EventId,
+    WorkspaceBinding(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistEventPlan {
+    shared_index_workspace: PersistWorkspaceTarget,
+    priority_lane: i64,
+    fanout_workspace: PersistWorkspaceTarget,
+}
+
+fn persist_event_kind(type_name: &str) -> PersistEventKind {
+    match type_name {
+        "workspace" => PersistEventKind::Workspace,
+        "endpoint_shared" => PersistEventKind::EndpointShared,
+        _ => PersistEventKind::Other,
+    }
+}
+
+fn normalize_persist_event(raw_rows: PersistEventRawRows) -> PersistEventDecisionContext {
+    PersistEventDecisionContext {
+        share_scope: raw_rows.share_scope,
+        event_kind: raw_rows.event_kind,
+        is_file_slice: raw_rows.is_file_slice,
+        workspace_binding: raw_rows.workspace_binding,
+    }
+}
+
+fn decide_persist_event_plan(context: &PersistEventDecisionContext) -> PersistEventPlan {
+    let workspace_target = match (context.share_scope, context.event_kind) {
+        (ShareScope::Local, _) | (ShareScope::Shared, PersistEventKind::EndpointShared) => {
+            PersistWorkspaceTarget::Skip
+        }
+        (ShareScope::Shared, PersistEventKind::Workspace) => PersistWorkspaceTarget::EventId,
+        (ShareScope::Shared, PersistEventKind::Other) => match &context.workspace_binding {
+            Some(workspace_id) => PersistWorkspaceTarget::WorkspaceBinding(workspace_id.clone()),
+            None => PersistWorkspaceTarget::MissingBinding,
+        },
+    };
+
+    PersistEventPlan {
+        shared_index_workspace: workspace_target.clone(),
+        priority_lane: if context.is_file_slice { 2 } else { 1 },
+        fanout_workspace: workspace_target,
+    }
+}
+
+fn resolve_persist_workspace_target(
+    target: &PersistWorkspaceTarget,
+    event_id_b64: &str,
+) -> Option<String> {
+    match target {
+        PersistWorkspaceTarget::Skip | PersistWorkspaceTarget::MissingBinding => None,
+        PersistWorkspaceTarget::EventId => Some(event_id_b64.to_string()),
+        PersistWorkspaceTarget::WorkspaceBinding(workspace_id) => Some(workspace_id.clone()),
+    }
+}
+
 fn ingest_recorded_by_for_blob(recorded_by: &str, blob: &[u8]) -> String {
     match crate::event_modules::parse_event(blob) {
         Ok(crate::event_modules::ParsedEvent::EndpointShared(event)) => {
@@ -57,29 +142,49 @@ pub(super) fn run_persist_phase(
         if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
             if let Some(type_code) = events::extract_event_type(blob) {
                 if let Some(meta) = reg.lookup(type_code) {
-                    // Only insert into shared_event_index for shared events (defense-in-depth)
-                    if meta.share_scope == ShareScope::Shared {
-                        // Look up workspace_id from cache or invites_accepted projection.
-                        // For shared workspace events themselves, workspace_id is the
-                        // event_id and may exist before invite_accepted projects.
-                        let ws_id = if let Some(cached) = workspace_cache.get(recorded_by) {
+                    let event_kind = persist_event_kind(meta.type_name);
+                    let is_file_slice = events::outer_semantic_type_code(blob)
+                        == Some(events::EVENT_TYPE_FILE_SLICE);
+                    let workspace_binding = if meta.share_scope == ShareScope::Shared
+                        && matches!(event_kind, PersistEventKind::Other)
+                    {
+                        if let Some(cached) = workspace_cache.get(&effective_recorded_by) {
                             Some(cached.clone())
-                        } else if meta.type_name == "workspace" {
-                            Some(event_id_b64.clone())
-                        } else if meta.type_name == "endpoint_shared" {
-                            None
                         } else if let Some(ws) = lookup_workspace_id(db, &effective_recorded_by) {
                             workspace_cache.insert(effective_recorded_by.clone(), ws.clone());
                             Some(ws)
                         } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let persist_plan =
+                        decide_persist_event_plan(&normalize_persist_event(PersistEventRawRows {
+                            share_scope: meta.share_scope,
+                            event_kind,
+                            is_file_slice,
+                            workspace_binding,
+                        }));
+
+                    // Only insert into shared_event_index when the pure persist
+                    // plan selects a workspace target.
+                    match &persist_plan.shared_index_workspace {
+                        PersistWorkspaceTarget::Skip => {}
+                        PersistWorkspaceTarget::MissingBinding => {
                             tracing::warn!(
                                 "no accepted workspace binding for {}, skipping shared_event_index for {}",
                                 effective_recorded_by,
                                 event_id_b64
                             );
-                            None
-                        };
-                        if let Some(ws_id) = ws_id {
+                        }
+                        PersistWorkspaceTarget::EventId
+                        | PersistWorkspaceTarget::WorkspaceBinding(_) => {
+                            let ws_id = resolve_persist_workspace_target(
+                                &persist_plan.shared_index_workspace,
+                                &event_id_b64,
+                            )
+                            .expect("workspace target selected");
                             if let Err(e) = shared_event_index_stmt.execute(rusqlite::params![
                                 &ws_id,
                                 created_at_ms as i64,
@@ -146,18 +251,11 @@ pub(super) fn run_persist_phase(
                         }
                     }
                     // Enqueue for durable projection (atomicity boundary 1)
-                    let priority_lane = if events::outer_semantic_type_code(blob)
-                        == Some(events::EVENT_TYPE_FILE_SLICE)
-                    {
-                        2
-                    } else {
-                        1
-                    };
                     if let Err(e) = enqueue_stmt.execute(rusqlite::params![
                         &effective_recorded_by,
                         &event_id_b64,
                         current_timestamp_ms(),
-                        priority_lane,
+                        persist_plan.priority_lane,
                         created_at_ms as i64
                     ]) {
                         tracing::warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
@@ -167,19 +265,15 @@ pub(super) fn run_persist_phase(
                         .tenants_seen
                         .insert(effective_recorded_by.clone());
                     persist_output.persisted_event_ids.push(*event_id);
-                    if meta.share_scope == ShareScope::Shared && meta.type_name != "endpoint_shared"
-                    {
-                        if let Some(workspace_id) = if meta.type_name == "workspace" {
-                            Some(event_id_b64.clone())
-                        } else {
-                            lookup_workspace_id(db, &effective_recorded_by)
-                        } {
-                            persist_output.shared_event_fanouts.push(SharedEventFanout {
-                                origin_peer_id: effective_recorded_by.clone(),
-                                workspace_id,
-                                event_id: *event_id,
-                            });
-                        }
+                    if let Some(workspace_id) = resolve_persist_workspace_target(
+                        &persist_plan.fanout_workspace,
+                        &event_id_b64,
+                    ) {
+                        persist_output.shared_event_fanouts.push(SharedEventFanout {
+                            origin_peer_id: effective_recorded_by.clone(),
+                            workspace_id,
+                            event_id: *event_id,
+                        });
                     }
                 } else {
                 }
@@ -216,11 +310,11 @@ mod tests {
     };
     use crate::event_modules::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_FILE_SLICE};
 
-    #[test]
-    fn run_persist_phase_enqueues_encrypted_file_slice_as_bulk() {
-        let db = open_in_memory().unwrap();
-        create_tables(&db).unwrap();
-
+    fn run_persist_phase_for_test(
+        db: &rusqlite::Connection,
+        batch: &[IngestItem],
+        workspace_cache: &mut HashMap<String, String>,
+    ) -> PersistPhaseOutput {
         let mut shared_event_index_stmt = db.prepare(SQL_INSERT_SHARED_EVENT_INDEX_ENTRY).unwrap();
         let mut recorded_stmt = db.prepare(SQL_INSERT_RECORDED_EVENT).unwrap();
         let mut events_stmt = db.prepare(SQL_INSERT_EVENT).unwrap();
@@ -234,6 +328,62 @@ mod tests {
                  AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
             )
             .unwrap();
+
+        run_persist_phase(
+            db,
+            batch,
+            event_modules::registry(),
+            workspace_cache,
+            &mut shared_event_index_stmt,
+            &mut recorded_stmt,
+            &mut events_stmt,
+            &mut enqueue_stmt,
+        )
+    }
+
+    #[test]
+    fn persist_event_plan_excludes_endpoint_shared_even_with_workspace_binding() {
+        let context = normalize_persist_event(PersistEventRawRows {
+            share_scope: ShareScope::Shared,
+            event_kind: PersistEventKind::EndpointShared,
+            is_file_slice: false,
+            workspace_binding: Some(event_id_to_base64(&[7u8; 32])),
+        });
+
+        assert_eq!(
+            decide_persist_event_plan(&context),
+            PersistEventPlan {
+                shared_index_workspace: PersistWorkspaceTarget::Skip,
+                priority_lane: 1,
+                fanout_workspace: PersistWorkspaceTarget::Skip,
+            }
+        );
+    }
+
+    #[test]
+    fn persist_event_plan_self_references_workspace_event() {
+        let context = normalize_persist_event(PersistEventRawRows {
+            share_scope: ShareScope::Shared,
+            event_kind: PersistEventKind::Workspace,
+            is_file_slice: false,
+            workspace_binding: Some(event_id_to_base64(&[7u8; 32])),
+        });
+
+        assert_eq!(
+            decide_persist_event_plan(&context),
+            PersistEventPlan {
+                shared_index_workspace: PersistWorkspaceTarget::EventId,
+                priority_lane: 1,
+                fanout_workspace: PersistWorkspaceTarget::EventId,
+            }
+        );
+    }
+
+    #[test]
+    fn run_persist_phase_enqueues_encrypted_file_slice_as_bulk() {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
         let mut workspace_cache = HashMap::new();
         let blob = event_modules::encode_event(&ParsedEvent::Encrypted(EncryptedEvent {
             created_at_ms: 123,
@@ -255,16 +405,7 @@ mod tests {
             0,
         )];
 
-        let output = run_persist_phase(
-            &db,
-            &batch,
-            event_modules::registry(),
-            &mut workspace_cache,
-            &mut shared_event_index_stmt,
-            &mut recorded_stmt,
-            &mut events_stmt,
-            &mut enqueue_stmt,
-        );
+        let output = run_persist_phase_for_test(&db, &batch, &mut workspace_cache);
 
         assert_eq!(output.persisted_event_ids, vec![event_id]);
         let priority_lane: i64 = db
@@ -277,5 +418,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(priority_lane, 2);
+    }
+
+    #[test]
+    fn run_persist_phase_does_not_index_endpoint_shared_even_with_cached_workspace() {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
+        let parsed =
+            event_modules::endpoint_shared::deterministic_endpoint_shared_event([0x55u8; 32]);
+        let endpoint_id = match &parsed {
+            ParsedEvent::EndpointShared(event) => {
+                event_modules::endpoint_shared::endpoint_id_from_public_key_bytes(&event.public_key)
+            }
+            _ => unreachable!("deterministic endpoint helper returns endpoint_shared"),
+        };
+        let blob = event_modules::encode_event(&parsed).unwrap();
+        let event_id = hash_event(&blob);
+        let mut workspace_cache =
+            HashMap::from([(endpoint_id.clone(), event_id_to_base64(&[9u8; 32]))]);
+        let batch = vec![(event_id, blob, endpoint_id, "sync".to_string(), 0, 0)];
+
+        let output = run_persist_phase_for_test(&db, &batch, &mut workspace_cache);
+
+        let shared_index_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM shared_event_index WHERE id = ?1",
+                rusqlite::params![event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_index_count, 0);
+        assert!(output.shared_event_fanouts.is_empty());
+    }
+
+    #[test]
+    fn run_persist_phase_indexes_workspace_event_by_own_event_id() {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
+        let blob =
+            event_modules::encode_event(&ParsedEvent::Workspace(event_modules::WorkspaceEvent {
+                created_at_ms: 321,
+                public_key: [4u8; 32],
+                name: "plan-ws".to_string(),
+            }))
+            .unwrap();
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let mut workspace_cache =
+            HashMap::from([("peer-alpha".to_string(), event_id_to_base64(&[9u8; 32]))]);
+        let batch = vec![(
+            event_id,
+            blob,
+            "peer-alpha".to_string(),
+            "sync".to_string(),
+            0,
+            0,
+        )];
+
+        let output = run_persist_phase_for_test(&db, &batch, &mut workspace_cache);
+
+        let indexed_workspace_id: String = db
+            .query_row(
+                "SELECT workspace_id FROM shared_event_index WHERE id = ?1",
+                rusqlite::params![event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_workspace_id, event_id_b64);
+        assert_eq!(output.shared_event_fanouts.len(), 1);
+        assert_eq!(output.shared_event_fanouts[0].workspace_id, event_id_b64);
     }
 }
