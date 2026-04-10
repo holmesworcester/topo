@@ -42,6 +42,22 @@ enum ContextLoadDispositionPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectionDecisionEffectRawRows {
+    Valid,
+    Block { missing: Vec<EventId> },
+    Reject,
+    AlreadyProcessed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectionDecisionEffectDecisionContext {
+    Valid,
+    Block { missing: Vec<EventId> },
+    Reject,
+    AlreadyProcessed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectionDecisionEffectPlan {
     ApplyWriteOpsAndEmitCommands,
     EmitCommandsOnly { missing: Vec<EventId> },
@@ -237,15 +253,48 @@ fn decide_context_load_disposition(
 }
 
 fn decide_projection_decision_effect_plan(
-    decision: &ProjectionDecision,
+    context: &ProjectionDecisionEffectDecisionContext,
 ) -> ProjectionDecisionEffectPlan {
+    match context {
+        ProjectionDecisionEffectDecisionContext::Valid => {
+            ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands
+        }
+        ProjectionDecisionEffectDecisionContext::Block { missing } => {
+            ProjectionDecisionEffectPlan::EmitCommandsOnly {
+                missing: missing.clone(),
+            }
+        }
+        ProjectionDecisionEffectDecisionContext::Reject
+        | ProjectionDecisionEffectDecisionContext::AlreadyProcessed => {
+            ProjectionDecisionEffectPlan::NoEffects
+        }
+    }
+}
+
+fn load_projection_decision_effect_raw_rows(
+    decision: &ProjectionDecision,
+) -> ProjectionDecisionEffectRawRows {
     match decision {
-        ProjectionDecision::Valid => ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands,
-        ProjectionDecision::Block { missing } => ProjectionDecisionEffectPlan::EmitCommandsOnly {
+        ProjectionDecision::Valid => ProjectionDecisionEffectRawRows::Valid,
+        ProjectionDecision::Block { missing } => ProjectionDecisionEffectRawRows::Block {
             missing: missing.clone(),
         },
-        ProjectionDecision::Reject { .. } | ProjectionDecision::AlreadyProcessed => {
-            ProjectionDecisionEffectPlan::NoEffects
+        ProjectionDecision::Reject { .. } => ProjectionDecisionEffectRawRows::Reject,
+        ProjectionDecision::AlreadyProcessed => ProjectionDecisionEffectRawRows::AlreadyProcessed,
+    }
+}
+
+fn normalize_projection_decision_effect_context(
+    raw_rows: ProjectionDecisionEffectRawRows,
+) -> ProjectionDecisionEffectDecisionContext {
+    match raw_rows {
+        ProjectionDecisionEffectRawRows::Valid => ProjectionDecisionEffectDecisionContext::Valid,
+        ProjectionDecisionEffectRawRows::Block { missing } => {
+            ProjectionDecisionEffectDecisionContext::Block { missing }
+        }
+        ProjectionDecisionEffectRawRows::Reject => ProjectionDecisionEffectDecisionContext::Reject,
+        ProjectionDecisionEffectRawRows::AlreadyProcessed => {
+            ProjectionDecisionEffectDecisionContext::AlreadyProcessed
         }
     }
 }
@@ -586,7 +635,10 @@ fn apply_projection_frame<B: ProjectionBackend>(
     // - Valid: apply write_ops and emitted commands.
     // - Block: apply emitted commands only (for block-side effects).
     // - Reject / AlreadyProcessed: no side effects.
-    match decide_projection_decision_effect_plan(&result.decision) {
+    let projection_decision_effect_context = normalize_projection_decision_effect_context(
+        load_projection_decision_effect_raw_rows(&result.decision),
+    );
+    match decide_projection_decision_effect_plan(&projection_decision_effect_context) {
         ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands => {
             backend.execute_write_ops(&result.write_ops)?;
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
@@ -654,10 +706,14 @@ mod tests {
 
     #[test]
     fn projection_decision_effect_plan_disables_effects_for_rejects() {
-        assert_eq!(
-            decide_projection_decision_effect_plan(&ProjectionDecision::Reject {
+        let context = normalize_projection_decision_effect_context(
+            load_projection_decision_effect_raw_rows(&ProjectionDecision::Reject {
                 reason: "nope".to_string(),
             }),
+        );
+        assert_eq!(context, ProjectionDecisionEffectDecisionContext::Reject);
+        assert_eq!(
+            decide_projection_decision_effect_plan(&context),
             ProjectionDecisionEffectPlan::NoEffects
         );
     }

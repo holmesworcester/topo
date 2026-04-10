@@ -32,6 +32,20 @@ pub enum ProjectionDecision {
     AlreadyProcessed,
 }
 
+pub enum ProjectionDecisionEffectRawRows {
+    Valid,
+    Block,
+    Reject,
+    AlreadyProcessed,
+}
+
+pub enum ProjectionDecisionEffectDecisionContext {
+    Valid,
+    Block,
+    Reject,
+    AlreadyProcessed,
+}
+
 pub enum ProjectionDecisionEffectPlan {
     ApplyWriteOpsAndEmitCommands,
     EmitCommandsOnly,
@@ -64,13 +78,31 @@ pub open spec fn decide_context_load_disposition(
     }
 }
 
+pub open spec fn normalize_projection_decision_effect_context(
+    raw_rows: ProjectionDecisionEffectRawRows,
+) -> ProjectionDecisionEffectDecisionContext {
+    match raw_rows {
+        ProjectionDecisionEffectRawRows::Valid => ProjectionDecisionEffectDecisionContext::Valid,
+        ProjectionDecisionEffectRawRows::Block => ProjectionDecisionEffectDecisionContext::Block,
+        ProjectionDecisionEffectRawRows::Reject => ProjectionDecisionEffectDecisionContext::Reject,
+        ProjectionDecisionEffectRawRows::AlreadyProcessed => {
+            ProjectionDecisionEffectDecisionContext::AlreadyProcessed
+        }
+    }
+}
+
 pub open spec fn decide_projection_decision_effect_plan(
-    decision: ProjectionDecision,
+    context: ProjectionDecisionEffectDecisionContext,
 ) -> ProjectionDecisionEffectPlan {
-    match decision {
-        ProjectionDecision::Valid => ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands,
-        ProjectionDecision::Block => ProjectionDecisionEffectPlan::EmitCommandsOnly,
-        ProjectionDecision::Reject | ProjectionDecision::AlreadyProcessed => {
+    match context {
+        ProjectionDecisionEffectDecisionContext::Valid => {
+            ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands
+        }
+        ProjectionDecisionEffectDecisionContext::Block => {
+            ProjectionDecisionEffectPlan::EmitCommandsOnly
+        }
+        ProjectionDecisionEffectDecisionContext::Reject
+        | ProjectionDecisionEffectDecisionContext::AlreadyProcessed => {
             ProjectionDecisionEffectPlan::NoEffects
         }
     }
@@ -86,6 +118,20 @@ proof fn context_load_disposition_normalizer_preserves_query_facts()
             == ContextLoadDispositionDecisionContext::Reject,
         normalize_context_load_disposition(ContextLoadDispositionRawRows::Purge)
             == ContextLoadDispositionDecisionContext::Purge,
+{
+}
+
+proof fn projection_decision_effect_normalizer_preserves_query_facts()
+    ensures
+        normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Valid)
+            == ProjectionDecisionEffectDecisionContext::Valid,
+        normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Block)
+            == ProjectionDecisionEffectDecisionContext::Block,
+        normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Reject)
+            == ProjectionDecisionEffectDecisionContext::Reject,
+        normalize_projection_decision_effect_context(
+            ProjectionDecisionEffectRawRows::AlreadyProcessed,
+        ) == ProjectionDecisionEffectDecisionContext::AlreadyProcessed,
 {
 }
 
@@ -118,16 +164,22 @@ proof fn purged_context_emits_only_hard_purge()
 
 proof fn reject_and_already_processed_have_no_effects()
     ensures
-        decide_projection_decision_effect_plan(ProjectionDecision::Reject)
+        decide_projection_decision_effect_plan(normalize_projection_decision_effect_context(
+            ProjectionDecisionEffectRawRows::Reject,
+        ))
             == ProjectionDecisionEffectPlan::NoEffects,
-        decide_projection_decision_effect_plan(ProjectionDecision::AlreadyProcessed)
+        decide_projection_decision_effect_plan(normalize_projection_decision_effect_context(
+            ProjectionDecisionEffectRawRows::AlreadyProcessed,
+        ))
             == ProjectionDecisionEffectPlan::NoEffects,
 {
 }
 
 proof fn valid_applies_write_ops_and_commands()
     ensures
-        decide_projection_decision_effect_plan(ProjectionDecision::Valid)
+        decide_projection_decision_effect_plan(normalize_projection_decision_effect_context(
+            ProjectionDecisionEffectRawRows::Valid,
+        ))
             == ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands,
 {
 }
