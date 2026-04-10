@@ -33,6 +33,25 @@ pub struct SharedSyncEntryPlan {
     pub candidate_entry_count: nat,
 }
 
+pub struct SharedSendEligibilityRawRows {
+    pub requested_by_reconciliation: bool,
+    pub present_in_workspace_index: bool,
+    pub shared_blob_available: bool,
+    pub used_bootstrap_auth: bool,
+    pub used_peer_shared_auth: bool,
+}
+
+pub struct SharedSendEligibilityDecisionContext {
+    pub requested_by_reconciliation: bool,
+    pub present_in_workspace_index: bool,
+    pub shared_blob_available: bool,
+}
+
+pub enum SharedSendEligibilityPlan {
+    SendRoot,
+    SkipRoot,
+}
+
 pub struct SelectedDepOrderRawRows {
     pub dep_is_selected: bool,
     pub dep_already_emitted: bool,
@@ -91,6 +110,29 @@ pub open spec fn decide_shared_sync_entry_plan(
         } else {
             context.base_entry_count
         },
+    }
+}
+
+pub open spec fn normalize_shared_send_eligibility_context(
+    raw_rows: SharedSendEligibilityRawRows,
+) -> SharedSendEligibilityDecisionContext {
+    SharedSendEligibilityDecisionContext {
+        requested_by_reconciliation: raw_rows.requested_by_reconciliation,
+        present_in_workspace_index: raw_rows.present_in_workspace_index,
+        shared_blob_available: raw_rows.shared_blob_available,
+    }
+}
+
+pub open spec fn decide_shared_send_eligibility_plan(
+    context: &SharedSendEligibilityDecisionContext,
+) -> SharedSendEligibilityPlan {
+    if context.requested_by_reconciliation
+        && context.present_in_workspace_index
+        && context.shared_blob_available
+    {
+        SharedSendEligibilityPlan::SendRoot
+    } else {
+        SharedSendEligibilityPlan::SkipRoot
     }
 }
 
@@ -158,6 +200,62 @@ proof fn selected_dep_order_normalizer_preserves_query_facts(
             dep_already_emitted,
             dep_currently_visiting,
         }),
+{
+}
+
+proof fn shared_send_eligibility_requires_request_workspace_index_and_shared_blob(
+    context: SharedSendEligibilityDecisionContext,
+)
+    ensures
+        decide_shared_send_eligibility_plan(&context) == SharedSendEligibilityPlan::SendRoot
+            ==> context.requested_by_reconciliation
+                && context.present_in_workspace_index
+                && context.shared_blob_available,
+{
+}
+
+proof fn shared_send_eligibility_blocks_local_only_or_wrong_workspace()
+    ensures
+        decide_shared_send_eligibility_plan(&SharedSendEligibilityDecisionContext {
+            requested_by_reconciliation: true,
+            present_in_workspace_index: true,
+            shared_blob_available: false,
+        }) == SharedSendEligibilityPlan::SkipRoot,
+        decide_shared_send_eligibility_plan(&SharedSendEligibilityDecisionContext {
+            requested_by_reconciliation: true,
+            present_in_workspace_index: false,
+            shared_blob_available: true,
+        }) == SharedSendEligibilityPlan::SkipRoot,
+{
+}
+
+proof fn shared_send_eligibility_auth_path_noninterference(
+    requested_by_reconciliation: bool,
+    present_in_workspace_index: bool,
+    shared_blob_available: bool,
+    bootstrap_a: bool,
+    peer_shared_a: bool,
+    bootstrap_b: bool,
+    peer_shared_b: bool,
+)
+    ensures
+        decide_shared_send_eligibility_plan(&normalize_shared_send_eligibility_context(
+            SharedSendEligibilityRawRows {
+                requested_by_reconciliation,
+                present_in_workspace_index,
+                shared_blob_available,
+                used_bootstrap_auth: bootstrap_a,
+                used_peer_shared_auth: peer_shared_a,
+            },
+        )) == decide_shared_send_eligibility_plan(&normalize_shared_send_eligibility_context(
+            SharedSendEligibilityRawRows {
+                requested_by_reconciliation,
+                present_in_workspace_index,
+                shared_blob_available,
+                used_bootstrap_auth: bootstrap_b,
+                used_peer_shared_auth: peer_shared_b,
+            },
+        )),
 {
 }
 

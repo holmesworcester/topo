@@ -56,4 +56,54 @@ mod boundary_tests {
     fn test_projector_tla_bijection_enforced() {
         assert_python_script_passes("scripts/check_projector_tla_bijection.py");
     }
+
+    fn collect_verus_sources(dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("failed to read {}: {}", dir.display(), err))
+        {
+            let entry = entry
+                .unwrap_or_else(|err| panic!("failed to read entry in {}: {}", dir.display(), err));
+            let path = entry.path();
+            if path.is_dir() {
+                collect_verus_sources(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if matches!(file_name, "lib.rs" | "mod.rs") {
+                continue;
+            }
+            let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let relative = path
+                .strip_prefix(repo_root)
+                .unwrap_or_else(|err| panic!("failed to relativize {}: {}", path.display(), err))
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(relative);
+        }
+    }
+
+    #[test]
+    fn test_formal_seam_coverage_indexes_verus_sources() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let coverage =
+            std::fs::read_to_string(repo_root.join("docs/planning/FORMAL_SEAM_COVERAGE.md"))
+                .expect("read formal seam coverage");
+        let mut sources = Vec::new();
+        collect_verus_sources(&repo_root.join("verus-proofs/src"), &mut sources);
+        sources.sort();
+
+        let missing = sources
+            .into_iter()
+            .filter(|source| !coverage.contains(source))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "every non-module Verus source must be indexed as a covered seam or supporting proof module in docs/planning/FORMAL_SEAM_COVERAGE.md; missing: {missing:?}"
+        );
+    }
 }

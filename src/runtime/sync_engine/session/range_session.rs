@@ -102,6 +102,28 @@ struct SharedSyncEntryPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedSendEligibilityRawRows {
+    requested_by_reconciliation: bool,
+    present_in_workspace_index: bool,
+    shared_blob_available: bool,
+    used_bootstrap_auth: bool,
+    used_peer_shared_auth: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedSendEligibilityDecisionContext {
+    requested_by_reconciliation: bool,
+    present_in_workspace_index: bool,
+    shared_blob_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedSendEligibilityPlan {
+    SendRoot,
+    SkipRoot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SelectedDepOrderRawRows {
     dep_is_selected: bool,
     dep_already_emitted: bool,
@@ -141,6 +163,30 @@ fn normalize_shared_sync_entry_context(
 fn decide_shared_sync_entry_plan(context: &SharedSyncEntryDecisionContext) -> SharedSyncEntryPlan {
     SharedSyncEntryPlan {
         include_hot_week_deps: should_include_week_deps(context.window_kind),
+    }
+}
+
+fn normalize_shared_send_eligibility_context(
+    raw_rows: SharedSendEligibilityRawRows,
+) -> SharedSendEligibilityDecisionContext {
+    let _ = (raw_rows.used_bootstrap_auth, raw_rows.used_peer_shared_auth);
+    SharedSendEligibilityDecisionContext {
+        requested_by_reconciliation: raw_rows.requested_by_reconciliation,
+        present_in_workspace_index: raw_rows.present_in_workspace_index,
+        shared_blob_available: raw_rows.shared_blob_available,
+    }
+}
+
+fn decide_shared_send_eligibility_plan(
+    context: &SharedSendEligibilityDecisionContext,
+) -> SharedSendEligibilityPlan {
+    if context.requested_by_reconciliation
+        && context.present_in_workspace_index
+        && context.shared_blob_available
+    {
+        SharedSendEligibilityPlan::SendRoot
+    } else {
+        SharedSendEligibilityPlan::SkipRoot
     }
 }
 
@@ -327,6 +373,147 @@ pub fn load_shared_send_batch(
     Ok(ordered)
 }
 
+fn load_workspace_index_membership(
+    conn: &Connection,
+    workspace_id: &str,
+    range: SyncWindow,
+    ids: &[EventId],
+) -> Result<HashSet<EventId>, String> {
+    let mut members = HashSet::new();
+    if ids.is_empty() {
+        return Ok(members);
+    }
+
+    for chunk in ids.chunks(64) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut sql = format!(
+            "SELECT id
+             FROM shared_event_index
+             WHERE workspace_id = ?
+               AND id IN ({placeholders})",
+        );
+        let mut params = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 3);
+        params.push(rusqlite::types::Value::Text(workspace_id.to_string()));
+        for event_id in chunk {
+            params.push(rusqlite::types::Value::Blob(event_id.to_vec()));
+        }
+        if let Some(ts_min) = range.ts_min() {
+            sql.push_str(" AND ts >= ?");
+            params.push(rusqlite::types::Value::Integer(ts_min));
+        }
+        if let Some(ts_max) = range.ts_max_exclusive() {
+            sql.push_str(" AND ts < ?");
+            params.push(rusqlite::types::Value::Integer(ts_max));
+        }
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare shared send eligibility query: {e}"))?;
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params.iter()))
+            .map_err(|e| format!("query shared send eligibility rows: {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("iterate shared send eligibility rows: {e}"))?
+        {
+            let id_blob: Vec<u8> = row
+                .get(0)
+                .map_err(|e| format!("read shared send eligibility id: {e}"))?;
+            if id_blob.len() != 32 {
+                continue;
+            }
+            let mut event_id = [0u8; 32];
+            event_id.copy_from_slice(&id_blob);
+            members.insert(event_id);
+        }
+    }
+
+    if should_include_week_deps(range.kind) {
+        let now_ms = range
+            .ts_max_exclusive()
+            .unwrap_or_else(crate::db::queue::current_timestamp_ms);
+        let week_starts = week_starts_for_window(range, now_ms);
+        if !week_starts.is_empty() {
+            let week_placeholders = week_starts
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            for chunk in ids.chunks(64) {
+                let id_placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT event_id
+                     FROM hot_week_dep_index
+                     WHERE workspace_id = ?
+                       AND event_id IN ({id_placeholders})
+                       AND week_start_ms IN ({week_placeholders})",
+                );
+                let mut params = Vec::<rusqlite::types::Value>::with_capacity(
+                    1 + chunk.len() + week_starts.len(),
+                );
+                params.push(rusqlite::types::Value::Text(workspace_id.to_string()));
+                for event_id in chunk {
+                    params.push(rusqlite::types::Value::Text(event_id_to_base64(event_id)));
+                }
+                for week_start in &week_starts {
+                    params.push(rusqlite::types::Value::Integer(*week_start));
+                }
+
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("prepare hot dep send eligibility query: {e}"))?;
+                let mut rows = stmt
+                    .query(rusqlite::params_from_iter(params.iter()))
+                    .map_err(|e| format!("query hot dep send eligibility rows: {e}"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|e| format!("iterate hot dep send eligibility rows: {e}"))?
+                {
+                    let event_id_b64: String = row
+                        .get(0)
+                        .map_err(|e| format!("read hot dep send eligibility id: {e}"))?;
+                    if let Some(event_id) = crate::crypto::event_id_from_base64(&event_id_b64) {
+                        members.insert(event_id);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(members)
+}
+
+fn eligible_shared_send_root_ids(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    range: SyncWindow,
+    requested_ids: &[EventId],
+) -> Result<(Vec<EventId>, HashMap<EventId, i64>), String> {
+    let workspace_index_members =
+        load_workspace_index_membership(conn, workspace_id, range, requested_ids)?;
+    let created_at_by_id = store
+        .get_shared_created_at_batch(requested_ids)
+        .map_err(|e| format!("load selected created_at batch: {e}"))?;
+    let mut eligible = Vec::with_capacity(requested_ids.len());
+    for event_id in requested_ids {
+        let plan = decide_shared_send_eligibility_plan(&normalize_shared_send_eligibility_context(
+            SharedSendEligibilityRawRows {
+                requested_by_reconciliation: true,
+                present_in_workspace_index: workspace_index_members.contains(event_id),
+                shared_blob_available: created_at_by_id.contains_key(event_id),
+                used_bootstrap_auth: false,
+                used_peer_shared_auth: false,
+            },
+        ));
+        if matches!(plan, SharedSendEligibilityPlan::SendRoot) {
+            eligible.push(*event_id);
+        }
+    }
+
+    Ok((eligible, created_at_by_id))
+}
+
 fn live_suppression_order_rank(seed: &str, event_id: &EventId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(seed.as_bytes());
@@ -334,6 +521,41 @@ fn live_suppression_order_rank(seed: &str, event_id: &EventId) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn prioritize_send_order_with_created_at(
+    range: SyncWindow,
+    ids: &[EventId],
+    live_suppression_seed: Option<&str>,
+    created_at_by_id: &HashMap<EventId, i64>,
+) -> Vec<EventId> {
+    if let Some(seed) = live_suppression_seed {
+        let mut ranked = ids
+            .iter()
+            .map(|event_id| (*event_id, live_suppression_order_rank(seed, event_id)))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        return ranked.into_iter().map(|(event_id, _)| event_id).collect();
+    }
+
+    let order_policy = decide_shared_send_order_policy(range.kind);
+    if matches!(order_policy, SharedSendOrderPolicy::PreserveInput) {
+        return ids.to_vec();
+    }
+
+    let mut ordered = ids.to_vec();
+    ordered.sort_by(|left, right| {
+        let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
+        let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
+        match order_policy {
+            SharedSendOrderPolicy::NewestFirst => {
+                right_ts.cmp(&left_ts).then_with(|| right.cmp(left))
+            }
+            SharedSendOrderPolicy::PreserveInput => left.cmp(right),
+        }
+    });
+    ordered
+}
+
+#[cfg(test)]
 fn prioritize_send_order(
     store: &Store<'_>,
     range: SyncWindow,
@@ -744,12 +966,15 @@ fn order_requested_ids_for_send(
         return Ok(Vec::new());
     }
 
-    let ordered_roots = prioritize_send_order(store, range, requested_ids, live_suppression_seed)?;
-    let selected_ids: HashSet<EventId> = requested_ids.iter().copied().collect();
-    let selected_vec = requested_ids.to_vec();
-    let created_at_by_id = store
-        .get_shared_created_at_batch(&selected_vec)
-        .map_err(|e| format!("load selected created_at batch: {e}"))?;
+    let (eligible_roots, created_at_by_id) =
+        eligible_shared_send_root_ids(conn, store, workspace_id, range, requested_ids)?;
+    let ordered_roots = prioritize_send_order_with_created_at(
+        range,
+        &eligible_roots,
+        live_suppression_seed,
+        &created_at_by_id,
+    );
+    let selected_ids: HashSet<EventId> = eligible_roots.iter().copied().collect();
 
     let mut ordered = Vec::new();
     let mut emitted = HashSet::new();
@@ -1665,6 +1890,112 @@ mod tests {
     }
 
     #[test]
+    fn shared_send_eligibility_plan_ignores_session_auth_path() {
+        let bootstrap_context =
+            normalize_shared_send_eligibility_context(SharedSendEligibilityRawRows {
+                requested_by_reconciliation: true,
+                present_in_workspace_index: true,
+                shared_blob_available: true,
+                used_bootstrap_auth: true,
+                used_peer_shared_auth: false,
+            });
+        let peer_shared_context =
+            normalize_shared_send_eligibility_context(SharedSendEligibilityRawRows {
+                requested_by_reconciliation: true,
+                present_in_workspace_index: true,
+                shared_blob_available: true,
+                used_bootstrap_auth: false,
+                used_peer_shared_auth: true,
+            });
+
+        assert_eq!(bootstrap_context, peer_shared_context);
+        assert_eq!(
+            decide_shared_send_eligibility_plan(&bootstrap_context),
+            SharedSendEligibilityPlan::SendRoot
+        );
+        assert_eq!(
+            decide_shared_send_eligibility_plan(&peer_shared_context),
+            SharedSendEligibilityPlan::SendRoot
+        );
+    }
+
+    #[test]
+    fn order_requested_ids_for_send_filters_local_only_rows_even_if_indexed() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "workspace-a";
+        let blob = b"local secret blob";
+        let event_id = hash_event(blob);
+        insert_event(
+            &conn,
+            &event_id,
+            "key_secret",
+            blob,
+            ShareScope::Local,
+            1,
+            1,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![workspace_id, 1i64, event_id.as_slice()],
+        )
+        .unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = order_requested_ids_for_send(
+            &conn,
+            &store,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::Full,
+                ts_min_inclusive_ms: None,
+                ts_max_exclusive_ms: None,
+            },
+            &[event_id],
+            None,
+        )
+        .unwrap();
+
+        assert!(ordered.is_empty());
+    }
+
+    #[test]
+    fn order_requested_ids_for_send_filters_wrong_workspace_rows() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let blob = b"shared workspace-b blob";
+        let event_id = hash_event(blob);
+        insert_event(&conn, &event_id, "message", blob, ShareScope::Shared, 1, 1).unwrap();
+        insert_shared_event_index_entry_if_shared(
+            &conn,
+            ShareScope::Shared,
+            1,
+            &event_id,
+            "workspace-b",
+            blob,
+        )
+        .unwrap();
+
+        let store = Store::new(&conn);
+        let range = SyncWindow {
+            kind: SyncWindowKind::Full,
+            ts_min_inclusive_ms: None,
+            ts_max_exclusive_ms: None,
+        };
+        let wrong_workspace_order =
+            order_requested_ids_for_send(&conn, &store, "workspace-a", range, &[event_id], None)
+                .unwrap();
+        let matching_workspace_order =
+            order_requested_ids_for_send(&conn, &store, "workspace-b", range, &[event_id], None)
+                .unwrap();
+
+        assert!(wrong_workspace_order.is_empty());
+        assert_eq!(matching_workspace_order, vec![event_id]);
+    }
+
+    #[test]
     fn selected_dep_order_plan_emits_only_selected_unvisited_deps() {
         assert_eq!(
             decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
@@ -2292,6 +2623,21 @@ mod tests {
             insert_shared_message(&conn, &workspace_id, &author_id, 20, "second");
         let (third_id, third_blob) =
             insert_shared_message(&conn, &workspace_id, &author_id, 30, "third");
+        for (created_at_ms, event_id, blob) in [
+            (10, first_id, first_blob.as_slice()),
+            (20, second_id, _second_blob.as_slice()),
+            (30, third_id, third_blob.as_slice()),
+        ] {
+            insert_shared_event_index_entry_if_shared(
+                &conn,
+                ShareScope::Shared,
+                created_at_ms,
+                &event_id,
+                "workspace-live-sender",
+                blob,
+            )
+            .unwrap();
+        }
         let store = Store::new(&conn);
         let range = SyncWindow {
             kind: SyncWindowKind::LastDay,

@@ -22,6 +22,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_hot_week_dep_index_lookup
             ON hot_week_dep_index(workspace_id, week_start_ms, dep_created_at_ms, event_id);
+        CREATE INDEX IF NOT EXISTS idx_hot_week_dep_index_workspace_event_week
+            ON hot_week_dep_index(workspace_id, event_id, week_start_ms);
         CREATE INDEX IF NOT EXISTS idx_hot_week_dep_index_prune
             ON hot_week_dep_index(week_start_ms);
         ",

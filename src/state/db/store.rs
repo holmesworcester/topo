@@ -74,6 +74,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             id BLOB NOT NULL,
             PRIMARY KEY (workspace_id, ts, id)
         ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_shared_event_index_workspace_id_id
+            ON shared_event_index(workspace_id, id);
         ",
     )?;
     Ok(())
