@@ -916,6 +916,22 @@ mod tests {
     }
 
     #[test]
+    fn session_auth_failure_plan_does_not_override_without_retry_invite() {
+        for connection_lost in [false, true] {
+            assert_eq!(
+                decide_session_auth_failure_plan(SessionAuthFailureDecisionContext {
+                    connection_lost,
+                    bootstrap_retry_invite: None,
+                }),
+                SessionAuthFailurePlan {
+                    next_auth_plan_override: None,
+                    evict_live_connection: connection_lost,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn session_auth_failure_normalizer_preserves_raw_rows_for_planner() {
         let raw = SessionAuthFailureRawRows {
             connection_lost: false,

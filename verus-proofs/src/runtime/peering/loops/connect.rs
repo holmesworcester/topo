@@ -287,6 +287,17 @@ proof fn session_auth_failure_preserves_bootstrap_retry_and_evicts_lost_connecti
 {
 }
 
+proof fn session_auth_failure_effects_require_classified_causes(
+    context: SessionAuthFailureDecisionContext,
+)
+    ensures
+        !context.has_bootstrap_retry_invite ==>
+            !decide_session_auth_failure_plan(context).next_auth_plan_override,
+        !context.connection_lost ==>
+            !decide_session_auth_failure_plan(context).evict_live_connection,
+{
+}
+
 proof fn session_retry_plan_does_not_back_off_after_completed_session()
     ensures
         decide_session_retry_plan(&SessionRetryDecisionContext {
