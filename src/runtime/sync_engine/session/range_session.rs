@@ -840,6 +840,30 @@ mod tests {
     }
 
     #[test]
+    fn selected_dep_order_plan_matches_all_boolean_cases() {
+        for dep_is_selected in [false, true] {
+            for dep_already_emitted in [false, true] {
+                for dep_currently_visiting in [false, true] {
+                    let context = SelectedDepOrderDecisionContext {
+                        dep_is_selected,
+                        dep_already_emitted,
+                        dep_currently_visiting,
+                    };
+                    let expected = if dep_is_selected
+                        && !dep_already_emitted
+                        && !dep_currently_visiting
+                    {
+                        SelectedDepOrderPlan::EmitDepBeforeRoot
+                    } else {
+                        SelectedDepOrderPlan::SkipDepEdge
+                    };
+                    assert_eq!(decide_selected_dep_order_plan(&context), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn selected_dep_order_normalizer_preserves_raw_rows_for_planner() {
         let raw = SelectedDepOrderRawRows {
             dep_is_selected: true,

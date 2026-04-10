@@ -207,6 +207,17 @@ proof fn selected_unemitted_dep_is_emitted_before_root()
 {
 }
 
+proof fn emit_dep_before_root_requires_selected_unemitted_nonvisiting(
+    context: SelectedDepOrderDecisionContext,
+)
+    ensures
+        decide_selected_dep_order_plan(&context) == SelectedDepOrderPlan::EmitDepBeforeRoot
+            ==> context.dep_is_selected
+                && !context.dep_already_emitted
+                && !context.dep_currently_visiting,
+{
+}
+
 proof fn unselected_or_cycle_dep_edge_is_skipped()
     ensures
         decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
