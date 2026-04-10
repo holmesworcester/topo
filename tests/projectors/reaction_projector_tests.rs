@@ -28,7 +28,7 @@ mod tests {
     #[test]
     fn test_reaction_valid() {
         let parsed = make_reaction();
-        let ctx = topo::projection::contract::ContextSnapshot {
+        let ctx = topo::projection::contract::ProjectorDecisionContext {
             current_owner_event_id: Some(b64(&[1u8; 32])),
             ..Default::default()
         };
@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn test_reaction_rejects_owner_mismatch() {
         let parsed = make_reaction();
-        let ctx = topo::projection::contract::ContextSnapshot {
+        let ctx = topo::projection::contract::ProjectorDecisionContext {
             current_owner_event_id: Some(b64(&[9u8; 32])),
             ..Default::default()
         };

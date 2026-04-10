@@ -84,6 +84,115 @@ pub struct ProjectionFrameContext {
     pub current_signer: Option<CurrentSignerInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceAcceptedRawRows {
+    pub workspace_ids: Vec<String>,
+    pub malformed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceDecisionContext {
+    MissingAcceptedWorkspace,
+    UniqueAcceptedWorkspace { workspace_id: String },
+    RejectAmbiguousAcceptedWorkspace,
+    RejectMalformedAcceptedWorkspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceContextPlan {
+    BlockOnAcceptedWorkspace,
+    Ready { accepted_workspace_id: String },
+    Reject { reason: String },
+}
+
+pub fn normalize_workspace_acceptance(
+    raw_rows: &WorkspaceAcceptedRawRows,
+) -> WorkspaceDecisionContext {
+    if raw_rows.malformed {
+        return WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace;
+    }
+
+    let mut workspace_ids = raw_rows.workspace_ids.clone();
+    workspace_ids.sort();
+    workspace_ids.dedup();
+    if workspace_ids
+        .iter()
+        .any(|workspace_id| event_id_from_base64(workspace_id).is_none())
+    {
+        return WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace;
+    }
+
+    match workspace_ids.as_slice() {
+        [] => WorkspaceDecisionContext::MissingAcceptedWorkspace,
+        [workspace_id] => WorkspaceDecisionContext::UniqueAcceptedWorkspace {
+            workspace_id: workspace_id.clone(),
+        },
+        _ => WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace,
+    }
+}
+
+pub fn build_workspace_projector_decision_context(
+    context: &WorkspaceDecisionContext,
+) -> ProjectorDecisionContext {
+    match context {
+        WorkspaceDecisionContext::UniqueAcceptedWorkspace { workspace_id } => {
+            ProjectorDecisionContext {
+                accepted_workspace_id: Some(workspace_id.clone()),
+                ..ProjectorDecisionContext::default()
+            }
+        }
+        WorkspaceDecisionContext::MissingAcceptedWorkspace
+        | WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace
+        | WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace => {
+            ProjectorDecisionContext::default()
+        }
+    }
+}
+
+pub fn decide_workspace_context_plan(
+    context: &WorkspaceDecisionContext,
+    event_id_b64: &str,
+) -> WorkspaceContextPlan {
+    match context {
+        WorkspaceDecisionContext::MissingAcceptedWorkspace => {
+            WorkspaceContextPlan::BlockOnAcceptedWorkspace
+        }
+        WorkspaceDecisionContext::UniqueAcceptedWorkspace { workspace_id }
+            if workspace_id == event_id_b64 =>
+        {
+            WorkspaceContextPlan::Ready {
+                accepted_workspace_id: workspace_id.clone(),
+            }
+        }
+        WorkspaceDecisionContext::UniqueAcceptedWorkspace { .. } => WorkspaceContextPlan::Reject {
+            reason: "workspace_id does not match accepted invite binding".to_string(),
+        },
+        WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace => {
+            WorkspaceContextPlan::Reject {
+                reason: "ambiguous accepted invite workspace binding".to_string(),
+            }
+        }
+        WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace => {
+            WorkspaceContextPlan::Reject {
+                reason: "malformed accepted invite workspace binding".to_string(),
+            }
+        }
+    }
+}
+
+pub fn workspace_context_plan_to_load_result(plan: WorkspaceContextPlan) -> ContextLoadResult {
+    match plan {
+        WorkspaceContextPlan::BlockOnAcceptedWorkspace => ContextLoadResult::block(vec![]),
+        WorkspaceContextPlan::Ready {
+            accepted_workspace_id,
+        } => ContextLoadResult::ready(ProjectorDecisionContext {
+            accepted_workspace_id: Some(accepted_workspace_id),
+            ..ProjectorDecisionContext::default()
+        }),
+        WorkspaceContextPlan::Reject { reason } => ContextLoadResult::reject(reason),
+    }
+}
+
 pub trait ProjectionQueries {
     fn load_dep_result(
         &self,
@@ -106,6 +215,20 @@ pub trait ProjectionQueries {
         event_id_b64: &str,
         workspace: &WorkspaceEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext>;
+
+    fn load_workspace_decision_context(
+        &self,
+        frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        event_id_b64: &str,
+        workspace: &WorkspaceEvent,
+    ) -> ProjectionQueryResult<WorkspaceDecisionContext> {
+        let ctx = self.load_workspace_context(frame, recorded_by, event_id_b64, workspace)?;
+        Ok(normalize_workspace_acceptance(&WorkspaceAcceptedRawRows {
+            workspace_ids: ctx.accepted_workspace_id.into_iter().collect(),
+            malformed: false,
+        }))
+    }
 
     fn load_admin_context(
         &self,
@@ -599,6 +722,36 @@ fn bootstrap_spki_already_peer_shared(
     )
 }
 
+fn load_workspace_accepted_raw_rows(
+    conn: &Connection,
+    recorded_by: &str,
+) -> rusqlite::Result<WorkspaceAcceptedRawRows> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT workspace_id
+         FROM invites_accepted
+         WHERE recorded_by = ?1
+         ORDER BY workspace_id
+         LIMIT 2",
+    )?;
+    let workspace_ids = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            crate::db::sql_types::get_text(row, 0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(WorkspaceAcceptedRawRows {
+        workspace_ids,
+        malformed: false,
+    })
+}
+
+fn load_workspace_decision_context_from_db(
+    conn: &Connection,
+    recorded_by: &str,
+) -> ProjectionQueryResult<WorkspaceDecisionContext> {
+    let raw_rows = load_workspace_accepted_raw_rows(conn, recorded_by)?;
+    Ok(normalize_workspace_acceptance(&raw_rows))
+}
+
 impl ProjectionQueries for Connection {
     fn load_dep_result(
         &self,
@@ -654,24 +807,18 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         _workspace: &WorkspaceEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let accepted_workspace_id = match self.query_row(
-            "SELECT workspace_id
-             FROM invites_accepted
-             WHERE recorded_by = ?1
-             ORDER BY created_at ASC, event_id ASC
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| crate::db::sql_types::get_text(row, 0),
-        ) {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e.into()),
-        };
+        let context = load_workspace_decision_context_from_db(self, recorded_by)?;
+        Ok(build_workspace_projector_decision_context(&context))
+    }
 
-        Ok(ProjectorDecisionContext {
-            accepted_workspace_id,
-            ..ProjectorDecisionContext::default()
-        })
+    fn load_workspace_decision_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        _event_id_b64: &str,
+        _workspace: &WorkspaceEvent,
+    ) -> ProjectionQueryResult<WorkspaceDecisionContext> {
+        load_workspace_decision_context_from_db(self, recorded_by)
     }
 
     fn load_admin_context(
@@ -1227,5 +1374,95 @@ impl ProjectionQueries for Connection {
             }),
             ..ProjectorDecisionContext::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_id(byte: u8) -> String {
+        event_id_to_base64(&[byte; 32])
+    }
+
+    #[test]
+    fn workspace_acceptance_blocks_when_missing() {
+        let context = normalize_workspace_acceptance(&WorkspaceAcceptedRawRows {
+            workspace_ids: vec![],
+            malformed: false,
+        });
+
+        assert_eq!(
+            decide_workspace_context_plan(&context, &workspace_id(1)),
+            WorkspaceContextPlan::BlockOnAcceptedWorkspace
+        );
+    }
+
+    #[test]
+    fn workspace_acceptance_allows_multiple_invites_for_same_workspace() {
+        let workspace_id = workspace_id(1);
+        let context = normalize_workspace_acceptance(&WorkspaceAcceptedRawRows {
+            workspace_ids: vec![workspace_id.clone(), workspace_id.clone()],
+            malformed: false,
+        });
+
+        assert_eq!(
+            context,
+            WorkspaceDecisionContext::UniqueAcceptedWorkspace {
+                workspace_id: workspace_id.clone()
+            }
+        );
+        assert_eq!(
+            decide_workspace_context_plan(&context, &workspace_id),
+            WorkspaceContextPlan::Ready {
+                accepted_workspace_id: workspace_id
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_acceptance_rejects_distinct_workspace_bindings() {
+        let context = normalize_workspace_acceptance(&WorkspaceAcceptedRawRows {
+            workspace_ids: vec![workspace_id(1), workspace_id(2)],
+            malformed: false,
+        });
+
+        assert_eq!(
+            context,
+            WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace
+        );
+        assert!(matches!(
+            decide_workspace_context_plan(&context, &workspace_id(1)),
+            WorkspaceContextPlan::Reject { reason } if reason.contains("ambiguous")
+        ));
+    }
+
+    #[test]
+    fn workspace_acceptance_rejects_malformed_workspace_binding() {
+        let context = normalize_workspace_acceptance(&WorkspaceAcceptedRawRows {
+            workspace_ids: vec!["not-base64".to_string()],
+            malformed: false,
+        });
+
+        assert_eq!(
+            context,
+            WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace
+        );
+        assert!(matches!(
+            decide_workspace_context_plan(&context, &workspace_id(1)),
+            WorkspaceContextPlan::Reject { reason } if reason.contains("malformed")
+        ));
+    }
+
+    #[test]
+    fn workspace_context_plan_rejects_mismatched_workspace_event() {
+        let context = WorkspaceDecisionContext::UniqueAcceptedWorkspace {
+            workspace_id: workspace_id(1),
+        };
+
+        assert!(matches!(
+            decide_workspace_context_plan(&context, &workspace_id(2)),
+            WorkspaceContextPlan::Reject { reason } if reason.contains("does not match")
+        ));
     }
 }

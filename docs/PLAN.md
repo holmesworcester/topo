@@ -72,7 +72,7 @@ For active work:
 - `invite_accepted` is local accepted-workspace binding:
   - it writes `invites_accepted` rows from carried `workspace_id` in peer scope,
   - it is not gated by the root-workspace accepted-workspace guard itself,
-  - winner selection is deterministic at read time (`created_at,event_id`).
+  - authority reads that require one workspace binding normalize by distinct `workspace_id`: same-workspace duplicate acceptances collapse to one binding, while distinct-workspace ambiguity rejects rather than selecting a canonical invite event.
 - Accepted-workspace guards apply to root workspace events (foreign root ids must not become valid).
 - Deterministic emitted event types stay inside the emitted-event rule flow but are unsigned for determinism (`no signed_by/signer_type/signature`).
 
@@ -172,7 +172,7 @@ Repo-wide composition invariants:
 3. **Workspace confinement.**
    - Workspace-scoped replay, fanout, and sync may only affect tenants that are bound to that same workspace by valid local state.
 4. **Ambiguity and malformation fail closed.**
-   - Contradictory, duplicate, malformed, or out-of-range context state must normalize to rejection, ambiguity, or absence, never silent authorization.
+   - Contradictory, conflicting duplicate, malformed, or out-of-range context state must normalize to rejection, ambiguity, or absence, never silent authorization.
 5. **Executors cannot exceed their plan.**
    - Runtime code may only perform side effects explicitly authorized by the computed plan.
    - Executors must not widen scope by re-querying broader authority after planning.
@@ -1343,8 +1343,8 @@ Before writing identity/encryption projectors in Rust:
    - invalid signature rejects (not block).
 2. Build/update a TLA+ model of causal relationships and guards for this phase.
 3. Model split invite types (`user_invite_shared`, `peer_invite_shared`) and accepted-workspace semantics.
-4. **Model workspace binding**: workspace events must be parameterized by workspace id, and the accepted binding must resolve to a specific workspace winner. The model must prove that foreign workspace events (for workspaces the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid workspace events, making it insufficiently expressive for multi-workspace scenarios. See `InvWorkspaceAnchor`, `InvSingleWorkspace`, `InvForeignWorkspaceExcluded` invariants.
-5. **Model invite-derived accepted-workspace binding**: the accepted workspace winner must derive from event-carried `workspace_id` values, with deterministic winner selection. This ensures the binding mechanism is faithful to the real protocol where accepted rows carry `workspace_id`. See `InvTrustAnchorMatchesCarried` invariant.
+4. **Model workspace binding**: workspace events must be parameterized by workspace id, and the accepted binding must resolve to one distinct accepted workspace id or reject ambiguity. The model must prove that foreign workspace events (for workspaces the peer did not accept an invite for) can never become valid. Without this, the model cannot distinguish between valid and invalid workspace events, making it insufficiently expressive for multi-workspace scenarios. See `InvWorkspaceAnchor`, `InvSingleWorkspace`, `InvForeignWorkspaceExcluded` invariants.
+5. **Model invite-derived accepted-workspace binding**: the accepted workspace binding must derive from event-carried `workspace_id` values, collapse same-workspace duplicate acceptances, and reject multiple distinct workspace ids rather than choose a canonical invite event. This ensures the binding mechanism is faithful to the real protocol where accepted rows carry `workspace_id`. See `InvTrustAnchorMatchesCarried` invariant.
 6. **Model guard placement explicitly (poc-6 parity)**:
    - accepted-workspace guard applies to root workspace events,
    - `invite_accepted` is local binding from carried `workspace_id` (no invite-presence dep gate),
@@ -1401,8 +1401,8 @@ Required behavior:
 
 Current state (implemented):
 - `invite_accepted` owns `invites_accepted` projection rows directly (event-to-own-table clarity).
-- Workspace/tenant reads resolve binding from `invites_accepted` winner row (`created_at,event_id`).
-- `workspace` projector validates that a matching accepted-invite winner exists before projection.
+- Workspace authority reads normalize `invites_accepted` by distinct `workspace_id`; same-workspace duplicate acceptances collapse to one binding, while distinct-workspace ambiguity rejects.
+- `workspace` context loading validates that a matching accepted-workspace binding exists before projection.
 - End state authority is `invite_accepted` projection rows only; there is no separate `trust_anchors` table.
 
 Self-invite bootstrap sequence must stay explicit:

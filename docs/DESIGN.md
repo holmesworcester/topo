@@ -99,6 +99,14 @@ Design guidance:
 3. executors should not add extra authority decisions beyond the emitted plan,
 4. when a behavior needs a proof, prefer introducing a context-query seam rather than proving over ad-hoc interleaved SQL and network logic.
 
+For the accepted-workspace guard specifically, the context query normalizes
+`invites_accepted` by distinct `workspace_id`: zero rows block on missing
+accepted-workspace state, one distinct workspace id is the accepted binding
+(even if there are many invite/acceptance events for that same workspace), and
+multiple distinct workspace ids or malformed workspace ids reject. There is no
+canonical invite event for this guard, and it must not silently pick the first
+row.
+
 ### Composition Invariants
 
 Local planner proofs are not enough on their own. The repo-wide proof story should compose around a small set of system-level invariants:
@@ -111,7 +119,7 @@ Local planner proofs are not enough on their own. The repo-wide proof story shou
 3. **Workspace confinement.**
    - Workspace-scoped replay, fanout, and sync may only affect tenants that are bound to that same workspace by valid local state.
 4. **Ambiguity and malformation fail closed.**
-   - Contradictory, duplicate, malformed, or out-of-range context state must normalize to rejection, ambiguity, or absence, never silent authorization.
+   - Contradictory, conflicting duplicate, malformed, or out-of-range context state must normalize to rejection, ambiguity, or absence, never silent authorization.
 5. **Executors cannot exceed their plan.**
    - Runtime code may only perform side effects explicitly authorized by the computed plan. Executors must not re-query broader authority after planning.
 
@@ -1669,7 +1677,7 @@ Self-invite bootstrap stays explicit:
 
 Guard placement rules:
 1. accepted-workspace guard applies to root workspace events only; foreign root ids must not become valid,
-2. `invite_accepted` is a local accepted-workspace binding event (no invite-presence dependency gate). It writes its own binding row from carried `workspace_id`; winner selection is deterministic at read time (`created_at,event_id`),
+2. `invite_accepted` is a local accepted-workspace binding event (no invite-presence dependency gate). It writes its own binding row from carried `workspace_id`; authority reads that require one workspace binding normalize by distinct `workspace_id` and reject distinct-workspace ambiguity rather than choosing a canonical invite event,
 3. new user/device/peer identities are still gated by normal signer/dependency validation in the same peer scope (for example `user -> user_invite_shared`, `peer_shared -> peer_invite_shared`),
 4. bootstrap transport trust is persisted in SQL and queried at connection creation time; projected peer keys are not treated as in-memory-only authority.
 

@@ -13,7 +13,7 @@ mod tests {
     use topo::event_modules::message_deletion::MessageDeletionEvent;
     use topo::event_modules::message_deletion::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::{ContextSnapshot, EmitCommand};
+    use topo::projection::contract::{EmitCommand, ProjectorDecisionContext};
     use topo::projection::queries::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
@@ -30,7 +30,7 @@ mod tests {
     fn test_deletion_valid() {
         let author_b64 = b64(&[2u8; 32]);
         let parsed = make_deletion([1u8; 32]);
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             target_message_author: Some(author_b64.clone()),
             deletion_signer_user_id: Some(author_b64),
             ..Default::default()
@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn test_deletion_valid_for_admin_signer() {
         let parsed = make_deletion([1u8; 32]);
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             target_message_author: Some(b64(&[9u8; 32])),
             deletion_signer_is_admin: true,
             ..Default::default()
@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_wrong_author() {
         let parsed = make_deletion([1u8; 32]);
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             target_message_author: Some(b64(&[99u8; 32])),
             deletion_signer_user_id: Some(b64(&[2u8; 32])),
             ..Default::default()
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_non_message_target() {
         let parsed = make_deletion([1u8; 32]);
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             deletion_signer_user_id: Some(b64(&[2u8; 32])),
             target_is_non_message: true,
             ..Default::default()
@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn test_deletion_intent_only_when_no_target() {
         let parsed = make_deletion([1u8; 32]);
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             deletion_signer_user_id: Some(b64(&[2u8; 32])),
             ..Default::default()
         };
@@ -111,7 +111,7 @@ mod tests {
     fn test_deletion_idempotent_when_tombstoned() {
         let author_b64 = b64(&[2u8; 32]);
         let parsed = make_deletion([1u8; 32]);
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             target_tombstone_author: Some(author_b64.clone()),
             deletion_signer_user_id: Some(author_b64),
             ..Default::default()
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_when_tombstoned_wrong_author() {
         let parsed = make_deletion([1u8; 32]);
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             target_tombstone_author: Some(b64(&[99u8; 32])),
             deletion_signer_user_id: Some(b64(&[2u8; 32])),
             ..Default::default()
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_invalid_signer_auth() {
         let parsed = make_deletion([1u8; 32]);
-        let queries = queries_with_ctx(ContextSnapshot {
+        let queries = queries_with_ctx(ProjectorDecisionContext {
             deletion_signer_reject_reason: Some(
                 "message_deletion signer must be peer_shared or admin".to_string(),
             ),
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn test_deletion_rejects_outer_owner_event_id() {
         let parsed = make_deletion([1u8; 32]);
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             deletion_signer_user_id: Some(b64(&[2u8; 32])),
             current_owner_event_id: Some(b64(&[9u8; 32])),
             ..Default::default()

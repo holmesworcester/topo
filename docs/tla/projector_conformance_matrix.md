@@ -23,8 +23,11 @@ both `pass` and `break` polarity unless waived.
 | SPEC_SIGNER_03 | InvSigner | CHK_SIGNER_RESOLVE | pipeline_integration | apply::tests::tenant::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_WS_ANCHOR_01 | InvWorkspaceAnchor | CHK_WS_TRUST_ANCHOR_BLOCK | projector_unit | workspace_projector_tests::tests::test_workspace_blocks_without_trust_anchor | break |
 | SPEC_WS_ANCHOR_01 | InvWorkspaceAnchor | CHK_WS_TRUST_ANCHOR_BLOCK | projector_unit | workspace_projector_tests::tests::test_workspace_valid_with_matching_anchor | pass |
+| SPEC_WS_ANCHOR_01 | InvWorkspaceAnchor | CHK_WS_TRUST_ANCHOR_BLOCK | pipeline_integration | apply::tests::invite::test_workspace_context_allows_multiple_acceptances_for_same_workspace | pass |
 | SPEC_WS_ANCHOR_02 | InvForeignWorkspaceExcluded | CHK_WS_TRUST_ANCHOR_MISMATCH | projector_unit | workspace_projector_tests::tests::test_workspace_rejects_anchor_mismatch | break |
 | SPEC_WS_ANCHOR_02 | InvForeignWorkspaceExcluded | CHK_WS_TRUST_ANCHOR_MISMATCH | pipeline_integration | apply::tests::cascade::test_invite_accepted_guard_retry_on_workspace | pass |
+| SPEC_WS_ANCHOR_02 | InvForeignWorkspaceExcluded | CHK_WS_TRUST_ANCHOR_AMBIGUOUS | pipeline_integration | apply::tests::invite::test_workspace_context_allows_multiple_acceptances_for_same_workspace | pass |
+| SPEC_WS_ANCHOR_02 | InvForeignWorkspaceExcluded | CHK_WS_TRUST_ANCHOR_AMBIGUOUS | pipeline_integration | apply::tests::invite::test_workspace_context_rejects_distinct_workspace_bindings | break |
 | SPEC_WS_SINGLE_01 | InvSingleWorkspace | CHK_WS_INSERT | projector_unit | workspace_projector_tests::tests::test_workspace_insert_or_ignore | pass |
 | SPEC_WS_SINGLE_01 | InvSingleWorkspace | CHK_WS_INSERT | projector_unit | workspace_projector_tests::tests::test_workspace_rejects_anchor_mismatch | break |
 | SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_TRUST_ANCHOR_WRITE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |

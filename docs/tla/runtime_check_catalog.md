@@ -8,8 +8,9 @@ an explicit `NON_MODELED::<reason>` waiver.
 
 | check_id | owner | tla_guard_id | category |
 |----------|-------|-------------|----------|
-| CHK_WS_TRUST_ANCHOR_BLOCK | event_modules/workspace::project_pure | InvWorkspaceAnchor | projector_local |
-| CHK_WS_TRUST_ANCHOR_MISMATCH | event_modules/workspace::project_pure | InvForeignWorkspaceExcluded | projector_local |
+| CHK_WS_TRUST_ANCHOR_BLOCK | state/projection/queries::decide_workspace_context_plan | InvWorkspaceAnchor | projector_context |
+| CHK_WS_TRUST_ANCHOR_MISMATCH | state/projection/queries::decide_workspace_context_plan | InvForeignWorkspaceExcluded | projector_context |
+| CHK_WS_TRUST_ANCHOR_AMBIGUOUS | state/projection/queries::normalize_workspace_acceptance | InvForeignWorkspaceExcluded | projection_read_model |
 | CHK_WS_INSERT | event_modules/workspace::project_pure | InvSingleWorkspace | projector_local |
 | CHK_IA_TRUST_ANCHOR_WRITE | event_modules/invite_accepted::project_pure | InvTrustAnchorImmutable | projector_local |
 | CHK_IA_TRUST_ANCHOR_CONFLICT | state/db/store::lookup_workspace_id | InvTrustAnchorImmutable | projection_read_model |

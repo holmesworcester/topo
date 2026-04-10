@@ -69,7 +69,7 @@ mod tests {
     fn test_file_slice_context_purges_when_owner_message_deleted() {
         let parsed = make_file_slice([1u8; 32]);
         let root_message = b64(&[9u8; 32]);
-        let queries = queries_with_ctx(topo::projection::contract::ContextSnapshot {
+        let queries = queries_with_ctx(topo::projection::contract::ProjectorDecisionContext {
             purge_message_event_id: Some(root_message.clone()),
             file_descriptors: vec![descriptor(&root_message, &b64(&[3u8; 32]), "key_1")],
             current_owner_event_id: Some(root_message.clone()),
@@ -95,7 +95,7 @@ mod tests {
     fn test_file_slice_context_ready_when_owner_message_live() {
         let parsed = make_file_slice([1u8; 32]);
         let root_message = b64(&[9u8; 32]);
-        let queries = queries_with_ctx(topo::projection::contract::ContextSnapshot {
+        let queries = queries_with_ctx(topo::projection::contract::ProjectorDecisionContext {
             file_descriptors: vec![descriptor(&root_message, &b64(&[3u8; 32]), "key_1")],
             current_owner_event_id: Some(root_message),
             current_signer: Some(topo::projection::contract::CurrentSignerInfo {
@@ -180,7 +180,7 @@ mod tests {
         let signer_b64 = b64(&signer);
         let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
-        let ctx = topo::projection::contract::ContextSnapshot {
+        let ctx = topo::projection::contract::ProjectorDecisionContext {
             file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_expected")],
             current_owner_event_id: Some(owner_b64),
             current_signer: Some(topo::projection::contract::CurrentSignerInfo {
@@ -203,7 +203,7 @@ mod tests {
         let signer_b64 = b64(&signer);
         let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
-        let ctx = topo::projection::contract::ContextSnapshot {
+        let ctx = topo::projection::contract::ProjectorDecisionContext {
             file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_1")],
             current_owner_event_id: Some(owner_b64),
             current_signer: Some(topo::projection::contract::CurrentSignerInfo {
@@ -226,7 +226,7 @@ mod tests {
         let signer_b64 = b64(&signer);
         let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
-        let ctx = topo::projection::contract::ContextSnapshot {
+        let ctx = topo::projection::contract::ProjectorDecisionContext {
             file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_1")],
             current_owner_event_id: Some(owner_b64),
             current_signer: Some(topo::projection::contract::CurrentSignerInfo {

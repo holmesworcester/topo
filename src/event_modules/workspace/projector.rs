@@ -1,6 +1,9 @@
 use crate::event_modules::ParsedEvent;
 use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
+use crate::projection::queries::{
+    decide_workspace_context_plan, workspace_context_plan_to_load_result, ContextLoadResult,
+    ProjectionFrameContext, ProjectionQueries,
+};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
@@ -14,14 +17,10 @@ pub fn build_projector_context(
         _ => return Err("workspace context loader called for non-workspace event".into()),
     };
 
-    let ctx = queries.load_workspace_context(frame, recorded_by, event_id_b64, workspace)?;
-    match &ctx.accepted_workspace_id {
-        None => Ok(ContextLoadResult::block(vec![])),
-        Some(anchor_wid) if anchor_wid == event_id_b64 => Ok(ContextLoadResult::ready(ctx)),
-        Some(_) => Ok(ContextLoadResult::reject(
-            "workspace_id does not match accepted invite binding",
-        )),
-    }
+    let context =
+        queries.load_workspace_decision_context(frame, recorded_by, event_id_b64, workspace)?;
+    let plan = decide_workspace_context_plan(&context, event_id_b64);
+    Ok(workspace_context_plan_to_load_result(plan))
 }
 
 /// Pure projector: Workspace guard — accepted-invite binding must match workspace event_id.

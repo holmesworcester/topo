@@ -11,7 +11,9 @@ mod tests {
     use topo::event_modules::key_shared::{project_pure, KeySharedEvent};
     use topo::event_modules::removal::frontier_hash_from_refs;
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::{ContextSnapshot, EmitCommand, UnwrappedSecretMaterial};
+    use topo::projection::contract::{
+        EmitCommand, ProjectorDecisionContext, UnwrappedSecretMaterial,
+    };
 
     const PEER: &str = "peer_alice";
     fn make_key_shared(
@@ -52,7 +54,7 @@ mod tests {
             frontier_hash,
             delivery_target_id(&key_event_id, &frontier_hash, &[2u8; 32], &[3u8; 32]),
         );
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             unwrapped_secret_material: Some(UnwrappedSecretMaterial { key_bytes }),
             ..Default::default()
         };
@@ -77,7 +79,7 @@ mod tests {
             frontier_hash,
             delivery_target_id(&[7u8; 32], &frontier_hash, &[2u8; 32], &[3u8; 32]),
         );
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             unwrapped_secret_material: Some(UnwrappedSecretMaterial {
                 key_bytes: [42u8; 32],
             }),
@@ -102,7 +104,7 @@ mod tests {
             frontier_hash_from_refs(&[]),
             [8u8; 32],
         );
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             unwrapped_secret_material: Some(UnwrappedSecretMaterial { key_bytes }),
             ..Default::default()
         };
@@ -128,7 +130,7 @@ mod tests {
             [0xBB; 32],
             delivery_target_id(&key_event_id, &[0xBB; 32], &[2u8; 32], &[3u8; 32]),
         );
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             unwrapped_secret_material: Some(UnwrappedSecretMaterial { key_bytes }),
             ..Default::default()
         };
@@ -152,7 +154,7 @@ mod tests {
             frontier_hash,
             delivery_target_id(&key_event_id, &frontier_hash, &[2u8; 32], &[3u8; 32]),
         );
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             unwrapped_secret_material: Some(UnwrappedSecretMaterial { key_bytes }),
             ..Default::default()
         };
@@ -177,7 +179,7 @@ mod tests {
             frontier_hash,
             delivery_target_id(&key_event_id, &frontier_hash, &[2u8; 32], &[3u8; 32]),
         );
-        let ctx = ContextSnapshot {
+        let ctx = ProjectorDecisionContext {
             unwrapped_secret_material: Some(UnwrappedSecretMaterial { key_bytes }),
             ..Default::default()
         };

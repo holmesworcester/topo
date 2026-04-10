@@ -1,6 +1,6 @@
 //! Shared test harness for pure projector conformance tests.
 //!
-//! Provides fixture builders for ParsedEvent variants and ContextSnapshot,
+//! Provides fixture builders for ParsedEvent variants and ProjectorDecisionContext,
 //! plus assertion helpers for ProjectorResult inspection.
 
 #[cfg(test)]
@@ -11,8 +11,8 @@ pub mod fixtures {
         UserInviteEvent, WorkspaceEvent,
     };
     use topo::projection::contract::{
-        BootstrapContextSnapshot, ContextSnapshot, CurrentSignerInfo, EmitCommand,
-        FileDescriptorInfo, ProjectorResult, WriteOp,
+        BootstrapDecisionContext, CurrentSignerInfo, EmitCommand, FileDescriptorInfo,
+        ProjectorDecisionContext, ProjectorResult, WriteOp,
     };
     use topo::projection::decision::ProjectionDecision;
     use topo::projection::queries::{
@@ -21,11 +21,11 @@ pub mod fixtures {
 
     #[derive(Clone)]
     pub struct FixtureProjectionQueries {
-        ctx: ContextSnapshot,
+        ctx: ProjectorDecisionContext,
     }
 
     impl FixtureProjectionQueries {
-        pub fn new(ctx: ContextSnapshot) -> Self {
+        pub fn new(ctx: ProjectorDecisionContext) -> Self {
             Self { ctx }
         }
     }
@@ -55,7 +55,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _workspace: &WorkspaceEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -65,7 +65,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _admin: &AdminEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -75,7 +75,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _peer_shared: &PeerSharedEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -85,7 +85,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _user_invite: &UserInviteEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -95,7 +95,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _device_invite: &DeviceInviteEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -105,7 +105,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _message: &MessageEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -115,7 +115,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _message_deletion: &MessageDeletionEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -125,7 +125,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _reaction: &ReactionEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -135,7 +135,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _file: &FileEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -145,7 +145,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _file_slice: &FileSliceEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -155,7 +155,7 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _invite_accepted: &InviteAcceptedEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
 
@@ -165,50 +165,52 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _key_shared: &KeySharedEvent,
-        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }
     }
 
-    /// Default ContextSnapshot with all fields at their zero/empty/false defaults.
-    pub fn empty_ctx() -> ContextSnapshot {
-        ContextSnapshot::default()
+    /// Default ProjectorDecisionContext with all fields at their zero/empty/false defaults.
+    pub fn empty_ctx() -> ProjectorDecisionContext {
+        ProjectorDecisionContext::default()
     }
 
-    pub fn queries_with_ctx(ctx: ContextSnapshot) -> FixtureProjectionQueries {
+    pub fn queries_with_ctx(ctx: ProjectorDecisionContext) -> FixtureProjectionQueries {
         FixtureProjectionQueries::new(ctx)
     }
 
-    /// ContextSnapshot with trust anchor set to the given workspace_id base64.
-    pub fn ctx_with_anchor(workspace_id_b64: &str) -> ContextSnapshot {
-        ContextSnapshot {
+    /// ProjectorDecisionContext with trust anchor set to the given workspace_id base64.
+    pub fn ctx_with_anchor(workspace_id_b64: &str) -> ProjectorDecisionContext {
+        ProjectorDecisionContext {
             accepted_workspace_id: Some(workspace_id_b64.to_string()),
             ..Default::default()
         }
     }
 
-    /// ContextSnapshot with signer-user mismatch reason set.
-    pub fn ctx_with_signer_mismatch(reason: &str) -> ContextSnapshot {
-        ContextSnapshot {
+    /// ProjectorDecisionContext with signer-user mismatch reason set.
+    pub fn ctx_with_signer_mismatch(reason: &str) -> ProjectorDecisionContext {
+        ProjectorDecisionContext {
             signer_user_mismatch_reason: Some(reason.to_string()),
             ..Default::default()
         }
     }
 
-    /// ContextSnapshot with file descriptors.
-    pub fn ctx_with_file_descriptors(descriptors: Vec<FileDescriptorInfo>) -> ContextSnapshot {
-        ContextSnapshot {
+    /// ProjectorDecisionContext with file descriptors.
+    pub fn ctx_with_file_descriptors(
+        descriptors: Vec<FileDescriptorInfo>,
+    ) -> ProjectorDecisionContext {
+        ProjectorDecisionContext {
             file_descriptors: descriptors,
             ..Default::default()
         }
     }
 
-    /// ContextSnapshot with an explicit current signer envelope.
+    /// ProjectorDecisionContext with an explicit current signer envelope.
     pub fn ctx_with_current_signer(
         signer_event_id_b64: &str,
         semantic_type_code: u8,
-    ) -> ContextSnapshot {
-        ContextSnapshot {
+    ) -> ProjectorDecisionContext {
+        ProjectorDecisionContext {
             current_signer: Some(CurrentSignerInfo {
                 event_id: signer_event_id_b64.to_string(),
                 semantic_type_code,
@@ -217,10 +219,10 @@ pub mod fixtures {
         }
     }
 
-    /// ContextSnapshot with bootstrap context and is_local_create flag.
-    pub fn ctx_with_bootstrap(workspace_id: &str, is_local: bool) -> ContextSnapshot {
-        ContextSnapshot {
-            bootstrap_context: Some(BootstrapContextSnapshot {
+    /// ProjectorDecisionContext with bootstrap context and is_local_create flag.
+    pub fn ctx_with_bootstrap(workspace_id: &str, is_local: bool) -> ProjectorDecisionContext {
+        ProjectorDecisionContext {
+            bootstrap_context: Some(BootstrapDecisionContext {
                 workspace_id: workspace_id.to_string(),
                 bootstrap_addrs: vec!["127.0.0.1:9000".to_string()],
                 bootstrap_spki_fingerprint: [0xAA; 32],
@@ -363,7 +365,7 @@ pub mod fixtures {
         }
     }
 
-    pub fn expect_context_ready(result: ContextLoadResult) -> ContextSnapshot {
+    pub fn expect_context_ready(result: ContextLoadResult) -> ProjectorDecisionContext {
         match result {
             ContextLoadResult::Ready(ctx) => ctx,
             other => panic!("expected ContextLoadResult::Ready, got {:?}", other),

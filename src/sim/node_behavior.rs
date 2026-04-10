@@ -16,7 +16,9 @@ use crate::projection::contract::{
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::queries::{
-    DepLoadResult, ProjectionFrameContext, ProjectionQueries, ProjectionQueryResult,
+    build_workspace_projector_decision_context, normalize_workspace_acceptance, DepLoadResult,
+    ProjectionFrameContext, ProjectionQueries, ProjectionQueryResult, WorkspaceAcceptedRawRows,
+    WorkspaceDecisionContext,
 };
 use crate::projection::signer::{ResolvedSigner, SignerResolution};
 use crate::sim::query_snapshot::ImportedPeerState;
@@ -1153,28 +1155,36 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_workspace_context(
         &self,
+        frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        event_id_b64: &str,
+        workspace: &events::WorkspaceEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let context =
+            self.load_workspace_decision_context(frame, recorded_by, event_id_b64, workspace)?;
+        Ok(build_workspace_projector_decision_context(&context))
+    }
+
+    fn load_workspace_decision_context(
+        &self,
         _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         _workspace: &events::WorkspaceEvent,
-    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+    ) -> ProjectionQueryResult<WorkspaceDecisionContext> {
         let state = self.state.borrow();
-        let accepted_workspace_id =
-            table_rows_for_recorded(&state, "invites_accepted", recorded_by)
-                .into_iter()
-                .filter_map(|row| {
-                    Some((
-                        row_int(row, "created_at").unwrap_or(i64::MAX),
-                        row_text(row, "event_id")?.to_string(),
-                        row_text(row, "workspace_id")?.to_string(),
-                    ))
-                })
-                .min_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))
-                .map(|(_, _, workspace_id)| workspace_id);
-        Ok(ProjectorDecisionContext {
-            accepted_workspace_id,
-            ..ProjectorDecisionContext::default()
-        })
+        let mut workspace_ids = Vec::new();
+        let mut malformed = false;
+        for row in table_rows_for_recorded(&state, "invites_accepted", recorded_by) {
+            match row_text(row, "workspace_id") {
+                Some(workspace_id) => workspace_ids.push(workspace_id.to_string()),
+                None => malformed = true,
+            }
+        }
+        Ok(normalize_workspace_acceptance(&WorkspaceAcceptedRawRows {
+            workspace_ids,
+            malformed,
+        }))
     }
 
     fn load_admin_context(

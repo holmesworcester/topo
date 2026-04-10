@@ -27,7 +27,12 @@ CATALOG_PATH = REPO_ROOT / "docs" / "tla" / "runtime_check_catalog.md"
 def extract_test_functions(source: str) -> set[str]:
     test_functions = {
         m.group(1)
-        for m in re.finditer(r"^\s*(?:async\s+)?fn\s+(test_\w+)\s*\(", source, re.MULTILINE)
+        for m in re.finditer(
+            r"(?m)^\s*#\[(?:tokio::)?test[^\]]*\]\s*"
+            r"(?:\n\s*#\[[^\]]+\]\s*)*"
+            r"\n\s*(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\(",
+            source,
+        )
     }
     test_functions.update(
         m.group(1)
@@ -195,8 +200,14 @@ def main() -> int:
     import subprocess
     real_test_paths: set[str] = set()
     cargo_available = False
+    skip_cargo_discovery = os.environ.get("TOPO_SKIP_CARGO_TEST_DISCOVERY", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     # Try listing lib tests, then integration tests (which may fail to compile).
-    if os.environ.get("TOPO_SKIP_CARGO_TEST_DISCOVERY") != "1":
+    if not skip_cargo_discovery:
         for cargo_args in [["--lib"], ["--tests"]]:
             try:
                 out = subprocess.check_output(

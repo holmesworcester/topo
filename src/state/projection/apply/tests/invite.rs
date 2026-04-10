@@ -1,5 +1,30 @@
 use super::*;
 
+fn insert_invites_accepted_binding(
+    conn: &Connection,
+    recorded_by: &str,
+    row_id_byte: u8,
+    workspace_id_b64: &str,
+) {
+    let event_id = event_id_to_base64(&[row_id_byte; 32]);
+    let tenant_event_id = event_id_to_base64(&[row_id_byte.wrapping_add(1); 32]);
+    let invite_event_id = event_id_to_base64(&[row_id_byte.wrapping_add(2); 32]);
+    conn.execute(
+        "INSERT INTO invites_accepted
+         (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            recorded_by,
+            &event_id,
+            &tenant_event_id,
+            &invite_event_id,
+            workspace_id_b64,
+            i64::from(row_id_byte)
+        ],
+    )
+    .unwrap();
+}
+
 // ── SPEC_DEPS_02: Dep type mismatch rejects ──
 
 #[test]
@@ -406,6 +431,57 @@ fn test_workspace_unblocks_via_cascade_after_late_arrival() {
         )
         .unwrap();
     assert_eq!(ws_row, 1, "workspace must be in workspaces table");
+}
+
+#[test]
+fn test_workspace_context_allows_multiple_acceptances_for_same_workspace() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let ws_event = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: now_ms(),
+        public_key: [0xAA; 32],
+        name: "same-workspace-acceptances".to_string(),
+    });
+    let ws_blob = events::encode_event(&ws_event).unwrap();
+    let ws_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
+    let ws_b64 = event_id_to_base64(&ws_eid);
+
+    insert_invites_accepted_binding(&conn, recorded_by, 0x10, &ws_b64);
+    insert_invites_accepted_binding(&conn, recorded_by, 0x20, &ws_b64);
+
+    assert_eq!(
+        project_one(&conn, recorded_by, &ws_eid).unwrap(),
+        ProjectionDecision::Valid,
+        "multiple acceptances for the same workspace remain a unique binding"
+    );
+}
+
+#[test]
+fn test_workspace_context_rejects_distinct_workspace_bindings() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let ws_event = ParsedEvent::Workspace(WorkspaceEvent {
+        created_at_ms: now_ms(),
+        public_key: [0xAA; 32],
+        name: "ambiguous-workspace-acceptances".to_string(),
+    });
+    let ws_blob = events::encode_event(&ws_event).unwrap();
+    let ws_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
+    let ws_b64 = event_id_to_base64(&ws_eid);
+    let other_ws_b64 = event_id_to_base64(&[0xBB; 32]);
+
+    insert_invites_accepted_binding(&conn, recorded_by, 0x10, &ws_b64);
+    insert_invites_accepted_binding(&conn, recorded_by, 0x20, &other_ws_b64);
+
+    assert!(
+        matches!(
+            project_one(&conn, recorded_by, &ws_eid).unwrap(),
+            ProjectionDecision::Reject { reason } if reason.contains("ambiguous accepted invite workspace binding")
+        ),
+        "distinct workspace bindings must fail closed instead of picking a canonical row"
+    );
 }
 
 /// Target semantics 4: Full bootstrap progression from projected SQL state.
