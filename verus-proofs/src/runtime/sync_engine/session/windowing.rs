@@ -9,6 +9,11 @@ pub enum ColdTierPlan {
     LowMemOnly,
 }
 
+pub struct ColdTierRawRows {
+    pub global_low_mem_mode: bool,
+    pub restrict_to_low_mem_windows: bool,
+}
+
 pub struct ColdTierDecisionContext {
     pub global_low_mem_mode: bool,
     pub restrict_to_low_mem_windows: bool,
@@ -21,10 +26,25 @@ pub enum SelectOutboundWindowPlan {
     MultiPeerCold,
 }
 
+pub struct SelectOutboundWindowRawRows {
+    pub last_day_only_mode: bool,
+    pub normalized_live_peer_count: nat,
+    pub peer_is_priority_owner: bool,
+}
+
 pub struct SelectOutboundWindowDecisionContext {
     pub last_day_only_mode: bool,
     pub normalized_live_peer_count: nat,
     pub peer_is_priority_owner: bool,
+}
+
+pub open spec fn normalize_cold_tier_context(
+    raw_rows: ColdTierRawRows,
+) -> ColdTierDecisionContext {
+    ColdTierDecisionContext {
+        global_low_mem_mode: raw_rows.global_low_mem_mode,
+        restrict_to_low_mem_windows: raw_rows.restrict_to_low_mem_windows,
+    }
 }
 
 pub open spec fn decide_cold_tier_plan(context: &ColdTierDecisionContext) -> ColdTierPlan {
@@ -32,6 +52,16 @@ pub open spec fn decide_cold_tier_plan(context: &ColdTierDecisionContext) -> Col
         ColdTierPlan::LowMemOnly
     } else {
         ColdTierPlan::Default
+    }
+}
+
+pub open spec fn normalize_select_outbound_window_context(
+    raw_rows: SelectOutboundWindowRawRows,
+) -> SelectOutboundWindowDecisionContext {
+    SelectOutboundWindowDecisionContext {
+        last_day_only_mode: raw_rows.last_day_only_mode,
+        normalized_live_peer_count: raw_rows.normalized_live_peer_count,
+        peer_is_priority_owner: raw_rows.peer_is_priority_owner,
     }
 }
 
@@ -47,6 +77,39 @@ pub open spec fn decide_select_outbound_window_plan(
     } else {
         SelectOutboundWindowPlan::MultiPeerCold
     }
+}
+
+proof fn cold_tier_normalizer_preserves_query_facts(
+    global_low_mem_mode: bool,
+    restrict_to_low_mem_windows: bool,
+)
+    ensures
+        normalize_cold_tier_context(ColdTierRawRows {
+            global_low_mem_mode,
+            restrict_to_low_mem_windows,
+        }) == (ColdTierDecisionContext {
+            global_low_mem_mode,
+            restrict_to_low_mem_windows,
+        }),
+{
+}
+
+proof fn select_outbound_window_normalizer_preserves_query_facts(
+    last_day_only_mode: bool,
+    normalized_live_peer_count: nat,
+    peer_is_priority_owner: bool,
+)
+    ensures
+        normalize_select_outbound_window_context(SelectOutboundWindowRawRows {
+            last_day_only_mode,
+            normalized_live_peer_count,
+            peer_is_priority_owner,
+        }) == (SelectOutboundWindowDecisionContext {
+            last_day_only_mode,
+            normalized_live_peer_count,
+            peer_is_priority_owner,
+        }),
+{
 }
 
 proof fn low_mem_or_peer_restriction_uses_low_mem_cold_tier()

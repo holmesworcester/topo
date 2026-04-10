@@ -62,6 +62,12 @@ struct PlannerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColdTierRawRows {
+    global_low_mem_mode: bool,
+    restrict_to_low_mem_windows: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ColdTierDecisionContext {
     global_low_mem_mode: bool,
     restrict_to_low_mem_windows: bool,
@@ -71,6 +77,13 @@ struct ColdTierDecisionContext {
 enum ColdTierPlan {
     Default,
     LowMemOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectOutboundWindowRawRows {
+    last_day_only_mode: bool,
+    normalized_live_peer_count: usize,
+    peer_is_priority_owner: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,10 +159,28 @@ fn tenant_state_for<'a>(
 }
 
 fn cold_tier_order(planner: &PlannerState) -> &'static [SyncWindowKind] {
-    cold_tier_order_for_plan(decide_cold_tier_plan(&ColdTierDecisionContext {
+    let context = normalize_cold_tier_context(ColdTierRawRows {
         global_low_mem_mode: low_mem_mode(),
         restrict_to_low_mem_windows: planner.restrict_to_low_mem_windows,
-    }))
+    });
+    cold_tier_order_for_plan(decide_cold_tier_plan(&context))
+}
+
+fn normalize_cold_tier_context(raw_rows: ColdTierRawRows) -> ColdTierDecisionContext {
+    ColdTierDecisionContext {
+        global_low_mem_mode: raw_rows.global_low_mem_mode,
+        restrict_to_low_mem_windows: raw_rows.restrict_to_low_mem_windows,
+    }
+}
+
+fn normalize_select_outbound_window_context(
+    raw_rows: SelectOutboundWindowRawRows,
+) -> SelectOutboundWindowDecisionContext {
+    SelectOutboundWindowDecisionContext {
+        last_day_only_mode: raw_rows.last_day_only_mode,
+        normalized_live_peer_count: raw_rows.normalized_live_peer_count,
+        peer_is_priority_owner: raw_rows.peer_is_priority_owner,
+    }
 }
 
 fn decide_cold_tier_plan(context: &ColdTierDecisionContext) -> ColdTierPlan {
@@ -281,22 +312,26 @@ pub fn select_outbound_window(
 ) -> SyncWindow {
     let last_day_only_mode = sync_last_day_only_mode();
     if matches!(
-        decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
-            last_day_only_mode,
-            normalized_live_peer_count: 0,
-            peer_is_priority_owner: false,
-        }),
+        decide_select_outbound_window_plan(&normalize_select_outbound_window_context(
+            SelectOutboundWindowRawRows {
+                last_day_only_mode,
+                normalized_live_peer_count: 0,
+                peer_is_priority_owner: false,
+            },
+        )),
         SelectOutboundWindowPlan::LastDayOnly
     ) {
         return window_for_kind(SyncWindowKind::LastDay, now_ms);
     }
     let live_peers = normalized_live_peers(peer_id, live_peer_ids);
     if matches!(
-        decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
-            last_day_only_mode,
-            normalized_live_peer_count: live_peers.len(),
-            peer_is_priority_owner: false,
-        }),
+        decide_select_outbound_window_plan(&normalize_select_outbound_window_context(
+            SelectOutboundWindowRawRows {
+                last_day_only_mode,
+                normalized_live_peer_count: live_peers.len(),
+                peer_is_priority_owner: false,
+            },
+        )),
         SelectOutboundWindowPlan::SinglePeer
     ) {
         return select_single_peer_window(db_path, recorded_by, peer_id, now_ms);
@@ -319,11 +354,13 @@ pub fn select_outbound_window(
     };
 
     if matches!(
-        decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
-            last_day_only_mode,
-            normalized_live_peer_count: live_peers.len(),
-            peer_is_priority_owner: owner_kind.is_some(),
-        }),
+        decide_select_outbound_window_plan(&normalize_select_outbound_window_context(
+            SelectOutboundWindowRawRows {
+                last_day_only_mode,
+                normalized_live_peer_count: live_peers.len(),
+                peer_is_priority_owner: owner_kind.is_some(),
+            },
+        )),
         SelectOutboundWindowPlan::MultiPeerPriorityOwner
     ) {
         let kind = owner_kind.expect("priority-owner plan requires owner window kind");
@@ -629,6 +666,43 @@ mod tests {
     }
 
     #[test]
+    fn cold_tier_normalizer_preserves_raw_rows_for_planner() {
+        let raw_rows = [
+            ColdTierRawRows {
+                global_low_mem_mode: false,
+                restrict_to_low_mem_windows: false,
+            },
+            ColdTierRawRows {
+                global_low_mem_mode: true,
+                restrict_to_low_mem_windows: false,
+            },
+            ColdTierRawRows {
+                global_low_mem_mode: false,
+                restrict_to_low_mem_windows: true,
+            },
+        ];
+
+        for raw in raw_rows {
+            let context = normalize_cold_tier_context(raw);
+            assert_eq!(
+                context,
+                ColdTierDecisionContext {
+                    global_low_mem_mode: raw.global_low_mem_mode,
+                    restrict_to_low_mem_windows: raw.restrict_to_low_mem_windows,
+                }
+            );
+            assert_eq!(
+                decide_cold_tier_plan(&context),
+                if raw.global_low_mem_mode || raw.restrict_to_low_mem_windows {
+                    ColdTierPlan::LowMemOnly
+                } else {
+                    ColdTierPlan::Default
+                }
+            );
+        }
+    }
+
+    #[test]
     fn select_outbound_window_decision_context_prioritizes_hot_window_owner() {
         assert_eq!(
             decide_select_outbound_window_plan(&SelectOutboundWindowDecisionContext {
@@ -662,6 +736,57 @@ mod tests {
             }),
             SelectOutboundWindowPlan::MultiPeerCold
         );
+    }
+
+    #[test]
+    fn select_outbound_window_normalizer_preserves_raw_rows_for_planner() {
+        let raw_rows = [
+            (
+                SelectOutboundWindowRawRows {
+                    last_day_only_mode: true,
+                    normalized_live_peer_count: 3,
+                    peer_is_priority_owner: false,
+                },
+                SelectOutboundWindowPlan::LastDayOnly,
+            ),
+            (
+                SelectOutboundWindowRawRows {
+                    last_day_only_mode: false,
+                    normalized_live_peer_count: 1,
+                    peer_is_priority_owner: false,
+                },
+                SelectOutboundWindowPlan::SinglePeer,
+            ),
+            (
+                SelectOutboundWindowRawRows {
+                    last_day_only_mode: false,
+                    normalized_live_peer_count: 3,
+                    peer_is_priority_owner: true,
+                },
+                SelectOutboundWindowPlan::MultiPeerPriorityOwner,
+            ),
+            (
+                SelectOutboundWindowRawRows {
+                    last_day_only_mode: false,
+                    normalized_live_peer_count: 3,
+                    peer_is_priority_owner: false,
+                },
+                SelectOutboundWindowPlan::MultiPeerCold,
+            ),
+        ];
+
+        for (raw, expected_plan) in raw_rows {
+            let context = normalize_select_outbound_window_context(raw);
+            assert_eq!(
+                context,
+                SelectOutboundWindowDecisionContext {
+                    last_day_only_mode: raw.last_day_only_mode,
+                    normalized_live_peer_count: raw.normalized_live_peer_count,
+                    peer_is_priority_owner: raw.peer_is_priority_owner,
+                }
+            );
+            assert_eq!(decide_select_outbound_window_plan(&context), expected_plan);
+        }
     }
 
     #[test]
