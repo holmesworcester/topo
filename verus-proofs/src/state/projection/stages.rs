@@ -4,6 +4,13 @@ use vstd::prelude::*;
 
 verus! {
 
+pub enum ContextLoadDispositionDecisionContext {
+    Ready,
+    Block,
+    Reject,
+    Purge,
+}
+
 pub enum ContextLoadDispositionPlan {
     Continue,
     RecordBlockAndReturn,
@@ -25,20 +32,17 @@ pub enum ProjectionDecisionEffectPlan {
 }
 
 pub open spec fn decide_context_load_disposition(
-    context_ready: bool,
-    context_blocked: bool,
-    context_rejected: bool,
-    context_purged: bool,
+    context: ContextLoadDispositionDecisionContext,
 ) -> ContextLoadDispositionPlan {
-    if context_ready {
-        ContextLoadDispositionPlan::Continue
-    } else if context_blocked {
-        ContextLoadDispositionPlan::RecordBlockAndReturn
-    } else if context_rejected {
-        ContextLoadDispositionPlan::Reject
-    } else {
-        let _ = context_purged;
-        ContextLoadDispositionPlan::EmitHardPurgeAndReturn
+    match context {
+        ContextLoadDispositionDecisionContext::Ready => ContextLoadDispositionPlan::Continue,
+        ContextLoadDispositionDecisionContext::Block => {
+            ContextLoadDispositionPlan::RecordBlockAndReturn
+        }
+        ContextLoadDispositionDecisionContext::Reject => ContextLoadDispositionPlan::Reject,
+        ContextLoadDispositionDecisionContext::Purge => {
+            ContextLoadDispositionPlan::EmitHardPurgeAndReturn
+        }
     }
 }
 
@@ -54,16 +58,23 @@ pub open spec fn decide_projection_decision_effect_plan(
     }
 }
 
+proof fn ready_context_continues_to_projector()
+    ensures
+        decide_context_load_disposition(ContextLoadDispositionDecisionContext::Ready)
+            == ContextLoadDispositionPlan::Continue,
+{
+}
+
 proof fn blocked_context_records_block_and_returns()
     ensures
-        decide_context_load_disposition(false, true, false, false)
+        decide_context_load_disposition(ContextLoadDispositionDecisionContext::Block)
             == ContextLoadDispositionPlan::RecordBlockAndReturn,
 {
 }
 
 proof fn purged_context_emits_only_hard_purge()
     ensures
-        decide_context_load_disposition(false, false, false, true)
+        decide_context_load_disposition(ContextLoadDispositionDecisionContext::Purge)
             == ContextLoadDispositionPlan::EmitHardPurgeAndReturn,
 {
 }
@@ -74,6 +85,13 @@ proof fn reject_and_already_processed_have_no_effects()
             == ProjectionDecisionEffectPlan::NoEffects,
         decide_projection_decision_effect_plan(ProjectionDecision::AlreadyProcessed)
             == ProjectionDecisionEffectPlan::NoEffects,
+{
+}
+
+proof fn valid_applies_write_ops_and_commands()
+    ensures
+        decide_projection_decision_effect_plan(ProjectionDecision::Valid)
+            == ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands,
 {
 }
 

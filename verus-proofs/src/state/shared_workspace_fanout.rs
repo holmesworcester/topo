@@ -4,6 +4,13 @@ use vstd::prelude::*;
 
 verus! {
 
+pub struct SharedFanoutDecisionContext {
+    pub origin_rejected: bool,
+    pub origin_removed: bool,
+    pub removal_event: bool,
+    pub has_any_eligible_sibling: bool,
+}
+
 pub enum SharedFanoutPlan {
     SkipOriginRejected,
     SkipOriginRemoved,
@@ -20,16 +27,13 @@ pub open spec fn sibling_is_eligible_for_fanout(
 }
 
 pub open spec fn decide_shared_fanout_plan(
-    origin_rejected: bool,
-    origin_removed: bool,
-    removal_event: bool,
-    has_any_eligible_sibling: bool,
+    context: &SharedFanoutDecisionContext,
 ) -> SharedFanoutPlan {
-    if origin_rejected {
+    if context.origin_rejected {
         SharedFanoutPlan::SkipOriginRejected
-    } else if origin_removed && !removal_event {
+    } else if context.origin_removed && !context.removal_event {
         SharedFanoutPlan::SkipOriginRemoved
-    } else if has_any_eligible_sibling {
+    } else if context.has_any_eligible_sibling {
         SharedFanoutPlan::FanoutToTargets
     } else {
         SharedFanoutPlan::NoTargets
@@ -38,23 +42,46 @@ pub open spec fn decide_shared_fanout_plan(
 
 proof fn removed_origin_cannot_fanout_non_removal_events()
     ensures
-        decide_shared_fanout_plan(false, true, false, true)
-            == SharedFanoutPlan::SkipOriginRemoved,
+        decide_shared_fanout_plan(&SharedFanoutDecisionContext {
+            origin_rejected: false,
+            origin_removed: true,
+            removal_event: false,
+            has_any_eligible_sibling: true,
+        }) == SharedFanoutPlan::SkipOriginRemoved,
 {
 }
 
 proof fn targeted_removal_can_reach_removed_sibling()
     ensures
         sibling_is_eligible_for_fanout(true, false, true),
-        decide_shared_fanout_plan(false, false, true, true)
-            == SharedFanoutPlan::FanoutToTargets,
+        decide_shared_fanout_plan(&SharedFanoutDecisionContext {
+            origin_rejected: false,
+            origin_removed: false,
+            removal_event: true,
+            has_any_eligible_sibling: true,
+        }) == SharedFanoutPlan::FanoutToTargets,
 {
 }
 
 proof fn origin_rejection_blocks_all_fanout()
     ensures
-        decide_shared_fanout_plan(true, false, true, true)
-            == SharedFanoutPlan::SkipOriginRejected,
+        decide_shared_fanout_plan(&SharedFanoutDecisionContext {
+            origin_rejected: true,
+            origin_removed: false,
+            removal_event: true,
+            has_any_eligible_sibling: true,
+        }) == SharedFanoutPlan::SkipOriginRejected,
+{
+}
+
+proof fn no_eligible_sibling_produces_no_targets()
+    ensures
+        decide_shared_fanout_plan(&SharedFanoutDecisionContext {
+            origin_rejected: false,
+            origin_removed: false,
+            removal_event: false,
+            has_any_eligible_sibling: false,
+        }) == SharedFanoutPlan::NoTargets,
 {
 }
 
