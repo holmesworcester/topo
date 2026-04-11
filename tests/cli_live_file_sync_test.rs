@@ -84,6 +84,15 @@ fn test_cli_incomplete_download_visible_before_completion() {
         "topo files snapshot should still be incomplete:\n{}",
         incomplete_snapshot
     );
+    let incomplete_line = incomplete_snapshot
+        .lines()
+        .find(|line| line.contains("\u{23f3}  large-payload.bin"))
+        .expect("incomplete file line present");
+    assert!(
+        incomplete_line.contains('%'),
+        "topo files incomplete line should include a percentage:\n{}",
+        incomplete_line
+    );
 
     let files_complete = assert_value_eventually(
         Duration::from_secs(60),
