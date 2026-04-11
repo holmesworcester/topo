@@ -6,6 +6,124 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
+fn test_cli_incomplete_download_visible_before_completion() {
+    hold_network_test_lock_for_binary();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir
+        .path()
+        .join("alice_incomplete_file.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bob_db = tmpdir
+        .path()
+        .join("bob_incomplete_file.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let source_path = tmpdir.path().join("large-payload.bin");
+    let mut source_file = std::fs::File::create(&source_path).unwrap();
+    let mut chunk = vec![0u8; 1024 * 1024];
+    for (i, b) in chunk.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    for _ in 0..128 {
+        source_file.write_all(&chunk).unwrap();
+    }
+    source_file.flush().unwrap();
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon(&alice_db);
+
+    let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon(&bob_db);
+
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    let gate_eid = send_message(&alice_db, "pre-incomplete-file-gate");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", gate_eid.trim()),
+        60_000,
+    );
+
+    let send_out = Command::new(bin())
+        .args([
+            "--db",
+            &alice_db,
+            "send-file",
+            "large binary payload",
+            "--file",
+            source_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run send-file");
+    assert!(
+        send_out.status.success(),
+        "send-file failed: {}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+
+    let incomplete_snapshot = assert_value_eventually(
+        Duration::from_secs(60),
+        Duration::from_millis(25),
+        "incomplete attachment appears in topo files before completion",
+        || get_files_raw(&bob_db),
+        |files_stdout| files_stdout.contains("\u{23f3}  large-payload.bin"),
+    );
+
+    assert!(
+        incomplete_snapshot.contains("\u{23f3}  large-payload.bin"),
+        "topo files should expose the attachment before completion:\n{}",
+        incomplete_snapshot
+    );
+    assert!(
+        !incomplete_snapshot.contains("\u{2714}  large-payload.bin"),
+        "topo files snapshot should still be incomplete:\n{}",
+        incomplete_snapshot
+    );
+
+    let files_complete = assert_value_eventually(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        "completed attachment appears in topo files",
+        || get_files_raw(&bob_db),
+        |files_stdout| files_stdout.contains("\u{2714}  large-payload.bin"),
+    );
+    let messages_complete = assert_value_eventually(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        "completed attachment appears in topo messages",
+        || get_messages_raw(&bob_db),
+        |messages_stdout| messages_stdout.contains("\u{2714}  large-payload.bin"),
+    );
+    assert!(
+        files_complete.contains("\u{2714}  large-payload.bin"),
+        "topo files should show the attachment as complete:\n{}",
+        files_complete
+    );
+    assert!(
+        messages_complete.contains("\u{2714}  large-payload.bin"),
+        "topo messages should show the attachment as complete:\n{}",
+        messages_complete
+    );
+
+    let restored_path = tmpdir.path().join("restored.bin");
+    save_file_eventually(
+        &bob_db,
+        "1",
+        restored_path.to_str().unwrap(),
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        std::fs::read(&restored_path).unwrap(),
+        std::fs::read(&source_path).unwrap()
+    );
+}
+
+#[test]
 fn test_cli_live_message_during_large_file_sync() {
     hold_network_test_lock_for_binary();
     let tmpdir = tempfile::tempdir().unwrap();

@@ -106,7 +106,9 @@ pub fn open_db_for_peer(
     peer_id: &str,
 ) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
     let conn = open_connection(db_path)?;
-    create_tables(&conn)?;
+    // The daemon owns schema initialization at startup. Re-running DDL here
+    // forces a write lock and can starve read RPCs such as `topo files` while
+    // an active download is writing file slices.
     Ok((peer_id.to_string(), conn))
 }
 

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use negentropy::{Id, NegentropyStorageVector};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::debug;
 
@@ -1031,13 +1031,42 @@ fn load_selected_direct_deps(
         .into_iter()
         .filter(|dep_id| selected_ids.contains(dep_id))
         .collect::<Vec<_>>();
+    if let Some(descriptor_dep_id) =
+        load_selected_file_descriptor_dep(conn, event_id, selected_ids)?
+    {
+        dep_ids.push(descriptor_dep_id);
+    }
     dep_ids.sort_by(|left, right| {
         let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
         let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
         left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
     });
+    dep_ids.dedup();
     dep_cache.insert(*event_id, dep_ids.clone());
     Ok(dep_ids)
+}
+
+fn load_selected_file_descriptor_dep(
+    conn: &Connection,
+    event_id: &EventId,
+    selected_ids: &HashSet<EventId>,
+) -> Result<Option<EventId>, String> {
+    let descriptor_event_id_b64: Option<String> = conn
+        .query_row(
+            "SELECT descriptor_event_id
+             FROM file_slices
+             WHERE event_id = ?1
+               AND descriptor_event_id != ''
+             ORDER BY recorded_by ASC
+             LIMIT 1",
+            rusqlite::params![event_id_to_base64(event_id)],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()
+        .map_err(|e| format!("load file_slice descriptor dependency: {e}"))?;
+    Ok(descriptor_event_id_b64
+        .and_then(|event_id_b64| crate::crypto::event_id_from_base64(&event_id_b64))
+        .filter(|descriptor_event_id| selected_ids.contains(descriptor_event_id)))
 }
 
 fn visit_selected_send_order(
@@ -2120,6 +2149,83 @@ mod tests {
 
         assert!(wrong_workspace_order.is_empty());
         assert_eq!(matching_workspace_order, vec![event_id]);
+    }
+
+    #[test]
+    fn order_requested_ids_for_send_emits_file_descriptor_before_selected_file_slice() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "workspace-files";
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: Some(10_000),
+        };
+
+        let file_blob = b"shared file descriptor";
+        let file_event_id = hash_event(file_blob);
+        insert_event(
+            &conn,
+            &file_event_id,
+            "file",
+            file_blob,
+            ShareScope::Shared,
+            100,
+            100,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![workspace_id, 100i64, file_event_id.as_slice()],
+        )
+        .unwrap();
+
+        let file_slice_blob = b"shared file slice";
+        let file_slice_event_id = hash_event(file_slice_blob);
+        insert_event(
+            &conn,
+            &file_slice_event_id,
+            "file_slice",
+            file_slice_blob,
+            ShareScope::Shared,
+            200,
+            200,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![workspace_id, 200i64, file_slice_event_id.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "tenant-a",
+                "file-id-b64",
+                0i64,
+                event_id_to_base64(&file_slice_event_id),
+                200i64,
+                event_id_to_base64(&file_event_id),
+            ],
+        )
+        .unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = order_requested_ids_for_send(
+            &conn,
+            &store,
+            workspace_id,
+            range,
+            &[file_slice_event_id, file_event_id],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![file_event_id, file_slice_event_id]);
     }
 
     #[test]
