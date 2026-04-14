@@ -2,7 +2,6 @@ pub mod daemon_identity;
 pub mod dep_index;
 pub mod event_display;
 pub mod health;
-pub mod hot_week_deps;
 pub mod iroh_log;
 pub mod local_client_ops;
 pub mod need_queue;
@@ -115,7 +114,6 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     iroh_log::ensure_schema(conn)?;
     project_queue::ensure_schema(conn)?;
     health::ensure_schema(conn)?;
-    hot_week_deps::ensure_schema(conn)?;
     negentropy_cache::ensure_schema(conn)?;
     sync_log::ensure_schema(conn)?;
     timeline::ensure_schema(conn)?;

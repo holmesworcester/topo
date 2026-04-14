@@ -8,11 +8,14 @@ use crate::db::{open_connection, store::Store};
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::peering::loops::live_session_peer_ids;
 use crate::runtime::sync_engine::session::admission::resolve_sync_admission;
+use crate::runtime::sync_engine::session::depsync::{
+    build_candidate_storage, build_range_dep_storage, decode_dep_sync_control,
+    encode_dep_sync_control, DepSyncControlPayload,
+};
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
-    load_shared_event_index_slice, open_live_suppression_session, send_have_events,
-    spawn_receive_log_task,
+    open_live_suppression_session, send_selected_events, spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, enqueue_receive_log_ingest_with_pending_overlay,
@@ -25,7 +28,7 @@ use crate::sync::session::windowing::{
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use crate::tuning::low_mem_mode;
-use negentropy::{Id, Negentropy};
+use negentropy::{DepReconcileDiff, DepReconciler, Id, Negentropy};
 
 type ManualRoundReply =
     std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>>;
@@ -50,22 +53,29 @@ fn drain_manual_commands(
 
 fn reply_manual_rounds(
     peer_id: &str,
-    need_ids: &[Id],
+    need_ids: &[crate::crypto::EventId],
     pending_round_replies: &mut Vec<ManualRoundReply>,
 ) {
     if pending_round_replies.is_empty() {
         return;
     }
-    let observed_ids: Vec<String> = need_ids
-        .iter()
-        .map(|id| hex::encode(neg_id_to_event_id(id)))
-        .collect();
+    let observed_ids: Vec<String> = need_ids.iter().map(hex::encode).collect();
     for reply in pending_round_replies.drain(..) {
         let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRoundCapture {
             peer_id: peer_id.to_string(),
             observed_ids: observed_ids.clone(),
         }));
     }
+}
+
+fn sort_dedup_ids(ids: &mut Vec<Id>) {
+    ids.sort_unstable();
+    ids.dedup();
+}
+
+fn sort_dedup_event_ids(ids: &mut Vec<crate::crypto::EventId>) {
+    ids.sort_unstable();
+    ids.dedup();
 }
 
 /// Run sync as the responder for one requested range.
@@ -124,12 +134,17 @@ where
 
     let db = open_connection(db_path)?;
     let ws_id = resolve_sync_admission(&db, recorded_by)?;
-    let storage = load_shared_event_index_slice(&db, db_path, &ws_id, range)?;
-    let mut neg = Negentropy::borrowed(storage.as_ref(), NEGENTROPY_FRAME_SIZE_LIMIT)?;
+    let phase1_storage = build_range_dep_storage(&db, db_path, &ws_id, range)?;
+    let mut phase1 = DepReconciler::borrowed(phase1_storage.as_ref());
 
-    let mut have_ids = Vec::<Id>::new();
-    let mut need_ids = Vec::<Id>::new();
-    let mut next_query = Some(neg_msg.to_vec());
+    let initial_payload = decode_dep_sync_control(neg_msg)
+        .map_err(|e| format!("responder failed to decode initial phase1 payload: {e}"))?;
+    let DepSyncControlPayload::Phase1(initial_phase1_query) = initial_payload else {
+        return Err("responder expected initial phase1 query payload".into());
+    };
+
+    let mut phase1_diff = DepReconcileDiff::default();
+    let mut next_query = Some(initial_phase1_query);
     loop {
         let query = if let Some(query) = next_query.take() {
             query
@@ -139,30 +154,172 @@ where
             let Frame::NegMsg { msg } = next else {
                 return Err("responder expected follow-up NegMsg".into());
             };
-            msg
+            let payload = decode_dep_sync_control(&msg)
+                .map_err(|e| format!("responder failed to decode phase1 payload: {e}"))?;
+            match payload {
+                DepSyncControlPayload::Phase1(msg) => msg,
+                DepSyncControlPayload::Phase1Done => break,
+                other => {
+                    return Err(
+                        format!("responder expected phase1 payload, got {:?}", other).into(),
+                    )
+                }
+            }
         };
-        if query.is_empty() {
-            break;
-        }
-        let response = neg.reconcile_with_diff(&query, &mut have_ids, &mut need_ids)?;
-        control.send(&Frame::NegMsg { msg: response }).await?;
+        let response = phase1.reconcile_with_diff(&query, &mut phase1_diff)?;
+        control
+            .send(&Frame::NegMsg {
+                msg: encode_dep_sync_control(&DepSyncControlPayload::Phase1(response)),
+            })
+            .await?;
         control.flush().await?;
     }
-    have_ids.sort_unstable();
-    have_ids.dedup();
-    need_ids.sort_unstable();
-    need_ids.dedup();
+    sort_dedup_ids(&mut phase1_diff.have_root_ids);
+    sort_dedup_ids(&mut phase1_diff.need_root_ids);
+    sort_dedup_ids(&mut phase1_diff.dep_probe_root_ids);
     debug!(
         target: "topo::sync_operation",
         session_id,
         peer = %&peer_id[..peer_id.len().min(16)],
         range = ?range.kind,
-        have_count = have_ids.len(),
-        need_count = need_ids.len(),
-        "responder negentropy reconcile complete"
+        have_root_count = phase1_diff.have_root_ids.len(),
+        need_root_count = phase1_diff.need_root_ids.len(),
+        dep_probe_root_count = phase1_diff.dep_probe_root_ids.len(),
+        "responder phase1 dep reconciliation complete"
     );
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
-    reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
+
+    let mut phase1_candidate_root_ids = phase1_diff
+        .have_root_ids
+        .iter()
+        .map(neg_id_to_event_id)
+        .collect::<Vec<_>>();
+    phase1_candidate_root_ids.extend(
+        phase1_diff
+            .dep_probe_root_ids
+            .iter()
+            .map(neg_id_to_event_id),
+    );
+    sort_dedup_event_ids(&mut phase1_candidate_root_ids);
+
+    let local_dep_candidates =
+        phase1_storage.dep_candidate_ids_for_roots(&phase1_candidate_root_ids);
+    let mut candidate_universe = local_dep_candidates.clone();
+    loop {
+        let next = tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv()).await??;
+        let Frame::NegMsg { msg } = next else {
+            return Err("responder expected dep candidate payload".into());
+        };
+        match decode_dep_sync_control(&msg)
+            .map_err(|e| format!("responder failed to decode dep candidate payload: {e}"))?
+        {
+            DepSyncControlPayload::DepCandidateChunk(ids) => candidate_universe.extend(ids),
+            DepSyncControlPayload::DepCandidateDone => break,
+            other => {
+                return Err(
+                    format!("responder expected dep candidate payload, got {:?}", other).into(),
+                )
+            }
+        }
+    }
+    sort_dedup_event_ids(&mut candidate_universe);
+
+    for chunk in crate::runtime::sync_engine::session::depsync::chunk_event_ids(
+        &local_dep_candidates,
+        crate::runtime::sync_engine::session::depsync::DEP_CANDIDATE_CHUNK_SIZE,
+    ) {
+        control
+            .send(&Frame::NegMsg {
+                msg: encode_dep_sync_control(&DepSyncControlPayload::DepCandidateChunk(chunk)),
+            })
+            .await?;
+    }
+    control
+        .send(&Frame::NegMsg {
+            msg: encode_dep_sync_control(&DepSyncControlPayload::DepCandidateDone),
+        })
+        .await?;
+    control.flush().await?;
+
+    let store = Store::new(&db);
+    let mut phase2_have_ids = Vec::<Id>::new();
+    let mut phase2_need_ids = Vec::<Id>::new();
+    let phase2_used = !candidate_universe.is_empty();
+    if phase2_used {
+        let phase2_storage = build_candidate_storage(&store, &candidate_universe)?;
+        let mut phase2 = Negentropy::borrowed(&phase2_storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
+        let mut next_query = None::<Vec<u8>>;
+        loop {
+            let query = if let Some(query) = next_query.take() {
+                query
+            } else {
+                let next = tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv())
+                    .await??;
+                let Frame::NegMsg { msg } = next else {
+                    return Err("responder expected phase2 NegMsg".into());
+                };
+                let payload = decode_dep_sync_control(&msg)
+                    .map_err(|e| format!("responder failed to decode phase2 payload: {e}"))?;
+                match payload {
+                    DepSyncControlPayload::Phase2(msg) => msg,
+                    DepSyncControlPayload::Phase2Done => break,
+                    other => {
+                        return Err(
+                            format!("responder expected phase2 payload, got {:?}", other).into(),
+                        )
+                    }
+                }
+            };
+            let response =
+                phase2.reconcile_with_diff(&query, &mut phase2_have_ids, &mut phase2_need_ids)?;
+            control
+                .send(&Frame::NegMsg {
+                    msg: encode_dep_sync_control(&DepSyncControlPayload::Phase2(response)),
+                })
+                .await?;
+            control.flush().await?;
+        }
+        sort_dedup_ids(&mut phase2_have_ids);
+        sort_dedup_ids(&mut phase2_need_ids);
+    } else {
+        let next = tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv()).await??;
+        let Frame::NegMsg { msg } = next else {
+            return Err("responder expected phase2 terminator".into());
+        };
+        let payload = decode_dep_sync_control(&msg)
+            .map_err(|e| format!("responder failed to decode phase2 terminator: {e}"))?;
+        if !matches!(payload, DepSyncControlPayload::Phase2Done) {
+            return Err("responder expected phase2 done payload".into());
+        }
+    }
+    debug!(
+        target: "topo::sync_operation",
+        session_id,
+        peer = %&peer_id[..peer_id.len().min(16)],
+        range = ?range.kind,
+        candidate_dep_count = candidate_universe.len(),
+        confirmed_dep_have_count = phase2_have_ids.len(),
+        confirmed_dep_need_count = phase2_need_ids.len(),
+        "responder phase2 dependency negentropy complete"
+    );
+
+    let mut observed_need_ids = phase1_diff
+        .need_root_ids
+        .iter()
+        .map(neg_id_to_event_id)
+        .collect::<Vec<_>>();
+    observed_need_ids.extend(phase2_need_ids.iter().map(neg_id_to_event_id));
+    sort_dedup_event_ids(&mut observed_need_ids);
+    drain_manual_commands(&mut command_rx, &mut pending_round_replies);
+    reply_manual_rounds(peer_id, &observed_need_ids, &mut pending_round_replies);
+
+    let mut send_event_ids = phase1_diff
+        .have_root_ids
+        .iter()
+        .map(neg_id_to_event_id)
+        .collect::<Vec<_>>();
+    send_event_ids.extend(phase2_have_ids.iter().map(neg_id_to_event_id));
+    sort_dedup_event_ids(&mut send_event_ids);
 
     let hot_receive = is_priority_ingest_window(range.kind);
     if hot_receive {
@@ -196,12 +353,11 @@ where
         rx_capture,
         receive_live_suppression,
     );
-    let store = Store::new(&db);
-    let (events_sent, bytes_sent) = send_have_events(
+    let (events_sent, bytes_sent) = send_selected_events(
         &db,
         &store,
         &mut data_send,
-        &have_ids,
+        &send_event_ids,
         recorded_by,
         &ws_id,
         range,
@@ -246,12 +402,11 @@ where
         "responder sync session complete"
     );
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
-    reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
     Ok(SyncStats {
         events_sent,
         events_received: received.events_received,
-        neg_rounds: 1,
+        neg_rounds: 1 + u64::from(phase2_used),
         bytes_sent,
         bytes_received: received.bytes_received,
         duration_ms: start.elapsed().as_millis(),

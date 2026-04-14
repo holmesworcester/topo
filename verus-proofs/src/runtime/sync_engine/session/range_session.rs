@@ -5,7 +5,7 @@ use vstd::prelude::*;
 verus! {
 
 pub enum SyncWindowKind {
-    Full,
+    Old,
     LastDay,
     LastWeek,
     LastTwelveWeeks,
@@ -18,19 +18,22 @@ pub enum SharedSendOrderPolicy {
 
 pub struct SharedSyncEntryRawRows {
     pub window_kind: SyncWindowKind,
-    pub base_entry_count: nat,
-    pub hot_week_dep_entry_count: nat,
+    pub root_entry_count: nat,
+    pub cache_epoch_matches: bool,
+    pub cache_bounds_match: bool,
 }
 
 pub struct SharedSyncEntryDecisionContext {
     pub window_kind: SyncWindowKind,
-    pub base_entry_count: nat,
-    pub hot_week_dep_entry_count: nat,
+    pub root_entry_count: nat,
+    pub cache_epoch_matches: bool,
+    pub cache_bounds_match: bool,
 }
 
 pub struct SharedSyncEntryPlan {
-    pub include_hot_week_deps: bool,
-    pub candidate_entry_count: nat,
+    pub dep_search_enabled: bool,
+    pub candidate_root_count: nat,
+    pub reuse_cached_snapshot: bool,
 }
 
 pub struct SharedSendEligibilityRawRows {
@@ -74,18 +77,18 @@ pub open spec fn decide_shared_send_order_policy(
 ) -> SharedSendOrderPolicy {
     match kind {
         SyncWindowKind::LastDay => SharedSendOrderPolicy::NewestFirst,
-        SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
+        SyncWindowKind::Old | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
             SharedSendOrderPolicy::PreserveInput
         }
     }
 }
 
-pub open spec fn should_include_hot_week_deps(kind: SyncWindowKind) -> bool {
+pub open spec fn should_search_deps(kind: SyncWindowKind) -> bool {
     match kind {
         SyncWindowKind::LastDay | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
             true
         }
-        SyncWindowKind::Full => false,
+        SyncWindowKind::Old => false,
     }
 }
 
@@ -94,22 +97,19 @@ pub open spec fn normalize_shared_sync_entry_context(
 ) -> SharedSyncEntryDecisionContext {
     SharedSyncEntryDecisionContext {
         window_kind: raw_rows.window_kind,
-        base_entry_count: raw_rows.base_entry_count,
-        hot_week_dep_entry_count: raw_rows.hot_week_dep_entry_count,
+        root_entry_count: raw_rows.root_entry_count,
+        cache_epoch_matches: raw_rows.cache_epoch_matches,
+        cache_bounds_match: raw_rows.cache_bounds_match,
     }
 }
 
 pub open spec fn decide_shared_sync_entry_plan(
     context: &SharedSyncEntryDecisionContext,
 ) -> SharedSyncEntryPlan {
-    let include_hot_week_deps = should_include_hot_week_deps(context.window_kind);
     SharedSyncEntryPlan {
-        include_hot_week_deps,
-        candidate_entry_count: if include_hot_week_deps {
-            context.base_entry_count + context.hot_week_dep_entry_count
-        } else {
-            context.base_entry_count
-        },
+        dep_search_enabled: should_search_deps(context.window_kind),
+        candidate_root_count: context.root_entry_count,
+        reuse_cached_snapshot: context.cache_epoch_matches && context.cache_bounds_match,
     }
 }
 
@@ -163,24 +163,27 @@ proof fn send_order_policy_matches_window_kind()
     ensures
         decide_shared_send_order_policy(SyncWindowKind::LastDay)
             == SharedSendOrderPolicy::NewestFirst,
-        decide_shared_send_order_policy(SyncWindowKind::Full)
+        decide_shared_send_order_policy(SyncWindowKind::Old)
             == SharedSendOrderPolicy::PreserveInput,
 {
 }
 
 proof fn shared_sync_entry_normalizer_preserves_query_facts(
-    base_count: nat,
-    hot_dep_count: nat,
+    root_count: nat,
+    cache_epoch_matches: bool,
+    cache_bounds_match: bool,
 )
     ensures
         normalize_shared_sync_entry_context(SharedSyncEntryRawRows {
             window_kind: SyncWindowKind::LastDay,
-            base_entry_count: base_count,
-            hot_week_dep_entry_count: hot_dep_count,
+            root_entry_count: root_count,
+            cache_epoch_matches,
+            cache_bounds_match,
         }) == (SharedSyncEntryDecisionContext {
             window_kind: SyncWindowKind::LastDay,
-            base_entry_count: base_count,
-            hot_week_dep_entry_count: hot_dep_count,
+            root_entry_count: root_count,
+            cache_epoch_matches,
+            cache_bounds_match,
         }),
 {
 }
@@ -259,39 +262,68 @@ proof fn shared_send_eligibility_auth_path_noninterference(
 {
 }
 
-proof fn full_window_does_not_expand_hot_week_deps(base_count: nat, hot_dep_count: nat)
+proof fn old_window_disables_dep_search(root_count: nat)
     ensures
         decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-            window_kind: SyncWindowKind::Full,
-            base_entry_count: base_count,
-            hot_week_dep_entry_count: hot_dep_count,
+            window_kind: SyncWindowKind::Old,
+            root_entry_count: root_count,
+            cache_epoch_matches: false,
+            cache_bounds_match: false,
         }) == (SharedSyncEntryPlan {
-            include_hot_week_deps: false,
-            candidate_entry_count: base_count,
+            dep_search_enabled: false,
+            candidate_root_count: root_count,
+            reuse_cached_snapshot: false,
         }),
 {
 }
 
-proof fn hot_windows_expand_hot_week_deps(base_count: nat, hot_dep_count: nat)
+proof fn hot_windows_enable_dep_search(root_count: nat)
     ensures
         decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
             window_kind: SyncWindowKind::LastDay,
-            base_entry_count: base_count,
-            hot_week_dep_entry_count: hot_dep_count,
+            root_entry_count: root_count,
+            cache_epoch_matches: false,
+            cache_bounds_match: false,
         }) == (SharedSyncEntryPlan {
-            include_hot_week_deps: true,
-            candidate_entry_count: base_count + hot_dep_count,
+            dep_search_enabled: true,
+            candidate_root_count: root_count,
+            reuse_cached_snapshot: false,
         }),
         decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
             window_kind: SyncWindowKind::LastWeek,
-            base_entry_count: base_count,
-            hot_week_dep_entry_count: hot_dep_count,
-        }).include_hot_week_deps,
+            root_entry_count: root_count,
+            cache_epoch_matches: false,
+            cache_bounds_match: false,
+        }).dep_search_enabled,
         decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
             window_kind: SyncWindowKind::LastTwelveWeeks,
-            base_entry_count: base_count,
-            hot_week_dep_entry_count: hot_dep_count,
-        }).include_hot_week_deps,
+            root_entry_count: root_count,
+            cache_epoch_matches: false,
+            cache_bounds_match: false,
+        }).dep_search_enabled,
+{
+}
+
+proof fn cache_reuse_requires_epoch_and_bounds_match(root_count: nat, kind: SyncWindowKind)
+    ensures
+        decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
+            window_kind: kind,
+            root_entry_count: root_count,
+            cache_epoch_matches: true,
+            cache_bounds_match: true,
+        }).reuse_cached_snapshot,
+        !decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
+            window_kind: kind,
+            root_entry_count: root_count,
+            cache_epoch_matches: false,
+            cache_bounds_match: true,
+        }).reuse_cached_snapshot,
+        !decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
+            window_kind: kind,
+            root_entry_count: root_count,
+            cache_epoch_matches: true,
+            cache_bounds_match: false,
+        }).reuse_cached_snapshot,
 {
 }
 

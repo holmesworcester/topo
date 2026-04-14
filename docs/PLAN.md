@@ -428,8 +428,8 @@ is the simpler production choice today, but it has a known security caveat.
 1. The original [range-based set reconciliation paper](https://aljoscha-meyer.de/assets/landing/rbsr.pdf) and current stock Negentropy implementations use an algebraically composable fingerprint for each range.
 2. That hashing scheme admits attacker-chosen collision attacks: a malicious peer can interfere with syncing of other peers' events by causing unequal ranges to look equal and therefore preventing deeper reconciliation in those ranges.
 3. The known stronger alternative is [Range-Based Set Reconciliation without Homomorphic Fingerprints](https://aljoscha-meyer.de/assets/landing/rbsr_nonhomomorphic.pdf), which computes range fingerprints from a clamped Merkle tree instead of the classic additive / homomorphic-style fingerprint.
-4. The tradeoff is a somewhat slower initial per-session index build.
-5. Repo guidance for now: prefer rebuilding the in-memory Negentropy hash graph from `shared_event_index` on each range session instead of maintaining a persistent sync-side cache or Merkle index. The protocol leaves room for such caching later, but current experiments favored rebuild-per-session for simplicity and stability.
+4. The tradeoff is a somewhat slower snapshot rebuild when a durable shared-index epoch changes.
+5. Repo guidance for now: keep one immutable in-memory dep-aware snapshot per standard window and reuse it across repeated sync checks until the durable shared-index epoch for that window changes. The protocol still leaves room for a stronger Merkle-style auxiliary structure later, but the current baseline is cached snapshot reuse, not rebuild-per-session.
 
 ## 4.3 Transport regression checklist
 
@@ -1019,7 +1019,7 @@ Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1`,
 
 1. `range receive path` (current runtime): QUIC frame -> hash event id -> append event id and blob to `ReceiveLog` -> background canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
-3. `range session worker`: stock negentropy over one selected window discovers missing ids, streams event blobs, and exchanges live-suppression frames when enabled.
+3. `range session worker`: dep-aware Phase 1 over one selected root window discovers missing roots and dependency-probe roots, an explicit candidate-dep exchange names the dep universe, stock Negentropy Phase 2 confirms missing deps, then the session streams event blobs and live-suppression frames when enabled.
 4. `cleanup worker`: reclaim expired project leases and TTL-purge old endpoint observations.
 
 Queue DRY requirement:
@@ -1030,11 +1030,12 @@ Queue DRY requirement:
 
 Sync event transfer is range-owned:
 1. each session selects one explicit range from the tier ladder,
-2. both sides load that range from `shared_event_index` into an in-memory negentropy vector,
-3. negentropy computes missing event ids for that range,
-4. each side streams its missing event blobs directly on the session data stream,
-5. live suppression mode lets receivers quickly advertise event ids they have already received or are receiving from sibling sessions,
-6. there are no durable `wanted` / `wanted_sources` tables, no `ResponseCredit`, and no per-event pull coordinator in the current plan.
+2. both sides reuse the cached dep-aware snapshot for that root range and overlay pending receive-log roots for local suppression,
+3. dep-aware Phase 1 compares combined fingerprints for root slices and exacts only root ids for small mismatched slices,
+4. both sides expand dep candidates from their Phase 1 local-only and dep-probe roots, exchange those candidate ids, and run stock Negentropy Phase 2 over that dep universe,
+5. each side streams the resulting missing roots plus confirmed-missing deps directly on the session data stream,
+6. live suppression mode lets receivers quickly advertise event ids they have already received or are receiving from sibling sessions,
+7. there are no durable `wanted` / `wanted_sources` tables, no `ResponseCredit`, and no per-event pull coordinator in the current plan.
 
 ## 8.5 Project queue dedupe + purge
 
@@ -1168,10 +1169,12 @@ Operational constraint: serial perf measurements (`--test-threads=1`) must be us
 
 Performance tuning should assume the current preferred maintenance model:
 
-1. Build the Negentropy hash graph in memory at range-session start from `shared_event_index`.
-2. Do not assume a persistent sync-side cache or Merkle tree is the default optimization path.
-3. If future work revisits a persisted auxiliary structure, it must beat rebuild-per-session on measured end-to-end stability and throughput, not just on isolated index-build cost.
-4. If future work adopts the non-homomorphic Merkle approach from [rbsr_nonhomomorphic.pdf](https://aljoscha-meyer.de/assets/landing/rbsr_nonhomomorphic.pdf), treat the extra initial build cost as an explicit security/performance tradeoff rather than a transparent drop-in.
+1. Keep one immutable in-memory dep-aware snapshot per `(db_path, workspace_id, window_kind, bounds, epoch)` and reuse it across repeated sync checks.
+2. Rebuild that snapshot only after the durable shared-index epoch for the window changes or the window bounds roll over.
+3. `LastDay`, `LastWeek`, and `LastTwelveWeeks` snapshots include recursive dependency contribution in Phase 1; `Old` does not expand deps.
+4. Stock Negentropy still remains the exact possession engine for Phase 2 candidate-dependency confirmation.
+5. If future work revisits a persisted auxiliary structure, it must beat cached-snapshot reuse on measured end-to-end stability and throughput, not just on isolated index-build cost.
+6. If future work adopts the non-homomorphic Merkle approach from [rbsr_nonhomomorphic.pdf](https://aljoscha-meyer.de/assets/landing/rbsr_nonhomomorphic.pdf), treat the extra initial build or maintenance cost as an explicit security/performance tradeoff rather than a transparent drop-in.
 
 ### 10.0.1 Implemented: batch dequeue + deferred WAL checkpoint
 
@@ -1282,11 +1285,12 @@ Current runtime shape:
    `last day -> last week -> last twelve weeks -> old`. Peer count,
    priority-owner flags, sorted peer rank, and hash partitions do not decide who
    owns a range.
-2. **Stock negentropy per selected range.** Each range session loads
-   `shared_event_index` plus range-local dep-sync rows into a sealed in-memory
-   `NegentropyStorageVector`, reuses that cached storage until a touched UTC
-   bucket changes, exchanges `NegOpen` / `NegMsg`, and streams missing event
-   blobs for that explicit range.
+2. **Dep-aware negentropy per selected range.** Each range session reuses a
+   cached dep-aware snapshot for one root window, overlays pending receive-log
+   roots for local suppression, runs dep-aware Phase 1 over combined
+   root-plus-dependency fingerprints, exchanges candidate dep ids, runs stock
+   Negentropy Phase 2 over that candidate-dep universe, and then streams the
+   resulting missing event blobs for that explicit range.
 3. **Receive-side event ids.** The receiver hashes each incoming blob once before
    durable append, writes the event id with the blob into the `ReceiveLog`, and
    records a pending-receive overlay entry for active range reconciliation.

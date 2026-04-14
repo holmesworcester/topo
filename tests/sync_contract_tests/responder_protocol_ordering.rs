@@ -15,6 +15,42 @@ use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair, run_local, test_session_meta,
 };
 
+const CONTROL_PHASE1: u8 = 1;
+const CONTROL_PHASE1_DONE: u8 = 2;
+const CONTROL_DEP_CANDIDATE_DONE: u8 = 4;
+const CONTROL_PHASE2_DONE: u8 = 6;
+
+enum TestDepSyncControlPayload {
+    Phase1(Vec<u8>),
+    Phase1Done,
+    DepCandidateDone,
+    Phase2Done,
+}
+
+fn encode_dep_sync_control(payload: TestDepSyncControlPayload) -> Vec<u8> {
+    match payload {
+        TestDepSyncControlPayload::Phase1(msg) => {
+            let mut out = Vec::with_capacity(1 + msg.len());
+            out.push(CONTROL_PHASE1);
+            out.extend_from_slice(&msg);
+            out
+        }
+        TestDepSyncControlPayload::Phase1Done => vec![CONTROL_PHASE1_DONE],
+        TestDepSyncControlPayload::DepCandidateDone => vec![CONTROL_DEP_CANDIDATE_DONE],
+        TestDepSyncControlPayload::Phase2Done => vec![CONTROL_PHASE2_DONE],
+    }
+}
+
+fn decode_dep_sync_control(msg: &[u8]) -> TestDepSyncControlPayload {
+    match msg.first().copied() {
+        Some(CONTROL_PHASE1) => TestDepSyncControlPayload::Phase1(msg[1..].to_vec()),
+        Some(CONTROL_PHASE1_DONE) => TestDepSyncControlPayload::Phase1Done,
+        Some(CONTROL_DEP_CANDIDATE_DONE) => TestDepSyncControlPayload::DepCandidateDone,
+        Some(CONTROL_PHASE2_DONE) => TestDepSyncControlPayload::Phase2Done,
+        other => panic!("unexpected dep-sync control tag: {:?}", other),
+    }
+}
+
 struct EnvGuard {
     prev_low_mem_ios: Option<String>,
 }
@@ -36,9 +72,57 @@ impl Drop for EnvGuard {
     }
 }
 
+#[derive(Default)]
+struct EmptyDepRangeStorage;
+
+impl negentropy::DepReconcileRangeStorage for EmptyDepRangeStorage {
+    fn root_size(&self) -> Result<usize, negentropy::Error> {
+        Ok(0)
+    }
+
+    fn get_root_item(&self, _i: usize) -> Result<Option<negentropy::Item>, negentropy::Error> {
+        Ok(None)
+    }
+
+    fn find_lower_bound(&self, _first: usize, _last: usize, _value: &negentropy::Bound) -> usize {
+        0
+    }
+
+    fn combined_fingerprint(
+        &self,
+        _begin: usize,
+        _end: usize,
+    ) -> Result<negentropy::Fingerprint, negentropy::Error> {
+        empty_fingerprint()
+    }
+
+    fn root_ids(
+        &self,
+        _begin: usize,
+        _end: usize,
+    ) -> Result<Vec<negentropy::Id>, negentropy::Error> {
+        Ok(Vec::new())
+    }
+}
+
+fn empty_fingerprint() -> Result<negentropy::Fingerprint, negentropy::Error> {
+    use negentropy::NegentropyStorageBase;
+
+    let mut storage = negentropy::NegentropyStorageVector::with_capacity(0);
+    storage.seal().unwrap();
+    storage.fingerprint(0, storage.size()?)
+}
+
+fn decode_control_payload(frame: Frame) -> TestDepSyncControlPayload {
+    let Frame::NegMsg { msg } = frame else {
+        panic!("expected NegMsg from responder");
+    };
+    decode_dep_sync_control(&msg)
+}
+
 async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSide) {
-    let storage = empty_negentropy_storage();
-    let mut neg = negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
+    let storage = EmptyDepRangeStorage;
+    let mut phase1 = negentropy::DepReconciler::borrowed(&storage);
     // Use a LastDay window header so this works even when LOW_MEM_IOS=1 leaks
     // from a concurrent test (low-mem responders reject Old/LastTwelveWeeks).
     let initial_msg = encode_initial_neg_open(
@@ -47,31 +131,50 @@ async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSi
             ts_min_inclusive_ms: Some(0),
             ts_max_exclusive_ms: None,
         },
-        neg.initiate().unwrap(),
+        encode_dep_sync_control(TestDepSyncControlPayload::Phase1(
+            phase1.initiate().unwrap(),
+        )),
     );
     peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
         .await;
 
-    loop {
-        let Some(frame) = peer
-            .recv_control_msg_timeout(Duration::from_millis(300))
-            .await
-        else {
-            break;
-        };
-        let Frame::NegMsg { msg } = frame else {
-            panic!("expected NegMsg from responder");
-        };
-        let mut have_ids = Vec::new();
-        let mut need_ids = Vec::new();
-        if let Some(next) = neg
-            .reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)
-            .unwrap()
-        {
-            peer.send_control_msg(&Frame::NegMsg { msg: next }).await;
-        }
-        break;
-    }
+    let phase1_reply = peer
+        .recv_control_msg_timeout(Duration::from_secs(2))
+        .await
+        .expect("expected phase1 response");
+    let TestDepSyncControlPayload::Phase1(msg) = decode_control_payload(phase1_reply) else {
+        panic!("expected phase1 response payload");
+    };
+    let mut diff = negentropy::DepReconcileDiff::default();
+    let next = phase1
+        .reconcile_with_ids(&msg, &mut diff)
+        .expect("reconcile empty phase1");
+    assert!(
+        next.is_none(),
+        "empty dep-aware phase1 should complete in one round"
+    );
+    peer.send_control_msg(&Frame::NegMsg {
+        msg: encode_dep_sync_control(TestDepSyncControlPayload::Phase1Done),
+    })
+    .await;
+
+    peer.send_control_msg(&Frame::NegMsg {
+        msg: encode_dep_sync_control(TestDepSyncControlPayload::DepCandidateDone),
+    })
+    .await;
+    let dep_candidate_reply = peer
+        .recv_control_msg_timeout(Duration::from_secs(2))
+        .await
+        .expect("expected dep candidate terminator");
+    assert!(matches!(
+        decode_control_payload(dep_candidate_reply),
+        TestDepSyncControlPayload::DepCandidateDone
+    ));
+
+    peer.send_control_msg(&Frame::NegMsg {
+        msg: encode_dep_sync_control(TestDepSyncControlPayload::Phase2Done),
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -134,7 +237,7 @@ async fn lowmem_responder_rejects_ranges_beyond_last_week() {
 }
 
 #[tokio::test]
-async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
+async fn responder_inbound_replies_negmsg_and_finishes_one_round_cleanly() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler = SyncConnectionHandler::responder(db_path, 30);
@@ -157,8 +260,14 @@ async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
             unexpected
         );
 
-        // A second round on the same session should also be answered.
-        drive_empty_inbound_round(&mut peer).await;
+        let closed = peer
+            .recv_control_msg_timeout(Duration::from_millis(250))
+            .await;
+        assert!(
+            closed.is_none(),
+            "expected no extra control frames after responder finished the round, got {:?}",
+            closed
+        );
 
         cancel.cancel();
         peer.force_close();

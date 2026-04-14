@@ -90,48 +90,6 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             ON CONFLICT(workspace_id, week_start_ms) DO UPDATE SET
                 epoch = epoch + 1;
         END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_negentropy_epoch_hot_dep_insert
-        AFTER INSERT ON hot_week_dep_index
-        BEGIN
-            INSERT INTO negentropy_day_epoch (workspace_id, day_start_ms, epoch)
-            VALUES (
-                NEW.workspace_id,
-                ((NEW.root_created_at_ms / {day_ms}) * {day_ms}),
-                1
-            )
-            ON CONFLICT(workspace_id, day_start_ms) DO UPDATE SET
-                epoch = epoch + 1;
-            INSERT INTO negentropy_week_epoch (workspace_id, week_start_ms, epoch)
-            VALUES (
-                NEW.workspace_id,
-                (((NEW.root_created_at_ms / {day_ms}) * {day_ms}) - ((((NEW.root_created_at_ms / {day_ms}) + 3) % 7) * {day_ms})),
-                1
-            )
-            ON CONFLICT(workspace_id, week_start_ms) DO UPDATE SET
-                epoch = epoch + 1;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_negentropy_epoch_hot_dep_delete
-        AFTER DELETE ON hot_week_dep_index
-        BEGIN
-            INSERT INTO negentropy_day_epoch (workspace_id, day_start_ms, epoch)
-            VALUES (
-                OLD.workspace_id,
-                ((OLD.root_created_at_ms / {day_ms}) * {day_ms}),
-                1
-            )
-            ON CONFLICT(workspace_id, day_start_ms) DO UPDATE SET
-                epoch = epoch + 1;
-            INSERT INTO negentropy_week_epoch (workspace_id, week_start_ms, epoch)
-            VALUES (
-                OLD.workspace_id,
-                (((OLD.root_created_at_ms / {day_ms}) * {day_ms}) - ((((OLD.root_created_at_ms / {day_ms}) + 3) % 7) * {day_ms})),
-                1
-            )
-            ON CONFLICT(workspace_id, week_start_ms) DO UPDATE SET
-                epoch = epoch + 1;
-        END;
         ",
         day_ms = DAY_MS,
     );
@@ -188,17 +146,15 @@ pub fn sum_week_epochs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::event_id_to_base64;
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
 
     #[test]
-    fn epochs_track_range_locality_for_shared_and_dep_rows() {
+    fn epochs_track_range_locality_for_shared_rows() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "ws";
         let event_id = [0x11u8; 32];
-        let dep_id = event_id_to_base64(&[0x22u8; 32]);
         let day_start_ms = 2 * DAY_MS;
         let tomorrow_start_ms = day_start_ms + DAY_MS;
         let old_week_start_ms = 0;
@@ -241,39 +197,6 @@ mod tests {
         );
 
         conn.execute(
-            "INSERT INTO hot_week_dep_index
-             (workspace_id, root_created_at_ms, dep_created_at_ms, event_id)
-             VALUES (?1, ?2, 1, ?3)",
-            params![workspace_id, day_start_ms + 2, dep_id],
-        )
-        .unwrap();
-        assert_eq!(
-            sum_day_epochs(&conn, workspace_id, day_start_ms, tomorrow_start_ms).unwrap(),
-            2
-        );
-        assert_eq!(
-            sum_week_epochs(
-                &conn,
-                workspace_id,
-                Some(old_week_start_ms),
-                next_week_start_ms
-            )
-            .unwrap(),
-            2
-        );
-
-        conn.execute(
-            "DELETE FROM hot_week_dep_index
-             WHERE workspace_id = ?1 AND event_id = ?2",
-            params![workspace_id, dep_id],
-        )
-        .unwrap();
-        assert_eq!(
-            sum_day_epochs(&conn, workspace_id, day_start_ms, tomorrow_start_ms).unwrap(),
-            3
-        );
-
-        conn.execute(
             "DELETE FROM shared_event_index
              WHERE workspace_id = ?1 AND id = ?2",
             params![workspace_id, event_id.as_slice()],
@@ -281,7 +204,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             sum_day_epochs(&conn, workspace_id, day_start_ms, tomorrow_start_ms).unwrap(),
-            4
+            2
         );
     }
 }

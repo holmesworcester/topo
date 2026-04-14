@@ -317,17 +317,6 @@ impl ProjectionBackend for Connection {
                 rusqlite::params![recorded_by, event_id_b64, semantic_type_code],
             )?;
             persist_shared_dep_edges(self, recorded_by, event_id_b64, sub_event)?;
-            if let Some(workspace_id) = lookup_workspace_id(self, recorded_by) {
-                if let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) {
-                    crate::db::hot_week_deps::track_valid_shared_event_deps(
-                        self,
-                        &workspace_id,
-                        &event_id,
-                        sub_event.created_at_ms() as i64,
-                        current_timestamp_ms(),
-                    )?;
-                }
-            }
 
             crate::state::subscriptions::on_projected_event(
                 self,
@@ -367,9 +356,9 @@ mod tests {
     use crate::event_modules::{
         encode_event, EncryptedEvent, ParsedEvent, TenantEvent, EVENT_TYPE_FILE_SLICE,
     };
+    use crate::projection::apply::stages::apply_projection_with_backend;
     use crate::projection::contract::{EmitCommand, ProjectorDecisionContext, WriteOp};
     use crate::projection::decision::ProjectionDecision;
-    use crate::projection::apply::stages::apply_projection_with_backend;
     use crate::projection::queries::{DepLoadResult, ProjectionQueryResult};
 
     use super::*;

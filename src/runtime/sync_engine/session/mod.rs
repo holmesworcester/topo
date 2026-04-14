@@ -1,6 +1,7 @@
 //! Sync session logic: initiator and responder range sessions.
 
 pub mod admission;
+pub mod depsync;
 pub mod initiator;
 pub mod logging;
 pub mod range_session;
