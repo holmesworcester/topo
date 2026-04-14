@@ -216,9 +216,9 @@ The attraction is real: connection sharing becomes simpler, and there is less ex
 
 ### Sync And Convergence
 
-Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. A range session loads the local `(ts, event_id)` membership for one selected range from `shared_event_index`, seals it into an in-memory `NegentropyStorageVector`, exchanges `NegOpen` / `NegMsg`, and then both sides stream all missing blobs for that range as event frames. The receiver hashes each blob, appends the event id and blob to a `ReceiveLog`, stamps `first_received_at` / `first_stored_at` in the file as each blob is appended, finalizes the spool file, and then lets canonical ingest continue in the background.
+Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. The active control path is dep-aware: for one selected range of root events from `shared_event_index`, each side reuses an immutable in-memory snapshot keyed by `(db_path, workspace_id, window_kind, bounds, epoch)`. Each root-partitioned slice carries one combined homomorphic fingerprint over the root ids in that slice plus the recursive dependency contribution induced by those roots. Phase 1 exchanges `NegOpen` / `NegMsg` over those combined fingerprints and exacts only root ids for small mismatched slices. Each side then expands dependency candidates from the local-only and dep-probe roots discovered in Phase 1, exchanges those candidate ids, and runs a second stock Negentropy round over that candidate-dependency universe to confirm which deps are actually missing before either side streams event blobs. The receiver hashes each blob, appends the event id and blob to a `ReceiveLog`, stamps `first_received_at` / `first_stored_at` in the file as each blob is appended, finalizes the spool file, and then lets canonical ingest continue in the background.
 
-Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses the Rust [`negentropy` library](https://crates.io/crates/negentropy) over one selected range at a time. The current scheduler intentionally stays simple and runs a per-peer cadence through:
+Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses a dep-aware Phase 1 over one selected root range at a time and a stock Negentropy Phase 2 only over candidate dependency ids. The current scheduler intentionally stays simple and runs a per-peer cadence through:
 
 1. `last day`
 2. `last week`
@@ -1305,20 +1305,21 @@ Bulk transfer is range-owned.
    - `last twelve weeks`
    - `old`
 2. the initiator opens a `Range` session and sends the concrete window bounds in the initial `NegOpen`,
-3. both sides load that range from `shared_event_index` into an in-memory `NegentropyStorageVector`,
-4. negentropy computes `have_ids` / `need_ids` for that explicit range,
-5. both sides stream all missing blobs for that range as raw event frames on the data stream,
-6. with live suppression enabled, the sender also accepts batched `SuppressIds` frames from the receiver and stops sending ids that are already received or pending elsewhere,
-7. the receiver hashes each blob once before append, records the event id plus blob in the `ReceiveLog`, stamps `first_received_at` and `first_stored_at`, and advertises the id to sibling same-workspace sessions,
-8. senders finish a live-suppression data stream with `RangeDataDone`; receivers continue to finalize on close or idle timeout for compatibility,
-9. on close or idle timeout, the log is finalized with `flush + sync_all`, the range session ends, and the log is queued for background canonical ingest,
-10. while a hot `LastDay` receive is active for a DB, bulk receive-log replay stays paused so download/store remains the priority path.
+3. both sides reuse a cached dep-aware snapshot for that root range and overlay pending receive-log roots for local suppression,
+4. Phase 1 compares one combined fingerprint per root slice and exacts only root ids for small mismatched slices,
+5. both sides expand dependency candidates from the Phase 1 local-only and dep-probe roots, exchange those candidate ids, and run a stock Negentropy Phase 2 over the shared candidate-dependency universe,
+6. after Phase 2 confirms which deps are truly missing, both sides stream all missing blobs for that range as raw event frames on the data stream in dependency-safe order,
+7. with live suppression enabled, the sender also accepts batched `SuppressIds` frames from the receiver and stops sending ids that are already received or pending elsewhere,
+8. the receiver hashes each blob once before append, records the event id plus blob in the `ReceiveLog`, stamps `first_received_at` and `first_stored_at`, and advertises the id to sibling same-workspace sessions,
+9. senders finish a live-suppression data stream with `RangeDataDone`; receivers continue to finalize on close or idle timeout for compatibility,
+10. on close or idle timeout, the log is finalized with `flush + sync_all`, the range session ends, and the log is queued for background canonical ingest,
+11. while a hot `LastDay` receive is active for a DB, bulk receive-log replay stays paused so download/store remains the priority path.
 
-Dependency repair happens through later prioritized range windows:
+Dependency repair is now range-owned inside the active round rather than delegated to a separate bucket system:
 
-1. projection blocking records the missing dep locally,
-2. auth/removal-frontier and key lanes are synced before the hot `LastDay` window,
-3. older bulk windows continue the catchup once hot visibility is satisfied.
+1. hot windows fold recursive dependency contribution directly into the Phase 1 range fingerprints,
+2. candidate deps are confirmed by the Phase 2 possession round before send, so a dep induced by a missing root is not resent if the peer already has it,
+3. auth/removal-frontier and key lanes are still scheduled before the hot `LastDay` window.
 
 ## 7.4 Dedupe and recovery
 
@@ -1394,34 +1395,39 @@ The active branch chooses simpler boundaries over a global per-event planner:
    by the live daemon-connection slot rule.
 4. **Per-peer cadence.** The current scheduler advances each peer through the
    fixed range ladder independently, with no peer-rank or hash partition.
-5. **Use stock negentropy directly.** The active path builds an in-memory
-   vector from `shared_event_index` for the selected range instead of routing bulk sync
-   through a bespoke request-credit scheduler.
+5. **Use a dep-aware Negentropy control path.** The active path keeps one
+   root-partitioned range tree per selected window, folds recursive dependency
+   contribution into the range fingerprints, exacts only root ids in Phase 1,
+   and confirms dependency possession with a second stock Negentropy pass over
+   candidate deps instead of routing bulk sync through a bespoke request-credit
+   scheduler.
 6. **Suppression-based multi-source coordination.** When live suppression is
    enabled, received event ids are advertised to same-workspace sessions and
    senders skip suppressed ids. Suppression is an efficiency hint; later range
    rounds recover any falsely suppressed or dropped ids.
-7. **Prefer session-local rebuilds over a persisted Negentropy index.** The
-   protocol can support a cached auxiliary structure, but current implementation
-   experience favors rebuilding the Negentropy hash graph for each range session
-   from `shared_event_index`. That path has been simpler and more stable than
-   trying to maintain a persistent sync-side cache or tree across writes and
-   deletes.
+7. **Prefer cached immutable window snapshots over per-session rebuilds.** The
+   active implementation reuses one in-memory dep-aware snapshot per
+   `(db_path, workspace_id, window_kind, bounds, epoch)` and only rebuilds that
+   snapshot after durable shared-index epoch changes or window-bound changes.
+   That keeps repeated peer sync checks cheap while avoiding a persisted
+   sync-side tree across writes and deletes.
 
 ## 7.7 Negentropy implementation notes
 
 Baseline implementation:
 1. `shared_event_index` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
-2. `RangeSession` queries `shared_event_index` plus range-local dependency rows for one explicit fixed UTC range and reuses a cached sealed `NegentropyStorageVector` for that range until a touched UTC bucket changes.
+2. `RangeSession` reuses a cached dep-aware snapshot for one explicit fixed UTC root range. That snapshot stores the ordered root ids in the range and the cached recursive dependency closure for each durable root in the range. Pending receive-log roots are overlaid per session for suppression, and the `Old` window intentionally disables dependency expansion.
 3. Control-plane reconciliation uses `NegOpen` and `NegMsg`; the first `NegOpen` may carry a `P7SW` window envelope selecting one of:
    - `LastDay`
    - `LastWeek`
    - `LastTwelveWeeks`
    - `Old`
-4. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
-5. Range data transfer streams event blobs after reconciliation for that range; live suppression mode also sends `SuppressIds` and `RangeDataDone` frames on the data stream.
-6. Multi-source coordination does not replace negentropy; live suppression only reduces duplicate sends after range-local membership has been discovered by negentropy.
-7. The current range path uses only the in-memory vector-backed storage built directly from `shared_event_index`; the older SQLite-backed storage path has been removed.
+4. Phase 1 compares one combined homomorphic fingerprint per root slice. Exact slices exchange only root ids plus the combined fingerprint, so Phase 1 does not inline exact dep ids.
+5. After Phase 1, both sides expand dependency candidates from the local-only and dep-probe roots, exchange those dep candidate ids explicitly, and run a stock Negentropy Phase 2 over that candidate universe to confirm which deps are actually missing.
+6. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
+7. Range data transfer streams event blobs after reconciliation for that range; live suppression mode also sends `SuppressIds` and `RangeDataDone` frames on the data stream.
+8. Multi-source coordination does not replace negentropy; live suppression only reduces duplicate sends after range-local membership has been discovered by the dep-aware Phase 1 and confirmed by the Phase 2 candidate-dep round.
+9. The current range path uses the cached dep-aware snapshot for Phase 1 and a vector-backed stock Negentropy storage only for the Phase 2 candidate-dependency round. The old manual dep-bucket path has been removed.
 
 ### 7.7.1 Fingerprint security note
 
@@ -1439,18 +1445,21 @@ claim that the stock Negentropy fingerprint is the strongest possible design.
    [Range-Based Set Reconciliation without Homomorphic Fingerprints](https://aljoscha-meyer.de/assets/landing/rbsr_nonhomomorphic.pdf),
    which derives range fingerprints from a clamped Merkle tree and reduces the
    problem to ordinary hash-collision resistance.
-4. The practical tradeoff is a somewhat slower initial index build for each sync
-   session.
-5. Our current engineering conclusion is still to rebuild the session-local
-   Negentropy graph from `shared_event_index` on each range session. The design
-   leaves room for a future cached auxiliary structure, but experiments with
-   persisted sync-side caches/trees were more complex and less stable than the
-   rebuild-per-session path.
+4. The practical tradeoff is a somewhat slower snapshot rebuild when a durable
+   shared-index epoch changes.
+5. Our current engineering conclusion is to keep an immutable in-memory
+   dep-aware snapshot per standard window and rebuild it lazily on the first
+   subsequent use after a durable epoch change. The design leaves room for a
+   future Merkle-based auxiliary structure, but repeated sync checks should stay
+   cheap by reusing the current snapshot rather than rebuilding per session.
 
 Primary code references:
-1. `src/runtime/sync_engine/session/range_session.rs`
-2. `src/runtime/sync_engine/session/windowing.rs`
-3. `src/shared/protocol.rs`
+1. `src/runtime/sync_engine/session/depsync.rs`
+2. `src/runtime/sync_engine/session/initiator.rs`
+3. `src/runtime/sync_engine/session/responder.rs`
+4. `src/runtime/sync_engine/session/range_session.rs`
+5. `src/runtime/sync_engine/session/windowing.rs`
+6. `src/shared/protocol.rs`
 
 ---
 

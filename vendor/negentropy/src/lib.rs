@@ -25,6 +25,7 @@ use core::convert::TryFrom;
 use std::collections::HashSet;
 
 mod constants;
+mod dep_reconcile;
 mod encoding;
 mod error;
 mod id;
@@ -33,12 +34,13 @@ mod storage;
 mod types;
 
 pub use self::constants::{FINGERPRINT_SIZE, ID_SIZE, PROTOCOL_VERSION};
+pub use self::dep_reconcile::{DepReconcileDiff, DepReconcileRangeStorage, DepReconciler};
 use self::encoding::{decode_var_int, encode_var_int, get_byte_array, get_bytes};
 pub use self::error::Error;
 pub use self::id::Id;
 pub use self::storage::{NegentropyStorageBase, NegentropyStorageVector, Storage};
 use self::types::Mode;
-pub use self::types::{Bound, Item};
+pub use self::types::{Bound, Fingerprint, Item};
 
 const MAX_U64: u64 = u64::MAX;
 const BUCKETS: usize = 16;

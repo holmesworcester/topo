@@ -11,18 +11,108 @@ use topo::sync::session::windowing::{
 };
 use topo::sync::session_handler::SyncConnectionHandler;
 
-use crate::fake_session_io::{
-    create_test_db, empty_negentropy_storage, fake_session_io_pair, run_local, test_session_meta,
-};
+use crate::fake_session_io::{create_test_db, fake_session_io_pair, run_local, test_session_meta};
 
-fn empty_negentropy_response(neg_open: Frame) -> Vec<u8> {
+const CONTROL_PHASE1: u8 = 1;
+const CONTROL_PHASE1_DONE: u8 = 2;
+const CONTROL_DEP_CANDIDATE_DONE: u8 = 4;
+const CONTROL_PHASE2_DONE: u8 = 6;
+
+enum TestDepSyncControlPayload {
+    Phase1(Vec<u8>),
+    Phase1Done,
+    DepCandidateDone,
+    Phase2Done,
+}
+
+fn encode_dep_sync_control(payload: TestDepSyncControlPayload) -> Vec<u8> {
+    match payload {
+        TestDepSyncControlPayload::Phase1(msg) => {
+            let mut out = Vec::with_capacity(1 + msg.len());
+            out.push(CONTROL_PHASE1);
+            out.extend_from_slice(&msg);
+            out
+        }
+        TestDepSyncControlPayload::Phase1Done => vec![CONTROL_PHASE1_DONE],
+        TestDepSyncControlPayload::DepCandidateDone => vec![CONTROL_DEP_CANDIDATE_DONE],
+        TestDepSyncControlPayload::Phase2Done => vec![CONTROL_PHASE2_DONE],
+    }
+}
+
+fn decode_dep_sync_control(msg: &[u8]) -> TestDepSyncControlPayload {
+    match msg.first().copied() {
+        Some(CONTROL_PHASE1) => TestDepSyncControlPayload::Phase1(msg[1..].to_vec()),
+        Some(CONTROL_PHASE1_DONE) => TestDepSyncControlPayload::Phase1Done,
+        Some(CONTROL_DEP_CANDIDATE_DONE) => TestDepSyncControlPayload::DepCandidateDone,
+        Some(CONTROL_PHASE2_DONE) => TestDepSyncControlPayload::Phase2Done,
+        other => panic!("unexpected dep-sync control tag: {:?}", other),
+    }
+}
+
+#[derive(Default)]
+struct EmptyDepRangeStorage;
+
+impl negentropy::DepReconcileRangeStorage for EmptyDepRangeStorage {
+    fn root_size(&self) -> Result<usize, negentropy::Error> {
+        Ok(0)
+    }
+
+    fn get_root_item(&self, _i: usize) -> Result<Option<negentropy::Item>, negentropy::Error> {
+        Ok(None)
+    }
+
+    fn find_lower_bound(&self, _first: usize, _last: usize, _value: &negentropy::Bound) -> usize {
+        0
+    }
+
+    fn combined_fingerprint(
+        &self,
+        _begin: usize,
+        _end: usize,
+    ) -> Result<negentropy::Fingerprint, negentropy::Error> {
+        empty_fingerprint()
+    }
+
+    fn root_ids(
+        &self,
+        _begin: usize,
+        _end: usize,
+    ) -> Result<Vec<negentropy::Id>, negentropy::Error> {
+        Ok(Vec::new())
+    }
+}
+
+fn empty_fingerprint() -> Result<negentropy::Fingerprint, negentropy::Error> {
+    use negentropy::NegentropyStorageBase;
+
+    let mut storage = negentropy::NegentropyStorageVector::with_capacity(0);
+    storage.seal().unwrap();
+    storage.fingerprint(0, storage.size()?)
+}
+
+fn empty_phase1_response(neg_open: Frame) -> Vec<u8> {
     let Frame::NegOpen { msg } = neg_open else {
         panic!("expected NegOpen frame");
     };
     let (_window, msg) = decode_initial_neg_open(&msg).expect("decode NegOpen header");
-    let storage = empty_negentropy_storage();
-    let mut neg = negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-    neg.reconcile(msg).unwrap()
+    let payload = decode_dep_sync_control(msg);
+    let TestDepSyncControlPayload::Phase1(query) = payload else {
+        panic!("expected phase1 payload in NegOpen");
+    };
+    let storage = EmptyDepRangeStorage;
+    let mut phase1 = negentropy::DepReconciler::borrowed(&storage);
+    let mut diff = negentropy::DepReconcileDiff::default();
+    let response = phase1
+        .reconcile_with_diff(&query, &mut diff)
+        .expect("reconcile empty phase1");
+    encode_dep_sync_control(TestDepSyncControlPayload::Phase1(response))
+}
+
+fn decode_control_payload(frame: Frame) -> TestDepSyncControlPayload {
+    let Frame::NegMsg { msg } = frame else {
+        panic!("expected NegMsg frame");
+    };
+    decode_dep_sync_control(&msg)
 }
 
 #[tokio::test]
@@ -46,7 +136,29 @@ async fn initiator_outbound_starts_with_negopen_then_ends_control_phase() {
             .expect("expected initial NegOpen");
         assert!(matches!(neg_open_1, Frame::NegOpen { .. }));
         peer.send_control_msg(&Frame::NegMsg {
-            msg: empty_negentropy_response(neg_open_1),
+            msg: empty_phase1_response(neg_open_1),
+        })
+        .await;
+
+        let phase1_done = peer
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected phase1 terminator");
+        assert!(matches!(
+            decode_control_payload(phase1_done),
+            TestDepSyncControlPayload::Phase1Done
+        ));
+
+        let dep_candidates = peer
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected local dep candidate terminator");
+        assert!(matches!(
+            decode_control_payload(dep_candidates),
+            TestDepSyncControlPayload::DepCandidateDone
+        ));
+        peer.send_control_msg(&Frame::NegMsg {
+            msg: encode_dep_sync_control(TestDepSyncControlPayload::DepCandidateDone),
         })
         .await;
 
@@ -58,13 +170,14 @@ async fn initiator_outbound_starts_with_negopen_then_ends_control_phase() {
             unexpected
         );
 
-        // The simplified range session ends the control phase with an empty
-        // NegMsg instead of starting another round on the same session.
         let frame = peer
             .recv_control_msg_timeout(Duration::from_secs(5))
             .await
             .expect("expected control terminator");
-        assert_eq!(frame, Frame::NegMsg { msg: Vec::new() });
+        assert!(matches!(
+            decode_control_payload(frame),
+            TestDepSyncControlPayload::Phase2Done
+        ));
 
         let no_second_round = peer
             .recv_control_msg_timeout(Duration::from_millis(250))

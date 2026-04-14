@@ -168,6 +168,7 @@ impl Deref for Fingerprint {
 
 impl Fingerprint {
     #[inline]
+    /// Return the raw fingerprint bytes.
     pub fn to_bytes(self) -> [u8; FINGERPRINT_SIZE] {
         self.buf
     }
