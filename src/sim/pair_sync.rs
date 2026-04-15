@@ -528,8 +528,8 @@ fn source_transport_peer_id(
     if let Some(target) = resolve_tenant_transport_target(conn, recorded_by)? {
         return Ok(target.transport_peer_id);
     }
-    if let Some(row) = crate::db::daemon_identity::load(conn)? {
-        return Ok(row.peer_id);
+    if let Some(peer_id) = crate::transport::load_local_daemon_endpoint_id(conn)? {
+        return Ok(peer_id);
     }
     Ok(recorded_by.to_string())
 }

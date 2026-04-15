@@ -94,7 +94,7 @@ impl DaemonState {
         let active = match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
-                let _ = crate::transport::ensure_daemon_identity(&conn);
+                let _ = crate::transport::materialize_daemon_identity(&conn);
                 match discover_tenant_scopes(&conn) {
                     Ok(tenants) if tenants.len() == 1 => Some(tenants[0].tenant_id.clone()),
                     Ok(_) => None,
@@ -1753,4 +1753,25 @@ pub fn dispatch_rpc_method(state: &DaemonState, method: RpcMethod) -> RpcRespons
     let shutdown = std::sync::atomic::AtomicBool::new(false);
     let shutdown_notify = tokio::sync::Notify::new();
     dispatch(state, method, &shutdown, &shutdown_notify)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonState;
+
+    #[test]
+    fn daemon_state_new_materializes_daemon_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("daemon.sqlite3");
+        let db_path = db_path.to_str().expect("db path");
+
+        let _state = DaemonState::new(db_path);
+
+        let conn = crate::db::open_connection(db_path).expect("open db");
+        crate::db::schema::create_tables(&conn).expect("create tables");
+        assert!(
+            crate::transport::load_daemon_identity(&conn).is_ok(),
+            "daemon startup should materialize daemon identity events"
+        );
+    }
 }
