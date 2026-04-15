@@ -21,6 +21,11 @@ elif [ -x "$HOME/verus-install/verus-x86-linux/cargo-verus" ]; then
 elif [ -x "$HOME/verus/cargo-verus" ]; then
     CARGO_VERUS="$HOME/verus/cargo-verus"
 else
+    if [ "${TOPO_REQUIRE_VERUS:-0}" = "1" ]; then
+        echo "FAIL: cargo-verus not found but TOPO_REQUIRE_VERUS=1"
+        echo "      Install from https://github.com/verus-lang/verus"
+        exit 1
+    fi
     echo "SKIP: cargo-verus not found (install from https://github.com/verus-lang/verus)"
     echo "      Verus proofs were not checked."
     exit 0
