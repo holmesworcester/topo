@@ -169,7 +169,7 @@ pub fn import_peer_state(
     let conn = open_connection(source_db_path)?;
     crate::db::schema::create_tables(&conn)?;
 
-    let daemon_peer_id = crate::transport::load_local_daemon_endpoint_id(&conn)?;
+    let daemon_peer_id = crate::db::daemon_identity::load(&conn)?.map(|row| row.peer_id);
     let local_target = resolve_tenant_transport_target(&conn, recorded_by)?;
     let workspace_id = lookup_workspace_id(&conn, recorded_by);
     let authorized_transport_rows = list_authorized_transport_rows(&conn, recorded_by)?;
@@ -416,9 +416,14 @@ mod tests {
 
     fn daemon_transport_peer_id(daemon: &VirtualDaemon) -> String {
         let conn = open_connection(daemon.db_path()).expect("open daemon db");
-        crate::transport::load_local_daemon_endpoint_id(&conn)
-            .expect("load daemon endpoint id")
-            .expect("daemon transport peer id")
+        conn.query_row(
+            "SELECT peer_id
+             FROM daemon_transport_identity
+             WHERE singleton_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("daemon transport peer id")
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use super::*;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_in_memory, schema::create_tables};
-use crate::event_modules::workspace::command_plans;
 use crate::event_modules::{parse_event, ParsedEvent, RemovalEvent};
 use crate::projection::create::create_signed_event_synchronous;
 use ed25519_dalek::SigningKey;
@@ -10,10 +9,6 @@ fn peer_id_for_signing_key(key: &SigningKey) -> String {
     hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
         &key.verifying_key().to_bytes(),
     ))
-}
-
-fn materialize_local_daemon_identity(conn: &rusqlite::Connection) {
-    crate::transport::materialize_daemon_identity(conn).expect("materialize daemon identity");
 }
 
 fn record_invite_link_workspace(
@@ -93,7 +88,6 @@ fn encrypted_wrapper_key_event_id(
 fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
-    materialize_local_daemon_identity(&conn);
 
     let end_at_ms = 90_u64 * 24 * 60 * 60 * 1000;
     let network_age_ms = 30_u64 * 24 * 60 * 60 * 1000;
@@ -190,7 +184,6 @@ fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
 fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
-    materialize_local_daemon_identity(&conn);
 
     let workspace =
         create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
@@ -269,7 +262,6 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
 fn create_device_link_materializes_pending_bootstrap_trust_via_projection() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
-    materialize_local_daemon_identity(&conn);
 
     let workspace =
         create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
@@ -321,17 +313,35 @@ fn create_device_link_materializes_pending_bootstrap_trust_via_projection() {
 fn create_workspace_allows_unscoped_recorded_by_when_creds_exist_and_creates_new_tenant() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
-    materialize_local_daemon_identity(&conn);
-    let daemon_peer_id = crate::transport::load_local_daemon_endpoint_id(&conn)
-        .expect("load daemon endpoint id")
-        .expect("daemon endpoint id");
+
+    // Seed an existing tenant identity.
+    let (cert, key) = crate::transport::generate_self_signed_cert().expect("generate cert");
+    let fp = crate::transport::extract_spki_fingerprint(cert.as_ref()).expect("extract spki");
+    let tenant_peer_id = hex::encode(fp);
+    crate::db::transport_creds::store_local_creds(
+        &conn,
+        &tenant_peer_id,
+        cert.as_ref(),
+        key.secret_pkcs8_der(),
+    )
+    .expect("store transport creds");
 
     let created = create_workspace(&conn, "bootstrap", "ws", "alice", "laptop")
         .expect("unscoped bootstrap should still create a new workspace tenant");
     let created_peer_id = peer_id_for_signing_key(&created.peer_shared_key);
     assert_ne!(
-        created_peer_id, daemon_peer_id,
-        "create_workspace should mint a tenant identity instead of reusing the daemon endpoint identity"
+        created_peer_id, tenant_peer_id,
+        "create_workspace should mint a new tenant instead of reusing existing transport creds"
+    );
+
+    let local_creds_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+            row.get(0)
+        })
+        .expect("count transport creds");
+    assert_eq!(
+        local_creds_count, 2,
+        "workspace creation should add a second local transport identity"
     );
 
     let tenants =
@@ -351,13 +361,22 @@ fn create_workspace_for_db_creates_new_tenant_when_workspace_missing() {
     let db_path = db_path.to_string_lossy().to_string();
     let conn = crate::db::open_connection(&db_path).expect("open db");
     create_tables(&conn).expect("create tables");
+
+    // Seed only local transport creds (no workspace/trust anchor rows yet).
+    let (cert, key) = crate::transport::generate_self_signed_cert().expect("generate cert");
+    let fp = crate::transport::extract_spki_fingerprint(cert.as_ref()).expect("extract spki");
+    let seeded_peer_id = hex::encode(fp);
+    crate::db::transport_creds::store_local_creds(
+        &conn,
+        &seeded_peer_id,
+        cert.as_ref(),
+        key.secret_pkcs8_der(),
+    )
+    .expect("store transport creds");
     drop(conn);
-    let seeded_peer_id = crate::transport::materialize_daemon_identity_from_db(&db_path)
-        .expect("materialize daemon identity")
-        .0;
 
     let resp = create_workspace_for_db(&db_path, "ws", "alice", "laptop")
-        .expect("create workspace should succeed with materialized daemon identity");
+        .expect("create workspace should succeed with existing transport identity rows");
     assert!(
         !resp.workspace_id.is_empty(),
         "workspace id should be populated"
@@ -378,25 +397,9 @@ fn create_workspace_for_db_creates_new_tenant_when_workspace_missing() {
 }
 
 #[test]
-fn create_workspace_requires_materialized_daemon_identity() {
-    let conn = open_in_memory().expect("open in-memory db");
-    create_tables(&conn).expect("create tables");
-
-    let err = match create_workspace(&conn, "bootstrap", "ws", "alice", "laptop") {
-        Ok(_) => panic!("create_workspace should fail without daemon identity"),
-        Err(err) => err,
-    };
-    assert_eq!(
-        err.to_string(),
-        command_plans::MISSING_LOCAL_DAEMON_ENDPOINT_SHARED_ERROR
-    );
-}
-
-#[test]
 fn join_workspace_replays_existing_same_workspace_shared_events_for_new_tenant() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
-    materialize_local_daemon_identity(&conn);
 
     let workspace =
         create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
@@ -489,7 +492,6 @@ fn join_workspace_replays_existing_same_workspace_shared_events_for_new_tenant()
 fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
-    materialize_local_daemon_identity(&conn);
 
     let workspace =
         create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
@@ -612,7 +614,6 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
 fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
-    materialize_local_daemon_identity(&conn);
 
     let workspace =
         create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");

@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 use crate::db::transport_creds::discover_local_tenants;
 use crate::db::{open_connection, schema::create_tables};
 use crate::transport::{
-    create_runtime_endpoint_for_tenants, extract_spki_fingerprint, load_daemon_identity,
+    create_runtime_endpoint_for_tenants, ensure_daemon_identity, extract_spki_fingerprint,
     TransportEndpoint,
 };
 
@@ -33,7 +33,7 @@ pub(crate) async fn setup_endpoint_and_tenants(
 ) -> Result<StartupResult, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
-    let (daemon_peer_id, _daemon_cert, _daemon_key) = load_daemon_identity(&db)?;
+    let (daemon_peer_id, _daemon_cert, _daemon_key) = ensure_daemon_identity(&db)?;
 
     let tenants = discover_local_tenants(&db)?;
     drop(db);

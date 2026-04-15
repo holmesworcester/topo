@@ -511,8 +511,7 @@ pub struct Peer {
 
 fn install_test_daemon_identity(peer: &Peer) {
     let db = open_connection(&peer.db_path).expect("failed to open db for daemon identity");
-    crate::transport::materialize_daemon_identity(&db)
-        .expect("failed to materialize test daemon identity");
+    crate::transport::ensure_daemon_identity(&db).expect("failed to ensure test daemon identity");
 }
 
 impl Peer {
@@ -1551,7 +1550,7 @@ impl Peer {
         user_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        crate::transport::materialize_daemon_identity(&db).expect("materialize endpoint identity");
+        crate::transport::ensure_daemon_identity(&db).expect("ensure endpoint identity");
         let endpoint_shared_event_id =
             crate::event_modules::endpoint_shared::load_local_endpoint_shared(&db)
                 .expect("load endpoint_shared")

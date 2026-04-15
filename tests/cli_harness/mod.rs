@@ -1019,8 +1019,8 @@ pub fn daemon_transport_fingerprint(db: &str) -> String {
 
 /// Get the daemon identity fingerprint used for bootstrap invite SPKI.
 pub fn daemon_identity_fingerprint(db: &str) -> String {
-    let (peer_id, _cert_der, _key_der) = topo::transport::materialize_daemon_identity_from_db(db)
-        .expect("materialize daemon transport identity");
+    let (peer_id, _cert_der, _key_der) = topo::transport::ensure_daemon_identity_from_db(db)
+        .expect("load daemon transport identity");
     peer_id
 }
 
