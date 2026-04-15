@@ -1363,14 +1363,14 @@ mod tests {
     use crate::event_modules::{encode_event, ParsedEvent, UserInviteEvent};
     use crate::transport::{
         accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
-        ensure_daemon_identity_from_db, load_daemon_identity_from_db,
+        load_daemon_identity_from_db, materialize_daemon_identity_from_db,
         multi_workspace::transport_sni, TransportEndpoint,
     };
 
     use super::*;
 
     fn store_test_daemon_identity(db_path: &str) -> String {
-        ensure_daemon_identity_from_db(db_path)
+        materialize_daemon_identity_from_db(db_path)
             .expect("ensure daemon identity")
             .0
     }
