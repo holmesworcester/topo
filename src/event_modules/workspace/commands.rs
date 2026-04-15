@@ -28,7 +28,6 @@ use crate::projection::create::{
     event_id_or_blocked, project_event,
 };
 use crate::state::db::queue::current_timestamp_ms_u64;
-use crate::transport::ensure_daemon_identity;
 
 fn index_endpoint_shared_for_workspace(
     db: &Connection,
@@ -68,26 +67,9 @@ fn index_endpoint_shared_for_workspace(
 fn resolve_local_endpoint_shared_event_id(
     db: &Connection,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    let (daemon_endpoint_id, _cert, _key) = ensure_daemon_identity(db)?;
-    let secret_row = crate::event_modules::endpoint_secret::load_local_endpoint_secret(db)?
-        .ok_or("endpoint_secret missing after ensure_daemon_identity")?;
-    if secret_row.endpoint_id != daemon_endpoint_id {
-        return Err("endpoint_secret endpoint_id mismatch after ensure_daemon_identity".into());
-    }
-    let endpoint_shared_event_id =
-        crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event_id(
-            &secret_row.private_key_bytes,
-        );
-    let endpoint_shared_event_id_b64 = event_id_to_base64(&endpoint_shared_event_id);
-    let present: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
-        rusqlite::params![&endpoint_shared_event_id_b64],
-        |row| row.get(0),
-    )?;
-    if !present {
-        return Err("endpoint_shared event missing after ensure_daemon_identity".into());
-    }
-    Ok(endpoint_shared_event_id)
+    let decision_context = super::command_plans::load_local_endpoint_shared_decision_context(db)?;
+    let plan = super::command_plans::decide_local_endpoint_shared_plan(&decision_context);
+    super::command_plans::resolve_local_endpoint_shared_plan(plan)
 }
 
 /// In a shared DB, sibling tenants can already have the workspace's shared

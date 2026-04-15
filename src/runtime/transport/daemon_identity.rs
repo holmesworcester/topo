@@ -4,6 +4,24 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use super::generate_self_signed_cert_from_signing_key;
 use crate::projection::create::create_event_synchronous;
 
+pub const MISSING_DAEMON_IDENTITY_ERROR: &str = "daemon identity not found; start the daemon first";
+pub const INCONSISTENT_DAEMON_IDENTITY_ERROR: &str =
+    "daemon identity is inconsistent: endpoint_shared exists without endpoint_secret";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonIdentityMaterializationDecisionContext {
+    endpoint_secret_present: bool,
+    endpoint_shared_present: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonIdentityMaterializationPlan {
+    AlreadyMaterialized,
+    CreateSecretAndShared,
+    CreateSharedFromExistingSecret,
+    RejectSharedWithoutSecret,
+}
+
 fn sqlite_other(msg: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(msg.into())))
 }
@@ -17,6 +35,60 @@ fn load_endpoint_secret_row(
     crate::event_modules::endpoint_secret::load_local_endpoint_secret(conn)
 }
 
+fn load_endpoint_shared_row(
+    conn: &Connection,
+) -> Result<
+    Option<crate::event_modules::endpoint_shared::EndpointSharedRow>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    crate::event_modules::endpoint_shared::load_local_endpoint_shared(conn)
+}
+
+fn raw_endpoint_secret_present(
+    conn: &Connection,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let present = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM endpoint_secrets LIMIT 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(present)
+}
+
+fn raw_endpoint_shared_present(
+    conn: &Connection,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let present = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM endpoints_shared LIMIT 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(present)
+}
+
+fn load_daemon_identity_materialization_decision_context(
+    conn: &Connection,
+) -> Result<DaemonIdentityMaterializationDecisionContext, Box<dyn std::error::Error + Send + Sync>>
+{
+    Ok(DaemonIdentityMaterializationDecisionContext {
+        endpoint_secret_present: raw_endpoint_secret_present(conn)?,
+        endpoint_shared_present: raw_endpoint_shared_present(conn)?,
+    })
+}
+
+fn decide_daemon_identity_materialization_plan(
+    context: &DaemonIdentityMaterializationDecisionContext,
+) -> DaemonIdentityMaterializationPlan {
+    match (
+        context.endpoint_secret_present,
+        context.endpoint_shared_present,
+    ) {
+        (true, true) => DaemonIdentityMaterializationPlan::AlreadyMaterialized,
+        (false, false) => DaemonIdentityMaterializationPlan::CreateSecretAndShared,
+        (true, false) => DaemonIdentityMaterializationPlan::CreateSharedFromExistingSecret,
+        (false, true) => DaemonIdentityMaterializationPlan::RejectSharedWithoutSecret,
+    }
+}
 fn ensure_endpoint_secret_row(
     conn: &Connection,
 ) -> Result<
@@ -61,10 +133,9 @@ fn ensure_endpoint_shared_row(
     crate::event_modules::endpoint_shared::EndpointSharedRow,
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let expected_public_key =
-        ed25519_dalek::SigningKey::from_bytes(&secret_row.private_key_bytes)
-            .verifying_key()
-            .to_bytes();
+    let expected_public_key = ed25519_dalek::SigningKey::from_bytes(&secret_row.private_key_bytes)
+        .verifying_key()
+        .to_bytes();
     let expected_event_id =
         crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event_id(
             &secret_row.private_key_bytes,
@@ -118,23 +189,32 @@ fn ensure_endpoint_shared_row(
     Ok(row)
 }
 
-pub fn ensure_daemon_identity(
+pub fn materialize_daemon_identity(
     conn: &Connection,
 ) -> Result<
     (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let row = ensure_endpoint_secret_row(conn)?;
-    let _ = ensure_endpoint_shared_row(conn, &row)?;
+    let context = load_daemon_identity_materialization_decision_context(conn)?;
+    let plan = decide_daemon_identity_materialization_plan(&context);
+    let row = match plan {
+        DaemonIdentityMaterializationPlan::AlreadyMaterialized
+        | DaemonIdentityMaterializationPlan::CreateSharedFromExistingSecret => {
+            let row = load_endpoint_secret_row(conn)?.ok_or(MISSING_DAEMON_IDENTITY_ERROR)?;
+            let _ = ensure_endpoint_shared_row(conn, &row)?;
+            row
+        }
+        DaemonIdentityMaterializationPlan::CreateSecretAndShared => {
+            let row = ensure_endpoint_secret_row(conn)?;
+            let _ = ensure_endpoint_shared_row(conn, &row)?;
+            row
+        }
+        DaemonIdentityMaterializationPlan::RejectSharedWithoutSecret => {
+            return Err(INCONSISTENT_DAEMON_IDENTITY_ERROR.into());
+        }
+    };
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&row.private_key_bytes);
     let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(&signing_key)?;
-    crate::db::daemon_identity::store(
-        conn,
-        &row.endpoint_id,
-        cert_der.as_ref(),
-        key_der.secret_pkcs8_der(),
-    )
-    .map_err(|e| sqlite_other(e.to_string()))?;
     Ok((row.endpoint_id, cert_der, key_der))
 }
 
@@ -144,33 +224,59 @@ pub fn load_daemon_identity(
     (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let row = load_endpoint_secret_row(conn)?
-        .ok_or("endpoint identity not found; start the daemon, create a workspace, or accept an invite first")?;
+    let row = load_endpoint_secret_row(conn)?.ok_or(MISSING_DAEMON_IDENTITY_ERROR)?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&row.private_key_bytes);
     let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(&signing_key)?;
     Ok((row.endpoint_id, cert_der, key_der))
 }
 
+pub fn ensure_daemon_identity(
+    conn: &Connection,
+) -> Result<
+    (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let (endpoint_id, cert_der, key_der) = materialize_daemon_identity(conn)?;
+    crate::db::daemon_identity::store(
+        conn,
+        &endpoint_id,
+        cert_der.as_ref(),
+        key_der.secret_pkcs8_der(),
+    )
+    .map_err(|e| sqlite_other(e.to_string()))?;
+    Ok((endpoint_id, cert_der, key_der))
+}
+
 pub fn load_daemon_signing_key(
     conn: &Connection,
 ) -> Result<ed25519_dalek::SigningKey, Box<dyn std::error::Error + Send + Sync>> {
-    let row = load_endpoint_secret_row(conn)?
-        .ok_or("endpoint identity not found; start the daemon, create a workspace, or accept an invite first")?;
+    let row = load_endpoint_secret_row(conn)?.ok_or(MISSING_DAEMON_IDENTITY_ERROR)?;
     Ok(ed25519_dalek::SigningKey::from_bytes(
         &row.private_key_bytes,
     ))
+}
+
+pub fn load_local_daemon_endpoint_id(
+    conn: &Connection,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(row) = load_endpoint_secret_row(conn)? {
+        return Ok(Some(row.endpoint_id));
+    }
+    if let Some(row) = load_endpoint_shared_row(conn)? {
+        return Ok(Some(row.endpoint_id));
+    }
+    Ok(None)
 }
 
 #[cfg(feature = "iroh-transport")]
 pub fn load_daemon_iroh_secret_key(
     conn: &Connection,
 ) -> Result<iroh::SecretKey, Box<dyn std::error::Error + Send + Sync>> {
-    let row = load_endpoint_secret_row(conn)?
-        .ok_or("endpoint identity not found; start the daemon, create a workspace, or accept an invite first")?;
+    let row = load_endpoint_secret_row(conn)?.ok_or(MISSING_DAEMON_IDENTITY_ERROR)?;
     Ok(iroh::SecretKey::from_bytes(&row.private_key_bytes))
 }
 
-pub fn ensure_daemon_identity_from_db(
+pub fn materialize_daemon_identity_from_db(
     db_path: &str,
 ) -> Result<
     (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
@@ -178,7 +284,7 @@ pub fn ensure_daemon_identity_from_db(
 > {
     let conn = crate::db::open_connection(db_path)?;
     crate::db::schema::create_tables(&conn)?;
-    ensure_daemon_identity(&conn)
+    materialize_daemon_identity(&conn)
 }
 
 pub fn load_daemon_identity_from_db(
@@ -190,6 +296,17 @@ pub fn load_daemon_identity_from_db(
     let conn = crate::db::open_connection(db_path)?;
     crate::db::schema::create_tables(&conn)?;
     load_daemon_identity(&conn)
+}
+
+pub fn ensure_daemon_identity_from_db(
+    db_path: &str,
+) -> Result<
+    (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let conn = crate::db::open_connection(db_path)?;
+    crate::db::schema::create_tables(&conn)?;
+    ensure_daemon_identity(&conn)
 }
 
 pub fn load_daemon_signing_key_from_db(
@@ -215,12 +332,12 @@ mod tests {
     use crate::db::{open_in_memory, schema::create_tables};
 
     #[test]
-    fn ensure_daemon_identity_generates_and_persists_endpoint_secret() {
+    fn materialize_daemon_identity_generates_and_persists_endpoint_events() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        let first = ensure_daemon_identity(&conn).unwrap();
-        let second = ensure_daemon_identity(&conn).unwrap();
+        let first = materialize_daemon_identity(&conn).unwrap();
+        let second = materialize_daemon_identity(&conn).unwrap();
 
         assert_eq!(first.0, second.0);
         assert_eq!(first.0.len(), 64);
@@ -244,6 +361,45 @@ mod tests {
                 .unwrap()
                 .expect("endpoint shared row");
         assert_eq!(endpoint_shared.endpoint_id, first.0);
+        assert!(
+            crate::db::daemon_identity::load(&conn).unwrap().is_none(),
+            "daemon identity should be derived from endpoint events, not persisted in a cache table"
+        );
+    }
+
+    #[test]
+    fn materialize_daemon_identity_repairs_missing_endpoint_shared() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let secret = ensure_endpoint_secret_row(&conn).unwrap();
+        assert!(load_endpoint_shared_row(&conn).unwrap().is_none());
+
+        let materialized = materialize_daemon_identity(&conn).unwrap();
+        assert_eq!(materialized.0, secret.endpoint_id);
+        assert!(load_endpoint_shared_row(&conn).unwrap().is_some());
+    }
+
+    #[test]
+    fn materialize_daemon_identity_rejects_shared_without_secret() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO endpoints_shared (recorded_by, event_id, endpoint_id, public_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "ghost-endpoint",
+                crate::crypto::event_id_to_base64(&[0x55; 32]),
+                hex::encode([0x11; 32]),
+                vec![0x22_u8; 32],
+                1_i64
+            ],
+        )
+        .unwrap();
+
+        let err = materialize_daemon_identity(&conn).unwrap_err();
+        assert_eq!(err.to_string(), INCONSISTENT_DAEMON_IDENTITY_ERROR);
     }
 
     #[test]
@@ -269,9 +425,10 @@ mod tests {
         .unwrap();
 
         let repaired = ensure_daemon_identity(&conn).unwrap();
-        let repaired_shared = crate::event_modules::endpoint_shared::load_local_endpoint_shared(&conn)
-            .unwrap()
-            .expect("repaired endpoint shared row");
+        let repaired_shared =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&conn)
+                .unwrap()
+                .expect("repaired endpoint shared row");
         let repaired_event_present: bool = conn
             .query_row(
                 "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
@@ -291,6 +448,19 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        assert!(load_daemon_identity(&conn).is_err());
+        let err = load_daemon_identity(&conn).unwrap_err();
+        assert_eq!(err.to_string(), MISSING_DAEMON_IDENTITY_ERROR);
+    }
+
+    #[test]
+    fn load_local_daemon_endpoint_id_prefers_endpoint_secret() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let secret = ensure_endpoint_secret_row(&conn).unwrap();
+        assert_eq!(
+            load_local_daemon_endpoint_id(&conn).unwrap(),
+            Some(secret.endpoint_id)
+        );
     }
 }

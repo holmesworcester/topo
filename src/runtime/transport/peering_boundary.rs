@@ -21,11 +21,11 @@ use crate::tuning::low_mem_mode;
 use super::connection_lifecycle::{
     accept_daemon, dial_daemon, ConnectedDaemon, ConnectionLifecycleError,
 };
+use super::load_daemon_iroh_secret_key_from_db;
 use super::session_factory::{
     accept_session_io, open_session_io_for_class, InboundSessionState, SessionCarrier,
     SessionClass, SessionOpenError,
 };
-use super::{ensure_daemon_identity_from_db, load_daemon_iroh_secret_key_from_db};
 
 pub const TOPO_ALPN: &[u8] = b"topo/p7/1";
 
@@ -409,7 +409,6 @@ pub async fn create_runtime_endpoint_for_tenants(
     bind_addr: SocketAddr,
     db_path: &str,
 ) -> Result<TransportEndpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let _ = ensure_daemon_identity_from_db(db_path)?;
     let secret_key = load_daemon_iroh_secret_key_from_db(db_path)?;
     let mut builder = iroh::Endpoint::empty_builder()
         .secret_key(secret_key)
