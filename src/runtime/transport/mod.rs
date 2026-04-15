@@ -38,7 +38,9 @@ pub use connection_lifecycle::{
 };
 pub use daemon_identity::{
     ensure_daemon_identity, ensure_daemon_identity_from_db, load_daemon_identity,
-    load_daemon_identity_from_db,
+    load_daemon_identity_from_db, load_local_daemon_endpoint_id, materialize_daemon_identity,
+    materialize_daemon_identity_from_db,
+    INCONSISTENT_DAEMON_IDENTITY_ERROR, MISSING_DAEMON_IDENTITY_ERROR,
 };
 #[cfg(feature = "iroh-transport")]
 pub use daemon_identity::{load_daemon_iroh_secret_key, load_daemon_iroh_secret_key_from_db};

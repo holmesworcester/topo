@@ -1,5 +1,6 @@
 pub mod authoring;
 pub mod bootstrap_address;
+mod command_plans;
 pub mod commands;
 mod commands_api;
 pub mod identity_ops;

@@ -103,29 +103,16 @@ fn resolve_admin_event_for_signer(
     }
 }
 
-fn decode_hex32(
-    value: &str,
-    what: &str,
-) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = hex::decode(value)?;
-    if bytes.len() != 32 {
-        return Err(format!("{what} is not valid 32-byte hex endpoint id").into());
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(arr)
-}
-
 fn resolve_invite_bootstrap_endpoint_id(
     db: &Connection,
     public_endpoint_id_hex: Option<&str>,
 ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(endpoint_id_hex) = public_endpoint_id_hex {
-        return decode_hex32(endpoint_id_hex, "endpoint_id");
-    }
-
-    let (daemon_peer_id, _cert, _key) = crate::transport::ensure_daemon_identity(db)?;
-    decode_hex32(&daemon_peer_id, "daemon_endpoint_id")
+    let decision_context = super::command_plans::load_invite_bootstrap_endpoint_decision_context(
+        db,
+        public_endpoint_id_hex,
+    )?;
+    let plan = super::command_plans::decide_invite_bootstrap_endpoint_plan(&decision_context);
+    super::command_plans::resolve_invite_bootstrap_endpoint_plan(plan)
 }
 
 // DB-path-level command wrappers (moved from service.rs)
@@ -553,20 +540,23 @@ pub fn create_device_link_for_peer(
 
 #[cfg(test)]
 mod tests {
+    use super::accept_device_link;
+    use super::accept_invite;
     use super::create_invite_for_peer;
     use super::create_workspace_for_db;
     use super::resolve_invite_bootstrap_endpoint_id;
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
+    use crate::event_modules::workspace::command_plans;
     use crate::event_modules::workspace::invite_link::parse_invite_link;
-    use crate::transport::ensure_daemon_identity;
+    use crate::transport::{materialize_daemon_identity, MISSING_DAEMON_IDENTITY_ERROR};
 
     #[test]
     fn resolve_invite_bootstrap_endpoint_id_uses_daemon_identity_by_default() {
         let db = open_in_memory().expect("open in-memory db");
         create_tables(&db).expect("create tables");
         let (daemon_peer_id, _cert, _key) =
-            ensure_daemon_identity(&db).expect("ensure daemon identity");
+            materialize_daemon_identity(&db).expect("materialize daemon identity");
 
         let endpoint_id =
             resolve_invite_bootstrap_endpoint_id(&db, None).expect("resolve endpoint id");
@@ -589,10 +579,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_invite_bootstrap_endpoint_id_rejects_missing_daemon_identity_without_explicit() {
+        let db = open_in_memory().expect("open in-memory db");
+        create_tables(&db).expect("create tables");
+
+        let err = resolve_invite_bootstrap_endpoint_id(&db, None).unwrap_err();
+        assert_eq!(err.to_string(), MISSING_DAEMON_IDENTITY_ERROR);
+    }
+
+    #[test]
     fn create_invite_for_peer_leaves_bootstrap_addresses_empty_by_default() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("invite.sqlite3");
         let db_path = db_path.to_str().expect("db path");
+        crate::transport::materialize_daemon_identity_from_db(db_path)
+            .expect("materialize daemon identity");
         let workspace =
             create_workspace_for_db(db_path, "alpha", "alice", "laptop").expect("create workspace");
 
@@ -614,6 +615,62 @@ mod tests {
         assert!(
             parsed.relay_url.is_none(),
             "without a live runtime relay, the invite should remain endpoint-id only"
+        );
+    }
+
+    #[test]
+    fn accept_invite_requires_materialized_daemon_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let creator_db = temp.path().join("creator.sqlite3");
+        let creator_db = creator_db.to_str().expect("creator db");
+        crate::transport::materialize_daemon_identity_from_db(creator_db)
+            .expect("materialize creator daemon identity");
+        let workspace =
+            create_workspace_for_db(creator_db, "alpha", "alice", "laptop").expect("workspace");
+        let invite = create_invite_for_peer(
+            creator_db,
+            &workspace.peer_id,
+            &[],
+            crate::event_modules::workspace::invite_link::DEFAULT_PORT,
+            None,
+            None,
+        )
+        .expect("create invite");
+
+        let joiner_db = temp.path().join("joiner.sqlite3");
+        let joiner_db = joiner_db.to_str().expect("joiner db");
+        let err = accept_invite(joiner_db, &invite.invite_link, "bob", "tablet").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            command_plans::MISSING_LOCAL_DAEMON_ENDPOINT_SHARED_ERROR
+        );
+    }
+
+    #[test]
+    fn accept_device_link_requires_materialized_daemon_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let creator_db = temp.path().join("creator.sqlite3");
+        let creator_db = creator_db.to_str().expect("creator db");
+        crate::transport::materialize_daemon_identity_from_db(creator_db)
+            .expect("materialize creator daemon identity");
+        let workspace =
+            create_workspace_for_db(creator_db, "alpha", "alice", "laptop").expect("workspace");
+        let invite = super::create_device_link_for_peer(
+            creator_db,
+            &workspace.peer_id,
+            &[],
+            crate::event_modules::workspace::invite_link::DEFAULT_PORT,
+            None,
+            None,
+        )
+        .expect("create device link");
+
+        let joiner_db = temp.path().join("joiner.sqlite3");
+        let joiner_db = joiner_db.to_str().expect("joiner db");
+        let err = accept_device_link(joiner_db, &invite.invite_link, "phone").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            command_plans::MISSING_LOCAL_DAEMON_ENDPOINT_SHARED_ERROR
         );
     }
 }
