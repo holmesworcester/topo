@@ -3,6 +3,7 @@
 //! - `pipeline/`: projection-pipeline and ingestion proofs
 //! - `runtime/`: transport, peering, and sync-session proofs
 //! - `state/`: state-selection and purge/fanout proofs
+//! - `event_modules/`: event-module command family proofs
 //! - `bug_hunt.rs`: intentionally cross-cutting counterexample-oriented proofs
 
 use vstd::prelude::*;

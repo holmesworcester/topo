@@ -249,6 +249,15 @@ adds per-area success criteria, required checks, and end-to-end validation so
 the remaining work can be tracked as completion criteria instead of open-ended
 proof intent.
 
+Primary formal gate rules:
+
+1. `scripts/run_merge_readiness_checks.sh targeted` is the primary agent/merge-readiness gate and must run the formal checks before the serial regression cases.
+2. That primary gate must run `cargo test --lib boundary_tests::`, `cargo test --lib registry_formal_projector_coverage`, and strict Verus verification (`TOPO_REQUIRE_VERUS=1 scripts/run_verus_proofs.sh`).
+3. Repo command entry files (`src/**/commands.rs`, `src/**/commands_api.rs`) must be indexed in `docs/planning/COMMAND_FORMAL_COVERAGE.md` with a Verus mirror and concrete targeted checks.
+4. Registered event projectors must remain assigned to a Verus-covered projector family, and projector TLA/runtime mapping checks must stay in the primary gate path.
+5. New runtime/state decision seams, repo command entry files, and new Verus source files must fail the primary gate until their coverage inventory and proof mirrors are updated.
+6. If a covered runtime command/seam/projector path changes, the same diff must also touch one of its mapped Verus mirrors.
+
 ## 2.1 Strict Endpoint/Auth Target
 
 Before more transport/auth work lands, the intended authority model is:

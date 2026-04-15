@@ -1092,3 +1092,58 @@ pub(crate) fn run_topo_log_action(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_target_selector;
+
+    #[test]
+    fn resolve_target_selector_rejects_conflicting_selectors() {
+        let err = resolve_target_selector(
+            Some("positional".to_string()),
+            Some("deprecated".to_string()),
+            "react",
+            None,
+        )
+        .expect_err("conflicting selectors must reject");
+        assert!(err.to_string().contains("conflicting target selectors"));
+    }
+
+    #[test]
+    fn resolve_target_selector_accepts_positional_selector() {
+        let target = resolve_target_selector(
+            Some("42".to_string()),
+            None,
+            "delete-message",
+            Some("ignored-default"),
+        )
+        .expect("positional selector");
+        assert_eq!(target, "42");
+    }
+
+    #[test]
+    fn resolve_target_selector_accepts_deprecated_selector_when_positional_missing() {
+        let target = resolve_target_selector(
+            None,
+            Some("7".to_string()),
+            "react",
+            Some("ignored-default"),
+        )
+        .expect("deprecated selector");
+        assert_eq!(target, "7");
+    }
+
+    #[test]
+    fn resolve_target_selector_uses_default_when_missing() {
+        let target =
+            resolve_target_selector(None, None, "react", Some("1")).expect("default selector");
+        assert_eq!(target, "1");
+    }
+
+    #[test]
+    fn resolve_target_selector_rejects_missing_without_default() {
+        let err =
+            resolve_target_selector(None, None, "save-file", None).expect_err("missing target");
+        assert!(err.to_string().contains("missing target"));
+    }
+}
