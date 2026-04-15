@@ -62,6 +62,16 @@ mod boundary_tests {
         assert_python_script_passes("scripts/check_formal_seam_coverage.py");
     }
 
+    #[test]
+    fn test_command_formal_coverage_enforced() {
+        assert_python_script_passes("scripts/check_command_formal_coverage.py");
+    }
+
+    #[test]
+    fn test_formal_mirror_updates_enforced() {
+        assert_python_script_passes("scripts/check_formal_mirror_updates.py");
+    }
+
     fn collect_verus_sources(dir: &std::path::Path, out: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir)
             .unwrap_or_else(|err| panic!("failed to read {}: {}", dir.display(), err))
