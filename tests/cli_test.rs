@@ -848,7 +848,7 @@ fn assert_message_visible_on_all_with_sync_rounds(
     }
 }
 
-fn start_linked_cli_peer(
+fn start_linked_discovery_cli_peer(
     tmpdir: &tempfile::TempDir,
     db_name: &str,
     invite_link: &str,
@@ -856,7 +856,7 @@ fn start_linked_cli_peer(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    let daemon = start_daemon(&db);
+    let daemon = start_discovery_daemon(&db);
     accept_device_link_with_name_on_running_daemon(
         &db,
         invite_link,
@@ -2660,7 +2660,8 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     let phone_base_eid = send_message(&phone.db, phone_base);
     assert_event_visible_on_all(&[&phone.db], &phone_base_eid, timeout_ms);
 
-    let laptop = start_linked_cli_peer(&tmpdir, "laptop.db", &link_a, "alice", "laptop");
+    let laptop =
+        start_linked_discovery_cli_peer(&tmpdir, "laptop.db", &link_a, "alice", "laptop");
     let laptop_tenant = laptop.tenant_label();
     assert_identity_eventually_materialized(&laptop.db, timeout_ms);
     assert_event_visible_on_all(&[&laptop.db], &phone_base_eid, timeout_ms);
@@ -2669,7 +2670,8 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     assert_event_visible_on_all(&[&phone.db, &laptop.db], &laptop_eid, timeout_ms);
 
     let link_b = create_device_link(&laptop.db, &daemon_listen_addr(&laptop.db));
-    let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &link_b, "alice", "tablet");
+    let tablet =
+        start_linked_discovery_cli_peer(&tmpdir, "tablet.db", &link_b, "alice", "tablet");
     let tablet_tenant = tablet.tenant_label();
     assert_identity_eventually_materialized(&tablet.db, timeout_ms);
     assert_event_visible_on_all(&[&tablet.db], &phone_base_eid, timeout_ms);
@@ -2682,7 +2684,8 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
         timeout_ms,
     );
 
-    let desktop = start_linked_cli_peer(&tmpdir, "desktop.db", &link_a, "alice", "desktop");
+    let desktop =
+        start_linked_discovery_cli_peer(&tmpdir, "desktop.db", &link_a, "alice", "desktop");
     let desktop_tenant = desktop.tenant_label();
     assert_identity_eventually_materialized(&desktop.db, timeout_ms);
     assert_event_visible_on_all(&[&desktop.db], &phone_base_eid, timeout_ms);
@@ -3319,10 +3322,6 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
     let mut owner_daemon = start_daemon(&owner_db);
     let home_tenant = "home/home-root".to_string();
     let home_peer_id = tenant_peer_id_for_username(&owner_db, "home").expect("home peer id");
-    let owner_daemon_peer_id = daemon_identity_fingerprint(&owner_db);
-    let owner_remote: SocketAddr = daemon_listen_addr(&owner_db)
-        .parse()
-        .expect("owner listen addr");
 
     let home_bootstrap = "home-space/bootstrap";
     let home_bootstrap_eid = send_message(&owner_db, home_bootstrap);
@@ -3334,11 +3333,7 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
         "home-guest",
         "guest-laptop",
     );
-    let home_guest_peer_id = wait_for_username_peer_id(&home_guest.db, "home-guest", timeout_ms);
-    let home_guest_daemon_peer_id = daemon_identity_fingerprint(&home_guest.db);
-    let home_guest_remote: SocketAddr = daemon_listen_addr(&home_guest.db)
-        .parse()
-        .expect("home guest listen addr");
+    let _home_guest_peer_id = wait_for_username_peer_id(&home_guest.db, "home-guest", timeout_ms);
     assert_event_visible_on_all(&[&home_guest.db], &home_bootstrap_eid, timeout_ms);
 
     create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
@@ -3392,24 +3387,7 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
     assert_event_visible_on_all(&[&zeta_db], &zeta_eid, timeout_ms);
 
     use_tenant_for_username(&owner_db, "home");
-    wait_for_direct_trust_dial(
-        &owner_db,
-        &home_peer_id,
-        home_guest_remote,
-        &home_guest_daemon_peer_id,
-        &home_guest_peer_id,
-        &home_guest_peer_id,
-        timeout_ms,
-    );
-    wait_for_direct_trust_dial(
-        &home_guest.db,
-        &home_guest_peer_id,
-        owner_remote,
-        &owner_daemon_peer_id,
-        &home_peer_id,
-        &home_peer_id,
-        timeout_ms,
-    );
+    wait_for_tenant_transport_converged(&owner_db, &home_peer_id, Duration::from_secs(120));
     wait_for_active_tenant_ready(&owner_db, Duration::from_secs(120));
     wait_for_live_sync_session(&owner_db, Duration::from_secs(60));
     wait_for_live_sync_session(&home_guest.db, Duration::from_secs(60));

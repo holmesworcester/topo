@@ -528,6 +528,10 @@ impl Peer {
 
         let db = open_connection(&db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
+        // Match a real daemon's first-run state so production workspace
+        // commands can resolve the daemon endpoint identity in tests too.
+        crate::transport::materialize_daemon_identity(&db)
+            .expect("failed to materialize daemon identity");
 
         let identity = ensure_transport_peer_id(&db).expect("failed to compute identity");
         let author_id: [u8; 32] = rand::random();
