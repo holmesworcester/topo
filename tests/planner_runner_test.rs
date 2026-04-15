@@ -141,6 +141,12 @@ fn authoring_ready(daemon: &VirtualDaemon) -> bool {
         .is_ok()
 }
 
+fn message_count(daemon: &VirtualDaemon) -> i64 {
+    daemon.call_ok_value(RpcMethod::Stats).expect("stats")["message_count"]
+        .as_i64()
+        .unwrap_or_default()
+}
+
 fn finish_bootstrap_until_authoring_ready(db_paths: &[String], ready_peers: &[&VirtualDaemon]) {
     for _ in 0..4 {
         if ready_peers.iter().all(|daemon| authoring_ready(daemon)) {
@@ -424,8 +430,8 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
     .expect("planner tick");
 
     assert_eq!(report.imported_nodes, 3);
-    assert_eq!(report.unique_pairs, 2);
-    assert_eq!(report.sessions_executed, 2);
+    assert_eq!(report.unique_pairs, 3);
+    assert_eq!(report.sessions_executed, 3);
     assert!(
         report.pairs.iter().any(|pair| {
             pair.left_recorded_by == laptop_peer && pair.right_recorded_by == phone_peer
@@ -441,15 +447,15 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
         "planner runner should execute the real laptop-tablet pair session"
     );
     assert!(
-        !report.pairs.iter().any(|pair| {
+        report.pairs.iter().any(|pair| {
             pair.left_recorded_by == phone_peer && pair.right_recorded_by == tablet_peer
                 || pair.left_recorded_by == tablet_peer && pair.right_recorded_by == phone_peer
         }),
-        "planner runner must not invent a direct phone-tablet session"
+        "shared runtime planning should surface the real direct phone-tablet known-peer session"
     );
 
     assert_has_event(&laptop, &routed_message);
-    assert_lacks_event(&tablet, &routed_message);
+    assert_has_event(&tablet, &routed_message);
     for event_id in &phone_key_shared_ids {
         assert_has_event(&tablet, event_id);
     }
@@ -461,7 +467,7 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
     ])
     .tick()
     .expect("second planner tick");
-    assert_eq!(second_round.unique_pairs, 2);
+    assert_eq!(second_round.unique_pairs, 3);
     assert_has_event(&tablet, &routed_message);
 }
 
@@ -649,6 +655,111 @@ fn fake_star_message_reaches_all_peers_in_one_round() {
     assert_eq!(bob_arrival_ms, 1_000);
     assert_eq!(carol_arrival_ms, 1_000);
     assert_eq!(dave_arrival_ms, 1_000);
+}
+
+#[test]
+fn planner_runner_advances_seeded_history_by_real_window_cadence() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db");
+    let bob_db = tmpdir.path().join("bob.db");
+
+    let alice = VirtualDaemon::new(alice_db.to_str().unwrap());
+    let bob = VirtualDaemon::new(bob_db.to_str().unwrap());
+
+    let created = alice.call(RpcMethod::CreateWorkspace {
+        workspace_name: "sim".into(),
+        username: "alice".into(),
+        device_name: "laptop".into(),
+        message_count: 64,
+        network_age: Some("30d".into()),
+    });
+    assert!(created.ok, "workspace creation failed: {:?}", created.error);
+    let alice_peer = active_peer_id(&alice);
+
+    let invite = create_invite(&alice);
+    let accepted = bob.call(RpcMethod::AcceptInvite {
+        invite,
+        username: "bob".into(),
+        devicename: "phone".into(),
+    });
+    assert!(
+        accepted.ok,
+        "bob accept invite failed: {:?}",
+        accepted.error
+    );
+    let bob_peer = active_peer_id(&bob);
+
+    let dbs = vec![
+        alice_db.to_string_lossy().into_owned(),
+        bob_db.to_string_lossy().into_owned(),
+    ];
+    let alice_total = message_count(&alice);
+    assert_eq!(alice_total, 64);
+
+    let round1 = PlannerSimulation::new(dbs.clone())
+        .tick()
+        .expect("round 1 planner tick");
+    let round1_alice_to_bob = round1
+        .pairs
+        .iter()
+        .flat_map(|pair| [&pair.stats.left_to_right, &pair.stats.right_to_left])
+        .find(|stats| stats.source_recorded_by == alice_peer && stats.dest_recorded_by == bob_peer)
+        .expect("alice->bob stats in round 1");
+    assert_eq!(
+        round1_alice_to_bob.selected_window_kind.as_deref(),
+        Some("LastDay")
+    );
+    assert!(
+        message_count(&bob) < alice_total,
+        "last-day window should not converge the entire 30-day backlog in one round"
+    );
+
+    let round2 = PlannerSimulation::new(dbs.clone())
+        .tick()
+        .expect("round 2 planner tick");
+    let round2_alice_to_bob = round2
+        .pairs
+        .iter()
+        .flat_map(|pair| [&pair.stats.left_to_right, &pair.stats.right_to_left])
+        .find(|stats| stats.source_recorded_by == alice_peer && stats.dest_recorded_by == bob_peer)
+        .expect("alice->bob stats in round 2");
+    assert_eq!(
+        round2_alice_to_bob.selected_window_kind.as_deref(),
+        Some("LastWeek")
+    );
+
+    let round3 = PlannerSimulation::new(dbs.clone())
+        .tick()
+        .expect("round 3 planner tick");
+    let round3_alice_to_bob = round3
+        .pairs
+        .iter()
+        .flat_map(|pair| [&pair.stats.left_to_right, &pair.stats.right_to_left])
+        .find(|stats| stats.source_recorded_by == alice_peer && stats.dest_recorded_by == bob_peer)
+        .expect("alice->bob stats in round 3");
+    assert_eq!(
+        round3_alice_to_bob.selected_window_kind.as_deref(),
+        Some("LastDay")
+    );
+
+    let round4 = PlannerSimulation::new(dbs.clone())
+        .tick()
+        .expect("round 4 planner tick");
+    let round4_alice_to_bob = round4
+        .pairs
+        .iter()
+        .flat_map(|pair| [&pair.stats.left_to_right, &pair.stats.right_to_left])
+        .find(|stats| stats.source_recorded_by == alice_peer && stats.dest_recorded_by == bob_peer)
+        .expect("alice->bob stats in round 4");
+    assert_eq!(
+        round4_alice_to_bob.selected_window_kind.as_deref(),
+        Some("LastTwelveWeeks")
+    );
+    assert_eq!(
+        message_count(&bob),
+        alice_total,
+        "the three real window rounds should converge a 30-day seeded backlog"
+    );
 }
 
 #[test]

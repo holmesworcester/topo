@@ -68,15 +68,23 @@ pub struct ProjectorResult {
     pub decision: super::decision::ProjectionDecision,
     pub write_ops: Vec<WriteOp>,
     pub emit_commands: Vec<EmitCommand>,
+    pub suppress_sharing: bool,
 }
 
 impl ProjectorResult {
     /// Convenience: create a Valid result with the given write_ops.
     pub fn valid(write_ops: Vec<WriteOp>) -> Self {
+        Self::valid_with_sharing(write_ops, false)
+    }
+
+    /// Convenience: create a Valid result with the given write_ops and a
+    /// projection-owned suppress_sharing decision.
+    pub fn valid_with_sharing(write_ops: Vec<WriteOp>, suppress_sharing: bool) -> Self {
         Self {
             decision: super::decision::ProjectionDecision::Valid,
             write_ops,
             emit_commands: Vec::new(),
+            suppress_sharing,
         }
     }
 
@@ -86,6 +94,7 @@ impl ProjectorResult {
             decision: super::decision::ProjectionDecision::Valid,
             write_ops,
             emit_commands,
+            suppress_sharing: false,
         }
     }
 
@@ -95,6 +104,7 @@ impl ProjectorResult {
             decision: super::decision::ProjectionDecision::Reject { reason },
             write_ops: Vec::new(),
             emit_commands: Vec::new(),
+            suppress_sharing: false,
         }
     }
 
@@ -104,6 +114,7 @@ impl ProjectorResult {
             decision: super::decision::ProjectionDecision::Block { missing },
             write_ops: Vec::new(),
             emit_commands: Vec::new(),
+            suppress_sharing: false,
         }
     }
 
@@ -113,6 +124,7 @@ impl ProjectorResult {
             decision: super::decision::ProjectionDecision::AlreadyProcessed,
             write_ops: Vec::new(),
             emit_commands: Vec::new(),
+            suppress_sharing: false,
         }
     }
 }
@@ -230,6 +242,10 @@ pub struct ProjectorDecisionContext {
     /// recorded from the accepted invite link. Local self-create remains
     /// valid when invite_event_id == workspace_id.
     pub invite_accepted_link_workspace_mismatch_reason: Option<String>,
+
+    /// For KeyRequest: projection may suppress later sharing once a projected
+    /// response already exists for the same delivery target.
+    pub key_request_suppress_sharing: bool,
 
     /// Whether this event was locally created (source = 'local' in recorded_events).
     /// Used to gate pending bootstrap trust writes: only locally-created invite

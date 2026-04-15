@@ -7,7 +7,7 @@
 pub mod fixtures {
     use topo::event_modules::{
         AdminEvent, DeviceInviteEvent, FileEvent, FileSliceEvent, InviteAcceptedEvent,
-        KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
+        KeyRequestEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
         UserInviteEvent, WorkspaceEvent,
     };
     use topo::projection::contract::{
@@ -155,6 +155,16 @@ pub mod fixtures {
             _recorded_by: &str,
             _event_id_b64: &str,
             _invite_accepted: &InviteAcceptedEvent,
+        ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_key_request_context(
+            &self,
+            _frame: &ProjectionFrameContext,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _key_request: &KeyRequestEvent,
         ) -> Result<ProjectorDecisionContext, Box<dyn std::error::Error>> {
             Ok(self.ctx.clone())
         }

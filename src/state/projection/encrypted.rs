@@ -128,7 +128,7 @@ pub fn project_encrypted(
     // so encrypted deps are validated by semantic inner type rather than outer
     // wrapper type code.
     let transport_key_event_id_b64 = event_id_to_base64(&enc.key_event_id);
-    let (decision, _) = run_dep_and_projection_stages(
+    let (decision, _, _) = run_dep_and_projection_stages(
         conn,
         recorded_by,
         event_id_b64,

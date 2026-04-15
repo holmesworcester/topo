@@ -6,11 +6,20 @@ use serde::Serialize;
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::hash_event;
 use crate::db::open_connection;
+use crate::db::store::{lookup_workspace_id, Store};
 use crate::event_modules::{self as events, ParsedEvent};
 use crate::event_pipeline::ingest_now;
-use crate::sim::key_repair::{key_request_target, key_shared_target, response_rank, RepairTarget};
+use crate::runtime::key_repair::shared_sendable_event_id;
+use crate::sim::key_repair::{key_shared_target, response_rank, RepairTarget};
 use crate::sim::query_snapshot::{ImportedConnectTarget, ImportedPeerState};
 use crate::state::db::transport_creds::resolve_tenant_transport_target;
+use crate::sync::session::range_session::{
+    list_missing_shared_event_ids_for_range, load_shared_send_batch,
+    order_requested_shared_event_ids_for_send_for_peer,
+};
+use crate::sync::session::windowing::{
+    mark_outbound_window_completed, select_outbound_window, SyncWindow,
+};
 
 type PairSyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -26,6 +35,7 @@ pub(crate) struct PreparedPairSyncDirection {
     pub(crate) stats: PairSyncDirectionStats,
     pub(crate) dest_db_path: String,
     pub(crate) batch: Vec<IngestItem>,
+    pub(crate) selected_window: Option<SyncWindow>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +94,9 @@ pub struct PairSyncDirectionStats {
     pub source_recorded_by: String,
     pub dest_db_path: String,
     pub dest_recorded_by: String,
+    pub selected_window_kind: Option<String>,
+    pub selected_window_ts_min_inclusive_ms: Option<i64>,
+    pub selected_window_ts_max_exclusive_ms: Option<i64>,
     pub transferred_events: usize,
     pub transferred_bytes: u64,
     pub transferred_key_request_events: usize,
@@ -198,6 +211,28 @@ pub(crate) fn prepare_pair_sync_session(
     })
 }
 
+pub(crate) fn prepare_synthetic_pair_sync_session(
+    left_db_path: &str,
+    left_recorded_by: &str,
+    right_db_path: &str,
+    right_recorded_by: &str,
+) -> PairSyncResult<PreparedPairSyncSession> {
+    Ok(PreparedPairSyncSession {
+        left_to_right: collect_synthetic_shared_events_one_way(
+            left_db_path,
+            left_recorded_by,
+            right_db_path,
+            right_recorded_by,
+        )?,
+        right_to_left: collect_synthetic_shared_events_one_way(
+            right_db_path,
+            right_recorded_by,
+            left_db_path,
+            left_recorded_by,
+        )?,
+    })
+}
+
 pub(crate) fn apply_prepared_pair_sync_session(
     prepared: PreparedPairSyncSession,
 ) -> PairSyncResult<PairSyncSessionStats> {
@@ -222,7 +257,6 @@ fn collect_shared_events_one_way(
 
     let known_dest_events = stored_event_ids(&dest)?;
     let winning_key_shared_events = winning_key_shared_event_ids(&source, source_recorded_by)?;
-    let observed_key_shared_targets = observed_key_shared_targets(&source, source_recorded_by)?;
     let source_tag = format!(
         "quic_recv:{}@sim",
         source_transport_peer_id(&source, source_recorded_by)?
@@ -253,20 +287,22 @@ fn collect_shared_events_one_way(
     })?;
 
     for row in rows {
-        let (event_id, _event_type, blob) = row?;
-        if known_dest_events.contains(&event_id) {
+        let (event_id_b64, _event_type, blob) = row?;
+        if known_dest_events.contains(&event_id_b64) {
             continue;
         }
         match semantic_parsed_event(&blob) {
-            Ok(ParsedEvent::KeyRequest(event)) => {
-                if observed_key_shared_targets.contains(&key_request_target(&event)) {
+            Ok(ParsedEvent::KeyRequest(_)) => {
+                let event_id = crate::crypto::event_id_from_base64(&event_id_b64)
+                    .ok_or("invalid base64 event_id in pair sync source")?;
+                if !shared_sendable_event_id(&source, source_recorded_by, &event_id)? {
                     suppressed_key_request_events = suppressed_key_request_events.saturating_add(1);
                     continue;
                 }
                 transferred_key_request_events = transferred_key_request_events.saturating_add(1);
             }
             Ok(ParsedEvent::KeyShared(_)) => {
-                if !winning_key_shared_events.contains(&event_id) {
+                if !winning_key_shared_events.contains(&event_id_b64) {
                     suppressed_key_shared_events = suppressed_key_shared_events.saturating_add(1);
                     continue;
                 }
@@ -274,9 +310,9 @@ fn collect_shared_events_one_way(
             }
             _ => {}
         }
-        primary_event_ids.push(event_id.clone());
+        primary_event_ids.push(event_id_b64.clone());
         primary_events.push(TransferableSharedEvent {
-            event_id,
+            event_id: event_id_b64,
             created_at_ms: events::extract_created_at_ms(&blob).unwrap_or(0) as i64,
             blob,
         });
@@ -312,6 +348,9 @@ fn collect_shared_events_one_way(
             source_recorded_by: source_recorded_by.to_string(),
             dest_db_path: dest_db_path.to_string(),
             dest_recorded_by: dest_recorded_by.to_string(),
+            selected_window_kind: None,
+            selected_window_ts_min_inclusive_ms: None,
+            selected_window_ts_max_exclusive_ms: None,
             transferred_events: transferred_event_ids.len(),
             transferred_bytes,
             transferred_key_request_events,
@@ -322,7 +361,196 @@ fn collect_shared_events_one_way(
         },
         dest_db_path: dest_db_path.to_string(),
         batch,
+        selected_window: None,
     })
+}
+
+fn collect_synthetic_shared_events_one_way(
+    source_db_path: &str,
+    source_recorded_by: &str,
+    dest_db_path: &str,
+    dest_recorded_by: &str,
+) -> PairSyncResult<PreparedPairSyncDirection> {
+    let source = open_connection(source_db_path)?;
+    crate::db::schema::create_tables(&source)?;
+    let dest = open_connection(dest_db_path)?;
+    crate::db::schema::create_tables(&dest)?;
+
+    let Some(source_workspace_id) = lookup_workspace_id(&source, source_recorded_by) else {
+        return Ok(empty_prepared_direction(
+            source_db_path,
+            source_recorded_by,
+            dest_db_path,
+            dest_recorded_by,
+            None,
+        ));
+    };
+    let Some(dest_workspace_id) = lookup_workspace_id(&dest, dest_recorded_by) else {
+        return Ok(empty_prepared_direction(
+            source_db_path,
+            source_recorded_by,
+            dest_db_path,
+            dest_recorded_by,
+            None,
+        ));
+    };
+    if source_workspace_id != dest_workspace_id {
+        return Ok(empty_prepared_direction(
+            source_db_path,
+            source_recorded_by,
+            dest_db_path,
+            dest_recorded_by,
+            None,
+        ));
+    }
+
+    let range = select_outbound_window(
+        source_db_path,
+        source_recorded_by,
+        dest_recorded_by,
+        &[],
+        crate::db::queue::current_timestamp_ms(),
+    );
+    let requested_ids = list_missing_shared_event_ids_for_range(
+        &source,
+        source_db_path,
+        &source_workspace_id,
+        &dest,
+        dest_db_path,
+        &dest_workspace_id,
+        range,
+    )?;
+    let winning_key_shared_events = winning_key_shared_event_ids(&source, source_recorded_by)?;
+    let source_tag = format!(
+        "quic_recv:{}@sim",
+        source_transport_peer_id(&source, source_recorded_by)?
+    );
+    let now_ms = crate::db::queue::current_timestamp_ms();
+    let store = Store::new(&source);
+    let requested_batch = load_shared_send_batch(&store, &requested_ids)?;
+
+    let mut filtered_requested_ids = Vec::new();
+    let mut transferred_key_request_events = 0usize;
+    let mut suppressed_key_request_events = 0usize;
+    let mut transferred_key_shared_events = 0usize;
+    let mut suppressed_key_shared_events = 0usize;
+
+    for (event_id, blob) in requested_batch {
+        match semantic_parsed_event(&blob) {
+            Ok(ParsedEvent::KeyRequest(_)) => {
+                if !shared_sendable_event_id(&source, source_recorded_by, &event_id)? {
+                    suppressed_key_request_events = suppressed_key_request_events.saturating_add(1);
+                    continue;
+                }
+                transferred_key_request_events = transferred_key_request_events.saturating_add(1);
+            }
+            Ok(ParsedEvent::KeyShared(_)) => {
+                let event_id_b64 = crate::crypto::event_id_to_base64(&event_id);
+                if !winning_key_shared_events.contains(&event_id_b64) {
+                    suppressed_key_shared_events = suppressed_key_shared_events.saturating_add(1);
+                    continue;
+                }
+                transferred_key_shared_events = transferred_key_shared_events.saturating_add(1);
+            }
+            _ => {}
+        }
+        filtered_requested_ids.push(event_id);
+    }
+
+    let ordered_ids = order_requested_shared_event_ids_for_send_for_peer(
+        &source,
+        source_recorded_by,
+        &source_workspace_id,
+        range,
+        &filtered_requested_ids,
+    )?;
+    let ordered_batch = load_shared_send_batch(&store, &ordered_ids)?;
+    let transferred_event_ids = ordered_ids
+        .iter()
+        .map(crate::crypto::event_id_to_base64)
+        .collect::<Vec<_>>();
+    let transferred_bytes = ordered_batch
+        .iter()
+        .map(|(_, blob)| blob.len() as u64)
+        .sum::<u64>();
+    let batch = ordered_batch
+        .into_iter()
+        .map(|(event_id, blob)| {
+            (
+                event_id,
+                blob,
+                dest_recorded_by.to_string(),
+                source_tag.clone(),
+                now_ms,
+                now_ms,
+            )
+        })
+        .map(
+            |(_event_id, blob, recorded_by, source_tag, recorded_at, inserted_at)| {
+                (
+                    hash_event(&blob),
+                    blob,
+                    recorded_by,
+                    source_tag,
+                    recorded_at,
+                    inserted_at,
+                )
+            },
+        )
+        .collect::<Vec<IngestItem>>();
+
+    Ok(PreparedPairSyncDirection {
+        stats: PairSyncDirectionStats {
+            source_db_path: source_db_path.to_string(),
+            source_recorded_by: source_recorded_by.to_string(),
+            dest_db_path: dest_db_path.to_string(),
+            dest_recorded_by: dest_recorded_by.to_string(),
+            selected_window_kind: Some(format!("{:?}", range.kind)),
+            selected_window_ts_min_inclusive_ms: range.ts_min(),
+            selected_window_ts_max_exclusive_ms: range.ts_max_exclusive(),
+            transferred_events: transferred_event_ids.len(),
+            transferred_bytes,
+            transferred_key_request_events,
+            suppressed_key_request_events,
+            transferred_key_shared_events,
+            suppressed_key_shared_events,
+            transferred_event_ids,
+        },
+        dest_db_path: dest_db_path.to_string(),
+        batch,
+        selected_window: Some(range),
+    })
+}
+
+fn empty_prepared_direction(
+    source_db_path: &str,
+    source_recorded_by: &str,
+    dest_db_path: &str,
+    dest_recorded_by: &str,
+    selected_window: Option<SyncWindow>,
+) -> PreparedPairSyncDirection {
+    PreparedPairSyncDirection {
+        stats: PairSyncDirectionStats {
+            source_db_path: source_db_path.to_string(),
+            source_recorded_by: source_recorded_by.to_string(),
+            dest_db_path: dest_db_path.to_string(),
+            dest_recorded_by: dest_recorded_by.to_string(),
+            selected_window_kind: selected_window.map(|window| format!("{:?}", window.kind)),
+            selected_window_ts_min_inclusive_ms: selected_window.and_then(|window| window.ts_min()),
+            selected_window_ts_max_exclusive_ms: selected_window
+                .and_then(|window| window.ts_max_exclusive()),
+            transferred_events: 0,
+            transferred_bytes: 0,
+            transferred_key_request_events: 0,
+            suppressed_key_request_events: 0,
+            transferred_key_shared_events: 0,
+            suppressed_key_shared_events: 0,
+            transferred_event_ids: Vec::new(),
+        },
+        dest_db_path: dest_db_path.to_string(),
+        batch: Vec::new(),
+        selected_window,
+    }
 }
 
 fn expand_transferable_shared_closure(
@@ -466,32 +694,6 @@ fn winning_key_shared_event_ids(
         .collect())
 }
 
-fn observed_key_shared_targets(
-    conn: &rusqlite::Connection,
-    recorded_by: &str,
-) -> PairSyncResult<BTreeSet<RepairTarget>> {
-    let mut stmt = conn.prepare(
-        "SELECT e.blob
-         FROM recorded_events re
-         JOIN events e ON e.event_id = re.event_id
-         WHERE re.peer_id = ?1
-         ORDER BY re.id ASC",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        crate::db::sql_types::get_blob(row, 0)
-    })?;
-
-    let mut out = BTreeSet::new();
-    for row in rows {
-        let blob = row?;
-        let Ok(ParsedEvent::KeyShared(event)) = semantic_parsed_event(&blob) else {
-            continue;
-        };
-        out.insert(key_shared_target(&event));
-    }
-    Ok(out)
-}
-
 fn apply_prepared_direction(direction: &PreparedPairSyncDirection) -> PairSyncResult<()> {
     if !direction.batch.is_empty() {
         let _ = ingest_now(&direction.dest_db_path, direction.batch.clone())?;
@@ -503,6 +705,14 @@ fn apply_prepared_direction(direction: &PreparedPairSyncDirection) -> PairSyncRe
                 1000,
             );
             if drained == 0 {
+                if let Some(window) = direction.selected_window {
+                    mark_outbound_window_completed(
+                        &direction.stats.source_db_path,
+                        &direction.stats.source_recorded_by,
+                        &direction.stats.dest_recorded_by,
+                        window,
+                    );
+                }
                 return Ok(());
             }
         }
@@ -511,6 +721,14 @@ fn apply_prepared_direction(direction: &PreparedPairSyncDirection) -> PairSyncRe
             direction.stats.dest_recorded_by
         )
         .into());
+    }
+    if let Some(window) = direction.selected_window {
+        mark_outbound_window_completed(
+            &direction.stats.source_db_path,
+            &direction.stats.source_recorded_by,
+            &direction.stats.dest_recorded_by,
+            window,
+        );
     }
     Ok(())
 }

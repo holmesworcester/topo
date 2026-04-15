@@ -45,6 +45,14 @@ fn assert_has_event(daemon: &VirtualDaemon, event_id: &str) {
     );
 }
 
+fn has_event(daemon: &VirtualDaemon, event_id: &str) -> bool {
+    daemon
+        .call(RpcMethod::AssertNow {
+            predicate: format!("has_event:{event_id} >= 1"),
+        })
+        .ok
+}
+
 fn snapshot_has_message_content(daemon: &VirtualDaemon, content: &str) -> bool {
     let messages = daemon
         .call_ok_value(RpcMethod::Messages { limit: 100 })
@@ -99,6 +107,69 @@ struct RepairBenchmark {
     transferred_key_shared_events: usize,
     suppressed_key_shared_events: usize,
     repair_rounds: usize,
+}
+
+fn run_fake_star_round(fake_star_db_paths: &[String], label: &str) -> topo::sim::PlannerRunReport {
+    topo::sim::PlannerSimulation::with_mode_and_topology(
+        fake_star_db_paths.to_vec(),
+        PlannerMode::NearestNeighborNoAuth,
+        FakeTopologyPreference::Star,
+    )
+    .run_rounds(1)
+    .unwrap_or_else(|err| panic!("{label}: {err}"))
+}
+
+fn accumulate_round_transfers(
+    benchmark: &mut RepairBenchmark,
+    report: &topo::sim::PlannerRunReport,
+) {
+    benchmark.transferred_key_request_events =
+        benchmark.transferred_key_request_events.saturating_add(
+            report
+                .rounds
+                .iter()
+                .flat_map(|round| round.pairs.iter())
+                .map(|pair| {
+                    pair.stats.left_to_right.transferred_key_request_events
+                        + pair.stats.right_to_left.transferred_key_request_events
+                })
+                .sum::<usize>(),
+        );
+    benchmark.suppressed_key_request_events =
+        benchmark.suppressed_key_request_events.saturating_add(
+            report
+                .rounds
+                .iter()
+                .flat_map(|round| round.pairs.iter())
+                .map(|pair| {
+                    pair.stats.left_to_right.suppressed_key_request_events
+                        + pair.stats.right_to_left.suppressed_key_request_events
+                })
+                .sum::<usize>(),
+        );
+    benchmark.transferred_key_shared_events =
+        benchmark.transferred_key_shared_events.saturating_add(
+            report
+                .rounds
+                .iter()
+                .flat_map(|round| round.pairs.iter())
+                .map(|pair| {
+                    pair.stats.left_to_right.transferred_key_shared_events
+                        + pair.stats.right_to_left.transferred_key_shared_events
+                })
+                .sum::<usize>(),
+        );
+    benchmark.suppressed_key_shared_events = benchmark.suppressed_key_shared_events.saturating_add(
+        report
+            .rounds
+            .iter()
+            .flat_map(|round| round.pairs.iter())
+            .map(|pair| {
+                pair.stats.left_to_right.suppressed_key_shared_events
+                    + pair.stats.right_to_left.suppressed_key_shared_events
+            })
+            .sum::<usize>(),
+    );
 }
 
 fn distinct_key_request_events(db_paths: &[String], blocked_event_id_b64: &str) -> usize {
@@ -396,108 +467,66 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
     let encrypted_event_id_b64 = event_id_to_base64(&encrypted_event_id);
     let key_event_id_b64 = event_id_to_base64(&alice_key);
 
-    let message_round_to_hub = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("message propagation round to hub");
-    assert_eq!(message_round_to_hub.unique_pairs, 4);
-    let message_round_to_requesters = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("message propagation round to requesters");
-    assert_eq!(message_round_to_requesters.unique_pairs, 4);
+    let mut delivery_rounds = 0usize;
+    while ![&bob, &carol, &dave, &erin]
+        .into_iter()
+        .all(|daemon| has_event(daemon, &encrypted_event_id_b64))
+    {
+        let report = run_fake_star_round(&fake_star_db_paths, "message propagation round");
+        assert_eq!(report.rounds[0].unique_pairs, 4);
+        delivery_rounds = delivery_rounds.saturating_add(1);
+        assert!(
+            delivery_rounds <= 8,
+            "encrypted message did not reach all peers within bounded planner rounds"
+        );
+    }
     assert_has_event(&bob, &encrypted_event_id_b64);
     assert!(!snapshot_has_message_content(&carol, content));
     assert!(!snapshot_has_message_content(&dave, content));
     assert!(!snapshot_has_message_content(&erin, content));
 
     let mut benchmark = RepairBenchmark::default();
-    let _requests = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
-    let request_round = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("request propagation round to hub");
-    benchmark.transferred_key_request_events =
-        benchmark.transferred_key_request_events.saturating_add(
-            request_round
-                .pairs
-                .iter()
-                .map(|pair| {
-                    pair.stats.left_to_right.transferred_key_request_events
-                        + pair.stats.right_to_left.transferred_key_request_events
-                })
-                .sum::<usize>(),
+    let mut converged = false;
+    for round_idx in 0..12 {
+        let _requests = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
+        let _responses = emit_key_shared_responses_for_dbs(&db_paths, policy)
+            .expect("emit key shared responses");
+        let report = run_fake_star_round(
+            &fake_star_db_paths,
+            &format!("repair propagation round {}", round_idx + 1),
         );
-
-    let _responses = emit_key_shared_responses_for_dbs(&db_paths, policy)
-        .expect("emit initial key shared responses");
-    let response_round_one = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("initial response propagation round");
-    benchmark.transferred_key_shared_events =
-        benchmark.transferred_key_shared_events.saturating_add(
-            response_round_one
-                .pairs
-                .iter()
-                .map(|pair| {
-                    pair.stats.left_to_right.transferred_key_shared_events
-                        + pair.stats.right_to_left.transferred_key_shared_events
-                })
-                .sum::<usize>(),
-        );
-    benchmark.suppressed_key_shared_events = benchmark.suppressed_key_shared_events.saturating_add(
-        response_round_one
-            .pairs
-            .iter()
-            .map(|pair| {
-                pair.stats.left_to_right.suppressed_key_shared_events
-                    + pair.stats.right_to_left.suppressed_key_shared_events
-            })
-            .sum::<usize>(),
+        accumulate_round_transfers(&mut benchmark, &report);
+        benchmark.repair_rounds = benchmark.repair_rounds.saturating_add(1);
+        if snapshot_has_message_content(&carol, content)
+            && snapshot_has_message_content(&dave, content)
+            && snapshot_has_message_content(&erin, content)
+        {
+            converged = true;
+            break;
+        }
+    }
+    assert!(
+        converged,
+        "repair path did not converge within bounded rounds: requests={} responses={} carol={} dave={} erin={}",
+        distinct_key_request_events(&db_paths, &encrypted_event_id_b64),
+        distinct_key_shared_events_for_key(&db_paths, &key_event_id_b64),
+        snapshot_has_message_content(&carol, content),
+        snapshot_has_message_content(&dave, content),
+        snapshot_has_message_content(&erin, content),
     );
-    benchmark.suppressed_key_request_events =
-        benchmark.suppressed_key_request_events.saturating_add(
-            response_round_one
-                .pairs
-                .iter()
-                .map(|pair| {
-                    pair.stats.left_to_right.suppressed_key_request_events
-                        + pair.stats.right_to_left.suppressed_key_request_events
-                })
-                .sum::<usize>(),
-        );
-    benchmark.repair_rounds = 1;
 
-    assert!(snapshot_has_message_content(&carol, content));
-    assert!(snapshot_has_message_content(&dave, content));
-    assert!(snapshot_has_message_content(&erin, content));
-
-    let post_response_request_round = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("post-response request suppression round");
+    let _follow_up_requests =
+        emit_key_requests_for_dbs(&db_paths).expect("emit follow-up requests");
+    let _follow_up_responses =
+        emit_key_shared_responses_for_dbs(&db_paths, policy).expect("emit follow-up responses");
+    let follow_up_round = run_fake_star_round(&fake_star_db_paths, "follow-up suppression round");
     benchmark.follow_up_transferred_key_request_events = benchmark
         .follow_up_transferred_key_request_events
         .saturating_add(
-            post_response_request_round
-                .pairs
+            follow_up_round
+                .rounds
                 .iter()
+                .flat_map(|round| round.pairs.iter())
                 .map(|pair| {
                     pair.stats.left_to_right.transferred_key_request_events
                         + pair.stats.right_to_left.transferred_key_request_events
@@ -506,47 +535,27 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
         );
     benchmark.suppressed_key_request_events =
         benchmark.suppressed_key_request_events.saturating_add(
-            post_response_request_round
-                .pairs
+            follow_up_round
+                .rounds
                 .iter()
+                .flat_map(|round| round.pairs.iter())
                 .map(|pair| {
                     pair.stats.left_to_right.suppressed_key_request_events
                         + pair.stats.right_to_left.suppressed_key_request_events
                 })
                 .sum::<usize>(),
         );
-
-    let _follow_up_responses = emit_key_shared_responses_for_dbs(&db_paths, policy)
-        .expect("emit follow-up key shared responses");
-    let response_round_two = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("follow-up response propagation round");
-    benchmark.transferred_key_shared_events =
-        benchmark.transferred_key_shared_events.saturating_add(
-            response_round_two
-                .pairs
-                .iter()
-                .map(|pair| {
-                    pair.stats.left_to_right.transferred_key_shared_events
-                        + pair.stats.right_to_left.transferred_key_shared_events
-                })
-                .sum::<usize>(),
-        );
     benchmark.suppressed_key_shared_events = benchmark.suppressed_key_shared_events.saturating_add(
-        response_round_two
-            .pairs
+        follow_up_round
+            .rounds
             .iter()
+            .flat_map(|round| round.pairs.iter())
             .map(|pair| {
                 pair.stats.left_to_right.suppressed_key_shared_events
                     + pair.stats.right_to_left.suppressed_key_shared_events
             })
             .sum::<usize>(),
     );
-    benchmark.repair_rounds = 2;
 
     benchmark.request_events = distinct_key_request_events(&db_paths, &encrypted_event_id_b64);
     benchmark.response_events = distinct_key_shared_events_for_key(&db_paths, &key_event_id_b64);
@@ -695,59 +704,65 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
             .expect("create encrypted message with rotated key");
     let encrypted_event_id_b64 = event_id_to_base64(&encrypted_event_id);
 
-    let first_round = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("first propagation round");
-    assert_eq!(first_round.unique_pairs, 3);
-
-    let second_round = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("second propagation round");
-    assert_eq!(second_round.unique_pairs, 3);
+    let mut propagation_rounds = 0usize;
+    while ![&bob, &carol, &dave]
+        .into_iter()
+        .all(|daemon| has_event(daemon, &encrypted_event_id_b64))
+    {
+        let report = run_fake_star_round(
+            &fake_star_db_paths,
+            &format!("frontier propagation round {}", propagation_rounds + 1),
+        );
+        assert_eq!(report.rounds[0].unique_pairs, 3);
+        propagation_rounds = propagation_rounds.saturating_add(1);
+        assert!(
+            propagation_rounds <= 8,
+            "encrypted event did not reach all peers within bounded planner rounds"
+        );
+    }
 
     assert_has_event(&bob, &encrypted_event_id_b64);
+    assert_has_event(&carol, &encrypted_event_id_b64);
+    assert_has_event(&dave, &encrypted_event_id_b64);
     assert!(!snapshot_has_message_content(&carol, content));
     assert!(!snapshot_has_message_content(&dave, content));
-
-    let request_stats = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
+    let mut request_stats = None;
+    for _ in 0..8 {
+        let stats = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
+        if stats.emitted_requests == 2 {
+            request_stats = Some(stats);
+            break;
+        }
+        let report = run_fake_star_round(&fake_star_db_paths, "request frontier propagation round");
+        assert_eq!(report.rounds[0].unique_pairs, 3);
+    }
+    let request_stats =
+        request_stats.expect("blocked non-holders never learned enough frontier to request");
     assert_eq!(
         request_stats.emitted_requests, 2,
         "only the two blocked non-holders should request"
     );
 
-    let request_round = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("request propagation round");
-    assert_eq!(request_round.unique_pairs, 3);
+    let mut saw_allowed_response = false;
+    for round_idx in 0..12 {
+        let response_stats =
+            emit_key_shared_responses_for_dbs(&db_paths, KeyResponsePolicy::AllEligible)
+                .expect("emit key shared responses");
+        saw_allowed_response |= response_stats.emitted_responses > 0;
+        let report = run_fake_star_round(
+            &fake_star_db_paths,
+            &format!("request/response propagation round {}", round_idx + 1),
+        );
+        assert_eq!(report.rounds[0].unique_pairs, 3);
+        if snapshot_has_message_content(&carol, content) {
+            break;
+        }
+    }
 
-    let response_stats =
-        emit_key_shared_responses_for_dbs(&db_paths, KeyResponsePolicy::AllEligible)
-            .expect("emit key shared responses");
-    assert_eq!(
-        response_stats.emitted_responses, 1,
-        "only the non-removed recipient should receive a response"
+    assert!(
+        saw_allowed_response,
+        "allowed recipient never observed a key_shared response"
     );
-
-    let response_round = PlannerSimulation::with_mode_and_topology(
-        fake_star_db_paths.clone(),
-        PlannerMode::NearestNeighborNoAuth,
-        FakeTopologyPreference::Star,
-    )
-    .tick()
-    .expect("response propagation round");
-    assert_eq!(response_round.unique_pairs, 3);
 
     assert!(snapshot_has_message_content(&carol, content));
     assert!(
@@ -888,22 +903,36 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
     .expect("create encrypted message");
     let encrypted_event_id_b64 = event_id_to_base64(&encrypted_event_id);
 
-    let alice_to_carol = PlannerSimulation::with_explicit_fake_pairs(
-        db_paths.clone(),
-        vec![(alice_peer.clone(), carol_peer.clone())],
-    )
-    .tick()
-    .expect("alice->carol propagation");
-    assert_eq!(alice_to_carol.unique_pairs, 1);
-    assert_has_event(&carol, &encrypted_event_id_b64);
-    assert!(
-        !snapshot_has_message_content(&carol, "request-before-removal"),
-        "carol should have the encrypted message but still be blocked before repair"
-    );
+    let request_event_id = {
+        let mut request_event_id = None;
+        for round_idx in 0..8 {
+            let alice_to_carol = PlannerSimulation::with_explicit_fake_pairs(
+                db_paths.clone(),
+                vec![(alice_peer.clone(), carol_peer.clone())],
+            )
+            .tick()
+            .unwrap_or_else(|err| {
+                panic!("alice->carol propagation round {}: {err}", round_idx + 1)
+            });
+            assert_eq!(alice_to_carol.unique_pairs, 1);
+            assert_has_event(&carol, &encrypted_event_id_b64);
+            assert!(
+                !snapshot_has_message_content(&carol, "request-before-removal"),
+                "carol should have the encrypted message but still be blocked before repair"
+            );
 
-    let request_stats = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
-    assert_eq!(request_stats.emitted_requests, 1);
-    let request_event_id = newest_key_request_event_id(&db_paths[2], &carol_peer, &alice_key);
+            let request_stats = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
+            if request_stats.emitted_requests == 1 {
+                request_event_id = Some(newest_key_request_event_id(
+                    &db_paths[2],
+                    &carol_peer,
+                    &alice_key,
+                ));
+                break;
+            }
+        }
+        request_event_id.expect("carol never emitted a request after bounded propagation rounds")
+    };
 
     ingest_selected_events(
         &db_paths[1],

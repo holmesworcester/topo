@@ -118,6 +118,7 @@ pub fn encode_key_request(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -192,7 +193,27 @@ pub fn project_pure(
         ],
     }];
 
-    ProjectorResult::valid(ops)
+    ProjectorResult::valid_with_sharing(ops, ctx.key_request_suppress_sharing)
+}
+
+pub fn build_projector_context(
+    queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    let key_request = match parsed {
+        ParsedEvent::KeyRequest(key_request) => key_request,
+        _ => return Err("key_request context loader called for non-key_request event".into()),
+    };
+
+    Ok(ContextLoadResult::ready(queries.load_key_request_context(
+        frame,
+        recorded_by,
+        event_id_b64,
+        key_request,
+    )?))
 }
 
 pub static KEY_REQUEST_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
@@ -208,5 +229,5 @@ pub static KEY_REQUEST_META: EventTypeMeta = crate::event_modules::registry::eve
     parse: parse_key_request,
     encode: encode_key_request,
     projector: project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: build_projector_context,
 };

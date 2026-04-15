@@ -4,12 +4,10 @@ use serde::Serialize;
 
 use super::hash_graph::{connected_hash_graph_neighbors, DEFAULT_HASH_GRAPH_DEGREE};
 use super::pair_sync::{
-    apply_prepared_pair_sync_session, plan_pair_sync_intents, prepare_pair_sync_session,
+    apply_prepared_pair_sync_session, plan_pair_sync_intents, prepare_synthetic_pair_sync_session,
     PairSyncIntent, PairSyncSessionStats, SimPeerNode,
 };
 use super::query_snapshot::import_local_tenants_from_db;
-use crate::runtime::peering::engine::should_initiate_connect_for_source_with_db;
-use crate::runtime::peering::engine::target_dispatch::TargetIngressSource;
 use crate::shared::crypto::event_id_from_hex;
 
 type PlannerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -199,18 +197,7 @@ impl PlannerSimulation {
     pub fn tick(&self) -> PlannerResult<PlannerRoundReport> {
         let nodes = self.imported_nodes()?;
         let intents = match self.mode {
-            PlannerMode::RealConnectTargets => plan_pair_sync_intents(&nodes)
-                .into_iter()
-                .filter(|intent| {
-                    pair_intent_source(intent).is_some_and(|source| {
-                        should_initiate_connect_for_source_with_db(
-                            &intent.initiator_db_path,
-                            &intent.initiator_recorded_by,
-                            &source,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>(),
+            PlannerMode::RealConnectTargets => plan_pair_sync_intents(&nodes),
             PlannerMode::NearestNeighborNoAuth => {
                 if let Some(explicit_fake_pairs) = &self.explicit_fake_pairs {
                     fake_explicit_intents(&nodes, explicit_fake_pairs)
@@ -229,7 +216,7 @@ impl PlannerSimulation {
 
         let mut prepared_pairs = Vec::new();
         for (pair, source_intents) in grouped {
-            let prepared = prepare_pair_sync_session(
+            let prepared = prepare_synthetic_pair_sync_session(
                 &pair.left.db_path,
                 &pair.left.recorded_by,
                 &pair.right.db_path,
@@ -306,19 +293,6 @@ impl PlannerSimulation {
             out.rounds.push(round);
         }
         Ok(out)
-    }
-}
-
-fn pair_intent_source(intent: &PairSyncIntent) -> Option<TargetIngressSource> {
-    match intent.source.as_str() {
-        "bootstrap" => Some(TargetIngressSource::Bootstrap {
-            daemon_peer_id: intent.target_transport_peer_id.clone(),
-            invite_event_id: intent.invite_event_id.clone().unwrap_or_default(),
-        }),
-        "observed" | "discovery" => Some(TargetIngressSource::KnownPeer {
-            peer_id: intent.target_transport_peer_id.clone(),
-        }),
-        _ => None,
     }
 }
 

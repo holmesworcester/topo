@@ -15,11 +15,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, warn};
 
+use super::bootstrap_auth::should_initiate_connect_for_source_with_db;
+use super::target_dispatch::{TargetIngressEvent, TargetIngressSource};
 use crate::db::open_connection;
-use crate::db::transport_creds::discover_local_tenants;
+use crate::db::transport_creds::{discover_local_tenants, resolve_tenant_transport_target};
 use crate::db::transport_trust::list_active_invite_bootstrap_targets;
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
 use crate::runtime::repeated_warning::should_emit_globally;
+use crate::shared::hash_graph::{connected_hash_graph_neighbors, DEFAULT_HASH_GRAPH_DEGREE};
 use crate::transport::resolve_bootstrap_inviter_peer_id;
 
 /// Dispatch decision for an outbound target.
@@ -154,6 +157,179 @@ fn short_value(value: &str) -> &str {
     &value[..16.min(value.len())]
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TargetPlannerOptions {
+    pub(crate) include_bootstrap_targets: bool,
+    pub(crate) allow_lookup_known_peers: bool,
+    pub(crate) known_peer_target_degree: usize,
+}
+
+impl Default for TargetPlannerOptions {
+    fn default() -> Self {
+        Self {
+            include_bootstrap_targets: true,
+            allow_lookup_known_peers: true,
+            known_peer_target_degree: DEFAULT_HASH_GRAPH_DEGREE,
+        }
+    }
+}
+
+fn discovered_local_tenant_ids(
+    db_path: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    let mut tenant_ids: Vec<String> = discover_local_tenants(&db)?
+        .into_iter()
+        .map(|tenant| tenant.peer_id)
+        .collect();
+    tenant_ids.sort();
+    tenant_ids.dedup();
+    Ok(tenant_ids)
+}
+
+fn desired_target_sort_key(
+    event: &TargetIngressEvent,
+) -> (String, u8, String, String, Option<String>, Option<String>) {
+    let (source_rank, peer_id, invite_event_id) = match &event.source {
+        TargetIngressSource::Bootstrap {
+            daemon_peer_id,
+            invite_event_id,
+        } => (0, daemon_peer_id.clone(), Some(invite_event_id.clone())),
+        TargetIngressSource::KnownPeer { peer_id } => (1, peer_id.clone(), None),
+    };
+    (
+        event.tenant_id.clone(),
+        source_rank,
+        peer_id,
+        event
+            .remote
+            .map(|remote| remote.to_string())
+            .unwrap_or_else(|| "lookup".to_string()),
+        event.relay_url.clone(),
+        invite_event_id,
+    )
+}
+
+fn decode_hash_graph_key(value: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(value).ok()?;
+    let array: [u8; 32] = bytes.try_into().ok()?;
+    Some(array)
+}
+
+fn select_known_peer_mesh_targets(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    candidates: Vec<(String, Option<SocketAddr>)>,
+    degree: usize,
+) -> Vec<(String, Option<SocketAddr>)> {
+    if candidates.len() <= degree.max(1) {
+        return candidates;
+    }
+
+    let Some(local_transport_peer_id) = resolve_tenant_transport_target(conn, tenant_id)
+        .ok()
+        .flatten()
+        .map(|target| target.transport_peer_id)
+    else {
+        return candidates;
+    };
+
+    let mut keys = Vec::with_capacity(candidates.len() + 1);
+    let Some(local_key) = decode_hash_graph_key(&local_transport_peer_id) else {
+        return candidates;
+    };
+    keys.push(local_key);
+    for (peer_id, _) in &candidates {
+        let Some(peer_key) = decode_hash_graph_key(peer_id) else {
+            return candidates;
+        };
+        keys.push(peer_key);
+    }
+
+    let neighbors = connected_hash_graph_neighbors(&keys, degree.max(1));
+    let selected = neighbors[0]
+        .iter()
+        .copied()
+        .filter_map(|neighbor_idx| neighbor_idx.checked_sub(1))
+        .collect::<HashSet<_>>();
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, candidate)| selected.contains(&idx).then_some(candidate))
+        .collect()
+}
+
+pub(crate) fn load_desired_outbound_targets(
+    db_path: &str,
+    tenant_ids: &[String],
+    options: &TargetPlannerOptions,
+) -> Result<Vec<TargetIngressEvent>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut out = Vec::new();
+    let db = open_connection(db_path)?;
+
+    if options.include_bootstrap_targets {
+        for (tenant_id, daemon_peer_id, invite_event_id, remote, relay_url) in
+            load_bootstrap_targets(db_path, tenant_ids)?
+        {
+            let event = TargetIngressEvent {
+                tenant_id,
+                remote,
+                relay_url,
+                source: TargetIngressSource::Bootstrap {
+                    daemon_peer_id,
+                    invite_event_id,
+                },
+            };
+            if should_initiate_connect_for_source_with_db(db_path, &event.tenant_id, &event.source)
+            {
+                out.push(event);
+            }
+        }
+    }
+
+    for tenant_id in tenant_ids {
+        let mut candidates = load_known_peer_targets(db_path, std::slice::from_ref(tenant_id))?
+            .into_iter()
+            .filter_map(|(_, peer_id, remote)| {
+                if remote.is_none() && !options.allow_lookup_known_peers {
+                    return None;
+                }
+                Some((peer_id, remote))
+            })
+            .collect::<Vec<_>>();
+        candidates = select_known_peer_mesh_targets(
+            &db,
+            tenant_id,
+            candidates,
+            options.known_peer_target_degree,
+        );
+        for (peer_id, remote) in candidates {
+            let event = TargetIngressEvent {
+                tenant_id: tenant_id.clone(),
+                remote,
+                relay_url: None,
+                source: TargetIngressSource::KnownPeer { peer_id },
+            };
+            if should_initiate_connect_for_source_with_db(db_path, &event.tenant_id, &event.source)
+            {
+                out.push(event);
+            }
+        }
+    }
+
+    out.sort_by_key(desired_target_sort_key);
+    Ok(out)
+}
+
+pub(crate) fn collect_desired_outbound_targets(
+    db_path: &str,
+    options: &TargetPlannerOptions,
+) -> Result<Vec<TargetIngressEvent>, Box<dyn std::error::Error + Send + Sync>> {
+    let tenant_ids = discovered_local_tenant_ids(db_path)?;
+    load_desired_outbound_targets(db_path, &tenant_ids, options)
+}
+
 pub(crate) fn load_bootstrap_targets(
     db_path: &str,
     tenant_ids: &[String],
@@ -284,23 +460,6 @@ pub(crate) fn load_bootstrap_targets(
     Ok(out)
 }
 
-pub(crate) fn collect_all_bootstrap_targets(
-    db_path: &str,
-) -> Result<
-    Vec<(String, String, String, Option<SocketAddr>, Option<String>)>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let db = open_connection(db_path)?;
-    let mut tenant_ids: Vec<String> = discover_local_tenants(&db)?
-        .into_iter()
-        .map(|tenant| tenant.peer_id)
-        .collect();
-    tenant_ids.sort();
-    tenant_ids.dedup();
-    drop(db);
-    load_bootstrap_targets(db_path, &tenant_ids)
-}
-
 pub(crate) fn load_observed_endpoint_targets(
     db_path: &str,
     tenant_ids: &[String],
@@ -382,20 +541,6 @@ pub(crate) fn load_known_peer_targets(
     Ok(out)
 }
 
-pub(crate) fn collect_all_known_peer_targets(
-    db_path: &str,
-) -> Result<Vec<(String, String, Option<SocketAddr>)>, Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    let mut tenant_ids: Vec<String> = discover_local_tenants(&db)?
-        .into_iter()
-        .map(|tenant| tenant.peer_id)
-        .collect();
-    tenant_ids.sort();
-    tenant_ids.dedup();
-    drop(db);
-    load_known_peer_targets(db_path, &tenant_ids)
-}
-
 fn bootstrap_target_superseded_by_observed_endpoint(
     conn: &rusqlite::Connection,
     tenant_id: &str,
@@ -466,6 +611,7 @@ pub(crate) fn known_peer_dispatch_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_PEER_SHARED};
     use crate::db::transport_trust::record_invite_bootstrap_trust;
     use crate::db::{open_connection, schema::create_tables};
     use rusqlite::params;
@@ -650,7 +796,6 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-
         let targets =
             load_bootstrap_targets(db_path.to_str().unwrap(), &["tenant-a".to_string()]).unwrap();
         assert_eq!(targets.len(), 1, "Tor should keep onion bootstrap targets");
@@ -665,5 +810,121 @@ mod tests {
             targets[0].4, None,
             "Tor invite bootstrap should not require relay URLs"
         );
+    }
+
+    #[test]
+    fn desired_outbound_targets_gate_lookup_only_known_peers_by_capability() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("lookup-known-peer.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "tenant-a",
+                "peer-shared-1",
+                vec![0x11u8; 32],
+                vec![0xBCu8; 32]
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let allow_lookup = load_desired_outbound_targets(
+            db_path.to_str().unwrap(),
+            &["tenant-a".to_string()],
+            &TargetPlannerOptions {
+                include_bootstrap_targets: false,
+                allow_lookup_known_peers: true,
+                known_peer_target_degree: DEFAULT_HASH_GRAPH_DEGREE,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            allow_lookup,
+            vec![TargetIngressEvent {
+                tenant_id: "tenant-a".to_string(),
+                remote: None,
+                relay_url: None,
+                source: TargetIngressSource::KnownPeer {
+                    peer_id: hex::encode([0xBC; 32]),
+                },
+            }]
+        );
+
+        let disallow_lookup = load_desired_outbound_targets(
+            db_path.to_str().unwrap(),
+            &["tenant-a".to_string()],
+            &TargetPlannerOptions {
+                include_bootstrap_targets: false,
+                allow_lookup_known_peers: false,
+                known_peer_target_degree: DEFAULT_HASH_GRAPH_DEGREE,
+            },
+        )
+        .unwrap();
+        assert!(
+            disallow_lookup.is_empty(),
+            "lookup-only known peers must be planner-filtered when address lookup is unavailable"
+        );
+    }
+
+    #[test]
+    fn desired_outbound_targets_bound_large_known_peer_sets_by_mesh_degree() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("mesh-degree-known-peers.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+
+        let local_transport_peer_id = hex::encode([0xAA; 32]);
+        set_local_transport_target(
+            &conn,
+            "tenant-a",
+            &local_transport_peer_id,
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+
+        for idx in 0u8..10 {
+            let mut transport_fingerprint = [0u8; 32];
+            transport_fingerprint[31] = idx.saturating_add(1);
+            conn.execute(
+                "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "tenant-a",
+                    format!("peer-shared-{idx}"),
+                    vec![idx; 32],
+                    transport_fingerprint.to_vec()
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let options = TargetPlannerOptions {
+            include_bootstrap_targets: false,
+            allow_lookup_known_peers: true,
+            known_peer_target_degree: 3,
+        };
+        let first = load_desired_outbound_targets(
+            db_path.to_str().unwrap(),
+            &["tenant-a".to_string()],
+            &options,
+        )
+        .unwrap();
+        let second = load_desired_outbound_targets(
+            db_path.to_str().unwrap(),
+            &["tenant-a".to_string()],
+            &options,
+        )
+        .unwrap();
+
+        assert_eq!(first, second, "mesh selection must be deterministic");
+        assert_eq!(first.len(), 3, "known-peer dials must be degree-bounded");
+        assert!(first.iter().all(|target| {
+            matches!(target.source, TargetIngressSource::KnownPeer { .. })
+                && target.remote.is_none()
+        }));
     }
 }

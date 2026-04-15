@@ -4,8 +4,8 @@
 //! - shared ingest writer
 //! - accept loop
 //! - unified target ingress/dispatch
-//! - bootstrap refresher
-//! - known-peer refresher
+//! - key repair loop
+//! - outbound target planner refresher
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +15,12 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::target_dispatch::{run_target_dispatcher, TargetIngressEvent, TargetIngressSource};
-use super::target_planner::{collect_all_bootstrap_targets, collect_all_known_peer_targets};
+use super::target_dispatch::{run_target_dispatcher, TargetIngressEvent};
+use super::target_planner::{collect_desired_outbound_targets, TargetPlannerOptions};
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::db::transport_creds::TenantInfo;
 use crate::peering::loops::accept_loop_until_cancel;
+use crate::runtime::key_repair::run_periodic_key_repair;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::TransportEndpoint;
 
@@ -39,8 +40,8 @@ enum RuntimeEvent {
 enum WorkerKind {
     AcceptLoop,
     TargetDispatcher,
-    BootstrapRefresher,
-    KnownPeerRefresher,
+    KeyRepairLoop,
+    PlannerRefresher,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,39 +159,41 @@ impl RuntimeSupervisor {
             );
         }
 
-        if env_flag("TOPO_DISABLE_PLACEHOLDER_AUTODIAL") {
-            warn!("BOOTSTRAP AUTODIAL DISABLED by TOPO_DISABLE_PLACEHOLDER_AUTODIAL");
-        } else {
+        {
             let db_path = self.db_path.clone();
-            let ingress = target_tx.clone();
             let cancel = root_cancel.child_token();
             spawn_worker(
                 &mut workers,
-                WorkerKind::BootstrapRefresher,
-                "bootstrap-refresher",
+                WorkerKind::KeyRepairLoop,
+                "key-repair-loop",
                 cancel.clone(),
-                async move { run_bootstrap_refresher(db_path, ingress, cancel).await },
+                async move { run_periodic_key_repair(db_path, cancel).await },
             );
         }
 
-        {
-            let db_path = self.db_path.clone();
-            let ingress = target_tx.clone();
-            let cancel = root_cancel.child_token();
-            let discovery_disabled = env_flag("TOPO_DISABLE_DISCOVERY");
-            if discovery_disabled {
-                warn!("iroh address lookup disabled by TOPO_DISABLE_DISCOVERY");
-            }
-            spawn_worker(
-                &mut workers,
-                WorkerKind::KnownPeerRefresher,
-                "known-peer-refresher",
-                cancel.clone(),
-                async move {
-                    run_known_peer_refresher(db_path, ingress, cancel, discovery_disabled).await
-                },
-            );
+        if env_flag("TOPO_DISABLE_PLACEHOLDER_AUTODIAL") {
+            warn!("BOOTSTRAP AUTODIAL DISABLED by TOPO_DISABLE_PLACEHOLDER_AUTODIAL");
         }
+
+        let db_path = self.db_path.clone();
+        let ingress = target_tx.clone();
+        let cancel = root_cancel.child_token();
+        let discovery_disabled = env_flag("TOPO_DISABLE_DISCOVERY");
+        if discovery_disabled {
+            warn!("iroh address lookup disabled by TOPO_DISABLE_DISCOVERY");
+        }
+        let planner_options = TargetPlannerOptions {
+            include_bootstrap_targets: !env_flag("TOPO_DISABLE_PLACEHOLDER_AUTODIAL"),
+            allow_lookup_known_peers: !discovery_disabled,
+            known_peer_target_degree: crate::shared::hash_graph::DEFAULT_HASH_GRAPH_DEGREE,
+        };
+        spawn_worker(
+            &mut workers,
+            WorkerKind::PlannerRefresher,
+            "planner-refresher",
+            cancel.clone(),
+            async move { run_planner_refresher(db_path, ingress, cancel, planner_options).await },
+        );
 
         let mut fatal_error: Option<String> = None;
 
@@ -291,8 +294,8 @@ fn worker_failure_policy(kind: WorkerKind) -> WorkerFailurePolicy {
     match kind {
         WorkerKind::AcceptLoop
         | WorkerKind::TargetDispatcher
-        | WorkerKind::BootstrapRefresher
-        | WorkerKind::KnownPeerRefresher => WorkerFailurePolicy::FailRuntime,
+        | WorkerKind::KeyRepairLoop
+        | WorkerKind::PlannerRefresher => WorkerFailurePolicy::FailRuntime,
     }
 }
 
@@ -321,10 +324,11 @@ fn transition_state(_state: RuntimeState, event: RuntimeEvent) -> RuntimeState {
     }
 }
 
-async fn run_bootstrap_refresher(
+async fn run_planner_refresher(
     db_path: String,
     ingress_tx: mpsc::UnboundedSender<TargetIngressEvent>,
     shutdown: CancellationToken,
+    planner_options: TargetPlannerOptions,
 ) -> Result<(), String> {
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
@@ -332,79 +336,17 @@ async fn run_bootstrap_refresher(
             break;
         }
 
-        match collect_all_bootstrap_targets(&db_path) {
+        match collect_desired_outbound_targets(&db_path, &planner_options) {
             Ok(targets) => {
                 warning_gate.clear();
-                for (tenant_id, peer_id, invite_event_id, remote, relay_url) in targets {
-                    if ingress_tx
-                        .send(TargetIngressEvent {
-                            tenant_id,
-                            remote,
-                            relay_url,
-                            source: TargetIngressSource::Bootstrap {
-                                daemon_peer_id: peer_id,
-                                invite_event_id,
-                            },
-                        })
-                        .is_err()
-                    {
+                for event in targets {
+                    if ingress_tx.send(event).is_err() {
                         return Ok(());
                     }
                 }
             }
             Err(e) => {
-                let message = format!("BOOTSTRAP AUTODIAL REFRESH failed: {}", e);
-                if warning_gate.should_emit(message.clone())
-                    && should_emit_globally(format!("engine:{message}"))
-                {
-                    warn!("{}", message);
-                }
-            }
-        }
-
-        tokio::select! {
-            _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
-        }
-    }
-
-    Ok(())
-}
-
-async fn run_known_peer_refresher(
-    db_path: String,
-    ingress_tx: mpsc::UnboundedSender<TargetIngressEvent>,
-    shutdown: CancellationToken,
-    discovery_disabled: bool,
-) -> Result<(), String> {
-    let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
-    loop {
-        if shutdown.is_cancelled() {
-            break;
-        }
-
-        match collect_all_known_peer_targets(&db_path) {
-            Ok(targets) => {
-                warning_gate.clear();
-                for (tenant_id, peer_id, remote) in targets {
-                    if discovery_disabled && remote.is_none() {
-                        continue;
-                    }
-                    if ingress_tx
-                        .send(TargetIngressEvent {
-                            tenant_id,
-                            remote,
-                            relay_url: None,
-                            source: TargetIngressSource::KnownPeer { peer_id },
-                        })
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                }
-            }
-            Err(e) => {
-                let message = format!("KNOWN PEER REFRESH failed: {}", e);
+                let message = format!("OUTBOUND TARGET PLANNER REFRESH failed: {}", e);
                 if warning_gate.should_emit(message.clone())
                     && should_emit_globally(format!("engine:{message}"))
                 {
@@ -444,11 +386,11 @@ mod tests {
             WorkerFailurePolicy::FailRuntime
         );
         assert_eq!(
-            worker_failure_policy(WorkerKind::BootstrapRefresher),
+            worker_failure_policy(WorkerKind::KeyRepairLoop),
             WorkerFailurePolicy::FailRuntime
         );
         assert_eq!(
-            worker_failure_policy(WorkerKind::KnownPeerRefresher),
+            worker_failure_policy(WorkerKind::PlannerRefresher),
             WorkerFailurePolicy::FailRuntime
         );
     }

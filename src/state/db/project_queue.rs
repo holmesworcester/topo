@@ -10,6 +10,14 @@ fn valid_events_has_semantic_type_column(conn: &Connection) -> SqliteResult<bool
     Ok(names.iter().any(|name| name == "semantic_type_code"))
 }
 
+fn valid_events_has_suppress_sharing_column(conn: &Connection) -> SqliteResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(valid_events)")?;
+    let names = stmt
+        .query_map([], |row| get_text(row, 1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names.iter().any(|name| name == "suppress_sharing"))
+}
+
 fn project_queue_has_column(conn: &Connection, column: &str) -> SqliteResult<bool> {
     let mut stmt = conn.prepare("PRAGMA table_info(project_queue)")?;
     let names = stmt
@@ -96,6 +104,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             peer_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
             semantic_type_code INTEGER,
+            suppress_sharing INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (peer_id, event_id)
         );
 
@@ -140,6 +149,12 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     if !valid_events_has_semantic_type_column(conn)? {
         conn.execute(
             "ALTER TABLE valid_events ADD COLUMN semantic_type_code INTEGER",
+            [],
+        )?;
+    }
+    if !valid_events_has_suppress_sharing_column(conn)? {
+        conn.execute(
+            "ALTER TABLE valid_events ADD COLUMN suppress_sharing INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

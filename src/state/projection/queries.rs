@@ -1,9 +1,10 @@
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::{
     endpoint_shared::load_endpoint_shared_by_event_id, parse_event, AdminEvent, DeviceInviteEvent,
-    FileEvent, FileSliceEvent, InviteAcceptedEvent, KeySharedEvent, MessageDeletionEvent,
-    MessageEvent, ParsedEvent, PeerSharedEvent, ReactionEvent, UserInviteEvent, WorkspaceEvent,
-    EVENT_TYPE_ADMIN, EVENT_TYPE_DEVICE_INVITE, EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
+    FileEvent, FileSliceEvent, InviteAcceptedEvent, KeyRequestEvent, KeySharedEvent,
+    MessageDeletionEvent, MessageEvent, ParsedEvent, PeerSharedEvent, ReactionEvent,
+    UserInviteEvent, WorkspaceEvent, EVENT_TYPE_ADMIN, EVENT_TYPE_DEVICE_INVITE,
+    EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
 };
 use crate::projection::contract::{
     BootstrapDecisionContext, CurrentSignerInfo, DeletionIntentInfo, FileDescriptorInfo,
@@ -1092,6 +1093,14 @@ pub trait ProjectionQueries {
         invite_accepted: &InviteAcceptedEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext>;
 
+    fn load_key_request_context(
+        &self,
+        frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        event_id_b64: &str,
+        key_request: &KeyRequestEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext>;
+
     fn load_key_shared_context(
         &self,
         frame: &ProjectionFrameContext,
@@ -2000,6 +2009,31 @@ impl ProjectionQueries for Connection {
         }
 
         Ok(ctx)
+    }
+
+    fn load_key_request_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        _event_id_b64: &str,
+        key_request: &KeyRequestEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let delivery_target_b64 = event_id_to_base64(&key_request.delivery_target_id);
+        let key_request_suppress_sharing = self.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM key_shared
+                 WHERE recorded_by = ?1
+                   AND delivery_target_id = ?2
+             )",
+            rusqlite::params![recorded_by, &delivery_target_b64],
+            |row| row.get(0),
+        )?;
+
+        Ok(ProjectorDecisionContext {
+            key_request_suppress_sharing,
+            ..ProjectorDecisionContext::default()
+        })
     }
 
     fn load_key_shared_context(

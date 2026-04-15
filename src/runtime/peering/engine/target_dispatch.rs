@@ -31,7 +31,7 @@ use crate::peering::loops::{
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::{resolve_bound_daemon_peer_id, OutboundSessionAuthPlan, TransportEndpoint};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TargetIngressSource {
     Bootstrap {
         daemon_peer_id: String,
@@ -42,7 +42,7 @@ pub(crate) enum TargetIngressSource {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TargetIngressEvent {
     pub(crate) tenant_id: String,
     pub(crate) remote: Option<SocketAddr>,

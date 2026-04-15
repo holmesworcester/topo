@@ -89,6 +89,7 @@ struct SharedSendEligibilityRawRows {
     requested_by_reconciliation: bool,
     present_in_workspace_index: bool,
     shared_blob_available: bool,
+    transport_shareable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +97,7 @@ struct SharedSendEligibilityDecisionContext {
     requested_by_reconciliation: bool,
     present_in_workspace_index: bool,
     shared_blob_available: bool,
+    transport_shareable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +157,7 @@ fn normalize_shared_send_eligibility_context(
         requested_by_reconciliation: raw_rows.requested_by_reconciliation,
         present_in_workspace_index: raw_rows.present_in_workspace_index,
         shared_blob_available: raw_rows.shared_blob_available,
+        transport_shareable: raw_rows.transport_shareable,
     }
 }
 
@@ -164,6 +167,7 @@ fn decide_shared_send_eligibility_plan(
     if context.requested_by_reconciliation
         && context.present_in_workspace_index
         && context.shared_blob_available
+        && context.transport_shareable
     {
         SharedSendEligibilityPlan::SendRoot
     } else {
@@ -394,7 +398,6 @@ fn sync_window_contains_ts(range: SyncWindow, created_at_ms: i64) -> bool {
     true
 }
 
-#[cfg(test)]
 fn load_shared_sync_entries_with_pending(
     conn: &Connection,
     db_path: &str,
@@ -415,6 +418,27 @@ fn load_shared_sync_entries_with_pending(
 
     entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     Ok(entries)
+}
+
+fn load_workspace_index_membership_with_pending(
+    conn: &Connection,
+    db_path: &str,
+    workspace_id: &str,
+    range: SyncWindow,
+    ids: &[EventId],
+) -> Result<HashSet<EventId>, String> {
+    let mut known = load_workspace_index_membership(conn, workspace_id, range, ids)?;
+    if ids.is_empty() {
+        return Ok(known);
+    }
+
+    let requested = ids.iter().copied().collect::<HashSet<_>>();
+    for pending in pending_entries_in_range(db_path, workspace_id, range) {
+        if requested.contains(&pending.event_id) {
+            known.insert(pending.event_id);
+        }
+    }
+    Ok(known)
 }
 
 pub fn load_shared_event_index_slice(
@@ -482,6 +506,44 @@ pub fn load_shared_send_batch(
     Ok(ordered)
 }
 
+pub fn list_missing_shared_event_ids_for_range(
+    source_conn: &Connection,
+    source_db_path: &str,
+    source_workspace_id: &str,
+    dest_conn: &Connection,
+    dest_db_path: &str,
+    dest_workspace_id: &str,
+    range: SyncWindow,
+) -> Result<Vec<EventId>, String> {
+    let source_entries = load_shared_sync_entries_with_pending(
+        source_conn,
+        source_db_path,
+        source_workspace_id,
+        range,
+    )?;
+    if source_entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let source_ids = source_entries
+        .iter()
+        .map(|(_, event_id)| *event_id)
+        .collect::<Vec<_>>();
+    let known_dest = load_workspace_index_membership_with_pending(
+        dest_conn,
+        dest_db_path,
+        dest_workspace_id,
+        range,
+        &source_ids,
+    )?;
+
+    Ok(source_entries
+        .into_iter()
+        .map(|(_, event_id)| event_id)
+        .filter(|event_id| !known_dest.contains(event_id))
+        .collect())
+}
+
 fn load_workspace_index_membership(
     conn: &Connection,
     workspace_id: &str,
@@ -543,6 +605,7 @@ fn load_workspace_index_membership(
 fn eligible_shared_send_root_ids(
     conn: &Connection,
     store: &Store<'_>,
+    recorded_by: Option<&str>,
     workspace_id: &str,
     range: SyncWindow,
     requested_ids: &[EventId],
@@ -553,11 +616,19 @@ fn eligible_shared_send_root_ids(
         .map_err(|e| format!("load selected created_at batch: {e}"))?;
     let mut eligible = Vec::with_capacity(requested_ids.len());
     for event_id in requested_ids {
+        let transport_shareable = match recorded_by {
+            Some(recorded_by) => {
+                crate::runtime::key_repair::shared_sendable_event_id(conn, recorded_by, event_id)
+                    .map_err(|e| format!("evaluate shared sendability for event: {e}"))?
+            }
+            None => true,
+        };
         let plan = decide_shared_send_eligibility_plan(&normalize_shared_send_eligibility_context(
             SharedSendEligibilityRawRows {
                 requested_by_reconciliation: true,
                 present_in_workspace_index: true,
                 shared_blob_available: created_at_by_id.contains_key(event_id),
+                transport_shareable,
             },
         ));
         if matches!(plan, SharedSendEligibilityPlan::SendRoot) {
@@ -1049,8 +1120,14 @@ fn order_requested_ids_for_send(
         return Ok(Vec::new());
     }
 
-    let (eligible_roots, created_at_by_id) =
-        eligible_shared_send_root_ids(conn, store, workspace_id, range, requested_ids)?;
+    let (eligible_roots, created_at_by_id) = eligible_shared_send_root_ids(
+        conn,
+        store,
+        live_suppression_seed,
+        workspace_id,
+        range,
+        requested_ids,
+    )?;
     let ordered_roots = prioritize_send_order_with_created_at(
         range,
         &eligible_roots,
@@ -1079,6 +1156,34 @@ fn order_requested_ids_for_send(
     }
 
     Ok(ordered)
+}
+
+pub fn order_requested_shared_event_ids_for_send(
+    conn: &Connection,
+    workspace_id: &str,
+    range: SyncWindow,
+    requested_ids: &[EventId],
+) -> Result<Vec<EventId>, String> {
+    let store = Store::new(conn);
+    order_requested_ids_for_send(conn, &store, workspace_id, range, requested_ids, None)
+}
+
+pub fn order_requested_shared_event_ids_for_send_for_peer(
+    conn: &Connection,
+    recorded_by: &str,
+    workspace_id: &str,
+    range: SyncWindow,
+    requested_ids: &[EventId],
+) -> Result<Vec<EventId>, String> {
+    let store = Store::new(conn);
+    order_requested_ids_for_send(
+        conn,
+        &store,
+        workspace_id,
+        range,
+        requested_ids,
+        Some(recorded_by),
+    )
 }
 
 async fn send_have_events_live<S>(
@@ -1962,6 +2067,7 @@ mod tests {
             requested_by_reconciliation: true,
             present_in_workspace_index: true,
             shared_blob_available: true,
+            transport_shareable: true,
         });
         assert_eq!(
             decide_shared_send_eligibility_plan(&context),

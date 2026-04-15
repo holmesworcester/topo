@@ -311,7 +311,7 @@ pub(crate) fn apply_projection_with_backend<B: ProjectionBackend>(
     event_id_b64: &str,
     blob: &[u8],
     parsed: &ParsedEvent,
-) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
+) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>, bool)> {
     apply_projection_frame(
         backend,
         recorded_by,
@@ -333,7 +333,7 @@ pub(crate) fn run_dep_and_projection_stages(
     is_encrypted_transport: bool,
     _allow_envelope_recursion: bool,
     current_transport_key_event_id: Option<&str>,
-) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
+) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>, bool)> {
     run_dep_and_projection_stages_with_backend(
         conn,
         recorded_by,
@@ -353,7 +353,7 @@ pub(crate) fn run_dep_and_projection_stages_with_backend<B: ProjectionBackend>(
     parsed: &ParsedEvent,
     is_encrypted_transport: bool,
     current_transport_key_event_id: Option<&str>,
-) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
+) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>, bool)> {
     let mut frame = ProjectionFrameContext::default();
     frame.current_transport_key_event_id = current_transport_key_event_id.map(ToOwned::to_owned);
     apply_projection_frame(
@@ -377,7 +377,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
     is_encrypted_transport: bool,
     frame: ProjectionFrameContext,
     envelope_depth: usize,
-) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
+) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>, bool)> {
     let meta = registry()
         .lookup(parsed.event_type_code())
         .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
@@ -388,11 +388,12 @@ fn apply_projection_frame<B: ProjectionBackend>(
                 reason: format!("{} missing current signer envelope", meta.type_name),
             },
             None,
+            false,
         ));
     }
 
     if let Err(reason) = check_transport_privacy(parsed, is_encrypted_transport) {
-        return Ok((ProjectionDecision::Reject { reason }, None));
+        return Ok((ProjectionDecision::Reject { reason }, None, false));
     }
 
     // Generic prerequisite reads now live at the context-load boundary:
@@ -411,17 +412,17 @@ fn apply_projection_frame<B: ProjectionBackend>(
             if !missing.is_empty() {
                 backend.record_block(recorded_by, event_id_b64, &missing)?;
             }
-            return Ok((ProjectionDecision::Block { missing }, None));
+            return Ok((ProjectionDecision::Block { missing }, None, false));
         }
         ContextLoadDispositionPlan::Reject { reason } => {
-            return Ok((ProjectionDecision::Reject { reason }, None));
+            return Ok((ProjectionDecision::Reject { reason }, None, false));
         }
         ContextLoadDispositionPlan::EmitHardPurgeAndReturn { message_event_id } => {
             backend.execute_emit_commands(
                 recorded_by,
                 &[EmitCommand::HardPurgeMessageGraph { message_event_id }],
             )?;
-            return Ok((ProjectionDecision::Valid, None));
+            return Ok((ProjectionDecision::Valid, None, false));
         }
     };
     ctx.current_transport_key_event_id = frame.current_transport_key_event_id.clone();
@@ -435,6 +436,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     reason: "projection envelope depth exceeded".to_string(),
                 },
                 None,
+                false,
             ));
         }
 
@@ -446,6 +448,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         reason: "signer key not found".to_string(),
                     },
                     None,
+                    false,
                 ));
             }
             SignerResolution::Invalid(msg) => {
@@ -454,6 +457,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         reason: format!("signer resolution failed: {}", msg),
                     },
                     None,
+                    false,
                 ));
             }
             SignerResolution::Found(resolved) => resolved,
@@ -465,6 +469,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     reason: "blob too short for signature".to_string(),
                 },
                 None,
+                false,
             ));
         }
         let signing_bytes = &blob[..blob.len() - 64];
@@ -474,6 +479,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     reason: "invalid signature".to_string(),
                 },
                 None,
+                false,
             ));
         }
 
@@ -485,6 +491,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         reason: format!("inner event parse error: {}", err),
                     },
                     None,
+                    false,
                 ));
             }
         };
@@ -498,6 +505,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     ),
                 },
                 None,
+                false,
             ));
         }
         if matches!(inner_parsed, ParsedEvent::Signed(_)) {
@@ -506,12 +514,13 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     reason: "nested signed wrappers are not allowed".to_string(),
                 },
                 None,
+                false,
             ));
         }
 
         let mut next_frame = frame.clone();
         next_frame.current_signer = Some(resolved.info.clone());
-        let (decision, inner) = apply_projection_frame(
+        let (decision, inner, suppress_sharing) = apply_projection_frame(
             backend,
             recorded_by,
             event_id_b64,
@@ -521,7 +530,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
             next_frame,
             envelope_depth + 1,
         )?;
-        return Ok((decision, inner.or(Some(inner_parsed))));
+        return Ok((decision, inner.or(Some(inner_parsed)), suppress_sharing));
     }
 
     if let ParsedEvent::Encrypted(enc) = parsed {
@@ -531,6 +540,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     reason: "projection envelope depth exceeded".to_string(),
                 },
                 None,
+                false,
             ));
         }
         let Some(key_bytes) = backend.load_key_secret_bytes(recorded_by, &enc.key_event_id)? else {
@@ -539,6 +549,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     reason: "secret key not found in key_secrets table".to_string(),
                 },
                 None,
+                false,
             ));
         };
         let plaintext = match crate::projection::encrypted::decrypt_event_blob(
@@ -554,6 +565,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         reason: "decryption failed (wrong key or corrupted)".to_string(),
                     },
                     None,
+                    false,
                 ));
             }
         };
@@ -565,6 +577,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         reason: format!("inner event parse error: {}", err),
                     },
                     None,
+                    false,
                 ));
             }
         };
@@ -578,6 +591,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     ),
                 },
                 None,
+                false,
             ));
         }
         let Some(inner_meta) = registry().lookup(inner_parsed.event_type_code()) else {
@@ -589,6 +603,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     ),
                 },
                 None,
+                false,
             ));
         };
         if !inner_meta.encryptable {
@@ -600,6 +615,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
                     ),
                 },
                 None,
+                false,
             ));
         }
         let transport_key_event_id_b64 = event_id_to_base64(&enc.key_event_id);
@@ -610,7 +626,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
         } else {
             next_frame.current_owner_event_id = None;
         }
-        let (decision, _) = apply_projection_frame(
+        let (decision, _, suppress_sharing) = apply_projection_frame(
             backend,
             recorded_by,
             event_id_b64,
@@ -621,7 +637,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
             envelope_depth + 1,
         )?;
         let inner = matches!(decision, ProjectionDecision::Valid).then_some(inner_parsed);
-        return Ok((decision, inner));
+        return Ok((decision, inner, suppress_sharing));
     }
 
     ctx.current_transport_key_event_id = frame.current_transport_key_event_id.clone();
@@ -652,7 +668,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
         ProjectionDecisionEffectPlan::NoEffects => {}
     }
 
-    Ok((result.decision, None))
+    Ok((result.decision, None, result.suppress_sharing))
 }
 
 #[cfg(test)]
