@@ -100,13 +100,19 @@ struct StoredRecordedEvent {
 }
 
 #[derive(Clone, Debug, Default)]
+struct ValidEventState {
+    semantic_type_code: Option<i64>,
+    suppress_sharing: bool,
+}
+
+#[derive(Clone, Debug, Default)]
 struct NodeBehaviorData {
     recorded_by: String,
     local_transport_peer_id: Option<String>,
     local_transport_source: Option<String>,
     events: BTreeMap<String, StoredEvent>,
     recorded_events: BTreeMap<String, StoredRecordedEvent>,
-    valid_events: BTreeMap<String, Option<i64>>,
+    valid_events: BTreeMap<String, ValidEventState>,
     rejected_events: BTreeMap<String, String>,
     blocked_events: BTreeMap<String, i64>,
     blocked_event_deps: BTreeMap<String, BTreeSet<String>>,
@@ -325,7 +331,7 @@ impl NodeBehaviorEngine {
                 "valid_events" => state
                     .valid_events
                     .iter()
-                    .map(|(event_id, semantic_type_code)| {
+                    .map(|(event_id, valid)| {
                         let mut values = BTreeMap::new();
                         values.insert(
                             "peer_id".to_string(),
@@ -335,12 +341,14 @@ impl NodeBehaviorEngine {
                             "event_id".to_string(),
                             BehaviorValue::Text(event_id.clone()),
                         );
-                        if let Some(code) = semantic_type_code {
-                            values.insert(
-                                "semantic_type_code".to_string(),
-                                BehaviorValue::Int(*code),
-                            );
+                        if let Some(code) = valid.semantic_type_code {
+                            values
+                                .insert("semantic_type_code".to_string(), BehaviorValue::Int(code));
                         }
+                        values.insert(
+                            "suppress_sharing".to_string(),
+                            BehaviorValue::Int(i64::from(valid.suppress_sharing)),
+                        );
                         BehaviorRow { values }
                     })
                     .collect(),
@@ -578,7 +586,10 @@ impl NodeBehaviorEngine {
         if matches!(decision, ProjectionDecision::Valid) {
             self.state.borrow_mut().valid_events.insert(
                 event_id_to_base64(event_id),
-                Some(i64::from(events::EVENT_TYPE_ENDPOINT_SHARED)),
+                ValidEventState {
+                    semantic_type_code: Some(i64::from(events::EVENT_TYPE_ENDPOINT_SHARED)),
+                    suppress_sharing: false,
+                },
             );
         }
         Ok(decision)
@@ -700,10 +711,14 @@ fn seed_state_from_summary(
                     let Some(event_id) = row_text(row, "event_id") else {
                         continue;
                     };
-                    let semantic_type_code = row_int(row, "semantic_type_code");
-                    state
-                        .valid_events
-                        .insert(event_id.to_string(), semantic_type_code);
+                    state.valid_events.insert(
+                        event_id.to_string(),
+                        ValidEventState {
+                            semantic_type_code: row_int(row, "semantic_type_code"),
+                            suppress_sharing: row_int(row, "suppress_sharing")
+                                .is_some_and(|value| value != 0),
+                        },
+                    );
                 }
             }
             "rejected_events" => {
@@ -1071,7 +1086,10 @@ impl ProjectionQueries for NodeBehaviorEngine {
         }
         let dep_b64 = event_id_to_base64(dep_id);
         if state.valid_events.contains_key(&dep_b64) {
-            let semantic_type_code = state.valid_events.get(&dep_b64).and_then(|value| *value);
+            let semantic_type_code = state
+                .valid_events
+                .get(&dep_b64)
+                .and_then(|value| value.semantic_type_code);
             return Ok(DepLoadResult::ready_raw(semantic_type_code));
         }
         if state.tables.get("endpoints_shared").is_some_and(|rows| {
@@ -1624,6 +1642,29 @@ impl ProjectionQueries for NodeBehaviorEngine {
             ..ProjectorDecisionContext::default()
         })
     }
+
+    fn load_key_request_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        _event_id_b64: &str,
+        key_request: &events::KeyRequestEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let state = self.state.borrow();
+        let delivery_target_id = event_id_to_base64(&key_request.delivery_target_id);
+        let key_request_suppress_sharing = first_row_for_recorded(
+            &state,
+            "key_shared",
+            recorded_by,
+            "delivery_target_id",
+            &delivery_target_id,
+        )
+        .is_some();
+        Ok(ProjectorDecisionContext {
+            key_request_suppress_sharing,
+            ..ProjectorDecisionContext::default()
+        })
+    }
 }
 
 impl ProjectionBackend for NodeBehaviorEngine {
@@ -1790,17 +1831,40 @@ impl ProjectionBackend for NodeBehaviorEngine {
         recorded_by: &str,
         event_id_b64: &str,
         sub_event: &ParsedEvent,
+        suppress_sharing: bool,
     ) -> ProjectionApplyResult<()> {
         if self.state.borrow().recorded_by != recorded_by {
             return Ok(());
         }
         self.state.borrow_mut().valid_events.insert(
             event_id_b64.to_string(),
-            Some(i64::from(match sub_event {
-                ParsedEvent::Encrypted(enc) => enc.inner_type_code,
-                _ => sub_event.event_type_code(),
-            })),
+            ValidEventState {
+                semantic_type_code: Some(i64::from(match sub_event {
+                    ParsedEvent::Encrypted(enc) => enc.inner_type_code,
+                    _ => sub_event.event_type_code(),
+                })),
+                suppress_sharing,
+            },
         );
+        if let ParsedEvent::KeyShared(key_shared) = sub_event {
+            let delivery_target_id = event_id_to_base64(&key_shared.delivery_target_id);
+            let matching_request_ids = {
+                let state = self.state.borrow();
+                table_rows_for_recorded(&state, "key_requests", recorded_by)
+                    .into_iter()
+                    .filter(|row| {
+                        row_text(row, "delivery_target_id") == Some(delivery_target_id.as_str())
+                    })
+                    .filter_map(|row| row_text(row, "event_id").map(ToOwned::to_owned))
+                    .collect::<Vec<_>>()
+            };
+            let mut state = self.state.borrow_mut();
+            for key_request_event_id in matching_request_ids {
+                if let Some(valid) = state.valid_events.get_mut(&key_request_event_id) {
+                    valid.suppress_sharing = true;
+                }
+            }
+        }
         Ok(())
     }
 }

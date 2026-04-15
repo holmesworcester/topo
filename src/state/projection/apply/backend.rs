@@ -157,6 +157,30 @@ fn persist_shared_dep_edges(
     Ok(())
 }
 
+fn suppress_matching_key_requests_for_key_shared(
+    conn: &Connection,
+    recorded_by: &str,
+    sub_event: &ParsedEvent,
+) -> ProjectionApplyResult<()> {
+    let ParsedEvent::KeyShared(key_shared) = sub_event else {
+        return Ok(());
+    };
+    let delivery_target_id_b64 = crate::crypto::event_id_to_base64(&key_shared.delivery_target_id);
+    conn.execute(
+        "UPDATE valid_events
+         SET suppress_sharing = 1
+         WHERE peer_id = ?1
+           AND event_id IN (
+               SELECT event_id
+               FROM key_requests
+               WHERE recorded_by = ?1
+                 AND delivery_target_id = ?2
+           )",
+        rusqlite::params![recorded_by, delivery_target_id_b64],
+    )?;
+    Ok(())
+}
+
 pub(crate) type ProjectionApplyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 pub(crate) trait ProjectionBackend: ProjectionQueries {
@@ -203,6 +227,7 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
         recorded_by: &str,
         event_id_b64: &str,
         sub_event: &ParsedEvent,
+        suppress_sharing: bool,
     ) -> ProjectionApplyResult<()>;
 }
 
@@ -294,6 +319,7 @@ impl ProjectionBackend for Connection {
         recorded_by: &str,
         event_id_b64: &str,
         sub_event: &ParsedEvent,
+        suppress_sharing: bool,
     ) -> ProjectionApplyResult<()> {
         // Some projectors hard-purge the current event inside the same
         // transaction (for example, content arriving after a tombstone).
@@ -312,10 +338,29 @@ impl ProjectionBackend for Connection {
         let commit_result = (|| -> ProjectionApplyResult<()> {
             let semantic_type_code = i64::from(sub_event.event_type_code());
             self.execute(
-                "INSERT OR IGNORE INTO valid_events (peer_id, event_id, semantic_type_code)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![recorded_by, event_id_b64, semantic_type_code],
+                "INSERT OR IGNORE INTO valid_events
+                 (peer_id, event_id, semantic_type_code, suppress_sharing)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    recorded_by,
+                    event_id_b64,
+                    semantic_type_code,
+                    if suppress_sharing { 1i64 } else { 0i64 }
+                ],
             )?;
+            self.execute(
+                "UPDATE valid_events
+                 SET semantic_type_code = ?3,
+                     suppress_sharing = ?4
+                 WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![
+                    recorded_by,
+                    event_id_b64,
+                    semantic_type_code,
+                    if suppress_sharing { 1i64 } else { 0i64 }
+                ],
+            )?;
+            suppress_matching_key_requests_for_key_shared(self, recorded_by, sub_event)?;
             persist_shared_dep_edges(self, recorded_by, event_id_b64, sub_event)?;
             if let Some(workspace_id) = lookup_workspace_id(self, recorded_by) {
                 if let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) {
@@ -367,9 +412,9 @@ mod tests {
     use crate::event_modules::{
         encode_event, EncryptedEvent, ParsedEvent, TenantEvent, EVENT_TYPE_FILE_SLICE,
     };
+    use crate::projection::apply::stages::apply_projection_with_backend;
     use crate::projection::contract::{EmitCommand, ProjectorDecisionContext, WriteOp};
     use crate::projection::decision::ProjectionDecision;
-    use crate::projection::apply::stages::apply_projection_with_backend;
     use crate::projection::queries::{DepLoadResult, ProjectionQueryResult};
 
     use super::*;
@@ -504,6 +549,7 @@ mod tests {
             _recorded_by: &str,
             event_id_b64: &str,
             _sub_event: &ParsedEvent,
+            _suppress_sharing: bool,
         ) -> ProjectionApplyResult<()> {
             self.valid_marked
                 .borrow_mut()
@@ -637,6 +683,16 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _invite_accepted: &crate::event_modules::InviteAcceptedEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+            Ok(ProjectorDecisionContext::default())
+        }
+
+        fn load_key_request_context(
+            &self,
+            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _key_request: &crate::event_modules::KeyRequestEvent,
         ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
@@ -847,12 +903,13 @@ mod tests {
             DepLoadResult::purge("deleted-message"),
         );
 
-        let (decision, inner) =
+        let (decision, inner, suppress_sharing) =
             apply_projection_with_backend(&backend, "peer-a", &event_id_b64, &blob, &parsed)
                 .unwrap();
 
         assert_eq!(decision, ProjectionDecision::Valid);
         assert!(inner.is_none());
+        assert!(!suppress_sharing);
         assert_eq!(*backend.write_batches.borrow(), 0);
         assert_eq!(*backend.emit_batches.borrow(), 1);
         assert_eq!(

@@ -6,7 +6,7 @@ use tempfile::TempDir;
 use crate::db::open_connection;
 use crate::rpc::protocol::RpcMethod;
 use crate::runtime::peering::engine::target_planner::{
-    load_bootstrap_targets, load_observed_endpoint_targets,
+    load_desired_outbound_targets, load_observed_endpoint_targets, TargetPlannerOptions,
 };
 use crate::sim::virtual_daemon::VirtualDaemon;
 use crate::state::db::store::lookup_workspace_id;
@@ -222,46 +222,36 @@ pub fn import_peer_state(
                 remote: remote.to_string(),
             })
             .collect::<Vec<_>>();
-    let mut connect_targets = Vec::new();
-    let mut seen_connect_targets = BTreeSet::new();
-    for (_, transport_peer_id, invite_event_id, remote, relay_url) in
-        load_bootstrap_targets(source_db_path, &[recorded_by.to_string()])?
-    {
-        let remote = match (remote, relay_url) {
-            (Some(remote), _) => remote.to_string(),
-            (None, Some(relay_url)) => format!("relay:{relay_url}"),
-            (None, None) => "lookup".to_string(),
-        };
-        if seen_connect_targets.insert((
-            "bootstrap".to_string(),
-            transport_peer_id.clone(),
-            remote.clone(),
-        )) {
-            connect_targets.push(ImportedConnectTarget {
-                source: "bootstrap".into(),
-                transport_peer_id,
-                remote,
-                invite_event_id: Some(invite_event_id),
-            });
-        }
-    }
-    for (_, transport_peer_id, remote) in
-        load_observed_endpoint_targets(source_db_path, &[recorded_by.to_string()])?
-    {
-        let remote = remote.to_string();
-        if seen_connect_targets.insert((
-            "observed".to_string(),
-            transport_peer_id.clone(),
-            remote.clone(),
-        )) {
-            connect_targets.push(ImportedConnectTarget {
-                source: "observed".into(),
-                transport_peer_id,
-                remote,
-                invite_event_id: None,
-            });
-        }
-    }
+    let connect_targets = load_desired_outbound_targets(
+        source_db_path,
+        &[recorded_by.to_string()],
+        &TargetPlannerOptions::default(),
+    )?
+    .into_iter()
+    .map(|target| match target.source {
+        crate::runtime::peering::engine::target_dispatch::TargetIngressSource::Bootstrap {
+            daemon_peer_id,
+            invite_event_id,
+        } => ImportedConnectTarget {
+            source: "bootstrap".into(),
+            transport_peer_id: daemon_peer_id,
+            remote: render_imported_target_remote(target.remote, target.relay_url.as_deref()),
+            invite_event_id: Some(invite_event_id),
+        },
+        crate::runtime::peering::engine::target_dispatch::TargetIngressSource::KnownPeer {
+            peer_id,
+        } => ImportedConnectTarget {
+            source: if target.remote.is_some() {
+                "observed".into()
+            } else {
+                "discovery".into()
+            },
+            transport_peer_id: peer_id,
+            remote: render_imported_target_remote(target.remote, target.relay_url.as_deref()),
+            invite_event_id: None,
+        },
+    })
+    .collect::<Vec<_>>();
 
     let mut known_events = Vec::new();
     let mut seen_known_event_ids = BTreeSet::new();
@@ -393,6 +383,17 @@ pub fn import_peer_state(
         known_events,
         ambient_shared_events,
     })
+}
+
+fn render_imported_target_remote(
+    remote: Option<std::net::SocketAddr>,
+    relay_url: Option<&str>,
+) -> String {
+    match (remote, relay_url) {
+        (Some(remote), _) => remote.to_string(),
+        (None, Some(relay_url)) => format!("relay:{relay_url}"),
+        (None, None) => "lookup".to_string(),
+    }
 }
 
 pub fn import_local_tenants_from_db(

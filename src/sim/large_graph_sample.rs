@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use super::hash_graph::{connected_hash_graph_neighbors, synthetic_hash_graph_key};
@@ -10,9 +11,13 @@ use super::key_repair::{
 };
 use super::planner_runner::PlannerSimulation;
 use super::virtual_daemon::VirtualDaemon;
+use crate::db::open_connection;
 use crate::rpc::protocol::RpcMethod;
 
 type SimResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+const RECENT_WINDOW_ROUND_MULTIPLIER: u32 = 4;
+const RECENT_WINDOW_ROUND_SLACK: u32 = 4;
+const REPAIR_PROPAGATION_PHASES: u32 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LargeGraphSampleDecryptConfig {
@@ -61,7 +66,39 @@ pub struct LargeGraphSampleDecryptReport {
     pub message_rounds: u32,
     pub request_rounds: u32,
     pub response_rounds: u32,
+    pub repair_transferred_events: usize,
+    pub repair_transferred_bytes: u64,
+    pub repair_transferred_key_request_events: usize,
+    pub repair_transferred_key_shared_events: usize,
+    pub distinct_key_request_events: usize,
+    pub distinct_key_shared_events: usize,
     pub sampled_peers: Vec<LargeGraphSampleDecryptPeerReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ObservedKeySharedDebug {
+    event_id: String,
+    recipient_event_id: String,
+    unwrap_key_event_id: String,
+    signer_event_id: Option<String>,
+    signer_valid_locally: bool,
+    matching_local_invite_secret_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SampleRepairDebugStatus {
+    logical_peer: usize,
+    has_encrypted_event: bool,
+    sender_seen_request_count: i64,
+    sender_emitted_response_count: i64,
+    recipient_key_shared_count: i64,
+    recipient_key_shared_for_key_count: i64,
+    recipient_target_key_secret_count: i64,
+    recipient_blocked_event_count: i64,
+    local_invite_event_id: Option<String>,
+    local_invite_secret_event_id: Option<String>,
+    local_invite_secret_count: i64,
+    observed_key_shared: Vec<ObservedKeySharedDebug>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +131,10 @@ pub fn run_large_graph_sampled_decrypt_trial(
     let db_paths = actual
         .values()
         .map(|peer| peer.daemon.db_path().to_string())
+        .collect::<Vec<_>>();
+    let repair_peers = actual
+        .values()
+        .map(|peer| (peer.daemon.db_path().to_string(), peer.recorded_by.clone()))
         .collect::<Vec<_>>();
     let explicit_pairs = corridor_edges
         .iter()
@@ -132,7 +173,7 @@ pub fn run_large_graph_sampled_decrypt_trial(
     )
     .map_err(|err| format!("seed sender key: {err}"))?;
 
-    let _message_event_id = create_encrypted_message_with_key(
+    let message_event_id = create_encrypted_message_with_key(
         sender_actual.daemon.db_path(),
         &sender_actual.recorded_by,
         &sender_key,
@@ -150,11 +191,28 @@ pub fn run_large_graph_sampled_decrypt_trial(
         .map(|&node| sender_tree.dist[node])
         .max()
         .unwrap_or(0);
+    let message_round_budget = bounded_recent_window_rounds(max_message_distance);
+    let repair_round_budget = bounded_recent_repair_rounds(max_holder_distance);
 
-    for _ in 0..max_message_distance {
+    let message_event_id_b64 = crate::crypto::event_id_to_base64(&message_event_id);
+    let mut message_rounds = 0u32;
+    while !samples.iter().all(|sample| {
+        let peer = actual
+            .get(sample)
+            .expect("sample actual peer for message visibility");
+        has_event(&peer.daemon, &message_event_id_b64)
+    }) {
         PlannerSimulation::with_explicit_fake_pairs(db_paths.clone(), explicit_pairs.clone())
             .tick()
-            .map_err(|err| format!("message propagation round: {err}"))?;
+            .map_err(|err| format!("message propagation round {}: {err}", message_rounds + 1))?;
+        message_rounds = message_rounds.saturating_add(1);
+        if message_rounds > message_round_budget {
+            return Err(format!(
+                "sampled encrypted event did not reach all peers within bounded rounds: budget={} samples={:?}",
+                message_round_budget, samples
+            )
+            .into());
+        }
     }
 
     for &sample in &samples {
@@ -164,21 +222,6 @@ pub fn run_large_graph_sampled_decrypt_trial(
         }
     }
 
-    let request_peers = samples
-        .iter()
-        .map(|sample| {
-            let peer = actual.get(sample).expect("sample request peer");
-            (peer.daemon.db_path().to_string(), peer.recorded_by.clone())
-        })
-        .collect::<Vec<_>>();
-    let _request_stats = emit_key_requests_for_peers(&request_peers)
-        .map_err(|err| format!("emit requests: {err}"))?;
-    for _ in 0..max_holder_distance {
-        PlannerSimulation::with_explicit_fake_pairs(db_paths.clone(), explicit_pairs.clone())
-            .tick()
-            .map_err(|err| format!("request propagation round: {err}"))?;
-    }
-
     let response_peers = [sender]
         .into_iter()
         .map(|logical| {
@@ -186,9 +229,6 @@ pub fn run_large_graph_sampled_decrypt_trial(
             (peer.daemon.db_path().to_string(), peer.recorded_by.clone())
         })
         .collect::<Vec<_>>();
-    let _response_stats =
-        emit_key_shared_responses_for_peers(&response_peers, config.response_policy)
-            .map_err(|err| format!("emit responses: {err}"))?;
     let mut sampled_reports = samples
         .iter()
         .map(|&sample| LargeGraphSampleDecryptPeerReport {
@@ -205,10 +245,48 @@ pub fn run_large_graph_sampled_decrypt_trial(
         })
         .collect::<Vec<_>>();
 
-    for response_round in 1..=max_holder_distance {
-        PlannerSimulation::with_explicit_fake_pairs(db_paths.clone(), explicit_pairs.clone())
-            .tick()
-            .map_err(|err| format!("response propagation round {response_round}: {err}"))?;
+    let mut repair_rounds = 0u32;
+    let mut repair_transferred_events = 0usize;
+    let mut repair_transferred_bytes = 0u64;
+    let mut repair_transferred_key_request_events = 0usize;
+    let mut repair_transferred_key_shared_events = 0usize;
+    for repair_round in 1..=repair_round_budget {
+        let _request_stats = emit_key_requests_for_peers(&repair_peers)
+            .map_err(|err| format!("emit requests before repair round {repair_round}: {err}"))?;
+        let _response_stats =
+            emit_key_shared_responses_for_peers(&response_peers, config.response_policy).map_err(
+                |err| format!("emit responses before repair round {repair_round}: {err}"),
+            )?;
+        let round_report =
+            PlannerSimulation::with_explicit_fake_pairs(db_paths.clone(), explicit_pairs.clone())
+                .tick()
+                .map_err(|err| format!("repair propagation round {repair_round}: {err}"))?;
+        repair_transferred_events =
+            repair_transferred_events.saturating_add(round_report.transferred_events);
+        repair_transferred_bytes =
+            repair_transferred_bytes.saturating_add(round_report.transferred_bytes);
+        repair_transferred_key_request_events = repair_transferred_key_request_events
+            .saturating_add(
+                round_report
+                    .pairs
+                    .iter()
+                    .map(|pair| {
+                        pair.stats.left_to_right.transferred_key_request_events
+                            + pair.stats.right_to_left.transferred_key_request_events
+                    })
+                    .sum::<usize>(),
+            );
+        repair_transferred_key_shared_events = repair_transferred_key_shared_events.saturating_add(
+            round_report
+                .pairs
+                .iter()
+                .map(|pair| {
+                    pair.stats.left_to_right.transferred_key_shared_events
+                        + pair.stats.right_to_left.transferred_key_shared_events
+                })
+                .sum::<usize>(),
+        );
+        repair_rounds = repair_round;
         for report in &mut sampled_reports {
             if report.decrypted {
                 continue;
@@ -218,15 +296,39 @@ pub fn run_large_graph_sampled_decrypt_trial(
                 .expect("sample actual peer for visibility");
             if snapshot_has_message_content(&peer.daemon, &config.message_content)? {
                 report.decrypted = true;
-                report.first_visible_round =
-                    Some(max_message_distance + max_holder_distance + response_round);
+                report.first_visible_round = Some(message_rounds + repair_round);
             }
+        }
+        if sampled_reports.iter().all(|peer| peer.decrypted) {
+            break;
         }
     }
 
     if sampled_reports.iter().any(|peer| !peer.decrypted) {
-        return Err(format!("not all sampled peers decrypted: {:?}", sampled_reports).into());
+        let stuck = sampled_reports
+            .iter()
+            .filter(|peer| !peer.decrypted)
+            .map(|peer| {
+                sample_repair_debug_status(
+                    &actual,
+                    sender,
+                    peer.logical_peer,
+                    &message_event_id_b64,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Err(format!(
+            "not all sampled peers decrypted: reports={:?} debug={:?}",
+            sampled_reports, stuck
+        )
+        .into());
     }
+
+    let key_event_id_b64 = crate::crypto::event_id_to_base64(&sender_key);
+    let distinct_key_request_events =
+        distinct_key_request_events_for_blocked_event(&actual, &message_event_id_b64)?;
+    let distinct_key_shared_events =
+        distinct_key_shared_events_for_key(&actual, &key_event_id_b64)?;
 
     Ok(LargeGraphSampleDecryptReport {
         logical_users: config.logical_users,
@@ -238,11 +340,278 @@ pub fn run_large_graph_sampled_decrypt_trial(
         corridor_edges: corridor_edges.len(),
         max_message_distance,
         max_holder_distance,
-        message_rounds: max_message_distance,
-        request_rounds: max_holder_distance,
-        response_rounds: max_holder_distance,
+        message_rounds,
+        request_rounds: repair_rounds,
+        response_rounds: repair_rounds,
+        repair_transferred_events,
+        repair_transferred_bytes,
+        repair_transferred_key_request_events,
+        repair_transferred_key_shared_events,
+        distinct_key_request_events,
+        distinct_key_shared_events,
         sampled_peers: sampled_reports,
     })
+}
+
+fn bounded_recent_window_rounds(max_distance: u32) -> u32 {
+    max_distance
+        .saturating_mul(RECENT_WINDOW_ROUND_MULTIPLIER)
+        .saturating_add(RECENT_WINDOW_ROUND_SLACK)
+}
+
+fn bounded_recent_repair_rounds(max_distance: u32) -> u32 {
+    bounded_recent_window_rounds(max_distance).saturating_mul(REPAIR_PROPAGATION_PHASES)
+}
+
+fn sample_repair_debug_status(
+    actual: &BTreeMap<usize, ActualPeer>,
+    sender: usize,
+    logical_peer: usize,
+    encrypted_event_id_b64: &str,
+) -> SimResult<SampleRepairDebugStatus> {
+    let peer = actual
+        .get(&logical_peer)
+        .expect("sample actual peer for debug status");
+    let sender_peer = actual
+        .get(&sender)
+        .expect("sender actual peer for debug status");
+    let conn = open_connection(peer.daemon.db_path())?;
+    let sender_conn = open_connection(sender_peer.daemon.db_path())?;
+    let encrypted_blob: Vec<u8> = conn.query_row(
+        "SELECT blob FROM events WHERE event_id = ?1",
+        rusqlite::params![encrypted_event_id_b64],
+        |row| crate::db::sql_types::get_blob(row, 0),
+    )?;
+    let target_key_event_id_b64 = match crate::event_modules::parse_event(&encrypted_blob) {
+        Ok(parsed) => match parsed {
+            crate::event_modules::ParsedEvent::Signed(signed) => {
+                match crate::event_modules::parse_event(&signed.payload) {
+                    Ok(crate::event_modules::ParsedEvent::Encrypted(enc)) => {
+                        crate::crypto::event_id_to_base64(&enc.key_event_id)
+                    }
+                    _ => return Err("sample encrypted event payload is not encrypted".into()),
+                }
+            }
+            crate::event_modules::ParsedEvent::Encrypted(enc) => {
+                crate::crypto::event_id_to_base64(&enc.key_event_id)
+            }
+            _ => return Err("sample event is not encrypted".into()),
+        },
+        Err(err) => return Err(format!("parse sample encrypted event: {err}").into()),
+    };
+    let local_invite_secret_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM invite_secrets
+         WHERE recorded_by = ?1",
+        rusqlite::params![&peer.recorded_by],
+        |row| row.get(0),
+    )?;
+    let local_invite_material: Option<(String, String)> = conn
+        .query_row(
+            "SELECT invite_event_id, event_id
+             FROM invite_secrets
+             WHERE recorded_by = ?1
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
+            rusqlite::params![&peer.recorded_by],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let local_invite_event_id = local_invite_material
+        .as_ref()
+        .map(|(invite_event_id, _)| invite_event_id.clone());
+    let local_invite_secret_event_id = local_invite_material
+        .as_ref()
+        .map(|(_, invite_secret_event_id)| invite_secret_event_id.clone());
+    let recipient_event_id_b64 = local_invite_event_id.clone().unwrap_or_default();
+    let sender_seen_request_count: i64 = sender_conn.query_row(
+        "SELECT COUNT(*)
+         FROM key_requests
+         WHERE recorded_by = ?1
+           AND recipient_event_id = ?2",
+        rusqlite::params![&sender_peer.recorded_by, &recipient_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let sender_emitted_response_count: i64 = sender_conn.query_row(
+        "SELECT COUNT(*)
+         FROM key_shared
+         WHERE recorded_by = ?1
+           AND recipient_event_id = ?2",
+        rusqlite::params![&sender_peer.recorded_by, &recipient_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let recipient_key_shared_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM key_shared
+         WHERE recorded_by = ?1
+           AND recipient_event_id = ?2",
+        rusqlite::params![&peer.recorded_by, &recipient_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let recipient_key_shared_for_key_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM key_shared
+         WHERE recorded_by = ?1
+           AND key_event_id = ?2",
+        rusqlite::params![&peer.recorded_by, &target_key_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let recipient_target_key_secret_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM key_secrets
+         WHERE recorded_by = ?1
+           AND event_id = ?2",
+        rusqlite::params![&peer.recorded_by, &target_key_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let recipient_blocked_event_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM blocked_events
+         WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&peer.recorded_by, encrypted_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let mut observed_key_shared_stmt = conn.prepare(
+        "SELECT ks.event_id, e.blob
+         FROM key_shared ks
+         JOIN events e ON e.event_id = ks.event_id
+         WHERE ks.recorded_by = ?1
+           AND ks.key_event_id = ?2
+         ORDER BY ks.event_id ASC",
+    )?;
+    let observed_key_shared = observed_key_shared_stmt
+        .query_map(
+            rusqlite::params![&peer.recorded_by, &target_key_event_id_b64],
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_blob(row, 1)?,
+                ))
+            },
+        )?
+        .map(|row| {
+            let (event_id, blob) = row?;
+            let (recipient_event_id, unwrap_key_event_id) =
+                match crate::event_modules::parse_event(&blob) {
+                    Ok(crate::event_modules::ParsedEvent::Signed(signed)) => {
+                        match crate::event_modules::parse_event(&signed.payload) {
+                            Ok(crate::event_modules::ParsedEvent::KeyShared(event)) => (
+                                crate::crypto::event_id_to_base64(&event.recipient_event_id),
+                                crate::crypto::event_id_to_base64(&event.unwrap_key_event_id),
+                            ),
+                            _ => return Err(rusqlite::Error::QueryReturnedNoRows),
+                        }
+                    }
+                    Ok(crate::event_modules::ParsedEvent::KeyShared(event)) => (
+                        crate::crypto::event_id_to_base64(&event.recipient_event_id),
+                        crate::crypto::event_id_to_base64(&event.unwrap_key_event_id),
+                    ),
+                    _ => return Err(rusqlite::Error::QueryReturnedNoRows),
+                };
+            let signer_event_id = crate::event_modules::signed::outer_signer_event_id(&blob)
+                .map(|event_id| crate::crypto::event_id_to_base64(&event_id));
+            let signer_valid_locally = signer_event_id
+                .as_ref()
+                .map(|signer_event_id| {
+                    conn.query_row(
+                        "SELECT EXISTS(
+                             SELECT 1
+                             FROM valid_events
+                             WHERE peer_id = ?1
+                               AND event_id = ?2
+                         )",
+                        rusqlite::params![&peer.recorded_by, signer_event_id],
+                        |row| row.get(0),
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let matching_local_invite_secret_count: i64 = conn.query_row(
+                "SELECT COUNT(*)
+                 FROM invite_secrets
+                 WHERE recorded_by = ?1
+                   AND invite_event_id = ?2
+                   AND event_id = ?3",
+                rusqlite::params![&peer.recorded_by, &recipient_event_id, &unwrap_key_event_id],
+                |row| row.get(0),
+            )?;
+            Ok(ObservedKeySharedDebug {
+                event_id,
+                recipient_event_id,
+                unwrap_key_event_id,
+                signer_event_id,
+                signer_valid_locally,
+                matching_local_invite_secret_count,
+            })
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+    Ok(SampleRepairDebugStatus {
+        logical_peer,
+        has_encrypted_event: has_event(&peer.daemon, encrypted_event_id_b64),
+        sender_seen_request_count,
+        sender_emitted_response_count,
+        recipient_key_shared_count,
+        recipient_key_shared_for_key_count,
+        recipient_target_key_secret_count,
+        recipient_blocked_event_count,
+        local_invite_event_id,
+        local_invite_secret_event_id,
+        local_invite_secret_count,
+        observed_key_shared,
+    })
+}
+
+fn has_event(daemon: &VirtualDaemon, event_id: &str) -> bool {
+    daemon
+        .call(RpcMethod::AssertNow {
+            predicate: format!("has_event:{event_id} >= 1"),
+        })
+        .ok
+}
+
+fn distinct_key_request_events_for_blocked_event(
+    actual: &BTreeMap<usize, ActualPeer>,
+    blocked_event_id_b64: &str,
+) -> SimResult<usize> {
+    let mut seen = BTreeSet::new();
+    for peer in actual.values() {
+        let conn = open_connection(peer.daemon.db_path())?;
+        let mut stmt = conn.prepare(
+            "SELECT event_id
+             FROM key_requests
+             WHERE blocked_event_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![blocked_event_id_b64], |row| {
+            crate::db::sql_types::get_text(row, 0)
+        })?;
+        for row in rows {
+            seen.insert(row?);
+        }
+    }
+    Ok(seen.len())
+}
+
+fn distinct_key_shared_events_for_key(
+    actual: &BTreeMap<usize, ActualPeer>,
+    key_event_id_b64: &str,
+) -> SimResult<usize> {
+    let mut seen = BTreeSet::new();
+    for peer in actual.values() {
+        let conn = open_connection(peer.daemon.db_path())?;
+        let mut stmt = conn.prepare(
+            "SELECT event_id
+             FROM key_shared
+             WHERE key_event_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![key_event_id_b64], |row| {
+            crate::db::sql_types::get_text(row, 0)
+        })?;
+        for row in rows {
+            seen.insert(row?);
+        }
+    }
+    Ok(seen.len())
 }
 
 fn snapshot_has_message_content(daemon: &VirtualDaemon, content: &str) -> SimResult<bool> {

@@ -77,7 +77,7 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
 
     // 4-6. Shared prereq/signer/projection stages
     // For encrypted events, inner_parsed contains the decrypted inner event.
-    let (decision, inner_parsed) =
+    let (decision, inner_parsed, suppress_sharing) =
         apply_projection_with_backend(backend, recorded_by, &event_id_b64, &blob, &parsed)?;
     match &decision {
         ProjectionDecision::Reject { ref reason } => {
@@ -93,7 +93,7 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
     }
 
     let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
-    backend.finalize_valid_projection(recorded_by, &event_id_b64, sub_event)?;
+    backend.finalize_valid_projection(recorded_by, &event_id_b64, sub_event, suppress_sharing)?;
 
     Ok((ProjectionDecision::Valid, Some(parsed)))
 }

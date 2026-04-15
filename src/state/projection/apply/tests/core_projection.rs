@@ -271,19 +271,22 @@ fn test_project_key_request_valid_with_delivery_target_binding() {
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
 
     let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[]);
+    let recipient_event_id = [0x33; 32];
+    let unwrap_key_event_id = [0x44; 32];
+    let delivery_target_id = crate::event_modules::key_request::delivery_target_id(
+        &[0x22; 32],
+        &frontier_hash,
+        &recipient_event_id,
+        &unwrap_key_event_id,
+    );
     let key_request = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: now_ms(),
         blocked_event_id: [0x11; 32],
         key_event_id: [0x22; 32],
         frontier_hash,
-        delivery_target_id: crate::event_modules::key_request::delivery_target_id(
-            &[0x22; 32],
-            &frontier_hash,
-            &[0x33; 32],
-            &[0x44; 32],
-        ),
-        recipient_event_id: [0x33; 32],
-        unwrap_key_event_id: [0x44; 32],
+        delivery_target_id,
+        recipient_event_id,
+        unwrap_key_event_id,
     });
     let blob = sign_blob(&signer_key, &signer_eid, &key_request);
     let key_request_eid = insert_event_raw(&conn, recorded_by, &blob);
@@ -300,6 +303,166 @@ fn test_project_key_request_valid_with_delivery_target_binding() {
         )
         .unwrap();
     assert!(projected, "valid key_request should project");
+
+    let suppress_sharing: i64 = conn
+        .query_row(
+            "SELECT suppress_sharing FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_request_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        suppress_sharing, 0,
+        "key_request should stay shareable until a matching key_shared is projected"
+    );
+}
+
+#[test]
+fn test_project_key_request_sets_suppress_sharing_after_matching_key_shared() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let (signer_eid, signer_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
+    insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
+
+    let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[]);
+    let recipient_event_id = [0x33; 32];
+    let unwrap_key_event_id = [0x44; 32];
+    let delivery_target_id = crate::event_modules::key_request::delivery_target_id(
+        &[0x22; 32],
+        &frontier_hash,
+        &recipient_event_id,
+        &unwrap_key_event_id,
+    );
+    conn.execute(
+        "INSERT INTO key_shared
+         (recorded_by, event_id, key_event_id, frontier_count, frontier_ref_1, frontier_ref_2,
+          frontier_ref_3, frontier_ref_4, frontier_hash, delivery_target_id, recipient_event_id,
+          wrapped_key)
+         VALUES (?1, ?2, ?3, 0, ?4, ?4, ?4, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            recorded_by,
+            event_id_to_base64(&[0x77; 32]),
+            event_id_to_base64(&[0x22; 32]),
+            event_id_to_base64(&[0u8; 32]),
+            event_id_to_base64(&frontier_hash),
+            event_id_to_base64(&delivery_target_id),
+            event_id_to_base64(&recipient_event_id),
+            vec![0x66u8; 32],
+        ],
+    )
+    .unwrap();
+
+    let key_request = ParsedEvent::KeyRequest(KeyRequestEvent {
+        created_at_ms: now_ms(),
+        blocked_event_id: [0x11; 32],
+        key_event_id: [0x22; 32],
+        frontier_hash,
+        delivery_target_id,
+        recipient_event_id,
+        unwrap_key_event_id,
+    });
+    let blob = sign_blob(&signer_key, &signer_eid, &key_request);
+    let key_request_eid = insert_event_raw(&conn, recorded_by, &blob);
+
+    let decision = project_one(&conn, recorded_by, &key_request_eid).unwrap();
+    assert_eq!(decision, ProjectionDecision::Valid);
+
+    let key_request_b64 = event_id_to_base64(&key_request_eid);
+    let suppress_sharing: i64 = conn
+        .query_row(
+            "SELECT suppress_sharing FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_request_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        suppress_sharing, 1,
+        "matching projected key_shared should suppress further sharing of the key_request"
+    );
+}
+
+#[test]
+fn test_project_key_shared_retroactively_suppresses_matching_key_request() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let (signer_eid, signer_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
+    insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
+
+    let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[]);
+    let recipient_event_id: EventId = conn
+        .query_row(
+            "SELECT event_id FROM user_invites WHERE recorded_by = ?1 LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
+        .unwrap();
+    let unwrap_key_event_id = [0x44; 32];
+    let delivery_target_id = crate::event_modules::key_request::delivery_target_id(
+        &[0x22; 32],
+        &frontier_hash,
+        &recipient_event_id,
+        &unwrap_key_event_id,
+    );
+
+    let key_request = ParsedEvent::KeyRequest(KeyRequestEvent {
+        created_at_ms: now_ms(),
+        blocked_event_id: [0x11; 32],
+        key_event_id: [0x22; 32],
+        frontier_hash,
+        delivery_target_id,
+        recipient_event_id,
+        unwrap_key_event_id,
+    });
+    let key_request_blob = sign_blob(&signer_key, &signer_eid, &key_request);
+    let key_request_eid = insert_event_raw(&conn, recorded_by, &key_request_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &key_request_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let key_request_b64 = event_id_to_base64(&key_request_eid);
+    let suppress_before: i64 = conn
+        .query_row(
+            "SELECT suppress_sharing FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_request_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(suppress_before, 0);
+
+    let key_shared = ParsedEvent::KeyShared(KeySharedEvent {
+        created_at_ms: now_ms(),
+        key_event_id: [0x22; 32],
+        frontier_count: 0,
+        frontier_ref_1: [0u8; 32],
+        frontier_ref_2: [0u8; 32],
+        frontier_ref_3: [0u8; 32],
+        frontier_ref_4: [0u8; 32],
+        frontier_hash,
+        delivery_target_id,
+        recipient_event_id,
+        unwrap_key_event_id,
+        wrapped_key: [0x66; 32],
+    });
+    let key_shared_blob = sign_blob(&signer_key, &signer_eid, &key_shared);
+    let key_shared_eid = insert_event_raw(&conn, recorded_by, &key_shared_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &key_shared_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let suppress_after: i64 = conn
+        .query_row(
+            "SELECT suppress_sharing FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_request_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        suppress_after, 1,
+        "projecting a matching key_shared should retroactively suppress the request"
+    );
 }
 
 #[test]

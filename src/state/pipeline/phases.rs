@@ -586,7 +586,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(indexed_workspace_id, output.shared_event_fanouts[0].workspace_id);
+        assert_eq!(
+            indexed_workspace_id,
+            output.shared_event_fanouts[0].workspace_id
+        );
 
         let pending_count: i64 = db
             .query_row(

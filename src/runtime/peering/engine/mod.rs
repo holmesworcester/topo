@@ -7,7 +7,6 @@ mod startup;
 pub(crate) mod supervisor;
 pub(crate) mod target_dispatch;
 pub(crate) mod target_planner;
-pub(crate) use bootstrap_auth::should_initiate_connect_for_source_with_db;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

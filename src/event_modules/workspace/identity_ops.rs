@@ -191,7 +191,7 @@ fn recent_key_rotations_for_peer(
     Ok(out)
 }
 
-fn current_removal_frontier_for_peer(
+pub(crate) fn current_removal_frontier_for_peer(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<EventId>, Box<dyn std::error::Error + Send + Sync>> {

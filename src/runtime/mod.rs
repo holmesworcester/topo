@@ -1,5 +1,6 @@
 pub(crate) mod build_mismatch;
 pub mod control;
+pub mod key_repair;
 pub mod memtrace;
 pub mod peering;
 pub(crate) mod repeated_warning;
