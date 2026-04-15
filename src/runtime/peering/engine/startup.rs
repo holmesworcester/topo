@@ -96,12 +96,8 @@ pub(crate) async fn setup_endpoint_and_tenants(
     let info = NodeRuntimeNetInfo {
         listen_addr: local_addr.to_string(),
         daemon_peer_id: endpoint.daemon_peer_id(),
-        published_addrs: endpoint
-            .endpoint_addr()
-            .ip_addrs()
-            .map(ToString::to_string)
-            .collect(),
-        mdns_enabled: endpoint.mdns_lookup().is_some(),
+        published_addrs: endpoint.published_addrs(),
+        mdns_enabled: endpoint.discovery_enabled(),
         endpoint: Some(endpoint.clone()),
     };
     let _ = net_info_tx.send(info);

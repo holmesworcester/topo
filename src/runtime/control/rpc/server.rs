@@ -4,6 +4,7 @@
 //! pressure (feedback item 2).
 
 use serde::Serialize;
+#[cfg(feature = "discovery")]
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -339,52 +340,6 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_link_local(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
-    }
-}
-
-fn endpoint_bootstrap_addrs(
-    endpoint: &TransportEndpoint,
-) -> Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> {
-    let include_loopback = env_flag("TOPO_TEST_DISCOVERY_LOOPBACK");
-    let mut addrs = Vec::new();
-    let mut seen = BTreeSet::new();
-    for addr in endpoint.endpoint_addr().ip_addrs().copied() {
-        let ip = addr.ip();
-        if ip.is_unspecified() {
-            continue;
-        }
-        if ip.is_loopback() && !include_loopback {
-            continue;
-        }
-        if is_link_local(&ip) {
-            continue;
-        }
-        let bootstrap = match ip {
-            std::net::IpAddr::V4(ip) => {
-                crate::event_modules::workspace::invite_link::BootstrapAddress::Ipv4 {
-                    ip,
-                    port: addr.port(),
-                }
-            }
-            std::net::IpAddr::V6(ip) => {
-                crate::event_modules::workspace::invite_link::BootstrapAddress::Ipv6 {
-                    ip,
-                    port: addr.port(),
-                }
-            }
-        };
-        let key = bootstrap.to_bootstrap_addr_string();
-        if seen.insert(key) {
-            addrs.push(bootstrap);
-        }
-    }
-    addrs
-}
-
 fn runtime_status_value(state: &DaemonState) -> Option<serde_json::Value> {
     if let Some(mut info) = state.runtime_net.read().unwrap().clone() {
         if let Some(endpoint) = info.endpoint.as_ref() {
@@ -392,11 +347,8 @@ fn runtime_status_value(state: &DaemonState) -> Option<serde_json::Value> {
                 info.listen_addr = listen_addr.to_string();
             }
             info.daemon_peer_id = endpoint.daemon_peer_id();
-            info.published_addrs = endpoint_bootstrap_addrs(endpoint)
-                .into_iter()
-                .map(|addr| addr.to_bootstrap_addr_string())
-                .collect();
-            info.mdns_enabled = endpoint.mdns_lookup().is_some();
+            info.published_addrs = endpoint.published_addrs();
+            info.mdns_enabled = endpoint.discovery_enabled();
         }
         let mut value = serde_json::to_value(info).ok()?;
         let endpoint_id = value["daemon_peer_id"]
@@ -454,6 +406,11 @@ fn runtime_relay_url_for_bootstrap(state: &DaemonState) -> Option<String> {
     if env_flag("TOPO_DISABLE_RELAY") {
         return None;
     }
+    if let Some(endpoint) = state.runtime_endpoint() {
+        if !endpoint.should_wait_for_relay_url() {
+            return endpoint.relay_url();
+        }
+    }
     state.notify_runtime_recheck();
     let deadline = Instant::now() + INVITE_RELAY_WAIT_TIMEOUT;
     loop {
@@ -471,6 +428,7 @@ fn runtime_relay_url_for_bootstrap(state: &DaemonState) -> Option<String> {
     }
 }
 
+#[cfg(feature = "discovery")]
 fn daemon_scope_annotations(
     conn: &rusqlite::Connection,
     daemon_peer_id: &str,

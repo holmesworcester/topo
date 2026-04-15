@@ -43,8 +43,8 @@ fn ensure_endpoint_secret_row(
             return Ok(row);
         }
 
-        let secret_key = iroh::SecretKey::from_bytes(&rand::random());
-        let private_key_bytes = secret_key.to_bytes();
+        let private_key_bytes =
+            ed25519_dalek::SigningKey::generate(&mut rand::thread_rng()).to_bytes();
         let endpoint_id = crate::event_modules::endpoint_secret::endpoint_id_from_private_key_bytes(
             &private_key_bytes,
         );
@@ -128,6 +128,17 @@ pub fn load_daemon_identity(
     Ok((row.endpoint_id, cert_der, key_der))
 }
 
+pub fn load_daemon_signing_key(
+    conn: &Connection,
+) -> Result<ed25519_dalek::SigningKey, Box<dyn std::error::Error + Send + Sync>> {
+    let row = load_endpoint_secret_row(conn)?
+        .ok_or("endpoint identity not found; start the daemon, create a workspace, or accept an invite first")?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(
+        &row.private_key_bytes,
+    ))
+}
+
+#[cfg(feature = "iroh-transport")]
 pub fn load_daemon_iroh_secret_key(
     conn: &Connection,
 ) -> Result<iroh::SecretKey, Box<dyn std::error::Error + Send + Sync>> {
@@ -158,6 +169,15 @@ pub fn load_daemon_identity_from_db(
     load_daemon_identity(&conn)
 }
 
+pub fn load_daemon_signing_key_from_db(
+    db_path: &str,
+) -> Result<ed25519_dalek::SigningKey, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = crate::db::open_connection(db_path)?;
+    crate::db::schema::create_tables(&conn)?;
+    load_daemon_signing_key(&conn)
+}
+
+#[cfg(feature = "iroh-transport")]
 pub fn load_daemon_iroh_secret_key_from_db(
     db_path: &str,
 ) -> Result<iroh::SecretKey, Box<dyn std::error::Error + Send + Sync>> {
@@ -181,6 +201,13 @@ mod tests {
 
         assert_eq!(first.0, second.0);
         assert_eq!(first.0.len(), 64);
+        let endpoint_secret =
+            crate::event_modules::endpoint_secret::load_local_endpoint_secret(&conn)
+                .unwrap()
+                .expect("endpoint secret row");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&endpoint_secret.private_key_bytes);
+        assert_eq!(hex::encode(signing_key.verifying_key().to_bytes()), first.0);
+        #[cfg(feature = "iroh-transport")]
         assert_eq!(
             load_daemon_iroh_secret_key(&conn)
                 .unwrap()
@@ -188,10 +215,6 @@ mod tests {
                 .to_string(),
             first.0
         );
-        let endpoint_secret =
-            crate::event_modules::endpoint_secret::load_local_endpoint_secret(&conn)
-                .unwrap()
-                .expect("endpoint secret row");
         assert_eq!(endpoint_secret.endpoint_id, first.0);
         let endpoint_shared =
             crate::event_modules::endpoint_shared::load_local_endpoint_shared(&conn)

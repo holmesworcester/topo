@@ -30,7 +30,10 @@ use super::{
     run_session, short_peer_id, ENDPOINT_TTL_MS,
 };
 
+#[cfg(feature = "iroh-transport")]
 const FIRST_SESSION_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(feature = "tor-transport")]
+const FIRST_SESSION_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DaemonConnectionAdmission {

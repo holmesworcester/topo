@@ -204,31 +204,61 @@ pub(crate) fn load_bootstrap_targets(
             } else if target.bootstrap_addr.starts_with("https://")
                 || target.bootstrap_addr.starts_with("http://")
             {
-                match target.bootstrap_addr.parse::<iroh::RelayUrl>() {
-                    Ok(_) => (None, Some(target.bootstrap_addr.clone())),
-                    Err(e) => {
-                        warn!(
-                            "Skipping invalid invite bootstrap relay_url '{}' for tenant {}: {}",
-                            target.bootstrap_addr,
-                            &tenant_id[..16.min(tenant_id.len())],
-                            e
-                        );
-                        continue;
+                #[cfg(feature = "iroh-transport")]
+                {
+                    match target.bootstrap_addr.parse::<iroh::RelayUrl>() {
+                        Ok(_) => (None, Some(target.bootstrap_addr.clone())),
+                        Err(e) => {
+                            warn!(
+                                "Skipping invalid invite bootstrap relay_url '{}' for tenant {}: {}",
+                                target.bootstrap_addr,
+                                &tenant_id[..16.min(tenant_id.len())],
+                                e
+                            );
+                            continue;
+                        }
                     }
                 }
-            } else {
-                match parse_bootstrap_address(&target.bootstrap_addr)
-                    .and_then(|addr| addr.to_socket_addr())
+                #[cfg(feature = "tor-transport")]
                 {
-                    Ok(addr) => (Some(addr), None),
-                    Err(e) => {
-                        warn!(
-                            "Skipping invalid/unresolvable invite bootstrap_addr '{}' for tenant {}: {}",
-                            target.bootstrap_addr,
-                            &tenant_id[..16.min(tenant_id.len())],
-                            e
-                        );
-                        continue;
+                    debug!(
+                        "Ignoring invite relay bootstrap_url '{}' for tenant {} under Tor transport",
+                        target.bootstrap_addr,
+                        short_value(tenant_id)
+                    );
+                    (None, None)
+                }
+            } else {
+                #[cfg(feature = "iroh-transport")]
+                {
+                    match parse_bootstrap_address(&target.bootstrap_addr)
+                        .and_then(|addr| addr.to_socket_addr())
+                    {
+                        Ok(addr) => (Some(addr), None),
+                        Err(e) => {
+                            warn!(
+                                "Skipping invalid/unresolvable invite bootstrap_addr '{}' for tenant {}: {}",
+                                target.bootstrap_addr,
+                                &tenant_id[..16.min(tenant_id.len())],
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(feature = "tor-transport")]
+                {
+                    match parse_bootstrap_address(&target.bootstrap_addr) {
+                        Ok(_) => (None, None),
+                        Err(e) => {
+                            warn!(
+                                "Skipping invalid invite bootstrap_addr '{}' for tenant {} under Tor transport: {}",
+                                target.bootstrap_addr,
+                                &tenant_id[..16.min(tenant_id.len())],
+                                e
+                            );
+                            continue;
+                        }
                     }
                 }
             };
@@ -585,5 +615,55 @@ mod tests {
         assert_eq!(targets[0].0, "tenant-a");
         assert_eq!(targets[0].1, hex::encode([0xAC; 32]));
         assert_eq!(targets[0].2, "invite-a");
+    }
+
+    #[cfg(feature = "tor-transport")]
+    #[test]
+    fn tor_transport_load_bootstrap_targets_keeps_onion_hostnames_under_tor() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("tor-onion-bootstrap.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+
+        record_invite_bootstrap_trust(
+            &conn,
+            "tenant-a",
+            "accepted-a",
+            "invite-a",
+            "workspace-a",
+            "5a3uqymkr67uegvyaxokyhk3xb6yj26ac3tbqik76cseb5buctkexcid.onion:17691",
+            &[0xAD; 32],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invites_accepted
+                 (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "tenant-a",
+                "accepted-a",
+                "tenant-event-a",
+                "invite-a",
+                "workspace-a",
+                1i64
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &["tenant-a".to_string()]).unwrap();
+        assert_eq!(targets.len(), 1, "Tor should keep onion bootstrap targets");
+        assert_eq!(targets[0].0, "tenant-a");
+        assert_eq!(targets[0].1, hex::encode([0xAD; 32]));
+        assert_eq!(targets[0].2, "invite-a");
+        assert_eq!(
+            targets[0].3, None,
+            "Tor dials by daemon id, not socket addr"
+        );
+        assert_eq!(
+            targets[0].4, None,
+            "Tor invite bootstrap should not require relay URLs"
+        );
     }
 }

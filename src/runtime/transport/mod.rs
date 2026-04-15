@@ -1,14 +1,32 @@
 pub mod cert;
 pub mod connection;
-pub mod connection_lifecycle;
 pub mod daemon_identity;
 pub mod identity;
 pub mod identity_adapter;
 pub mod multi_workspace;
-pub mod peering_boundary;
 pub mod session_auth;
 pub mod session_factory;
 pub mod transport_session_io;
+
+#[cfg(all(feature = "iroh-transport", feature = "tor-transport"))]
+compile_error!(
+    "topo transport backends are mutually exclusive; build the Tor variant with --no-default-features --features tor-transport"
+);
+
+#[cfg(not(any(feature = "iroh-transport", feature = "tor-transport")))]
+compile_error!("topo requires exactly one transport backend feature");
+
+#[cfg(feature = "tor-transport")]
+#[path = "connection_lifecycle_tor.rs"]
+pub mod connection_lifecycle;
+#[cfg(feature = "iroh-transport")]
+pub mod connection_lifecycle;
+
+#[cfg(feature = "tor-transport")]
+#[path = "peering_boundary_tor.rs"]
+pub mod peering_boundary;
+#[cfg(feature = "iroh-transport")]
+pub mod peering_boundary;
 
 pub use cert::{
     extract_spki_fingerprint, generate_keypair, generate_self_signed_cert,
@@ -20,8 +38,10 @@ pub use connection_lifecycle::{
 };
 pub use daemon_identity::{
     ensure_daemon_identity, ensure_daemon_identity_from_db, load_daemon_identity,
-    load_daemon_identity_from_db, load_daemon_iroh_secret_key, load_daemon_iroh_secret_key_from_db,
+    load_daemon_identity_from_db,
 };
+#[cfg(feature = "iroh-transport")]
+pub use daemon_identity::{load_daemon_iroh_secret_key, load_daemon_iroh_secret_key_from_db};
 pub use peering_boundary::{
     accept_daemon_connection, accept_daemon_peer, accept_session_peer, accept_session_provider,
     create_runtime_endpoint_for_tenants, dial_daemon_connection, dial_daemon_connection_target,

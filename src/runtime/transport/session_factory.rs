@@ -410,7 +410,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "iroh-transport"))]
 mod tests {
     use tokio::io::AsyncWriteExt;
 
@@ -669,6 +669,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "iroh-transport")]
     #[tokio::test]
     async fn accept_session_io_reports_build_mismatch_and_closes_with_reason() {
         let (_temp, _server_ep, server_conn, _client_ep, client_conn) =

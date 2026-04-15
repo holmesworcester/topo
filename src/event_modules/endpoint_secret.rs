@@ -27,8 +27,8 @@ impl super::Describe for EndpointSecretEvent {
 }
 
 pub fn endpoint_id_from_private_key_bytes(private_key_bytes: &[u8; 32]) -> String {
-    let secret_key = iroh::SecretKey::from_bytes(private_key_bytes);
-    hex::encode(secret_key.public().as_bytes())
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(private_key_bytes);
+    hex::encode(signing_key.verifying_key().to_bytes())
 }
 
 pub fn parse_endpoint_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {

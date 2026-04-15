@@ -39,6 +39,13 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_link_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TransportEndpoint {
     pub(crate) inner: iroh::Endpoint,
@@ -73,6 +80,28 @@ impl TransportEndpoint {
         self.inner.addr()
     }
 
+    pub fn published_addrs(&self) -> Vec<String> {
+        let include_loopback = env_flag("TOPO_TEST_DISCOVERY_LOOPBACK");
+        let mut addrs = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for addr in self.endpoint_addr().ip_addrs().copied() {
+            let ip = addr.ip();
+            if ip.is_unspecified() {
+                continue;
+            }
+            if ip.is_loopback() && !include_loopback {
+                continue;
+            }
+            if is_link_local(&ip) {
+                continue;
+            }
+            if seen.insert(addr) {
+                addrs.push(addr.to_string());
+            }
+        }
+        addrs
+    }
+
     pub fn relay_url(&self) -> Option<String> {
         self.inner
             .addr()
@@ -80,6 +109,14 @@ impl TransportEndpoint {
             .next()
             .cloned()
             .map(|url| url.to_string())
+    }
+
+    pub fn discovery_enabled(&self) -> bool {
+        self.mdns.is_some()
+    }
+
+    pub fn should_wait_for_relay_url(&self) -> bool {
+        true
     }
 
     pub fn mdns_lookup(&self) -> Option<MdnsAddressLookup> {

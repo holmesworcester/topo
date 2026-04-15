@@ -200,6 +200,58 @@ pub(crate) enum LiveDaemonConnectionClaim {
     Occupied(LiveDaemonConnectionOccupied),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDaemonConnectionDecision {
+    Acquire,
+    ReplaceClosed,
+    ReplaceSameDirectionNewInstance,
+    ReplacePreferredDirection,
+    Occupied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiveDaemonConnectionSnapshot {
+    direction: SessionDirection,
+    stable_id: usize,
+    is_closed: bool,
+}
+
+fn daemon_connection_snapshot(
+    daemon_connection: &DaemonConnection,
+    direction: SessionDirection,
+) -> LiveDaemonConnectionSnapshot {
+    let connection = daemon_connection.connection();
+    LiveDaemonConnectionSnapshot {
+        direction,
+        stable_id: connection.stable_id(),
+        is_closed: connection.close_reason().is_some(),
+    }
+}
+
+fn decide_live_daemon_connection_claim(
+    existing: Option<LiveDaemonConnectionSnapshot>,
+    requested: LiveDaemonConnectionSnapshot,
+    preferred_direction: Option<SessionDirection>,
+) -> LiveDaemonConnectionDecision {
+    match existing {
+        None => LiveDaemonConnectionDecision::Acquire,
+        Some(existing) if existing.is_closed => LiveDaemonConnectionDecision::ReplaceClosed,
+        Some(existing)
+            if existing.direction == requested.direction
+                && existing.stable_id != requested.stable_id =>
+        {
+            LiveDaemonConnectionDecision::ReplaceSameDirectionNewInstance
+        }
+        Some(existing)
+            if preferred_direction == Some(requested.direction)
+                && existing.direction != requested.direction =>
+        {
+            LiveDaemonConnectionDecision::ReplacePreferredDirection
+        }
+        Some(_) => LiveDaemonConnectionDecision::Occupied,
+    }
+}
+
 pub(crate) fn claim_live_daemon_connection_slot(
     db_path: &str,
     local_daemon_peer_id: &str,
@@ -211,6 +263,7 @@ pub(crate) fn claim_live_daemon_connection_slot(
     let preferred_direction =
         preferred_connection_direction(local_daemon_peer_id, remote_daemon_peer_id);
     let claim_id = next_live_daemon_connection_claim_id();
+    let requested = daemon_connection_snapshot(&daemon_connection, direction);
 
     let mut replaced: Option<(DaemonConnection, Arc<tokio::sync::Notify>)> = None;
     let claim = {
@@ -238,94 +291,105 @@ pub(crate) fn claim_live_daemon_connection_slot(
                 );
                 LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
             }
-            Some(existing)
-                if existing
-                    .daemon_connection
-                    .connection()
-                    .close_reason()
-                    .is_some() =>
-            {
-                debug!(
-                    target: "topo::connection",
-                    "claim live daemon connection replacing closed remote={} old_direction={:?} new_direction={:?}",
-                    short_peer_id(remote_daemon_peer_id),
-                    existing.direction,
-                    direction,
-                );
-                let released = Arc::new(tokio::sync::Notify::new());
-                replaced = Some((
-                    existing.daemon_connection.clone(),
-                    existing.released.clone(),
-                ));
-                *existing = LiveDaemonConnectionSlot {
-                    claim_id,
-                    direction,
-                    daemon_connection,
-                    released,
-                };
-                LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
-            }
-            Some(existing)
-                if existing.direction == direction
-                    && existing.daemon_connection.remote_addr()
-                        != daemon_connection.remote_addr() =>
-            {
-                debug!(
-                    target: "topo::connection",
-                    "claim live daemon connection replacing stale same-direction remote={} direction={:?}",
-                    short_peer_id(remote_daemon_peer_id),
-                    existing.direction,
-                );
-                let released = Arc::new(tokio::sync::Notify::new());
-                replaced = Some((
-                    existing.daemon_connection.clone(),
-                    existing.released.clone(),
-                ));
-                *existing = LiveDaemonConnectionSlot {
-                    claim_id,
-                    direction,
-                    daemon_connection,
-                    released,
-                };
-                LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
-            }
-            Some(existing)
-                if preferred_direction == Some(direction) && existing.direction != direction =>
-            {
-                debug!(
-                    target: "topo::connection",
-                    "claim live daemon connection replacing non-preferred remote={} old_direction={:?} new_direction={:?}",
-                    short_peer_id(remote_daemon_peer_id),
-                    existing.direction,
-                    direction,
-                );
-                let released = Arc::new(tokio::sync::Notify::new());
-                replaced = Some((
-                    existing.daemon_connection.clone(),
-                    existing.released.clone(),
-                ));
-                *existing = LiveDaemonConnectionSlot {
-                    claim_id,
-                    direction,
-                    daemon_connection,
-                    released,
-                };
-                LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
-            }
             Some(existing) => {
-                debug!(
-                    target: "topo::connection",
-                    "claim live daemon connection occupied remote={} active_direction={:?} requested_direction={:?} preferred={:?}",
-                    short_peer_id(remote_daemon_peer_id),
-                    existing.direction,
-                    direction,
+                match decide_live_daemon_connection_claim(
+                    Some(daemon_connection_snapshot(
+                        &existing.daemon_connection,
+                        existing.direction,
+                    )),
+                    requested,
                     preferred_direction,
-                );
-                LiveDaemonConnectionClaim::Occupied(LiveDaemonConnectionOccupied {
-                    preferred_direction,
-                    active_direction: existing.direction,
-                    daemon_connection: existing.daemon_connection.clone(),
-                })
+                ) {
+                    LiveDaemonConnectionDecision::Acquire => {
+                        unreachable!("existing slot cannot produce acquire")
+                    }
+                    LiveDaemonConnectionDecision::ReplaceClosed => {
+                        debug!(
+                            target: "topo::connection",
+                            "claim live daemon connection replacing closed remote={} old_direction={:?} new_direction={:?}",
+                            short_peer_id(remote_daemon_peer_id),
+                            existing.direction,
+                            direction,
+                        );
+                        let released = Arc::new(tokio::sync::Notify::new());
+                        replaced = Some((
+                            existing.daemon_connection.clone(),
+                            existing.released.clone(),
+                        ));
+                        *existing = LiveDaemonConnectionSlot {
+                            claim_id,
+                            direction,
+                            daemon_connection,
+                            released,
+                        };
+                        LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease {
+                            key,
+                            claim_id,
+                        })
+                    }
+                    LiveDaemonConnectionDecision::ReplaceSameDirectionNewInstance => {
+                        debug!(
+                            target: "topo::connection",
+                            "claim live daemon connection replacing stale same-direction remote={} direction={:?}",
+                            short_peer_id(remote_daemon_peer_id),
+                            existing.direction,
+                        );
+                        let released = Arc::new(tokio::sync::Notify::new());
+                        replaced = Some((
+                            existing.daemon_connection.clone(),
+                            existing.released.clone(),
+                        ));
+                        *existing = LiveDaemonConnectionSlot {
+                            claim_id,
+                            direction,
+                            daemon_connection,
+                            released,
+                        };
+                        LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease {
+                            key,
+                            claim_id,
+                        })
+                    }
+                    LiveDaemonConnectionDecision::ReplacePreferredDirection => {
+                        debug!(
+                            target: "topo::connection",
+                            "claim live daemon connection replacing non-preferred remote={} old_direction={:?} new_direction={:?}",
+                            short_peer_id(remote_daemon_peer_id),
+                            existing.direction,
+                            direction,
+                        );
+                        let released = Arc::new(tokio::sync::Notify::new());
+                        replaced = Some((
+                            existing.daemon_connection.clone(),
+                            existing.released.clone(),
+                        ));
+                        *existing = LiveDaemonConnectionSlot {
+                            claim_id,
+                            direction,
+                            daemon_connection,
+                            released,
+                        };
+                        LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease {
+                            key,
+                            claim_id,
+                        })
+                    }
+                    LiveDaemonConnectionDecision::Occupied => {
+                        debug!(
+                            target: "topo::connection",
+                            "claim live daemon connection occupied remote={} active_direction={:?} requested_direction={:?} preferred={:?}",
+                            short_peer_id(remote_daemon_peer_id),
+                            existing.direction,
+                            direction,
+                            preferred_direction,
+                        );
+                        LiveDaemonConnectionClaim::Occupied(LiveDaemonConnectionOccupied {
+                            preferred_direction,
+                            active_direction: existing.direction,
+                            daemon_connection: existing.daemon_connection.clone(),
+                        })
+                    }
+                }
             }
         }
     };
@@ -500,14 +564,21 @@ pub(super) use crate::tuning::drain_batch_size;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "iroh-transport")]
     use std::time::Duration;
 
+    #[cfg(feature = "iroh-transport")]
     use super::{
-        claim_live_daemon_connection_slot, claim_live_session_peer, live_daemon_connection,
-        live_session_peer_ids, preferred_connection_direction, LiveDaemonConnectionClaim,
+        claim_live_daemon_connection_slot, live_daemon_connection, LiveDaemonConnectionClaim,
+    };
+    use super::{
+        claim_live_session_peer, decide_live_daemon_connection_claim, live_session_peer_ids,
+        preferred_connection_direction, LiveDaemonConnectionDecision, LiveDaemonConnectionSnapshot,
         SessionDirection,
     };
+    #[cfg(feature = "iroh-transport")]
     use crate::db::schema::create_tables;
+    #[cfg(feature = "iroh-transport")]
     use crate::transport::{
         accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
         load_daemon_identity_from_db, multi_workspace::transport_sni,
@@ -543,8 +614,88 @@ mod tests {
     }
 
     #[test]
+    fn tor_transport_live_daemon_connection_claim_replaces_same_direction_new_instance() {
+        let decision = decide_live_daemon_connection_claim(
+            Some(LiveDaemonConnectionSnapshot {
+                direction: SessionDirection::Inbound,
+                stable_id: 1,
+                is_closed: false,
+            }),
+            LiveDaemonConnectionSnapshot {
+                direction: SessionDirection::Inbound,
+                stable_id: 2,
+                is_closed: false,
+            },
+            Some(SessionDirection::Outbound),
+        );
+        assert_eq!(
+            decision,
+            LiveDaemonConnectionDecision::ReplaceSameDirectionNewInstance
+        );
+    }
+
+    #[test]
+    fn tor_transport_live_daemon_connection_claim_prefers_canonical_direction() {
+        let decision = decide_live_daemon_connection_claim(
+            Some(LiveDaemonConnectionSnapshot {
+                direction: SessionDirection::Outbound,
+                stable_id: 1,
+                is_closed: false,
+            }),
+            LiveDaemonConnectionSnapshot {
+                direction: SessionDirection::Inbound,
+                stable_id: 2,
+                is_closed: false,
+            },
+            Some(SessionDirection::Inbound),
+        );
+        assert_eq!(
+            decision,
+            LiveDaemonConnectionDecision::ReplacePreferredDirection
+        );
+    }
+
+    #[test]
+    fn tor_transport_live_daemon_connection_claim_keeps_preferred_existing_connection() {
+        let decision = decide_live_daemon_connection_claim(
+            Some(LiveDaemonConnectionSnapshot {
+                direction: SessionDirection::Outbound,
+                stable_id: 1,
+                is_closed: false,
+            }),
+            LiveDaemonConnectionSnapshot {
+                direction: SessionDirection::Inbound,
+                stable_id: 2,
+                is_closed: false,
+            },
+            Some(SessionDirection::Outbound),
+        );
+        assert_eq!(decision, LiveDaemonConnectionDecision::Occupied);
+    }
+
+    #[test]
+    fn tor_transport_live_daemon_connection_claim_replaces_closed_connection() {
+        let decision = decide_live_daemon_connection_claim(
+            Some(LiveDaemonConnectionSnapshot {
+                direction: SessionDirection::Outbound,
+                stable_id: 1,
+                is_closed: true,
+            }),
+            LiveDaemonConnectionSnapshot {
+                direction: SessionDirection::Outbound,
+                stable_id: 1,
+                is_closed: false,
+            },
+            Some(SessionDirection::Outbound),
+        );
+        assert_eq!(decision, LiveDaemonConnectionDecision::ReplaceClosed);
+    }
+
+    #[test]
     fn live_session_peers_are_tracked_by_tenant_and_deduped() {
-        let db_path = "/tmp/live-session-peer-tracking.db";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("live-session-peer-tracking.db");
+        let db_path = db_path.to_str().expect("db path");
         let tenant_a = format!("{:064x}", 1);
         let tenant_b = format!("{:064x}", 2);
         let peer = format!("{:064x}", 3);
@@ -575,6 +726,7 @@ mod tests {
         assert_eq!(live_session_peer_ids(db_path, &tenant_b), vec![peer]);
     }
 
+    #[cfg(feature = "iroh-transport")]
     #[tokio::test]
     async fn inbound_reconnect_from_new_remote_addr_replaces_stale_slot() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -679,6 +831,7 @@ mod tests {
         server_ep.close(0u32.into(), b"test close");
     }
 
+    #[cfg(feature = "iroh-transport")]
     #[tokio::test]
     async fn preferred_inbound_connection_replaces_existing_outbound_slot() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -783,6 +936,7 @@ mod tests {
         remote_ep.close(0u32.into(), b"test close");
     }
 
+    #[cfg(feature = "iroh-transport")]
     #[tokio::test]
     async fn preferred_existing_connection_rejects_opposite_direction_duplicate() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -912,6 +1066,7 @@ mod tests {
         remote_ep_duplicate.close(0u32.into(), b"test close");
     }
 
+    #[cfg(feature = "iroh-transport")]
     #[tokio::test]
     async fn pending_bootstrap_aliases_share_live_daemon_slot() {
         let temp = tempfile::tempdir().expect("tempdir");
