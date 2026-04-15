@@ -254,7 +254,6 @@ fn collect_shared_events_one_way(
     crate::db::schema::create_tables(&source)?;
     let dest = open_connection(dest_db_path)?;
     crate::db::schema::create_tables(&dest)?;
-
     let known_dest_events = stored_event_ids(&dest)?;
     let winning_key_shared_events = winning_key_shared_event_ids(&source, source_recorded_by)?;
     let source_tag = format!(
@@ -375,6 +374,7 @@ fn collect_synthetic_shared_events_one_way(
     crate::db::schema::create_tables(&source)?;
     let dest = open_connection(dest_db_path)?;
     crate::db::schema::create_tables(&dest)?;
+    let known_dest_events = stored_event_ids(&dest)?;
 
     let Some(source_workspace_id) = lookup_workspace_id(&source, source_recorded_by) else {
         return Ok(empty_prepared_direction(
@@ -465,20 +465,31 @@ fn collect_synthetic_shared_events_one_way(
         &filtered_requested_ids,
     )?;
     let ordered_batch = load_shared_send_batch(&store, &ordered_ids)?;
-    let transferred_event_ids = ordered_ids
-        .iter()
-        .map(crate::crypto::event_id_to_base64)
-        .collect::<Vec<_>>();
-    let transferred_bytes = ordered_batch
-        .iter()
-        .map(|(_, blob)| blob.len() as u64)
-        .sum::<u64>();
-    let batch = ordered_batch
+    let primary_events = ordered_batch
         .into_iter()
-        .map(|(event_id, blob)| {
+        .map(|(event_id, blob)| TransferableSharedEvent {
+            event_id: crate::crypto::event_id_to_base64(&event_id),
+            created_at_ms: events::extract_created_at_ms(&blob).unwrap_or(0) as i64,
+            blob,
+        })
+        .collect::<Vec<_>>();
+    let expanded_events =
+        expand_transferable_shared_closure(&source, &known_dest_events, primary_events)?;
+    let transferred_event_ids = expanded_events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let transferred_bytes = expanded_events
+        .iter()
+        .map(|event| event.blob.len() as u64)
+        .sum::<u64>();
+    let batch = expanded_events
+        .into_iter()
+        .map(|event| {
             (
-                event_id,
-                blob,
+                crate::crypto::event_id_from_base64(&event.event_id)
+                    .expect("expanded synthetic event id should be valid base64"),
+                event.blob,
                 dest_recorded_by.to_string(),
                 source_tag.clone(),
                 now_ms,

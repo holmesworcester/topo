@@ -17,15 +17,6 @@ fn load_endpoint_secret_row(
     crate::event_modules::endpoint_secret::load_local_endpoint_secret(conn)
 }
 
-fn load_endpoint_shared_row(
-    conn: &Connection,
-) -> Result<
-    Option<crate::event_modules::endpoint_shared::EndpointSharedRow>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    crate::event_modules::endpoint_shared::load_local_endpoint_shared(conn)
-}
-
 fn ensure_endpoint_secret_row(
     conn: &Connection,
 ) -> Result<
@@ -70,22 +61,54 @@ fn ensure_endpoint_shared_row(
     crate::event_modules::endpoint_shared::EndpointSharedRow,
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    if let Some(row) = load_endpoint_shared_row(conn)? {
-        return Ok(row);
-    }
+    let expected_public_key =
+        ed25519_dalek::SigningKey::from_bytes(&secret_row.private_key_bytes)
+            .verifying_key()
+            .to_bytes();
+    let expected_event_id =
+        crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event_id(
+            &secret_row.private_key_bytes,
+        );
+    let expected_event_id_b64 = crate::crypto::event_id_to_base64(&expected_event_id);
+    let expected_created_at =
+        crate::event_modules::endpoint_shared::deterministic_endpoint_shared_created_at_ms(
+            &expected_public_key,
+        );
 
     let row = crate::state::db::queue::with_immediate_tx(conn, || {
-        if let Some(row) = crate::event_modules::endpoint_shared::load_local_endpoint_shared(conn)
-            .map_err(|e| sqlite_other(e.to_string()))?
-        {
-            return Ok(row);
+        let event_present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+                rusqlite::params![&expected_event_id_b64],
+                |row| row.get(0),
+            )
+            .map_err(|e| sqlite_other(e.to_string()))?;
+        if !event_present {
+            let event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+                secret_row.private_key_bytes,
+            );
+            create_event_synchronous(conn, &secret_row.endpoint_id, &event)
+                .map_err(|e| sqlite_other(e.to_string()))?;
         }
 
-        let event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
-            secret_row.private_key_bytes,
-        );
-        create_event_synchronous(conn, &secret_row.endpoint_id, &event)
-            .map_err(|e| sqlite_other(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM endpoints_shared WHERE endpoint_id = ?1 AND event_id <> ?2",
+            rusqlite::params![&secret_row.endpoint_id, &expected_event_id_b64],
+        )
+        .map_err(|e| sqlite_other(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO endpoints_shared
+             (recorded_by, event_id, endpoint_id, public_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                &secret_row.endpoint_id,
+                &expected_event_id_b64,
+                &secret_row.endpoint_id,
+                expected_public_key.as_slice(),
+                expected_created_at as i64,
+            ],
+        )
+        .map_err(|e| sqlite_other(e.to_string()))?;
 
         crate::event_modules::endpoint_shared::load_local_endpoint_shared(conn)
             .map_err(|e| sqlite_other(e.to_string()))?
@@ -221,6 +244,46 @@ mod tests {
                 .unwrap()
                 .expect("endpoint shared row");
         assert_eq!(endpoint_shared.endpoint_id, first.0);
+    }
+
+    #[test]
+    fn ensure_daemon_identity_repairs_stale_endpoint_shared_projection() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let first = ensure_daemon_identity(&conn).unwrap();
+        let endpoint_shared =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&conn)
+                .unwrap()
+                .expect("endpoint shared row");
+
+        let bogus_event_id = crate::crypto::event_id_to_base64(
+            &crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event_id(
+                &[0x77; 32],
+            ),
+        );
+        conn.execute(
+            "UPDATE endpoints_shared SET event_id = ?1 WHERE endpoint_id = ?2",
+            rusqlite::params![&bogus_event_id, &endpoint_shared.endpoint_id],
+        )
+        .unwrap();
+
+        let repaired = ensure_daemon_identity(&conn).unwrap();
+        let repaired_shared = crate::event_modules::endpoint_shared::load_local_endpoint_shared(&conn)
+            .unwrap()
+            .expect("repaired endpoint shared row");
+        let repaired_event_present: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                rusqlite::params![&repaired_shared.event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(repaired.0, first.0);
+        assert_eq!(repaired_shared.endpoint_id, endpoint_shared.endpoint_id);
+        assert_eq!(repaired_shared.event_id, endpoint_shared.event_id);
+        assert!(repaired_event_present);
     }
 
     #[test]

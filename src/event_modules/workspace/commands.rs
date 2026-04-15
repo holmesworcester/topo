@@ -65,6 +65,31 @@ fn index_endpoint_shared_for_workspace(
     Ok(())
 }
 
+fn resolve_local_endpoint_shared_event_id(
+    db: &Connection,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let (daemon_endpoint_id, _cert, _key) = ensure_daemon_identity(db)?;
+    let secret_row = crate::event_modules::endpoint_secret::load_local_endpoint_secret(db)?
+        .ok_or("endpoint_secret missing after ensure_daemon_identity")?;
+    if secret_row.endpoint_id != daemon_endpoint_id {
+        return Err("endpoint_secret endpoint_id mismatch after ensure_daemon_identity".into());
+    }
+    let endpoint_shared_event_id =
+        crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event_id(
+            &secret_row.private_key_bytes,
+        );
+    let endpoint_shared_event_id_b64 = event_id_to_base64(&endpoint_shared_event_id);
+    let present: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+        rusqlite::params![&endpoint_shared_event_id_b64],
+        |row| row.get(0),
+    )?;
+    if !present {
+        return Err("endpoint_shared event missing after ensure_daemon_identity".into());
+    }
+    Ok(endpoint_shared_event_id)
+}
+
 /// In a shared DB, sibling tenants can already have the workspace's shared
 /// event history in `events`/`shared_event_index` even though this tenant has not yet
 /// projected it into its own `valid_events` scope. Replay those shared events
@@ -365,13 +390,7 @@ pub fn create_workspace_with_options(
     // passing its recorded_by. User-facing create-workspace paths pass an
     // unbound bootstrap alias so they always mint a new tenant.
     if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
-        let endpoint_shared_event_id =
-            crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
-                .ok_or("endpoint_shared missing after local signer reuse")?
-                .event_id;
-        let endpoint_shared_event_id =
-            crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
-                .ok_or("invalid endpoint_shared event_id")?;
+        let endpoint_shared_event_id = resolve_local_endpoint_shared_event_id(db)?;
         let workspace_id = db
             .query_row(
                 "SELECT workspace_id
@@ -436,13 +455,7 @@ fn create_workspace_inner(
     let mut timestamps = options
         .resolved_network_age_ms()
         .map(|age| TimestampCursor::new(end_at_ms.saturating_sub(age), end_at_ms));
-    let _ = ensure_daemon_identity(db)?;
-    let endpoint_shared_event_id =
-        crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
-            .ok_or("endpoint_shared missing after ensure_daemon_identity")?
-            .event_id;
-    let endpoint_shared_event_id = crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
-        .ok_or("invalid endpoint_shared event_id")?;
+    let endpoint_shared_event_id = resolve_local_endpoint_shared_event_id(db)?;
 
     // Pre-derive peer_id from PeerShared key so all events are written under
     // the correct recorded_by from the start (no finalize_identity needed).
@@ -638,13 +651,7 @@ fn join_workspace_inner(
     peer_shared_key: SigningKey,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
-    let _ = ensure_daemon_identity(db)?;
-    let endpoint_shared_event_id =
-        crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
-            .ok_or("endpoint_shared missing after ensure_daemon_identity")?
-            .event_id;
-    let endpoint_shared_event_id = crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
-        .ok_or("invalid endpoint_shared event_id")?;
+    let endpoint_shared_event_id = resolve_local_endpoint_shared_event_id(db)?;
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_secret material. This is the key event
@@ -771,13 +778,7 @@ pub fn add_device_to_workspace(
     device_name: &str,
     peer_shared_key: SigningKey,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
-    let _ = ensure_daemon_identity(db)?;
-    let endpoint_shared_event_id =
-        crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
-            .ok_or("endpoint_shared missing after ensure_daemon_identity")?
-            .event_id;
-    let endpoint_shared_event_id = crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
-        .ok_or("invalid endpoint_shared event_id")?;
+    let endpoint_shared_event_id = resolve_local_endpoint_shared_event_id(db)?;
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_secret material so invite_accepted projection

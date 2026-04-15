@@ -71,6 +71,13 @@ pub fn deterministic_endpoint_shared_event(private_key_bytes: [u8; 32]) -> Parse
     })
 }
 
+pub fn deterministic_endpoint_shared_event_id(private_key_bytes: &[u8; 32]) -> [u8; 32] {
+    let event = deterministic_endpoint_shared_event(*private_key_bytes);
+    let blob =
+        super::encode_event(&event).expect("deterministic endpoint_shared encoding should succeed");
+    crate::crypto::hash_event(&blob)
+}
+
 pub fn parse_endpoint_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let values = decode_fields(EVENT_TYPE_ENDPOINT_SHARED, ENDPOINT_SHARED_FIELDS, blob)?;
     let signature = {
@@ -307,12 +314,8 @@ mod tests {
     #[test]
     fn test_deterministic_endpoint_shared_event_id_stable() {
         let key = [0x55u8; 32];
-        let a = crate::crypto::hash_event(
-            &encode_event(&deterministic_endpoint_shared_event(key)).unwrap(),
-        );
-        let b = crate::crypto::hash_event(
-            &encode_event(&deterministic_endpoint_shared_event(key)).unwrap(),
-        );
+        let a = deterministic_endpoint_shared_event_id(&key);
+        let b = deterministic_endpoint_shared_event_id(&key);
         assert_eq!(a, b);
     }
 
