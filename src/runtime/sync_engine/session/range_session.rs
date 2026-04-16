@@ -14,9 +14,11 @@ use crate::db::store::Store;
 use crate::protocol::{neg_id_to_event_id, Frame, MSG_TYPE_EVENT};
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::{
-    load_pending_receive_overlay_entries, open_pending_receive_overlay_session,
-    record_pending_receive_overlay_entries, PendingReceiveOverlayEntry,
-    PendingReceiveOverlaySession, ReceiveLogWriter,
+    enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment,
+    load_pending_receive_overlay_entries, next_pending_receive_overlay_session_id,
+    open_pending_receive_overlay_session, record_pending_receive_overlay_entries,
+    PendingReceiveOverlayEntry, PendingReceiveOverlayGuard, PendingReceiveOverlaySession,
+    ReceiveLogIngestWaiter, ReceiveLogWriter,
 };
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 use crate::transport::connection::ConnectionError;
@@ -29,12 +31,170 @@ use crate::tuning::{
 const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
 const LIVE_SUPPRESSION_PREFETCH_IDS: usize = 32;
 const LOW_MEM_LIVE_SUPPRESSION_PREFETCH_IDS: usize = 8;
+const LASTDAY_RECEIVE_LOG_ROLLOVER_BYTES: u64 = 512 * 1024;
 
 pub struct RangeReceiveResult {
     pub events_received: u64,
     pub bytes_received: u64,
     pub path: Option<PathBuf>,
     pub pending_overlay: Option<PendingReceiveOverlaySession>,
+    pub final_priority_segment_ordinal: Option<u64>,
+    pub ingest_waiters: Vec<ReceiveLogIngestWaiter>,
+}
+
+struct ReceiveLogSegmentBuffer {
+    db_path: String,
+    recorded_by: String,
+    workspace_id: String,
+    range: SyncWindow,
+    session_id: u64,
+    source_tag: String,
+    priority_ingest: bool,
+    current_segment_ordinal: u64,
+    writer: Option<ReceiveLogWriter>,
+    pending_overlay: Option<PendingReceiveOverlayGuard>,
+    pending_overlay_entries: Vec<PendingReceiveOverlayEntry>,
+    ingest_waiters: Vec<ReceiveLogIngestWaiter>,
+}
+
+impl ReceiveLogSegmentBuffer {
+    fn open(
+        db_path: String,
+        recorded_by: String,
+        workspace_id: String,
+        range: SyncWindow,
+        session_id: u64,
+        source_tag: String,
+    ) -> Result<Self, String> {
+        let priority_ingest = matches!(range.kind, SyncWindowKind::LastDay);
+        let mut this = Self {
+            db_path,
+            recorded_by,
+            workspace_id,
+            range,
+            session_id,
+            source_tag,
+            priority_ingest,
+            current_segment_ordinal: 0,
+            writer: None,
+            pending_overlay: None,
+            pending_overlay_entries: Vec::new(),
+            ingest_waiters: Vec::new(),
+        };
+        this.open_segment()?;
+        Ok(this)
+    }
+
+    fn open_segment(&mut self) -> Result<(), String> {
+        self.writer = Some(ReceiveLogWriter::open(
+            &self.db_path,
+            &self.recorded_by,
+            self.session_id,
+            &self.source_tag,
+        )?);
+        self.pending_overlay = Some(open_pending_receive_overlay_session(
+            &self.db_path,
+            &self.workspace_id,
+            self.range.kind,
+            next_pending_receive_overlay_session_id(),
+        ));
+        Ok(())
+    }
+
+    fn append_blob(
+        &mut self,
+        event_id: &EventId,
+        blob: &[u8],
+        overlay_entry: Option<PendingReceiveOverlayEntry>,
+    ) -> Result<(), String> {
+        if let Some(entry) = overlay_entry {
+            self.pending_overlay_entries.push(entry);
+        }
+        self.writer
+            .as_mut()
+            .expect("receive log segment should be open")
+            .append_blob(event_id, blob)?;
+        if self.should_roll() {
+            self.seal_current_segment_for_background_ingest()?;
+            self.open_segment()?;
+        }
+        Ok(())
+    }
+
+    fn should_roll(&self) -> bool {
+        self.range.kind == SyncWindowKind::LastDay
+            && self
+                .writer
+                .as_ref()
+                .map(|writer| writer.bytes_written() >= LASTDAY_RECEIVE_LOG_ROLLOVER_BYTES)
+                .unwrap_or(false)
+    }
+
+    fn seal_current_segment_for_background_ingest(&mut self) -> Result<(), String> {
+        let writer = self
+            .writer
+            .take()
+            .expect("receive log segment writer should be present");
+        let pending_overlay = self
+            .pending_overlay
+            .take()
+            .expect("receive log overlay should be present");
+        let path = writer.finish()?;
+        if let Some(path) = path {
+            record_pending_receive_overlay_entries(
+                pending_overlay.session(),
+                std::mem::take(&mut self.pending_overlay_entries),
+            );
+            let waiter =
+                enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment(
+                    &self.db_path,
+                    path,
+                    self.priority_ingest,
+                    self.priority_ingest.then_some(self.current_segment_ordinal),
+                    pending_overlay.into_session(),
+                )?;
+            self.ingest_waiters.push(waiter);
+        }
+        self.current_segment_ordinal = self.current_segment_ordinal.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+    ) -> Result<
+        (
+            Option<PathBuf>,
+            Option<PendingReceiveOverlaySession>,
+            Option<u64>,
+            Vec<ReceiveLogIngestWaiter>,
+        ),
+        String,
+    > {
+        let writer = self
+            .writer
+            .take()
+            .expect("receive log segment writer should be present");
+        let pending_overlay = self
+            .pending_overlay
+            .take()
+            .expect("receive log overlay should be present");
+        let path = writer.finish()?;
+        let pending_overlay = if path.is_some() {
+            record_pending_receive_overlay_entries(
+                pending_overlay.session(),
+                std::mem::take(&mut self.pending_overlay_entries),
+            );
+            Some(pending_overlay.into_session())
+        } else {
+            None
+        };
+        Ok((
+            path,
+            pending_overlay,
+            self.priority_ingest.then_some(self.current_segment_ordinal),
+            self.ingest_waiters,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -602,18 +762,37 @@ fn load_workspace_index_membership(
     Ok(members)
 }
 
+fn load_workspace_index_membership_any_range(
+    conn: &Connection,
+    workspace_id: &str,
+    ids: &[EventId],
+) -> Result<HashSet<EventId>, String> {
+    load_workspace_index_membership(
+        conn,
+        workspace_id,
+        SyncWindow {
+            kind: SyncWindowKind::Old,
+            ts_min_inclusive_ms: None,
+            ts_max_exclusive_ms: None,
+        },
+        ids,
+    )
+}
+
 fn eligible_shared_send_root_ids(
     conn: &Connection,
     store: &Store<'_>,
     recorded_by: Option<&str>,
     workspace_id: &str,
-    range: SyncWindow,
+    _range: SyncWindow,
     requested_ids: &[EventId],
 ) -> Result<(Vec<EventId>, HashMap<EventId, i64>), String> {
-    let _ = (conn, workspace_id, range);
     let created_at_by_id = store
         .get_shared_created_at_batch(requested_ids)
         .map_err(|e| format!("load selected created_at batch: {e}"))?;
+    let workspace_members =
+        load_workspace_index_membership_any_range(conn, workspace_id, requested_ids)
+            .map_err(|e| format!("load workspace index membership for selected sends: {e}"))?;
     let mut eligible = Vec::with_capacity(requested_ids.len());
     for event_id in requested_ids {
         let transport_shareable = match recorded_by {
@@ -626,7 +805,7 @@ fn eligible_shared_send_root_ids(
         let plan = decide_shared_send_eligibility_plan(&normalize_shared_send_eligibility_context(
             SharedSendEligibilityRawRows {
                 requested_by_reconciliation: true,
-                present_in_workspace_index: true,
+                present_in_workspace_index: workspace_members.contains(event_id),
                 shared_blob_available: created_at_by_id.contains_key(event_id),
                 transport_shareable,
             },
@@ -1552,10 +1731,14 @@ where
 {
     tokio::spawn(async move {
         let mut data_recv = data_recv;
-        let mut writer = ReceiveLogWriter::open(&db_path, &recorded_by, session_id, &source_tag)?;
-        let pending_overlay =
-            open_pending_receive_overlay_session(&db_path, &workspace_id, range.kind, session_id);
-        let mut pending_overlay_entries = Vec::new();
+        let mut receive_log = ReceiveLogSegmentBuffer::open(
+            db_path.clone(),
+            recorded_by.clone(),
+            workspace_id.clone(),
+            range,
+            session_id,
+            source_tag.clone(),
+        )?;
         let mut events_received = 0u64;
         let mut bytes_received = 0u64;
         let mut live_suppression = live_suppression;
@@ -1593,11 +1776,12 @@ where
                                 event_id,
                             )
                         }) {
-                            pending_overlay_entries.push(entry);
+                            receive_log.append_blob(&event_id, &blob, Some(entry))?;
+                        } else {
+                            receive_log.append_blob(&event_id, &blob, None)?;
                         }
                         bytes_received += blob.len() as u64;
                         events_received += 1;
-                        writer.append_blob(&event_id, &blob)?;
                     }
                     Ok(Ok(Frame::SuppressIds { ids })) => {
                         if let Some(state) = &live_suppression {
@@ -1643,11 +1827,12 @@ where
                                     event_id,
                                 )
                             }) {
-                                pending_overlay_entries.push(entry);
+                                receive_log.append_blob(&event_id, &blob, Some(entry))?;
+                            } else {
+                                receive_log.append_blob(&event_id, &blob, None)?;
                             }
                             bytes_received += blob.len() as u64;
                             events_received += 1;
-                            writer.append_blob(&event_id, &blob)?;
                         }
                         if offset > 0 {
                             buffer.drain(..offset);
@@ -1660,21 +1845,15 @@ where
             }
         }
 
-        let path = writer.finish()?;
-        let pending_overlay = if path.is_some() {
-            record_pending_receive_overlay_entries(
-                pending_overlay.session(),
-                pending_overlay_entries,
-            );
-            Some(pending_overlay.into_session())
-        } else {
-            None
-        };
+        let (path, pending_overlay, final_priority_segment_ordinal, ingest_waiters) =
+            receive_log.finish()?;
         Ok(RangeReceiveResult {
             events_received,
             bytes_received,
             path,
             pending_overlay,
+            final_priority_segment_ordinal,
+            ingest_waiters,
         })
     })
 }

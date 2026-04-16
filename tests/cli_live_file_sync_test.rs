@@ -1,7 +1,10 @@
 mod cli_harness;
+mod perf_network_shaper;
 
 use cli_harness::*;
+use perf_network_shaper::{NetworkProfile, UdpTrafficShaper};
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -302,5 +305,164 @@ fn test_cli_live_message_during_large_file_sync() {
         live_visible_snapshot.earliest_live_observation_id,
         live_visible_snapshot.last_file_slice_observation_id,
         live_visible_snapshot.file_slice_count
+    );
+}
+
+#[test]
+fn test_cli_topo_view_progress_advances_across_manual_refreshes() {
+    hold_network_test_lock_for_binary();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir
+        .path()
+        .join("alice_view_progress.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bob_db = tmpdir
+        .path()
+        .join("bob_view_progress.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let file_name = "manual-refresh-progress.bin";
+    let source_path = tmpdir.path().join(file_name);
+    let mut source_file = std::fs::File::create(&source_path).unwrap();
+    let mut chunk = vec![0u8; 1024 * 1024];
+    for (i, b) in chunk.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    for _ in 0..20 {
+        source_file.write_all(&chunk).unwrap();
+    }
+    source_file.flush().unwrap();
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            disable_relay: true,
+            ..Default::default()
+        },
+    );
+    let alice_real_addr = daemon_listen_addr(&alice_db)
+        .parse::<SocketAddr>()
+        .expect("parse alice listen addr");
+    let bob_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, random_port()));
+    let _shaper = UdpTrafficShaper::new(
+        alice_real_addr,
+        bob_bind_addr,
+        NetworkProfile {
+            slug: "manual-refresh-progress",
+            title: "Manual Refresh Progress",
+            note: "Shaped link for manual topo view refresh progress assertions",
+            bandwidth_mbps_per_direction: 4.0,
+            rtt_ms: 80,
+            jitter_ms: 0,
+            loss_percent: 0.0,
+        },
+    );
+    let invite_link = create_invite_with_spki(
+        &alice_db,
+        &_shaper.left_addr().to_string(),
+        Some(&daemon_identity_fingerprint(&alice_db)),
+    );
+    let mut bob_accept_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            bind_ip: Some(bob_bind_addr.ip().to_string()),
+            bind_port: Some(bob_bind_addr.port()),
+            disable_discovery: true,
+            disable_relay: true,
+            ..Default::default()
+        },
+    );
+    accept_invite_with_identity_on_running_daemon(
+        &bob_db,
+        &invite_link,
+        "user",
+        "device",
+        Duration::from_secs(30),
+    );
+    stop_daemon(&bob_db, &mut bob_accept_daemon);
+    wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
+    let _bob = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            bind_ip: Some(bob_bind_addr.ip().to_string()),
+            bind_port: Some(bob_bind_addr.port()),
+            disable_discovery: true,
+            disable_relay: true,
+            ..Default::default()
+        },
+    );
+
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    let gate_eid = send_message(&alice_db, "pre-view-progress-gate");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", gate_eid.trim()),
+        60_000,
+    );
+
+    let send_out = Command::new(bin())
+        .args([
+            "--db",
+            &alice_db,
+            "send-file",
+            "manual refresh progress",
+            "--file",
+            source_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run send-file");
+    assert!(
+        send_out.status.success(),
+        "send-file failed: {}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+
+    fn extract_incomplete_percent(snapshot: &str, file_name: &str) -> Option<u8> {
+        let line = snapshot
+            .lines()
+            .find(|line| line.contains("\u{23f3}") && line.contains(file_name))?;
+        let digits_rev: String = line
+            .split('%')
+            .next()?
+            .chars()
+            .rev()
+            .skip_while(|ch| !ch.is_ascii_digit())
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        let digits: String = digits_rev.chars().rev().collect();
+        digits.parse::<u8>().ok()
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut observed_progress = std::collections::BTreeSet::new();
+    let mut completed_snapshot = None;
+    while Instant::now() < deadline {
+        let view_snapshot = get_view_raw(&bob_db);
+        if let Some(percent) = extract_incomplete_percent(&view_snapshot, file_name) {
+            observed_progress.insert(percent);
+        }
+        if view_snapshot.contains(&format!("\u{2714}  {file_name}")) {
+            completed_snapshot = Some(view_snapshot);
+        }
+        if completed_snapshot.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let completed_snapshot =
+        completed_snapshot.expect("topo view never showed the attachment as complete");
+    assert!(
+        observed_progress.len() >= 2,
+        "manual topo view refreshes should observe more than one incomplete percentage before completion, saw {:?}\nfinal snapshot:\n{}",
+        observed_progress,
+        completed_snapshot
     );
 }

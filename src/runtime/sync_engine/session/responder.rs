@@ -18,8 +18,9 @@ use crate::sync::session::range_session::{
     open_live_suppression_session, send_selected_events, spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::{
-    enqueue_receive_log_ingest, enqueue_receive_log_ingest_with_pending_overlay,
-    note_hot_receive_finished, note_hot_receive_started,
+    acquire_peer_session_ingest_guard, enqueue_receive_log_ingest_waiter_with_priority_segment,
+    enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment,
+    note_hot_receive_finished, note_hot_receive_started, wait_for_receive_log_ingests,
 };
 use crate::sync::session::windowing::{
     decode_initial_neg_open, encode_sync_window_kind, is_low_mem_allowed_window,
@@ -134,6 +135,7 @@ where
 
     let db = open_connection(db_path)?;
     let ws_id = resolve_sync_admission(&db, recorded_by)?;
+    let _peer_session_ingest_guard = acquire_peer_session_ingest_guard(db_path, peer_id).await?;
     let phase1_storage = build_range_dep_storage(&db, db_path, &ws_id, range)?;
     let mut phase1 = DepReconciler::borrowed(phase1_storage.as_ref());
 
@@ -375,17 +377,32 @@ where
             return Err(format!("receive log task join: {e}").into());
         }
     };
-    if let Some(path) = received.path.clone() {
-        if let Some(pending_overlay) = received.pending_overlay.clone() {
-            enqueue_receive_log_ingest_with_pending_overlay(
+    let mut ingest_waiters = received.ingest_waiters;
+    if let Some(path) = received.path {
+        let waiter = if let Some(pending_overlay) = received.pending_overlay {
+            enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment(
                 db_path,
                 path,
                 hot_receive,
+                received.final_priority_segment_ordinal,
                 pending_overlay,
-            );
+            )
         } else {
-            enqueue_receive_log_ingest(db_path, path, hot_receive);
+            enqueue_receive_log_ingest_waiter_with_priority_segment(
+                db_path,
+                path,
+                hot_receive,
+                received.final_priority_segment_ordinal,
+            )
         }
+        .map_err(|e| format!("enqueue receive log ingest: {e}"))?;
+        ingest_waiters.push(waiter);
+    }
+    if let Err(e) = wait_for_receive_log_ingests(ingest_waiters).await {
+        if hot_receive {
+            note_hot_receive_finished(db_path);
+        }
+        return Err(format!("receive log ingest wait: {e}").into());
     }
     if hot_receive {
         note_hot_receive_finished(db_path);

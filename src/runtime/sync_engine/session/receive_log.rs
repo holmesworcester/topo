@@ -1,12 +1,13 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
@@ -42,12 +43,14 @@ struct ReceiveLogIngestState {
     wake: Condvar,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ReceiveLogIngestJob {
     path: PathBuf,
     priority: bool,
+    priority_segment_ordinal: Option<u64>,
+    enqueue_seq: u64,
     pending_overlay: Option<PendingReceiveOverlaySession>,
-    completion: Option<mpsc::Sender<Result<usize, String>>>,
+    completion: Option<oneshot::Sender<Result<usize, String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +65,8 @@ pub struct ReceiveLogWriter {
     file: File,
     bytes_written: u64,
 }
+
+pub type ReceiveLogIngestWaiter = oneshot::Receiver<Result<usize, String>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PendingReceiveOverlayKey {
@@ -203,6 +208,31 @@ fn ingest_state_map() -> &'static Mutex<HashMap<String, Arc<ReceiveLogIngestStat
     STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn peer_session_ingest_gate_map() -> &'static Mutex<HashMap<String, Arc<Semaphore>>> {
+    static GATES: OnceLock<Mutex<HashMap<String, Arc<Semaphore>>>> = OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn peer_session_ingest_gate(db_path: &str, peer_id: &str) -> Arc<Semaphore> {
+    let mut gates = peer_session_ingest_gate_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    gates
+        .entry(format!("{db_path}|{peer_id}"))
+        .or_insert_with(|| Arc::new(Semaphore::new(1)))
+        .clone()
+}
+
+pub async fn acquire_peer_session_ingest_guard(
+    db_path: &str,
+    peer_id: &str,
+) -> Result<OwnedSemaphorePermit, String> {
+    peer_session_ingest_gate(db_path, peer_id)
+        .acquire_owned()
+        .await
+        .map_err(|_| format!("peer session ingest gate closed for {peer_id}"))
+}
+
 fn ingest_state(db_path: &str) -> Arc<ReceiveLogIngestState> {
     let mut states = ingest_state_map()
         .lock()
@@ -246,7 +276,32 @@ pub fn note_hot_receive_finished(db_path: &str) {
     state.wake.notify_all();
 }
 
-pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf, priority: bool) {
+fn spawn_receive_log_ingest_worker(
+    db_path: &str,
+    state: &Arc<ReceiveLogIngestState>,
+) -> Result<(), String> {
+    let db_path = db_path.to_string();
+    let state = state.clone();
+    std::thread::Builder::new()
+        .name(format!("recvlog-ingest-{}", current_timestamp_ms()))
+        .spawn(move || receive_log_ingest_worker(db_path, state))
+        .map(|_| ())
+        .map_err(|e| format!("spawn receive log ingest worker: {e}"))
+}
+
+fn next_receive_log_ingest_enqueue_seq() -> u64 {
+    static NEXT_RECEIVE_LOG_INGEST_ENQUEUE_SEQ: AtomicU64 = AtomicU64::new(1);
+    NEXT_RECEIVE_LOG_INGEST_ENQUEUE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn enqueue_receive_log_ingest_job(
+    db_path: &str,
+    path: PathBuf,
+    priority: bool,
+    priority_segment_ordinal: Option<u64>,
+    pending_overlay: Option<PendingReceiveOverlaySession>,
+    completion: Option<oneshot::Sender<Result<usize, String>>>,
+) -> Result<(), String> {
     let state = ingest_state(db_path);
     let mut spawn_worker = false;
     {
@@ -257,8 +312,10 @@ pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf, priority: bool) 
         inner.pending.push_back(ReceiveLogIngestJob {
             path,
             priority,
-            pending_overlay: None,
-            completion: None,
+            priority_segment_ordinal,
+            enqueue_seq: next_receive_log_ingest_enqueue_seq(),
+            pending_overlay,
+            completion,
         });
         debug!(
             target: "topo::sync_operation",
@@ -276,14 +333,16 @@ pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf, priority: bool) 
     state.wake.notify_all();
 
     if spawn_worker {
-        let db_path = db_path.to_string();
-        let state = state.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("recvlog-ingest-{}", current_timestamp_ms()))
-            .spawn(move || receive_log_ingest_worker(db_path, state))
-        {
-            tracing::warn!("spawn receive log ingest worker: {}", e);
-        }
+        spawn_receive_log_ingest_worker(db_path, &state)?;
+    }
+    Ok(())
+}
+
+pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf, priority: bool) {
+    if let Err(e) =
+        enqueue_receive_log_ingest_job(db_path, path, priority, priority.then_some(0), None, None)
+    {
+        tracing::warn!("{e}");
     }
 }
 
@@ -293,44 +352,81 @@ pub fn enqueue_receive_log_ingest_with_pending_overlay(
     priority: bool,
     pending_overlay: PendingReceiveOverlaySession,
 ) {
-    let state = ingest_state(db_path);
-    let mut spawn_worker = false;
-    {
-        let mut inner = state
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.pending.push_back(ReceiveLogIngestJob {
-            path,
-            priority,
-            pending_overlay: Some(pending_overlay),
-            completion: None,
-        });
-        debug!(
-            target: "topo::sync_operation",
-            db_path,
-            pending_receive_logs = inner.pending.len(),
-            active_hot_receives = inner.active_hot_receives,
-            priority,
-            "receive log ingest enqueued with pending overlay"
-        );
-        if !inner.worker_running {
-            inner.worker_running = true;
-            spawn_worker = true;
-        }
+    if let Err(e) = enqueue_receive_log_ingest_job(
+        db_path,
+        path,
+        priority,
+        priority.then_some(0),
+        Some(pending_overlay),
+        None,
+    ) {
+        tracing::warn!("{e}");
     }
-    state.wake.notify_all();
+}
 
-    if spawn_worker {
-        let db_path = db_path.to_string();
-        let state = state.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("recvlog-ingest-{}", current_timestamp_ms()))
-            .spawn(move || receive_log_ingest_worker(db_path, state))
-        {
-            tracing::warn!("spawn receive log ingest worker: {}", e);
-        }
-    }
+pub fn enqueue_receive_log_ingest_waiter(
+    db_path: &str,
+    path: PathBuf,
+    priority: bool,
+) -> Result<ReceiveLogIngestWaiter, String> {
+    enqueue_receive_log_ingest_waiter_with_priority_segment(
+        db_path,
+        path,
+        priority,
+        priority.then_some(0),
+    )
+}
+
+pub fn enqueue_receive_log_ingest_waiter_with_priority_segment(
+    db_path: &str,
+    path: PathBuf,
+    priority: bool,
+    priority_segment_ordinal: Option<u64>,
+) -> Result<ReceiveLogIngestWaiter, String> {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    enqueue_receive_log_ingest_job(
+        db_path,
+        path,
+        priority,
+        priority_segment_ordinal,
+        None,
+        Some(completion_tx),
+    )?;
+    Ok(completion_rx)
+}
+
+pub fn enqueue_receive_log_ingest_with_pending_overlay_waiter(
+    db_path: &str,
+    path: PathBuf,
+    priority: bool,
+    pending_overlay: PendingReceiveOverlaySession,
+) -> Result<ReceiveLogIngestWaiter, String> {
+    enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment(
+        db_path,
+        path,
+        priority,
+        priority.then_some(0),
+        pending_overlay,
+    )
+}
+
+pub fn enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment(
+    db_path: &str,
+    path: PathBuf,
+    priority: bool,
+    priority_segment_ordinal: Option<u64>,
+    pending_overlay: PendingReceiveOverlaySession,
+) -> Result<ReceiveLogIngestWaiter, String> {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    enqueue_receive_log_ingest_job(
+        db_path,
+        path,
+        priority,
+        priority_segment_ordinal,
+        Some(pending_overlay),
+        Some(completion_tx),
+    )?;
+    Ok(completion_rx)
 }
 
 pub fn enqueue_receive_log_ingest_and_wait(
@@ -338,49 +434,24 @@ pub fn enqueue_receive_log_ingest_and_wait(
     path: PathBuf,
     priority: bool,
 ) -> Result<usize, String> {
-    let state = ingest_state(db_path);
-    let (completion_tx, completion_rx) = mpsc::channel();
-    let mut spawn_worker = false;
-    {
-        let mut inner = state
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.pending.push_back(ReceiveLogIngestJob {
-            path,
-            priority,
-            pending_overlay: None,
-            completion: Some(completion_tx),
-        });
-        debug!(
-            target: "topo::sync_operation",
-            db_path,
-            pending_receive_logs = inner.pending.len(),
-            active_hot_receives = inner.active_hot_receives,
-            priority,
-            "receive log ingest enqueued with waiter"
-        );
-        if !inner.worker_running {
-            inner.worker_running = true;
-            spawn_worker = true;
-        }
-    }
-    state.wake.notify_all();
-
-    if spawn_worker {
-        let db_path = db_path.to_string();
-        let state = state.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("recvlog-ingest-{}", current_timestamp_ms()))
-            .spawn(move || receive_log_ingest_worker(db_path, state))
-        {
-            return Err(format!("spawn receive log ingest worker: {e}"));
-        }
-    }
-
+    let completion_rx = enqueue_receive_log_ingest_waiter(db_path, path, priority)?;
     completion_rx
-        .recv()
+        .blocking_recv()
         .map_err(|e| format!("receive log ingest waiter dropped: {e}"))?
+}
+
+pub async fn wait_for_receive_log_ingests(
+    waiters: Vec<ReceiveLogIngestWaiter>,
+) -> Result<usize, String> {
+    let mut ingested = 0usize;
+    for waiter in waiters {
+        let result = tokio::task::spawn_blocking(move || waiter.blocking_recv())
+            .await
+            .map_err(|e| format!("join receive log ingest waiter: {e}"))?
+            .map_err(|e| format!("receive log ingest waiter dropped: {e}"))?;
+        ingested = ingested.saturating_add(result?);
+    }
+    Ok(ingested)
 }
 
 fn receive_log_ingest_worker(db_path: String, state: Arc<ReceiveLogIngestState>) {
@@ -395,11 +466,22 @@ fn receive_log_ingest_worker(db_path: String, state: Arc<ReceiveLogIngestState>)
                     inner.worker_running = false;
                     return;
                 }
+                if let Some((priority_idx, _)) = inner
+                    .pending
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, job)| job.priority)
+                    .min_by_key(|(_, job)| {
+                        (
+                            job.priority_segment_ordinal.unwrap_or(u64::MAX),
+                            Reverse(job.enqueue_seq),
+                        )
+                    })
+                {
+                    break inner.pending.remove(priority_idx);
+                }
                 if inner.active_hot_receives == 0 {
                     break inner.pending.pop_front();
-                }
-                if let Some(priority_idx) = inner.pending.iter().position(|job| job.priority) {
-                    break inner.pending.remove(priority_idx);
                 }
                 debug!(
                     target: "topo::sync_operation",
@@ -429,15 +511,19 @@ fn receive_log_ingest_worker(db_path: String, state: Arc<ReceiveLogIngestState>)
         if let Some(pending_overlay) = &path.pending_overlay {
             clear_pending_receive_overlay_session(pending_overlay);
         }
-        match (&result, path.completion) {
-            (Err(e), None) => {
+        if let Some(completion) = path.completion {
+            let _ = completion.send(result);
+            continue;
+        }
+        match result {
+            Err(e) => {
                 tracing::warn!(
                     "background receive log ingest {}: {}",
                     path.path.display(),
                     e
                 );
             }
-            (Ok(ingested), None) => {
+            Ok(ingested) => {
                 debug!(
                     target: "topo::sync_operation",
                     db_path = %db_path,
@@ -446,9 +532,6 @@ fn receive_log_ingest_worker(db_path: String, state: Arc<ReceiveLogIngestState>)
                     ingested,
                     "receive log ingest finished"
                 );
-            }
-            (_, Some(completion)) => {
-                let _ = completion.send(result);
             }
         }
     }
@@ -520,6 +603,10 @@ impl ReceiveLogWriter {
                 + RECEIVE_LOG_RECORD_SUFFIX_LEN) as u64,
         );
         Ok(())
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
     }
 
     pub fn finish(mut self) -> Result<Option<PathBuf>, String> {
@@ -626,6 +713,11 @@ fn receive_log_stem(session_id: u64) -> String {
         current_timestamp_ms(),
         NEXT_RECEIVE_LOG_NONCE.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+pub fn next_pending_receive_overlay_session_id() -> u64 {
+    static NEXT_PENDING_OVERLAY_NONCE: AtomicU64 = AtomicU64::new(1);
+    NEXT_PENDING_OVERLAY_NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
 fn write_receive_log_header(file: &mut File, header: &ReceiveLogHeader) -> Result<(), String> {
@@ -1023,5 +1115,104 @@ mod tests {
         }
 
         note_hot_receive_finished(db_path.to_str().unwrap());
+    }
+
+    #[test]
+    fn background_ingest_prefers_newest_priority_logs_during_active_hot_receives() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+
+        let older_blob = vec![0x41; 8 * 1024];
+        let mut older_writer =
+            ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 11, "peer-x").unwrap();
+        for idx in 0..2048u32 {
+            let mut blob = older_blob.clone();
+            blob[..4].copy_from_slice(&idx.to_le_bytes());
+            let event_id = hash_event(&blob);
+            older_writer.append_blob(&event_id, &blob).unwrap();
+        }
+        let older_path = older_writer.finish().unwrap().unwrap();
+
+        let newer_blob = b"newer-priority-log".to_vec();
+        let newer_event_id = hash_event(&newer_blob);
+        let newer_event_id_b64 = event_id_to_base64(&newer_event_id);
+        let mut newer_writer =
+            ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 12, "peer-x").unwrap();
+        newer_writer
+            .append_blob(&newer_event_id, &newer_blob)
+            .unwrap();
+        let newer_path = newer_writer.finish().unwrap().unwrap();
+
+        note_hot_receive_started(db_path.to_str().unwrap());
+        enqueue_receive_log_ingest(db_path.to_str().unwrap(), older_path.clone(), true);
+        enqueue_receive_log_ingest(db_path.to_str().unwrap(), newer_path.clone(), true);
+
+        let timeline = EventTimeline::new(&conn);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if timeline.load(&newer_event_id_b64).unwrap().is_some() && !newer_path.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "newest priority receive log did not ingest first"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(
+            older_path.exists(),
+            "older priority receive log should still be waiting while a hot receive is active"
+        );
+
+        note_hot_receive_finished(db_path.to_str().unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !older_path.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "older priority receive log did not ingest after hot receives finished"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_session_ingest_guard_serializes_same_peer() {
+        let first = acquire_peer_session_ingest_guard("/tmp/peer-gate-a", "peer-a")
+            .await
+            .unwrap();
+
+        let other_peer = tokio::time::timeout(
+            Duration::from_millis(100),
+            acquire_peer_session_ingest_guard("/tmp/peer-gate-a", "peer-b"),
+        )
+        .await
+        .expect("different peer should not block")
+        .unwrap();
+        drop(other_peer);
+
+        let waiting = tokio::spawn(async {
+            acquire_peer_session_ingest_guard("/tmp/peer-gate-a", "peer-a").await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "same peer should stay blocked until the previous session releases its ingest guard"
+        );
+
+        drop(first);
+
+        let second = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("same peer should unblock after release")
+            .expect("join waiting peer ingest guard task")
+            .expect("acquire same peer ingest guard");
+        drop(second);
     }
 }
