@@ -216,7 +216,7 @@ The attraction is real: connection sharing becomes simpler, and there is less ex
 
 ### Sync And Convergence
 
-Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. The active control path is dep-aware: for one selected range of root events from `shared_event_index`, each side reuses an immutable in-memory snapshot keyed by `(db_path, workspace_id, window_kind, bounds, epoch)`. Each root-partitioned slice carries one combined homomorphic fingerprint over the root ids in that slice plus the recursive dependency contribution induced by those roots. Phase 1 exchanges `NegOpen` / `NegMsg` over those combined fingerprints and exacts only root ids for small mismatched slices. Each side then expands dependency candidates from the local-only and dep-probe roots discovered in Phase 1, exchanges those candidate ids, and runs a second stock Negentropy round over that candidate-dependency universe to confirm which deps are actually missing before either side streams event blobs. The receiver hashes each blob, appends the event id and blob to a `ReceiveLog`, stamps `first_received_at` / `first_stored_at` in the file as each blob is appended, finalizes the spool file, and then lets canonical ingest continue in the background.
+Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. The active control path is dep-aware: for one selected range of root events from `shared_event_index`, each side reuses an immutable in-memory snapshot keyed by `(db_path, workspace_id, window_kind, bounds, epoch)`. Each root-partitioned slice carries one combined homomorphic fingerprint over the root ids in that slice plus the recursive dependency contribution induced by those roots. Phase 1 exchanges `NegOpen` / `NegMsg` over those combined fingerprints and exacts only root ids for small mismatched slices. Each side then expands dependency candidates from the local-only and dep-probe roots discovered in Phase 1, exchanges those candidate ids, and runs a second stock Negentropy round over that candidate-dependency universe to confirm which deps are actually missing before either side streams event blobs. The receiver hashes each blob, appends the event id and blob to a durable `ReceiveLog` segment, and stamps `first_received_at` / `first_stored_at` in that segment as each blob lands. Cold ranges still ingest after the session-finalized log closes; hot `LastDay` receives instead roll sealed `ReceiveLog` segments every `512 KiB` so canonical ingest can begin before the network session ends.
 
 Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses a dep-aware Phase 1 over one selected root range at a time and a stock Negentropy Phase 2 only over candidate dependency ids. The current scheduler intentionally stays simple and runs a per-peer cadence through:
 
@@ -227,7 +227,7 @@ Negentropy remains the set-reconciliation engine because it is agnostic to event
 
 When multiple peers are connected, each peer runs that same cadence independently. The scheduler no longer divides historical ranges by peer rank, ownership, or hash partition. Duplicate reduction is handled by live suppression: as a receiver hashes incoming events, it publishes those event ids to other same-workspace sessions; senders then skip ids that the receiver says it already has or is already receiving.
 
-This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, no peer partition, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, later rounds with the remaining peers reconcile the same ranges again and fill holes. While a hot `LastDay` receive is active for a DB, background receive-log ingest stays paused so download/store remains the priority path.
+This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, no peer partition, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, later rounds with the remaining peers reconcile the same ranges again and fill holes. While a hot `LastDay` receive is active for a DB, ordinary background receive-log ingest stays paused so download/store remains the priority path, but sealed hot `LastDay` segments are allowed through immediately. The ingest worker prefers the earliest sealed segment from that session first so descriptor-bearing metadata projects before later slice-heavy segments, and the next sync session with that same peer does not begin until the prior session's receive-log ingests have drained.
 
 Sync is range-owned with a receive-log durable handoff. Live suppression may advertise a freshly hashed id before canonical ingest because suppression is only an efficiency hint. Bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
 
@@ -502,7 +502,7 @@ Current shape:
    - negentropy reconcile for one explicit range,
    - bulk event transfer for that same range,
 2. bulk range transfer does not use `ResponseCredit`, durable `wanted`, or a per-event request scheduler,
-3. the receiver writes bulk data to a `ReceiveLog`; canonical ingest continues through the normal background path,
+3. the receiver writes bulk data to a `ReceiveLog`; cold ranges finalize one log and ingest it through the normal background path, while hot `LastDay` receives roll sealed `512 KiB` segments and enqueue those segments for priority ingest during the session,
 4. auth and removal-frontier state are prioritized ahead of hot-range transfer so newly visible messages unblock without a separate dependency fast path.
 
 ---
@@ -829,21 +829,28 @@ This PoC does not implement `PeerRemoved`, `UserRemoved`, or a `ban` command. Sa
 ### Receive logs and range ingest
 
 The active network ingest model has one durable receive boundary: range sessions
-write blobs to a per-session `ReceiveLog`, then background replay moves those
-records through canonical ingest and projection.
+write blobs to `ReceiveLog` files, then background replay moves those records
+through canonical ingest and projection. The durable handoff stays file-backed,
+but a hot `LastDay` receive is no longer forced to wait for one end-of-session
+log close before any ingest work starts.
 
 Range receive path:
 1. hash each incoming blob once before durable append to compute its event id,
 2. publish that event id to the live-suppression cohort when live suppression is enabled,
-3. append the event id and blob to the `ReceiveLog`,
+3. append the event id and blob to the active `ReceiveLog` segment,
 4. stamp first-store timing as the append succeeds,
 5. record an in-memory pending-receive overlay entry for active range reconciliation,
-6. finalize on connection close or idle timeout,
-7. replay the log into canonical ingest,
-8. recover leftover logs on startup and delete them after successful replay.
+6. for hot `LastDay` receives, seal and enqueue the segment every `512 KiB`; colder ranges still wait for close or idle timeout,
+7. let priority hot segments replay immediately while non-priority background logs wait behind active hot receives,
+8. order hot-segment replay by earliest segment ordinal first so early metadata reaches canonical state before later file slices,
+9. require the next session with that same peer to wait until the prior session's receive-log ingests finish,
+10. recover leftover logs on startup and delete them after successful replay.
 
 This keeps the bulk hot path free of per-event SQLite work while still using
-the same canonical/projector pipeline after the durable handoff point.
+the same canonical/projector pipeline after the durable handoff point. The
+tradeoff is explicit: live UX for hot `LastDay` transfers improves because
+sealed segments ingest mid-session, while durability and crash recovery still
+come from the same receive-log files.
 
 ### Session-auth credential storage
 
@@ -1285,7 +1292,8 @@ Peer runtime worker shape:
    - reconcile that range with negentropy on the control stream,
    - exchange missing blobs on the data stream as event frames,
    - hash received blobs once, publish live suppression when enabled, and append blobs plus event ids to a `ReceiveLog`,
-   - finish the spool file before local canonical ingest continues in the background.
+   - for hot `LastDay` receives, roll sealed `512 KiB` receive-log segments and enqueue them for priority ingest during the session,
+   - hold the same-peer session gate until those receive-log ingests complete.
 2. project worker/drain:
    - claim `project_queue`,
    - run `project_one` in autocommit,
@@ -1310,10 +1318,11 @@ Bulk transfer is range-owned.
 5. both sides expand dependency candidates from the Phase 1 local-only and dep-probe roots, exchange those candidate ids, and run a stock Negentropy Phase 2 over the shared candidate-dependency universe,
 6. after Phase 2 confirms which deps are truly missing, both sides stream all missing blobs for that range as raw event frames on the data stream in dependency-safe order,
 7. with live suppression enabled, the sender also accepts batched `SuppressIds` frames from the receiver and stops sending ids that are already received or pending elsewhere,
-8. the receiver hashes each blob once before append, records the event id plus blob in the `ReceiveLog`, stamps `first_received_at` and `first_stored_at`, and advertises the id to sibling same-workspace sessions,
+8. the receiver hashes each blob once before append, records the event id plus blob in the active `ReceiveLog` segment, stamps `first_received_at` and `first_stored_at`, and advertises the id to sibling same-workspace sessions,
 9. senders finish a live-suppression data stream with `RangeDataDone`; receivers continue to finalize on close or idle timeout for compatibility,
-10. on close or idle timeout, the log is finalized with `flush + sync_all`, the range session ends, and the log is queued for background canonical ingest,
-11. while a hot `LastDay` receive is active for a DB, bulk receive-log replay stays paused so download/store remains the priority path.
+10. on close or idle timeout, the current log is finalized with `flush + sync_all`; hot `LastDay` receives also seal intermediate `512 KiB` segments mid-session and queue each finished segment for canonical ingest,
+11. while a hot `LastDay` receive is active for a DB, non-priority receive-log replay stays paused so download/store remains the priority path, but those sealed hot segments are allowed through immediately,
+12. hot-segment replay prefers the earliest segment ordinal from a session first, and the next session with that same peer waits until the prior session's receive-log ingests complete.
 
 Dependency repair is now range-owned inside the active round rather than delegated to a separate bucket system:
 
@@ -1387,7 +1396,9 @@ live connections to the same peer.
 The active branch chooses simpler boundaries over a global per-event planner:
 
 1. **Range-owned bulk transfer.** One range session owns one explicit range and
-   one `ReceiveLog`.
+   one receive-log stream; cold ranges usually produce one finalized log, while
+   hot `LastDay` receives may roll multiple sealed `512 KiB` segments that are
+   ingested before session end.
 2. **Prioritized range repair.** Blockers are recorded locally and repaired by
    later range windows; there is no separate dependency session.
 3. **Daemon-connection-scoped ownership.** Sessions belong to one authenticated

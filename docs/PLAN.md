@@ -1026,7 +1026,7 @@ Separate queue tables stay simpler operationally.
 
 Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1`, `2`, and `4`.
 
-1. `range receive path` (current runtime): QUIC frame -> hash event id -> append event id and blob to `ReceiveLog` -> background canonical insert -> record by tenant -> enqueue project.
+1. `range receive path` (current runtime): QUIC frame -> hash event id -> append event id and blob to active `ReceiveLog` segment -> if hot `LastDay` segment reaches `512 KiB`, seal and enqueue priority ingest immediately -> canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
 3. `range session worker`: dep-aware Phase 1 over one selected root window discovers missing roots and dependency-probe roots, an explicit candidate-dep exchange names the dep universe, stock Negentropy Phase 2 confirms missing deps, then the session streams event blobs and live-suppression frames when enabled.
 4. `cleanup worker`: reclaim expired project leases and TTL-purge old endpoint observations.
@@ -1044,7 +1044,11 @@ Sync event transfer is range-owned:
 4. both sides expand dep candidates from their Phase 1 local-only and dep-probe roots, exchange those candidate ids, and run stock Negentropy Phase 2 over that dep universe,
 5. each side streams the resulting missing roots plus confirmed-missing deps directly on the session data stream,
 6. live suppression mode lets receivers quickly advertise event ids they have already received or are receiving from sibling sessions,
-7. there are no durable `wanted` / `wanted_sources` tables, no `ResponseCredit`, and no per-event pull coordinator in the current plan.
+7. hot `LastDay` receives roll `ReceiveLog` segments every `512 KiB` and enqueue each sealed segment for priority ingest without waiting for full session close,
+8. while any hot receive is active for a DB, non-priority receive-log replay stays paused, but priority hot segments are allowed through,
+9. priority hot replay prefers the earliest segment ordinal within a session first so descriptor-bearing metadata becomes visible before later slice-heavy segments,
+10. the next sync session with a given peer waits until the prior session's receive-log ingests have drained for that same peer,
+11. there are no durable `wanted` / `wanted_sources` tables, no `ResponseCredit`, and no per-event pull coordinator in the current plan.
 
 ## 8.5 Project queue dedupe + purge
 
@@ -1301,8 +1305,10 @@ Current runtime shape:
    Negentropy Phase 2 over that candidate-dep universe, and then streams the
    resulting missing event blobs for that explicit range.
 3. **Receive-side event ids.** The receiver hashes each incoming blob once before
-   durable append, writes the event id with the blob into the `ReceiveLog`, and
-   records a pending-receive overlay entry for active range reconciliation.
+   durable append, writes the event id with the blob into the active
+   `ReceiveLog` segment, and records a pending-receive overlay entry for active
+   range reconciliation. Hot `LastDay` receives seal and enqueue those segments
+   every `512 KiB` instead of waiting for one end-of-session file.
 4. **Live suppression cohort.** When `TOPO_ENABLE_LIVE_SUPPRESSION=1`, range
    sessions in the same `(db_path, recorded_by, workspace_id)` cohort share a
    bounded recent event-id list. New sessions replay the recent list, and active
@@ -1311,17 +1317,25 @@ Current runtime shape:
    same-workspace sessions in the cohort, not filtered by range overlap. This is
    intentionally broad because false suppression is cheaper than missing a
    suppression opportunity; later range rounds recover holes.
-6. **Large bounded lists.** The default live suppression cap is large
+6. **Priority ingest during hot receive.** While any hot receive is active for a
+   DB, ordinary background receive-log replay waits, but sealed hot `LastDay`
+   segments are still ingested. The worker prefers the earliest segment ordinal
+   first within a session so descriptor metadata lands before later file slices.
+7. **Per-peer ingest barrier.** A new range session with peer `P` does not start
+   until the previous range session with peer `P` has finished both network
+   transfer and receive-log ingest. This preserves the invariant that one
+   peer-specific negentropy session is fully ingested before the next starts.
+8. **Large bounded lists.** The default live suppression cap is large
    (`TOPO_LIVE_SUPPRESSION_EVENT_ID_CAP`, default 512k ids; lower in low-memory
    mode). Batch size is controlled by `TOPO_LIVE_SUPPRESSION_SEND_BATCH_SIZE`.
-7. **Deterministic scatter.** Send order is a deterministic shuffle over the
+9. **Deterministic scatter.** Send order is a deterministic shuffle over the
    full ordered id list using `blake3(seed || event_id)`, seeded by the local
    peer/recorder id. This avoids every identical source sending the same early
    ids first.
-8. **Settle only when useful.** `TOPO_LIVE_SUPPRESSION_BATCH_SETTLE_MS` defaults
+10. **Settle only when useful.** `TOPO_LIVE_SUPPRESSION_BATCH_SETTLE_MS` defaults
    to a small delay between batches, but the runtime skips it for a 1:1 cohort.
    It is only useful when another distinct source peer can act on suppression.
-9. **Connection idempotency after auth.** Either side may dial. After daemon
+11. **Connection idempotency after auth.** Either side may dial. After daemon
    identity extraction, at most one live daemon connection slot survives per
    remote daemon; the deterministic preferred direction is only a simultaneous
    duplicate tie-breaker.
