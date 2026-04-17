@@ -645,6 +645,10 @@ mod tests {
     }
 
     fn setup_workspace(db_path: &str) -> String {
+        // Simulate daemon startup: materialize the endpoint secret/shared pair
+        // that workspace commands require before any workspace is created.
+        crate::transport::materialize_daemon_identity_from_db(db_path)
+            .expect("materialize daemon identity");
         let resp = workspace::commands::create_workspace_for_db(
             db_path,
             "test-workspace",
@@ -750,6 +754,8 @@ mod tests {
     #[test]
     fn test_create_workspace_for_db_creates_distinct_tenants_on_repeat_calls() {
         let (_dir, db_path) = temp_db_path();
+        crate::transport::materialize_daemon_identity_from_db(&db_path)
+            .expect("materialize daemon identity");
         let resp = workspace::commands::create_workspace_for_db(
             &db_path,
             "test-workspace",

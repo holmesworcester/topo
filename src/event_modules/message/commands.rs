@@ -892,6 +892,8 @@ mod tests {
         let source_path = tmp.path().join("payload.bin");
         std::fs::write(&source_path, vec![0x5Au8; FILE_SLICE_DATA_BYTES * 2]).unwrap();
 
+        crate::transport::materialize_daemon_identity_from_db(db_path)
+            .expect("materialize daemon identity");
         let created = create_workspace_for_db(db_path, "ws", "alice", "laptop").unwrap();
         let err = send_file_for_peer_inner(
             db_path,

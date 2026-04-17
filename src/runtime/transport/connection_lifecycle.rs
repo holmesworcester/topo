@@ -166,7 +166,7 @@ mod tests {
     use super::{accept_daemon, dial_daemon};
     use crate::transport::{
         create_runtime_endpoint_for_tenants, load_daemon_identity_from_db,
-        multi_workspace::transport_sni, TransportEndpoint,
+        materialize_daemon_identity_from_db, multi_workspace::transport_sni, TransportEndpoint,
     };
 
     async fn endpoint_pair() -> Result<
@@ -183,6 +183,8 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let server_db = temp.path().join("server.sqlite3");
         let client_db = temp.path().join("client.sqlite3");
+        materialize_daemon_identity_from_db(server_db.to_str().unwrap())?;
+        materialize_daemon_identity_from_db(client_db.to_str().unwrap())?;
         let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
             server_db.to_str().unwrap(),

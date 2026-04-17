@@ -417,8 +417,8 @@ mod tests {
     use crate::protocol::{encode_frame, parse_frame, Frame};
     use crate::transport::{
         accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
-        load_daemon_identity_from_db, multi_workspace::transport_sni, TransportConnection,
-        TransportEndpoint,
+        load_daemon_identity_from_db, materialize_daemon_identity_from_db,
+        multi_workspace::transport_sni, TransportConnection, TransportEndpoint,
     };
 
     use super::{
@@ -441,6 +441,8 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let server_db = temp.path().join("server.sqlite3");
         let client_db = temp.path().join("client.sqlite3");
+        materialize_daemon_identity_from_db(server_db.to_str().unwrap())?;
+        materialize_daemon_identity_from_db(client_db.to_str().unwrap())?;
         let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
             server_db.to_str().unwrap(),
