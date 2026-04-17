@@ -224,7 +224,7 @@ The attraction is real: connection sharing becomes simpler, and there is less ex
 
 ### Sync And Convergence
 
-Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. The active control path is dep-aware: for one selected range of durable root events from `shared_event_index`, each side reuses an immutable in-memory snapshot keyed by `(db_path, workspace_id, window_kind, bounds, epoch)`. Each root-partitioned slice carries one combined homomorphic fingerprint over the root ids in that slice plus the recursive dependency contribution induced by those roots. Phase 1 exchanges `NegOpen` / `NegMsg` over those combined fingerprints and exacts only root ids for small mismatched slices. Each side then expands dependency candidates from the local-only and dep-probe roots discovered in Phase 1, exchanges those candidate ids, and runs a second stock Negentropy round over that candidate-dependency universe to confirm which deps are actually missing before either side streams event blobs. The receiver hashes each blob once, publishes live suppression immediately when enabled, and enqueues bounded in-memory direct-ingest batches. The direct-ingest worker writes canonical rows straight into SQLite, stamps `first_received_at` / `first_stored_at` during persist, and lets WAL backpressure slow the network path when ingest falls behind.
+Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. The active control path is dep-aware: for one selected range of durable root events from `shared_event_index`, each side reuses an immutable in-memory snapshot keyed by `(db_path, workspace_id, window_kind, bounds, epoch)`. Each root-partitioned slice carries one combined homomorphic fingerprint over the root ids in that slice plus the recursive dependency contribution induced by those roots. Phase 1 exchanges `NegOpen` / `NegMsg` over those combined fingerprints and exacts only root ids for small mismatched slices. Each side then expands dependency candidates from the local-only and dep-probe roots discovered in Phase 1, exchanges those candidate ids, and runs a second stock Negentropy round over that candidate-dependency universe to confirm which deps are actually missing before either side streams event blobs. The receiver hashes each blob once, publishes live suppression immediately when enabled, and enqueues bounded in-memory direct-ingest batches. The direct-ingest worker writes canonical rows straight into SQLite, stamps `first_received_at` / `first_stored_at` during persist, and lets WAL backpressure slow the network path when ingest falls behind. This is an explicit UX tradeoff: writing raw blobs straight to disk or into a large pre-ingest memory buffer can improve pure download-time / time-to-durable metrics because the network path finishes earlier, but direct on-the-fly ingest gives earlier canonical visibility, earlier projection, and better in-progress file/download UX.
 
 Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses a dep-aware Phase 1 over one selected root range at a time and a stock Negentropy Phase 2 only over candidate dependency ids. The current scheduler intentionally stays simple and runs a per-peer cadence through:
 
@@ -861,6 +861,12 @@ sessions hash blobs once, optionally publish live suppression immediately, and
 hand bounded batches straight to the direct-ingest worker. That worker writes
 canonical rows into SQLite and lets WAL backpressure slow the network path if
 ingest falls behind.
+
+This choice favors time-to-viewable / time-to-projected state over raw
+download completion. A design that first spills received blobs to a file or a
+large memory buffer before ingest can finish network receive sooner, but it
+pushes visibility later, weakens in-progress download progress, and reintroduces
+extra file/buffer lifecycle machinery that the direct-ingest path avoids.
 
 Range receive path:
 1. hash each incoming blob once to compute its event id,

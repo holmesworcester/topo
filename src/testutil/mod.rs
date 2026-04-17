@@ -1797,7 +1797,7 @@ impl Peer {
                 slice_number: i,
                 ciphertext: ciphertext.clone(),
             });
-            crate::projection::create::create_encrypted_event_synchronous_with_owner(
+            crate::projection::create::create_encrypted_event_with_owner(
                 &db,
                 &self.identity,
                 &key_event_id,
