@@ -1,3 +1,9 @@
+pub mod cascade_invariant;
+pub mod pipeline;
 pub mod projection;
+pub mod projector_registry;
+pub mod projector_result_discipline;
+pub mod queue_backoff;
 pub mod shared_workspace_fanout;
 pub mod tenant_isolation;
+pub mod writeop_idempotency;

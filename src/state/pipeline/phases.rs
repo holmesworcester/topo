@@ -24,27 +24,10 @@ enum PersistEventKind {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistValidationRawRows {
-    MissingCreatedAt,
-    MissingTypeCode,
-    UnknownType { type_code: u8 },
-    KnownType { created_at_ms: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistValidationDecisionContext {
-    RejectMissingCreatedAt,
-    RejectMissingTypeCode,
-    RejectUnknownType,
-    Ready { created_at_ms: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistValidationPlan {
-    Skip,
-    Continue { created_at_ms: u64 },
-}
+use topo_verus_proofs::state::pipeline::persist_validation::{
+    decide_persist_validation_plan, normalize_persist_validation, PersistValidationDecisionContext,
+    PersistValidationPlan, PersistValidationRawRows,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistEventRawRows {
@@ -94,42 +77,6 @@ fn load_persist_validation_raw_rows(
         None => PersistValidationRawRows::UnknownType { type_code },
     };
     (raw_rows, meta)
-}
-
-#[inline]
-fn normalize_persist_validation(
-    raw_rows: PersistValidationRawRows,
-) -> PersistValidationDecisionContext {
-    match raw_rows {
-        PersistValidationRawRows::MissingCreatedAt => {
-            PersistValidationDecisionContext::RejectMissingCreatedAt
-        }
-        PersistValidationRawRows::MissingTypeCode => {
-            PersistValidationDecisionContext::RejectMissingTypeCode
-        }
-        PersistValidationRawRows::UnknownType { .. } => {
-            PersistValidationDecisionContext::RejectUnknownType
-        }
-        PersistValidationRawRows::KnownType { created_at_ms } => {
-            PersistValidationDecisionContext::Ready { created_at_ms }
-        }
-    }
-}
-
-#[inline]
-fn decide_persist_validation_plan(
-    context: &PersistValidationDecisionContext,
-) -> PersistValidationPlan {
-    match context {
-        PersistValidationDecisionContext::Ready { created_at_ms } => {
-            PersistValidationPlan::Continue {
-                created_at_ms: *created_at_ms,
-            }
-        }
-        PersistValidationDecisionContext::RejectMissingCreatedAt
-        | PersistValidationDecisionContext::RejectMissingTypeCode
-        | PersistValidationDecisionContext::RejectUnknownType => PersistValidationPlan::Skip,
-    }
 }
 
 fn persist_event_kind(type_name: &str) -> PersistEventKind {

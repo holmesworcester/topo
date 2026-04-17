@@ -4,6 +4,19 @@ use rusqlite::Connection;
 use topo_verus_proofs::state::tenant_isolation::{
     check_writes_tenant_isolated, WriteOpTenantView,
 };
+use topo_verus_proofs::state::writeop_idempotency::{is_idempotent_writeop, WriteOpKind};
+
+/// Trusted extractor: exhaustive match over runtime `WriteOp` variants into the
+/// verus-proofs `WriteOpKind` tag. If a new `WriteOp` variant is ever added, this
+/// match goes non-exhaustive at compile time, forcing a new branch and a matching
+/// `WriteOpKind` variant in verus-proofs, which in turn forces `is_idempotent_writeop`
+/// to explicitly prove (or reject) the new kind.
+fn writeop_kind(op: &WriteOp) -> WriteOpKind {
+    match op {
+        WriteOp::InsertOrIgnore { .. } => WriteOpKind::InsertOrIgnore,
+        WriteOp::Delete { .. } => WriteOpKind::Delete,
+    }
+}
 
 /// Trusted extractor: build a `WriteOpTenantView` from a `WriteOp` given the executing
 /// tenant. Looks for a column (or where-clause key) named `recorded_by`; if present,
@@ -72,6 +85,10 @@ pub(crate) fn execute_write_ops(
     ops: &[WriteOp],
 ) -> Result<(), Box<dyn std::error::Error>> {
     for op in ops {
+        debug_assert!(
+            is_idempotent_writeop(writeop_kind(op)),
+            "WriteOp variant is not idempotent; all WriteOps must be replay-safe",
+        );
         match op {
             WriteOp::InsertOrIgnore {
                 table,

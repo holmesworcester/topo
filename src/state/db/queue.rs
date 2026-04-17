@@ -127,10 +127,20 @@ where
     }
 }
 
-/// Calculate backoff delay: base_ms * 2^min(attempts, max_attempts)
+/// Calculate backoff delay: base_ms * 2^min(attempts, max_attempts).
+/// Delegates to the Verus-verified `topo_verus_proofs::state::queue_backoff::backoff_ms`,
+/// which has ensures pinning delay >= BACKOFF_BASE_MS, delay <= BACKOFF_CAP_MS (1_024_000),
+/// and monotone growth up to the cap. Any change here that violates those bounds fails
+/// `cargo-verus verify`.
 pub fn backoff_ms(attempts: i64) -> i64 {
-    let capped = (attempts as u32).min(BACKOFF_MAX_ATTEMPTS);
-    BACKOFF_BASE_MS.saturating_mul(1i64 << capped)
+    let attempts_u32 = if attempts < 0 {
+        0
+    } else if attempts > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        attempts as u32
+    };
+    topo_verus_proofs::state::queue_backoff::backoff_ms(attempts_u32)
 }
 
 /// Recover expired leases on a given table by clearing lease_until.
