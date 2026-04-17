@@ -98,24 +98,48 @@ pub(crate) fn load_invite_bootstrap_endpoint_decision_context(
 pub(crate) fn decide_invite_bootstrap_endpoint_plan(
     context: &InviteBootstrapEndpointDecisionContext,
 ) -> InviteBootstrapEndpointPlan {
-    match context.explicit_endpoint {
-        ExplicitBootstrapEndpointState::Present(endpoint_id) => {
-            InviteBootstrapEndpointPlan::UseExplicit(endpoint_id)
-        }
-        ExplicitBootstrapEndpointState::Invalid => {
-            InviteBootstrapEndpointPlan::RejectInvalidExplicit
-        }
-        ExplicitBootstrapEndpointState::Absent => match context.local_daemon_endpoint {
+    // The plan-tag dispatch is verified in verus-proofs. Runtime projects its rich
+    // `Present(_)` payloads to payload-less tags, runs the verified dispatcher, and
+    // rehydrates the original `[u8; 32]` payload on the `Use*` branches.
+    use topo_verus_proofs::event_modules::workspace::command_plans::{
+        decide_invite_bootstrap_endpoint_plan_core, ExplicitBootstrapEndpointStateCore,
+        InviteBootstrapEndpointDecisionContextCore, InviteBootstrapEndpointPlanCore,
+        LocalDaemonEndpointStateCore,
+    };
+    let core_ctx = InviteBootstrapEndpointDecisionContextCore {
+        explicit_endpoint: match context.explicit_endpoint {
+            ExplicitBootstrapEndpointState::Absent => ExplicitBootstrapEndpointStateCore::Absent,
+            ExplicitBootstrapEndpointState::Present(_) => ExplicitBootstrapEndpointStateCore::Present,
+            ExplicitBootstrapEndpointState::Invalid => ExplicitBootstrapEndpointStateCore::Invalid,
+        },
+        local_daemon_endpoint: match context.local_daemon_endpoint {
+            LocalDaemonEndpointState::Missing => LocalDaemonEndpointStateCore::Missing,
+            LocalDaemonEndpointState::Present(_) => LocalDaemonEndpointStateCore::Present,
+            LocalDaemonEndpointState::Malformed => LocalDaemonEndpointStateCore::Malformed,
+        },
+    };
+    match decide_invite_bootstrap_endpoint_plan_core(core_ctx) {
+        InviteBootstrapEndpointPlanCore::UseExplicit => match context.explicit_endpoint {
+            ExplicitBootstrapEndpointState::Present(endpoint_id) => {
+                InviteBootstrapEndpointPlan::UseExplicit(endpoint_id)
+            }
+            _ => unreachable!("core returned UseExplicit but explicit_endpoint was not Present"),
+        },
+        InviteBootstrapEndpointPlanCore::UseLocalDaemon => match context.local_daemon_endpoint {
             LocalDaemonEndpointState::Present(endpoint_id) => {
                 InviteBootstrapEndpointPlan::UseLocalDaemon(endpoint_id)
             }
-            LocalDaemonEndpointState::Missing => {
-                InviteBootstrapEndpointPlan::RejectMissingLocalDaemonIdentity
-            }
-            LocalDaemonEndpointState::Malformed => {
-                InviteBootstrapEndpointPlan::RejectMalformedLocalDaemonIdentity
-            }
+            _ => unreachable!("core returned UseLocalDaemon but local daemon endpoint was not Present"),
         },
+        InviteBootstrapEndpointPlanCore::RejectInvalidExplicit => {
+            InviteBootstrapEndpointPlan::RejectInvalidExplicit
+        }
+        InviteBootstrapEndpointPlanCore::RejectMissingLocalDaemonIdentity => {
+            InviteBootstrapEndpointPlan::RejectMissingLocalDaemonIdentity
+        }
+        InviteBootstrapEndpointPlanCore::RejectMalformedLocalDaemonIdentity => {
+            InviteBootstrapEndpointPlan::RejectMalformedLocalDaemonIdentity
+        }
     }
 }
 
@@ -174,14 +198,28 @@ pub(crate) fn load_local_endpoint_shared_decision_context(
 pub(crate) fn decide_local_endpoint_shared_plan(
     context: &LocalEndpointSharedDecisionContext,
 ) -> LocalEndpointSharedPlan {
-    match context.local_endpoint_shared {
-        LocalEndpointSharedState::Present(event_id) => {
-            LocalEndpointSharedPlan::UseLocalEndpointShared(event_id)
-        }
-        LocalEndpointSharedState::Missing => {
+    use topo_verus_proofs::event_modules::workspace::command_plans::{
+        decide_local_endpoint_shared_plan_core, LocalEndpointSharedDecisionContextCore,
+        LocalEndpointSharedPlanCore, LocalEndpointSharedStateCore,
+    };
+    let core_ctx = LocalEndpointSharedDecisionContextCore {
+        local_endpoint_shared: match context.local_endpoint_shared {
+            LocalEndpointSharedState::Missing => LocalEndpointSharedStateCore::Missing,
+            LocalEndpointSharedState::Present(_) => LocalEndpointSharedStateCore::Present,
+            LocalEndpointSharedState::Malformed => LocalEndpointSharedStateCore::Malformed,
+        },
+    };
+    match decide_local_endpoint_shared_plan_core(core_ctx) {
+        LocalEndpointSharedPlanCore::UseLocalEndpointShared => match context.local_endpoint_shared {
+            LocalEndpointSharedState::Present(event_id) => {
+                LocalEndpointSharedPlan::UseLocalEndpointShared(event_id)
+            }
+            _ => unreachable!("core returned UseLocalEndpointShared but local_endpoint_shared was not Present"),
+        },
+        LocalEndpointSharedPlanCore::RejectMissingLocalDaemonIdentity => {
             LocalEndpointSharedPlan::RejectMissingLocalDaemonIdentity
         }
-        LocalEndpointSharedState::Malformed => {
+        LocalEndpointSharedPlanCore::RejectMalformedLocalDaemonIdentity => {
             LocalEndpointSharedPlan::RejectMalformedLocalDaemonIdentity
         }
     }

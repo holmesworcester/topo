@@ -1,3 +1,13 @@
+//! **Abstract specification — not grounded in runtime code.**
+//!
+//! Per `docs/planning/FORMAL_SEAM_COVERAGE.md`, this file encodes system-level
+//! invariants that no single runtime function body satisfies on its own. The
+//! SMT solver accepts the proofs inside this file, but they are NOT proofs about
+//! runtime code — the grounded verification lives in the per-seam `ensures`
+//! clauses on executable `pub fn`s in sibling modules. Do not treat entries
+//! here as "the runtime is proven to satisfy X"; treat them as "X is modeled
+//! in Verus and consistent with itself".
+//!
 //! Formal verification of dispatch and side-effect execution policy.
 
 use vstd::prelude::*;

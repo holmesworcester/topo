@@ -3,58 +3,77 @@
 //! The persist phase writes events to the database inside a transaction.
 //! Key properties:
 //! - Shared events get shared_event_index entries
-//! - Secret events do NOT get shared_event_index entries
+//! - Secret (local-scope) events do NOT get shared_event_index entries
 //! - File slices get priority_lane=2 (bulk), everything else gets 1
 //! - endpoint_shared events don't get live hints or fanouts
 //! - Fanout entries are persisted durably inside the transaction
+//!
+//! Every `pub fn` below is an executable Rust abstract model of the corresponding
+//! runtime composition in `src/state/pipeline/phases.rs`. Postconditions (`ensures`)
+//! are SMT-checked against the function body by `cargo-verus verify`.
+//!
+//! Runtime carries `workspace_binding: Option<String>`; the verified core reduces
+//! that to `has_workspace_binding: bool` — the runtime wrapper keeps the concrete
+//! workspace_id locally and only consults the core for the tag-level dispatch.
 
 use vstd::prelude::*;
 
 verus! {
 
 /// Share scope determines event visibility.
-pub enum ShareScope {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareScopeCore {
     Shared,
     Secret,
 }
 
-pub enum WorkspaceTarget {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceTargetCore {
     Skip,
     MissingBinding,
     EventId,
     WorkspaceBinding,
 }
 
-pub struct PersistEventRawRows {
-    pub share_scope: ShareScope,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistEventRawRowsCore {
+    pub share_scope: ShareScopeCore,
     pub type_name_is_endpoint_shared: bool,
     pub type_name_is_workspace: bool,
     pub is_file_slice: bool,
     pub has_workspace_binding: bool,
 }
 
-pub struct PersistEventDecisionContext {
-    pub share_scope: ShareScope,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistEventDecisionContextCore {
+    pub share_scope: ShareScopeCore,
     pub type_name_is_endpoint_shared: bool,
     pub type_name_is_workspace: bool,
     pub is_file_slice: bool,
     pub has_workspace_binding: bool,
 }
 
-/// Model of per-event persist phase decisions.
-pub struct PersistDecisions {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistDecisionsCore {
     pub write_shared_index: bool,
-    pub shared_index_workspace: WorkspaceTarget,
-    pub priority_lane: nat,
+    pub shared_index_workspace: WorkspaceTargetCore,
+    pub priority_lane: u32,
     pub emit_live_hint: bool,
     pub emit_fanout: bool,
-    pub fanout_workspace: WorkspaceTarget,
+    pub fanout_workspace: WorkspaceTargetCore,
 }
 
-pub open spec fn normalize_persist_event(
-    raw_rows: PersistEventRawRows,
-) -> PersistEventDecisionContext {
-    PersistEventDecisionContext {
+pub fn normalize_persist_event_core(
+    raw_rows: PersistEventRawRowsCore,
+) -> (context: PersistEventDecisionContextCore)
+    ensures
+        context.share_scope == raw_rows.share_scope,
+        context.type_name_is_endpoint_shared == raw_rows.type_name_is_endpoint_shared,
+        context.type_name_is_workspace == raw_rows.type_name_is_workspace,
+        context.is_file_slice == raw_rows.is_file_slice,
+        context.has_workspace_binding == raw_rows.has_workspace_binding,
+{
+    PersistEventDecisionContextCore {
         share_scope: raw_rows.share_scope,
         type_name_is_endpoint_shared: raw_rows.type_name_is_endpoint_shared,
         type_name_is_workspace: raw_rows.type_name_is_workspace,
@@ -63,10 +82,20 @@ pub open spec fn normalize_persist_event(
     }
 }
 
-pub open spec fn decide_persist_event_plan(
-    context: &PersistEventDecisionContext,
-) -> PersistDecisions {
-    persist_decisions_for_event(
+pub fn decide_persist_event_plan_core(
+    context: &PersistEventDecisionContextCore,
+) -> (plan: PersistDecisionsCore)
+    ensures
+        // Delegation: shape is identical to persist_decisions_for_event_core.
+        // File slices get bulk priority (2), everything else foreground (1).
+        context.is_file_slice ==> plan.priority_lane == 2,
+        !context.is_file_slice ==> plan.priority_lane == 1,
+        context.share_scope == ShareScopeCore::Secret ==> !plan.write_shared_index,
+        context.share_scope == ShareScopeCore::Secret ==> plan.shared_index_workspace == WorkspaceTargetCore::Skip,
+        context.share_scope == ShareScopeCore::Secret ==> !plan.emit_live_hint,
+        context.share_scope == ShareScopeCore::Secret ==> !plan.emit_fanout,
+{
+    persist_decisions_for_event_core(
         context.share_scope,
         context.type_name_is_endpoint_shared,
         context.type_name_is_workspace,
@@ -75,274 +104,109 @@ pub open spec fn decide_persist_event_plan(
     )
 }
 
-/// Persist phase decision model for a single event.
-pub open spec fn persist_decisions_for_event(
-    share_scope: ShareScope,
+/// Persist phase decision model for a single event (executable core).
+pub fn persist_decisions_for_event_core(
+    share_scope: ShareScopeCore,
     type_name_is_endpoint_shared: bool,
     type_name_is_workspace: bool,
     is_file_slice: bool,
     has_workspace_binding: bool,
-) -> PersistDecisions {
-    let workspace_target = if !matches!(share_scope, ShareScope::Shared)
-        || type_name_is_endpoint_shared
-    {
-        WorkspaceTarget::Skip
-    } else if type_name_is_workspace {
-        WorkspaceTarget::EventId
-    } else if has_workspace_binding {
-        WorkspaceTarget::WorkspaceBinding
-    } else {
-        WorkspaceTarget::MissingBinding
+) -> (plan: PersistDecisionsCore)
+    ensures
+        // File slices get bulk priority (2), everything else foreground (1).
+        is_file_slice ==> plan.priority_lane == 2,
+        !is_file_slice ==> plan.priority_lane == 1,
+        // Secret (local-scope) events: no shared index, no live hint, no fanout.
+        share_scope == ShareScopeCore::Secret ==> !plan.write_shared_index,
+        share_scope == ShareScopeCore::Secret ==> plan.shared_index_workspace == WorkspaceTargetCore::Skip,
+        share_scope == ShareScopeCore::Secret ==> !plan.emit_live_hint,
+        share_scope == ShareScopeCore::Secret ==> !plan.emit_fanout,
+        // endpoint_shared under Shared scope is excluded from hints/fanouts.
+        (share_scope == ShareScopeCore::Shared && type_name_is_endpoint_shared) ==> {
+            &&& !plan.write_shared_index
+            &&& plan.shared_index_workspace == WorkspaceTargetCore::Skip
+            &&& !plan.emit_live_hint
+            &&& !plan.emit_fanout
+            &&& plan.fanout_workspace == WorkspaceTargetCore::Skip
+        },
+        // Workspace events are self-referencing even without an existing binding.
+        (share_scope == ShareScopeCore::Shared
+         && !type_name_is_endpoint_shared
+         && type_name_is_workspace) ==> {
+            &&& plan.shared_index_workspace == WorkspaceTargetCore::EventId
+            &&& plan.write_shared_index
+        },
+        // Regular shared events with workspace bindings are indexed + fanned out.
+        (share_scope == ShareScopeCore::Shared
+         && !type_name_is_endpoint_shared
+         && !type_name_is_workspace
+         && has_workspace_binding) ==> {
+            &&& plan.shared_index_workspace == WorkspaceTargetCore::WorkspaceBinding
+            &&& plan.write_shared_index
+            &&& plan.emit_fanout
+        },
+        // Regular shared events without a workspace binding: indexed as missing.
+        (share_scope == ShareScopeCore::Shared
+         && !type_name_is_endpoint_shared
+         && !type_name_is_workspace
+         && !has_workspace_binding) ==> {
+            &&& plan.shared_index_workspace == WorkspaceTargetCore::MissingBinding
+            &&& !plan.write_shared_index
+            &&& !plan.emit_fanout
+            &&& plan.fanout_workspace == WorkspaceTargetCore::MissingBinding
+        },
+{
+    let share_is_shared = match share_scope {
+        ShareScopeCore::Shared => true,
+        ShareScopeCore::Secret => false,
     };
-    PersistDecisions {
-        // Shared events get index entries (if workspace known)
-        write_shared_index: matches!(share_scope, ShareScope::Shared)
-            && (has_workspace_binding || type_name_is_workspace)
-            && !type_name_is_endpoint_shared,
+    let workspace_target = if !share_is_shared || type_name_is_endpoint_shared {
+        WorkspaceTargetCore::Skip
+    } else if type_name_is_workspace {
+        WorkspaceTargetCore::EventId
+    } else if has_workspace_binding {
+        WorkspaceTargetCore::WorkspaceBinding
+    } else {
+        WorkspaceTargetCore::MissingBinding
+    };
+    let write_shared_index = share_is_shared
+        && (has_workspace_binding || type_name_is_workspace)
+        && !type_name_is_endpoint_shared;
+    let emit_live_hint = share_is_shared && !type_name_is_endpoint_shared;
+    let emit_fanout = match workspace_target {
+        WorkspaceTargetCore::EventId | WorkspaceTargetCore::WorkspaceBinding => true,
+        _ => false,
+    };
+    PersistDecisionsCore {
+        write_shared_index,
         shared_index_workspace: workspace_target,
-        // File slices get bulk priority (lane 2), everything else lane 1
         priority_lane: if is_file_slice { 2 } else { 1 },
-        // endpoint_shared events don't get live hints
-        emit_live_hint: matches!(share_scope, ShareScope::Shared) && !type_name_is_endpoint_shared,
-        // endpoint_shared events don't get fanouts
-        emit_fanout: matches!(workspace_target, WorkspaceTarget::EventId)
-            || matches!(workspace_target, WorkspaceTarget::WorkspaceBinding),
+        emit_live_hint,
+        emit_fanout,
         fanout_workspace: workspace_target,
     }
-}
-
-proof fn persist_event_normalizer_preserves_query_facts(
-    share_scope: ShareScope,
-    type_name_is_endpoint_shared: bool,
-    type_name_is_workspace: bool,
-    is_file_slice: bool,
-    has_workspace_binding: bool,
-)
-    ensures
-        normalize_persist_event(PersistEventRawRows {
-            share_scope,
-            type_name_is_endpoint_shared,
-            type_name_is_workspace,
-            is_file_slice,
-            has_workspace_binding,
-        }) == (PersistEventDecisionContext {
-            share_scope,
-            type_name_is_endpoint_shared,
-            type_name_is_workspace,
-            is_file_slice,
-            has_workspace_binding,
-        }),
-{
-}
-
-proof fn persist_event_plan_matches_legacy_model(
-    share_scope: ShareScope,
-    type_name_is_endpoint_shared: bool,
-    type_name_is_workspace: bool,
-    is_file_slice: bool,
-    has_workspace_binding: bool,
-)
-    ensures
-        decide_persist_event_plan(&normalize_persist_event(PersistEventRawRows {
-            share_scope,
-            type_name_is_endpoint_shared,
-            type_name_is_workspace,
-            is_file_slice,
-            has_workspace_binding,
-        })) == persist_decisions_for_event(
-            share_scope,
-            type_name_is_endpoint_shared,
-            type_name_is_workspace,
-            is_file_slice,
-            has_workspace_binding,
-        ),
-{
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Share Scope Proofs
-// ═══════════════════════════════════════════════════════════════════
-
-/// Proof: secret events never get shared_event_index entries.
-proof fn proof_secret_events_no_shared_index(
-    is_endpoint_shared: bool,
-    is_workspace: bool,
-    is_file_slice: bool,
-    has_ws: bool,
-)
-    ensures
-        ({
-            let d = persist_decisions_for_event(
-                ShareScope::Secret, is_endpoint_shared, is_workspace, is_file_slice, has_ws
-            );
-            !d.write_shared_index && d.shared_index_workspace == WorkspaceTarget::Skip
-        }),
-{
-}
-
-/// Proof: secret events never emit live hints.
-proof fn proof_secret_events_no_live_hints(
-    is_endpoint_shared: bool,
-    is_workspace: bool,
-    is_file_slice: bool,
-    has_ws: bool,
-)
-    ensures
-        !persist_decisions_for_event(
-            ShareScope::Secret, is_endpoint_shared, is_workspace, is_file_slice, has_ws
-        ).emit_live_hint,
-{
-}
-
-/// Proof: secret events never emit fanouts.
-proof fn proof_secret_events_no_fanouts(
-    is_endpoint_shared: bool,
-    is_workspace: bool,
-    is_file_slice: bool,
-    has_ws: bool,
-)
-    ensures
-        !persist_decisions_for_event(
-            ShareScope::Secret, is_endpoint_shared, is_workspace, is_file_slice, has_ws
-        ).emit_fanout,
-{
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Priority Lane Proofs
-// ═══════════════════════════════════════════════════════════════════
-
-/// Proof: file slices get priority lane 2.
-proof fn proof_file_slices_get_bulk_priority(
-    scope: ShareScope,
-    is_ep: bool,
-    is_ws: bool,
-    has_ws: bool,
-)
-    ensures
-        persist_decisions_for_event(scope, is_ep, is_ws, true, has_ws).priority_lane == 2,
-{
-}
-
-/// Proof: non-file-slice events get priority lane 1.
-proof fn proof_non_file_slices_get_foreground_priority(
-    scope: ShareScope,
-    is_ep: bool,
-    is_ws: bool,
-    has_ws: bool,
-)
-    ensures
-        persist_decisions_for_event(scope, is_ep, is_ws, false, has_ws).priority_lane == 1,
-{
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Endpoint Shared Exclusion Proofs
-// ═══════════════════════════════════════════════════════════════════
-
-/// Proof: endpoint_shared events don't get live hints or fanouts
-/// even though they are shared-scope.
-proof fn proof_endpoint_shared_exclusions()
-    ensures
-        ({
-            let d = persist_decisions_for_event(ShareScope::Shared, true, false, false, true);
-            !d.emit_live_hint
-                && !d.emit_fanout
-                && !d.write_shared_index
-                && d.shared_index_workspace == WorkspaceTarget::Skip
-                && d.fanout_workspace == WorkspaceTarget::Skip
-        }),
-{
-}
-
-/// Proof: regular shared events DO get live hints and fanouts.
-proof fn proof_regular_shared_gets_hints_and_fanouts()
-    ensures
-        ({
-            let d = persist_decisions_for_event(ShareScope::Shared, false, false, false, true);
-            d.emit_live_hint && d.emit_fanout && d.write_shared_index
-        }),
-{
-}
-
-/// Proof: a shared non-workspace event without an accepted workspace binding
-/// does not get indexed or fanned out because there is no concrete workspace
-/// target for either executor effect.
-proof fn proof_missing_workspace_binding_has_no_index_or_fanout()
-    ensures
-        ({
-            let d = persist_decisions_for_event(ShareScope::Shared, false, false, false, false);
-            !d.write_shared_index
-                && d.shared_index_workspace == WorkspaceTarget::MissingBinding
-                && !d.emit_fanout
-                && d.fanout_workspace == WorkspaceTarget::MissingBinding
-        }),
-{
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Workspace Event Self-Reference
-// ═══════════════════════════════════════════════════════════════════
-
-/// Proof: workspace events use their own event_id as workspace_id
-/// for the shared_event_index, even without a prior workspace binding.
-proof fn proof_workspace_event_self_references()
-    ensures
-        ({
-            let without_binding =
-                persist_decisions_for_event(ShareScope::Shared, false, true, false, false);
-            let with_binding =
-                persist_decisions_for_event(ShareScope::Shared, false, true, false, true);
-            without_binding.write_shared_index
-                && without_binding.shared_index_workspace == WorkspaceTarget::EventId
-                && with_binding.write_shared_index
-                && with_binding.shared_index_workspace == WorkspaceTarget::EventId
-        }),
-{
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // Durable Fanout Entries
 // ═══════════════════════════════════════════════════════════════════
 
-/// Model: fanout entries are persisted INSIDE the transaction.
+/// Executable model: fanout entries are persisted INSIDE the transaction.
 /// If the transaction commits, fanouts are durable.
 /// If it rolls back, fanouts are lost (but so are the events).
-pub open spec fn fanout_durability_model(
+pub fn fanout_durability_model(
     tx_committed: bool,
-    fanout_entries_written: nat,
-) -> nat {
+    fanout_entries_written: u64,
+) -> (out: u64)
+    ensures
+        tx_committed ==> out == fanout_entries_written,
+        !tx_committed ==> out == 0,
+{
     if tx_committed {
         fanout_entries_written
     } else {
         0  // rolled back
     }
-}
-
-/// Proof: committed fanouts are durable.
-proof fn proof_committed_fanouts_are_durable(count: nat)
-    ensures fanout_durability_model(true, count) == count,
-{
-}
-
-/// Proof: rolled-back fanouts are lost.
-proof fn proof_rolled_back_fanouts_are_lost(count: nat)
-    ensures fanout_durability_model(false, count) == 0,
-{
-}
-
-/// Proof: fanout durability is consistent with commit atomicity.
-/// Events and fanouts share the same transaction boundary.
-proof fn proof_fanout_atomicity_matches_events(
-    tx_committed: bool,
-    events_persisted: nat,
-    fanouts_written: nat,
-)
-    ensures
-        // Both are durable or both are lost
-        (tx_committed ==> fanout_durability_model(tx_committed, fanouts_written) == fanouts_written),
-        (!tx_committed ==> fanout_durability_model(tx_committed, fanouts_written) == 0),
-{
 }
 
 } // verus!

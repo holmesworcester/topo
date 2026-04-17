@@ -1,8 +1,13 @@
-//! Bug-hunting proofs: attempt to find contradictions, edge cases, and
-//! undesired behaviors in the actual code logic.
+//! **Counterexample proofs — document real, known bugs in the runtime.**
 //!
-//! Unlike the correctness proofs, these attempt to model the ACTUAL behavior
-//! precisely and surface violations of the proven invariants.
+//! Entries in this file are NOT proofs of runtime correctness. Each `finding_*`
+//! proof demonstrates that a specific undesired behavior is *possible* given the
+//! current runtime logic (TTL-window extension under clock skew, empty-missing
+//! blocks that the cascade can't resolve, TOCTOU race windows, etc.).
+//!
+//! Intended lifecycle: when a bug is fixed in the runtime, flip the corresponding
+//! counterexample into a positive invariant proof (an exec-fn `ensures` clause in
+//! the relevant seam) and remove it here. A shrinking `bug_hunt.rs` is progress.
 
 use vstd::prelude::*;
 use crate::decision::*;

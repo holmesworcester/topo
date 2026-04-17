@@ -10,196 +10,88 @@
 //!
 //! This models the new ContextLoadResult introduced to allow context loaders
 //! to short-circuit projection without running the pure projector.
+//!
+//! Every `pub fn` below is an executable Rust abstract model of the corresponding
+//! runtime composition in `src/state/projection/apply/stages.rs`. Postconditions
+//! (`ensures`) are SMT-checked against the function body by `cargo-verus verify`.
 
 use vstd::prelude::*;
 use crate::decision::*;
 
 verus! {
 
-pub spec const ONE: nat = 1;
-pub spec const TWO: nat = 2;
+pub const ONE: u32 = 1;
+pub const TWO: u32 = 2;
 
-/// The result of context loading.
-pub enum ContextLoadResult {
+/// The result of context loading (primitive-only Verus model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLoadResultCore {
     Ready,
-    Block { missing_count: nat },
+    Block { missing_count: u32 },
     Reject,
     Purge,
 }
 
-/// Model of the apply_projection flow with ContextLoadResult:
+/// Executable model of the apply_projection flow with ContextLoadResult:
 ///   1. Signer check (if required)
 ///   2. Context loading → may short-circuit
 ///   3. Pure projector dispatch
 ///   4. Side-effect execution
-pub open spec fn apply_with_context_loading(
+pub fn apply_with_context_loading(
     signer_ok: bool,
     signer_required: bool,
-    ctx_result: ContextLoadResult,
-    projector_decision: ProjectionDecision,
-) -> ProjectionDecision {
+    ctx_result: ContextLoadResultCore,
+    projector_decision: ProjectionDecisionCore,
+) -> (decision: ProjectionDecisionCore)
+    ensures
+        (signer_required && !signer_ok) ==> decision == ProjectionDecisionCore::Reject,
+        !(signer_required && !signer_ok) ==> match ctx_result {
+            ContextLoadResultCore::Block { missing_count } =>
+                decision == (ProjectionDecisionCore::Block { missing_count }),
+            ContextLoadResultCore::Reject => decision == ProjectionDecisionCore::Reject,
+            ContextLoadResultCore::Purge => decision == ProjectionDecisionCore::Valid,
+            ContextLoadResultCore::Ready => decision == projector_decision,
+        },
+{
     if signer_required && !signer_ok {
-        ProjectionDecision::Reject
+        ProjectionDecisionCore::Reject
     } else {
         match ctx_result {
-            ContextLoadResult::Block { missing_count } =>
-                ProjectionDecision::Block { missing_count },
-            ContextLoadResult::Reject =>
-                ProjectionDecision::Reject,
-            ContextLoadResult::Purge =>
-                ProjectionDecision::Valid,
-            ContextLoadResult::Ready =>
-                projector_decision,
+            ContextLoadResultCore::Block { missing_count } =>
+                ProjectionDecisionCore::Block { missing_count },
+            ContextLoadResultCore::Reject => ProjectionDecisionCore::Reject,
+            ContextLoadResultCore::Purge => ProjectionDecisionCore::Valid,
+            ContextLoadResultCore::Ready => projector_decision,
         }
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Context Loading Phase Proofs
-// ═══════════════════════════════════════════════════════════════════
-
-/// Proof: context Block prevents projector from running.
-proof fn proof_context_block_prevents_projector()
-    ensures
-        ({
-            let d = apply_with_context_loading(
-                true, false, ContextLoadResult::Block { missing_count: ONE },
-                ProjectionDecision::Valid,
-            );
-            matches!(d, ProjectionDecision::Block { .. })
-        }),
-{
-}
-
-/// Proof: context Reject prevents projector from running.
-proof fn proof_context_reject_prevents_projector()
-    ensures
-        ({
-            let d = apply_with_context_loading(
-                true, false, ContextLoadResult::Reject,
-                ProjectionDecision::Valid,
-            );
-            matches!(d, ProjectionDecision::Reject)
-        }),
-{
-}
-
-/// Proof: context Purge prevents projector from running and returns Valid
-/// after the hard-purge command has been emitted by the executor.
-proof fn proof_context_purge_prevents_projector(projector_decision: ProjectionDecision)
-    ensures
-        matches!(
-            apply_with_context_loading(
-                true,
-                false,
-                ContextLoadResult::Purge,
-                projector_decision,
-            ),
-            ProjectionDecision::Valid
-        ),
-{
-}
-
-/// Proof: context Purge is noninterfering with the projector decision.
-proof fn proof_context_purge_ignores_projector_decision(
-    a: ProjectionDecision,
-    b: ProjectionDecision,
-)
-    ensures
-        apply_with_context_loading(true, false, ContextLoadResult::Purge, a)
-            == apply_with_context_loading(true, false, ContextLoadResult::Purge, b),
-{
-}
-
-/// Proof: context Ready passes through to projector decision.
-proof fn proof_context_ready_passes_through(projector_decision: ProjectionDecision)
-    ensures
-        apply_with_context_loading(true, false, ContextLoadResult::Ready, projector_decision)
-            == projector_decision,
-{
-}
-
-/// Proof: signer failure takes priority over context loading.
-proof fn proof_signer_failure_overrides_context(ctx: ContextLoadResult, d: ProjectionDecision)
-    ensures
-        matches!(
-            apply_with_context_loading(false, true, ctx, d),
-            ProjectionDecision::Reject
-        ),
-{
-}
-
-/// Proof: signer check is skipped when not required.
-proof fn proof_signer_skip_when_not_required(ctx: ContextLoadResult, d: ProjectionDecision)
-    ensures
-        apply_with_context_loading(false, false, ctx, d)
-            == apply_with_context_loading(true, false, ctx, d),
-{
-}
-
-/// Proof: the full pipeline check order is signer → context → projector.
-/// Each earlier failure prevents later stages from executing.
-proof fn proof_full_pipeline_check_order()
-    ensures
-        // Signer failure: context and projector don't matter
-        matches!(apply_with_context_loading(false, true, ContextLoadResult::Ready, ProjectionDecision::Valid), ProjectionDecision::Reject),
-        // Context block: projector doesn't matter
-        matches!(apply_with_context_loading(true, true, ContextLoadResult::Block { missing_count: TWO }, ProjectionDecision::Valid), ProjectionDecision::Block { .. }),
-        // Context reject: projector doesn't matter
-        matches!(apply_with_context_loading(true, true, ContextLoadResult::Reject, ProjectionDecision::Valid), ProjectionDecision::Reject),
-        // Context purge: projector doesn't matter
-        matches!(apply_with_context_loading(true, true, ContextLoadResult::Purge, ProjectionDecision::Reject), ProjectionDecision::Valid),
-        // All pass: projector decision flows through
-        matches!(apply_with_context_loading(true, true, ContextLoadResult::Ready, ProjectionDecision::Valid), ProjectionDecision::Valid),
-{
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // Workspace Context Loading
 // ═══════════════════════════════════════════════════════════════════
 
-/// Model of workspace context loading:
+/// Executable model of workspace context loading:
 ///   - No accepted_workspace_id → Block (workspace not yet accepted)
 ///   - accepted_workspace_id != event_id → Reject (wrong workspace)
 ///   - accepted_workspace_id == event_id → Ready
-pub open spec fn workspace_context_load(
+pub fn workspace_context_load(
     has_accepted_workspace: bool,
     workspace_matches_event: bool,
-) -> ContextLoadResult {
+) -> (result: ContextLoadResultCore)
+    ensures
+        !has_accepted_workspace ==> result == (ContextLoadResultCore::Block { missing_count: ONE }),
+        (has_accepted_workspace && !workspace_matches_event)
+            ==> result == ContextLoadResultCore::Reject,
+        (has_accepted_workspace && workspace_matches_event)
+            ==> result == ContextLoadResultCore::Ready,
+{
     if !has_accepted_workspace {
-        ContextLoadResult::Block { missing_count: ONE }
+        ContextLoadResultCore::Block { missing_count: ONE }
     } else if !workspace_matches_event {
-        ContextLoadResult::Reject
+        ContextLoadResultCore::Reject
     } else {
-        ContextLoadResult::Ready
+        ContextLoadResultCore::Ready
     }
-}
-
-proof fn proof_workspace_blocks_without_acceptance()
-    ensures
-        matches!(
-            workspace_context_load(false, false),
-            ContextLoadResult::Block { .. }
-        ),
-{
-}
-
-proof fn proof_workspace_rejects_wrong_workspace()
-    ensures
-        matches!(
-            workspace_context_load(true, false),
-            ContextLoadResult::Reject
-        ),
-{
-}
-
-proof fn proof_workspace_ready_on_match()
-    ensures
-        matches!(
-            workspace_context_load(true, true),
-            ContextLoadResult::Ready
-        ),
-{
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -207,42 +99,20 @@ proof fn proof_workspace_ready_on_match()
 // ═══════════════════════════════════════════════════════════════════
 
 /// Many context loaders reject early on signer_user_mismatch.
-/// This models the pattern: if mismatch is detected during context loading,
-/// return ContextLoadResult::Reject before the projector runs.
-pub open spec fn content_event_context_load(
+/// This executable model captures the pattern: if mismatch is detected during
+/// context loading, return ContextLoadResultCore::Reject before the projector runs.
+pub fn content_event_context_load(
     has_signer_mismatch: bool,
-) -> ContextLoadResult {
+) -> (result: ContextLoadResultCore)
+    ensures
+        has_signer_mismatch ==> result == ContextLoadResultCore::Reject,
+        !has_signer_mismatch ==> result == ContextLoadResultCore::Ready,
+{
     if has_signer_mismatch {
-        ContextLoadResult::Reject
+        ContextLoadResultCore::Reject
     } else {
-        ContextLoadResult::Ready
+        ContextLoadResultCore::Ready
     }
-}
-
-/// Proof: signer mismatch in context loading always rejects,
-/// regardless of what the projector would have decided.
-proof fn proof_signer_mismatch_in_context_always_rejects(projector_decision: ProjectionDecision)
-    ensures
-        matches!(
-            apply_with_context_loading(
-                true, false,
-                content_event_context_load(true),
-                projector_decision,
-            ),
-            ProjectionDecision::Reject
-        ),
-{
-}
-
-/// Proof: no signer mismatch passes through to projector.
-proof fn proof_no_signer_mismatch_passes_through(projector_decision: ProjectionDecision)
-    ensures
-        apply_with_context_loading(
-            true, false,
-            content_event_context_load(false),
-            projector_decision,
-        ) == projector_decision,
-{
 }
 
 } // verus!

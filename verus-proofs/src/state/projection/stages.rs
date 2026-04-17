@@ -1,260 +1,217 @@
 //! Formal verification of context-load and projector-effect planning.
+//!
+//! Every `pub fn` below is an executable Rust core consumed by
+//! `src/state/projection/apply/stages.rs`. Postconditions (`ensures`) are SMT-checked
+//! against the function body by `cargo-verus verify`.
+//!
+//! Runtime carries rich variants like `Block { missing: Vec<EventId> }` and
+//! `Reject { reason: String }`. This Verus core reduces each state/plan/raw
+//! variant to a payload-less tag. The runtime wraps the core by projecting its
+//! concrete payloads to tags, calling the verified dispatcher, and rehydrating
+//! the original payloads in the output plan.
 
 use vstd::prelude::*;
 
 verus! {
 
-pub enum ContextLoadDispositionRawRows {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLoadDispositionRawRowsCore {
     Ready,
     Block,
     Reject,
     Purge,
 }
 
-pub enum ContextLoadDispositionDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLoadDispositionDecisionContextCore {
     Ready,
     Block,
     Reject,
     Purge,
 }
 
-pub enum ContextLoadDispositionPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextLoadDispositionPlanCore {
     Continue,
     RecordBlockAndReturn,
     Reject,
     EmitHardPurgeAndReturn,
 }
 
-pub enum ProjectionDecision {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionDecisionCore {
     Valid,
     Block,
     Reject,
     AlreadyProcessed,
 }
 
-pub enum ProjectionDecisionEffectRawRows {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionDecisionEffectRawRowsCore {
     Valid,
     Block,
     Reject,
     AlreadyProcessed,
 }
 
-pub enum ProjectionDecisionEffectDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionDecisionEffectDecisionContextCore {
     Valid,
     Block,
     Reject,
     AlreadyProcessed,
 }
 
-pub enum ProjectionDecisionEffectPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionDecisionEffectPlanCore {
     ApplyWriteOpsAndEmitCommands,
     EmitCommandsOnly,
     NoEffects,
 }
 
-pub struct ProjectionEffectAllowance {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectionEffectAllowanceCore {
     pub allow_write_ops: bool,
     pub allow_emit_commands: bool,
     pub allow_record_block: bool,
 }
 
-pub open spec fn normalize_context_load_disposition(
-    raw_rows: ContextLoadDispositionRawRows,
-) -> ContextLoadDispositionDecisionContext {
+pub fn normalize_context_load_disposition_core(
+    raw_rows: ContextLoadDispositionRawRowsCore,
+) -> (context: ContextLoadDispositionDecisionContextCore)
+    ensures
+        raw_rows == ContextLoadDispositionRawRowsCore::Ready
+            ==> context == ContextLoadDispositionDecisionContextCore::Ready,
+        raw_rows == ContextLoadDispositionRawRowsCore::Block
+            ==> context == ContextLoadDispositionDecisionContextCore::Block,
+        raw_rows == ContextLoadDispositionRawRowsCore::Reject
+            ==> context == ContextLoadDispositionDecisionContextCore::Reject,
+        raw_rows == ContextLoadDispositionRawRowsCore::Purge
+            ==> context == ContextLoadDispositionDecisionContextCore::Purge,
+{
     match raw_rows {
-        ContextLoadDispositionRawRows::Ready => ContextLoadDispositionDecisionContext::Ready,
-        ContextLoadDispositionRawRows::Block => ContextLoadDispositionDecisionContext::Block,
-        ContextLoadDispositionRawRows::Reject => ContextLoadDispositionDecisionContext::Reject,
-        ContextLoadDispositionRawRows::Purge => ContextLoadDispositionDecisionContext::Purge,
+        ContextLoadDispositionRawRowsCore::Ready => ContextLoadDispositionDecisionContextCore::Ready,
+        ContextLoadDispositionRawRowsCore::Block => ContextLoadDispositionDecisionContextCore::Block,
+        ContextLoadDispositionRawRowsCore::Reject => ContextLoadDispositionDecisionContextCore::Reject,
+        ContextLoadDispositionRawRowsCore::Purge => ContextLoadDispositionDecisionContextCore::Purge,
     }
 }
 
-pub open spec fn decide_context_load_disposition(
-    context: ContextLoadDispositionDecisionContext,
-) -> ContextLoadDispositionPlan {
+pub fn decide_context_load_disposition_core(
+    context: ContextLoadDispositionDecisionContextCore,
+) -> (plan: ContextLoadDispositionPlanCore)
+    ensures
+        context == ContextLoadDispositionDecisionContextCore::Ready
+            ==> plan == ContextLoadDispositionPlanCore::Continue,
+        context == ContextLoadDispositionDecisionContextCore::Block
+            ==> plan == ContextLoadDispositionPlanCore::RecordBlockAndReturn,
+        context == ContextLoadDispositionDecisionContextCore::Reject
+            ==> plan == ContextLoadDispositionPlanCore::Reject,
+        context == ContextLoadDispositionDecisionContextCore::Purge
+            ==> plan == ContextLoadDispositionPlanCore::EmitHardPurgeAndReturn,
+{
     match context {
-        ContextLoadDispositionDecisionContext::Ready => ContextLoadDispositionPlan::Continue,
-        ContextLoadDispositionDecisionContext::Block => {
-            ContextLoadDispositionPlan::RecordBlockAndReturn
+        ContextLoadDispositionDecisionContextCore::Ready => ContextLoadDispositionPlanCore::Continue,
+        ContextLoadDispositionDecisionContextCore::Block => {
+            ContextLoadDispositionPlanCore::RecordBlockAndReturn
         }
-        ContextLoadDispositionDecisionContext::Reject => ContextLoadDispositionPlan::Reject,
-        ContextLoadDispositionDecisionContext::Purge => {
-            ContextLoadDispositionPlan::EmitHardPurgeAndReturn
+        ContextLoadDispositionDecisionContextCore::Reject => ContextLoadDispositionPlanCore::Reject,
+        ContextLoadDispositionDecisionContextCore::Purge => {
+            ContextLoadDispositionPlanCore::EmitHardPurgeAndReturn
         }
     }
 }
 
-pub open spec fn normalize_projection_decision_effect_context(
-    raw_rows: ProjectionDecisionEffectRawRows,
-) -> ProjectionDecisionEffectDecisionContext {
+pub fn normalize_projection_decision_effect_context_core(
+    raw_rows: ProjectionDecisionEffectRawRowsCore,
+) -> (context: ProjectionDecisionEffectDecisionContextCore)
+    ensures
+        raw_rows == ProjectionDecisionEffectRawRowsCore::Valid
+            ==> context == ProjectionDecisionEffectDecisionContextCore::Valid,
+        raw_rows == ProjectionDecisionEffectRawRowsCore::Block
+            ==> context == ProjectionDecisionEffectDecisionContextCore::Block,
+        raw_rows == ProjectionDecisionEffectRawRowsCore::Reject
+            ==> context == ProjectionDecisionEffectDecisionContextCore::Reject,
+        raw_rows == ProjectionDecisionEffectRawRowsCore::AlreadyProcessed
+            ==> context == ProjectionDecisionEffectDecisionContextCore::AlreadyProcessed,
+{
     match raw_rows {
-        ProjectionDecisionEffectRawRows::Valid => ProjectionDecisionEffectDecisionContext::Valid,
-        ProjectionDecisionEffectRawRows::Block => ProjectionDecisionEffectDecisionContext::Block,
-        ProjectionDecisionEffectRawRows::Reject => ProjectionDecisionEffectDecisionContext::Reject,
-        ProjectionDecisionEffectRawRows::AlreadyProcessed => {
-            ProjectionDecisionEffectDecisionContext::AlreadyProcessed
+        ProjectionDecisionEffectRawRowsCore::Valid => ProjectionDecisionEffectDecisionContextCore::Valid,
+        ProjectionDecisionEffectRawRowsCore::Block => ProjectionDecisionEffectDecisionContextCore::Block,
+        ProjectionDecisionEffectRawRowsCore::Reject => ProjectionDecisionEffectDecisionContextCore::Reject,
+        ProjectionDecisionEffectRawRowsCore::AlreadyProcessed => {
+            ProjectionDecisionEffectDecisionContextCore::AlreadyProcessed
         }
     }
 }
 
-pub open spec fn decide_projection_decision_effect_plan(
-    context: ProjectionDecisionEffectDecisionContext,
-) -> ProjectionDecisionEffectPlan {
+pub fn decide_projection_decision_effect_plan_core(
+    context: ProjectionDecisionEffectDecisionContextCore,
+) -> (plan: ProjectionDecisionEffectPlanCore)
+    ensures
+        context == ProjectionDecisionEffectDecisionContextCore::Valid
+            ==> plan == ProjectionDecisionEffectPlanCore::ApplyWriteOpsAndEmitCommands,
+        context == ProjectionDecisionEffectDecisionContextCore::Block
+            ==> plan == ProjectionDecisionEffectPlanCore::EmitCommandsOnly,
+        context == ProjectionDecisionEffectDecisionContextCore::Reject
+            ==> plan == ProjectionDecisionEffectPlanCore::NoEffects,
+        context == ProjectionDecisionEffectDecisionContextCore::AlreadyProcessed
+            ==> plan == ProjectionDecisionEffectPlanCore::NoEffects,
+{
     match context {
-        ProjectionDecisionEffectDecisionContext::Valid => {
-            ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands
+        ProjectionDecisionEffectDecisionContextCore::Valid => {
+            ProjectionDecisionEffectPlanCore::ApplyWriteOpsAndEmitCommands
         }
-        ProjectionDecisionEffectDecisionContext::Block => {
-            ProjectionDecisionEffectPlan::EmitCommandsOnly
+        ProjectionDecisionEffectDecisionContextCore::Block => {
+            ProjectionDecisionEffectPlanCore::EmitCommandsOnly
         }
-        ProjectionDecisionEffectDecisionContext::Reject
-        | ProjectionDecisionEffectDecisionContext::AlreadyProcessed => {
-            ProjectionDecisionEffectPlan::NoEffects
+        ProjectionDecisionEffectDecisionContextCore::Reject
+        | ProjectionDecisionEffectDecisionContextCore::AlreadyProcessed => {
+            ProjectionDecisionEffectPlanCore::NoEffects
         }
     }
 }
 
-pub open spec fn projection_effect_allowance(
-    plan: ProjectionDecisionEffectPlan,
-) -> ProjectionEffectAllowance {
+pub fn projection_effect_allowance_core(
+    plan: ProjectionDecisionEffectPlanCore,
+) -> (allowance: ProjectionEffectAllowanceCore)
+    ensures
+        plan == ProjectionDecisionEffectPlanCore::ApplyWriteOpsAndEmitCommands
+            ==> allowance == (ProjectionEffectAllowanceCore {
+                allow_write_ops: true,
+                allow_emit_commands: true,
+                allow_record_block: false,
+            }),
+        plan == ProjectionDecisionEffectPlanCore::EmitCommandsOnly
+            ==> allowance == (ProjectionEffectAllowanceCore {
+                allow_write_ops: false,
+                allow_emit_commands: true,
+                allow_record_block: true,
+            }),
+        plan == ProjectionDecisionEffectPlanCore::NoEffects
+            ==> allowance == (ProjectionEffectAllowanceCore {
+                allow_write_ops: false,
+                allow_emit_commands: false,
+                allow_record_block: false,
+            }),
+{
     match plan {
-        ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands => ProjectionEffectAllowance {
+        ProjectionDecisionEffectPlanCore::ApplyWriteOpsAndEmitCommands => ProjectionEffectAllowanceCore {
             allow_write_ops: true,
             allow_emit_commands: true,
             allow_record_block: false,
         },
-        ProjectionDecisionEffectPlan::EmitCommandsOnly => ProjectionEffectAllowance {
+        ProjectionDecisionEffectPlanCore::EmitCommandsOnly => ProjectionEffectAllowanceCore {
             allow_write_ops: false,
             allow_emit_commands: true,
             allow_record_block: true,
         },
-        ProjectionDecisionEffectPlan::NoEffects => ProjectionEffectAllowance {
+        ProjectionDecisionEffectPlanCore::NoEffects => ProjectionEffectAllowanceCore {
             allow_write_ops: false,
             allow_emit_commands: false,
             allow_record_block: false,
         },
     }
-}
-
-proof fn context_load_disposition_normalizer_preserves_query_facts()
-    ensures
-        normalize_context_load_disposition(ContextLoadDispositionRawRows::Ready)
-            == ContextLoadDispositionDecisionContext::Ready,
-        normalize_context_load_disposition(ContextLoadDispositionRawRows::Block)
-            == ContextLoadDispositionDecisionContext::Block,
-        normalize_context_load_disposition(ContextLoadDispositionRawRows::Reject)
-            == ContextLoadDispositionDecisionContext::Reject,
-        normalize_context_load_disposition(ContextLoadDispositionRawRows::Purge)
-            == ContextLoadDispositionDecisionContext::Purge,
-{
-}
-
-proof fn projection_decision_effect_normalizer_preserves_query_facts()
-    ensures
-        normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Valid)
-            == ProjectionDecisionEffectDecisionContext::Valid,
-        normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Block)
-            == ProjectionDecisionEffectDecisionContext::Block,
-        normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Reject)
-            == ProjectionDecisionEffectDecisionContext::Reject,
-        normalize_projection_decision_effect_context(
-            ProjectionDecisionEffectRawRows::AlreadyProcessed,
-        ) == ProjectionDecisionEffectDecisionContext::AlreadyProcessed,
-{
-}
-
-proof fn ready_context_continues_to_projector()
-    ensures
-        decide_context_load_disposition(normalize_context_load_disposition(
-            ContextLoadDispositionRawRows::Ready,
-        ))
-            == ContextLoadDispositionPlan::Continue,
-{
-}
-
-proof fn blocked_context_records_block_and_returns()
-    ensures
-        decide_context_load_disposition(normalize_context_load_disposition(
-            ContextLoadDispositionRawRows::Block,
-        ))
-            == ContextLoadDispositionPlan::RecordBlockAndReturn,
-{
-}
-
-proof fn purged_context_emits_only_hard_purge()
-    ensures
-        decide_context_load_disposition(normalize_context_load_disposition(
-            ContextLoadDispositionRawRows::Purge,
-        ))
-            == ContextLoadDispositionPlan::EmitHardPurgeAndReturn,
-{
-}
-
-proof fn reject_and_already_processed_have_no_effects()
-    ensures
-        decide_projection_decision_effect_plan(normalize_projection_decision_effect_context(
-            ProjectionDecisionEffectRawRows::Reject,
-        ))
-            == ProjectionDecisionEffectPlan::NoEffects,
-        decide_projection_decision_effect_plan(normalize_projection_decision_effect_context(
-            ProjectionDecisionEffectRawRows::AlreadyProcessed,
-        ))
-            == ProjectionDecisionEffectPlan::NoEffects,
-{
-}
-
-proof fn reject_and_already_processed_allow_no_executor_effects()
-    ensures
-        projection_effect_allowance(decide_projection_decision_effect_plan(
-            normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Reject),
-        )) == (ProjectionEffectAllowance {
-            allow_write_ops: false,
-            allow_emit_commands: false,
-            allow_record_block: false,
-        }),
-        projection_effect_allowance(decide_projection_decision_effect_plan(
-            normalize_projection_decision_effect_context(
-                ProjectionDecisionEffectRawRows::AlreadyProcessed,
-            ),
-        )) == (ProjectionEffectAllowance {
-            allow_write_ops: false,
-            allow_emit_commands: false,
-            allow_record_block: false,
-        }),
-{
-}
-
-proof fn valid_applies_write_ops_and_commands()
-    ensures
-        decide_projection_decision_effect_plan(normalize_projection_decision_effect_context(
-            ProjectionDecisionEffectRawRows::Valid,
-        ))
-            == ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands,
-{
-}
-
-proof fn block_decision_never_allows_write_ops()
-    ensures
-        projection_effect_allowance(decide_projection_decision_effect_plan(
-            normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Block),
-        )) == (ProjectionEffectAllowance {
-            allow_write_ops: false,
-            allow_emit_commands: true,
-            allow_record_block: true,
-        }),
-{
-}
-
-proof fn valid_decision_allows_write_ops_and_commands_only()
-    ensures
-        projection_effect_allowance(decide_projection_decision_effect_plan(
-            normalize_projection_decision_effect_context(ProjectionDecisionEffectRawRows::Valid),
-        )) == (ProjectionEffectAllowance {
-            allow_write_ops: true,
-            allow_emit_commands: true,
-            allow_record_block: false,
-        }),
-{
 }
 
 } // verus!

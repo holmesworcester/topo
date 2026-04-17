@@ -2,173 +2,128 @@
 //!
 //! This models the boundary between raw typed SQL rows and the normalized
 //! `DecisionContext` consumed by projector/context-load planners.
+//!
+//! Every `pub fn` below is an executable Rust core dispatcher consumed by
+//! `src/state/projection/queries.rs`. Postconditions (`ensures`) are SMT-checked
+//! against the function body by `cargo-verus verify`.
+//!
+//! Runtime carries rich payloads (String signer_event_ids, Vec<Option<String>>
+//! user_id lists). This Verus core reduces each dispatch to primitive booleans
+//! and counts — the runtime keeps the rich payloads locally and only delegates
+//! the tag-level dispatch decision.
 
 use vstd::prelude::*;
 
 verus! {
 
-pub struct WorkspaceAcceptedRawRows {
-    pub row_count: nat,
+// ═══════════════════════════════════════════════════════════════════
+// Workspace acceptance
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceAcceptedRawRowsCore {
+    pub row_count: u64,
     pub all_workspace_ids_equal: bool,
     pub representative_workspace_matches_event: bool,
     pub malformed: bool,
 }
 
-pub enum WorkspaceDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceDecisionContextCore {
     MissingAcceptedWorkspace,
     UniqueAcceptedWorkspace { workspace_matches_event: bool },
     RejectAmbiguousAcceptedWorkspace,
     RejectMalformedAcceptedWorkspace,
 }
 
-pub enum WorkspaceContextPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceContextPlanCore {
     BlockOnAcceptedWorkspace,
     Ready,
     Reject,
 }
 
-pub open spec fn normalize_workspace_acceptance(
-    rows: WorkspaceAcceptedRawRows,
-) -> WorkspaceDecisionContext {
+pub fn normalize_workspace_acceptance_core(
+    rows: WorkspaceAcceptedRawRowsCore,
+) -> (context: WorkspaceDecisionContextCore)
+    ensures
+        rows.malformed ==> context == WorkspaceDecisionContextCore::RejectMalformedAcceptedWorkspace,
+        (!rows.malformed && rows.row_count == 0)
+            ==> context == WorkspaceDecisionContextCore::MissingAcceptedWorkspace,
+        (!rows.malformed && rows.row_count > 0 && rows.all_workspace_ids_equal)
+            ==> context == (WorkspaceDecisionContextCore::UniqueAcceptedWorkspace {
+                workspace_matches_event: rows.representative_workspace_matches_event,
+            }),
+        (!rows.malformed && rows.row_count > 0 && !rows.all_workspace_ids_equal)
+            ==> context == WorkspaceDecisionContextCore::RejectAmbiguousAcceptedWorkspace,
+{
     if rows.malformed {
-        WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace
+        WorkspaceDecisionContextCore::RejectMalformedAcceptedWorkspace
     } else if rows.row_count == 0 {
-        WorkspaceDecisionContext::MissingAcceptedWorkspace
+        WorkspaceDecisionContextCore::MissingAcceptedWorkspace
     } else if rows.all_workspace_ids_equal {
-        WorkspaceDecisionContext::UniqueAcceptedWorkspace {
+        WorkspaceDecisionContextCore::UniqueAcceptedWorkspace {
             workspace_matches_event: rows.representative_workspace_matches_event,
         }
     } else {
-        WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace
+        WorkspaceDecisionContextCore::RejectAmbiguousAcceptedWorkspace
     }
 }
 
-pub open spec fn decide_workspace_context_plan(
-    context: WorkspaceDecisionContext,
-) -> WorkspaceContextPlan {
+pub fn decide_workspace_context_plan_core(
+    context: WorkspaceDecisionContextCore,
+) -> (plan: WorkspaceContextPlanCore)
+    ensures
+        context == WorkspaceDecisionContextCore::MissingAcceptedWorkspace
+            ==> plan == WorkspaceContextPlanCore::BlockOnAcceptedWorkspace,
+        context == (WorkspaceDecisionContextCore::UniqueAcceptedWorkspace {
+            workspace_matches_event: true,
+        }) ==> plan == WorkspaceContextPlanCore::Ready,
+        context == (WorkspaceDecisionContextCore::UniqueAcceptedWorkspace {
+            workspace_matches_event: false,
+        }) ==> plan == WorkspaceContextPlanCore::Reject,
+        context == WorkspaceDecisionContextCore::RejectAmbiguousAcceptedWorkspace
+            ==> plan == WorkspaceContextPlanCore::Reject,
+        context == WorkspaceDecisionContextCore::RejectMalformedAcceptedWorkspace
+            ==> plan == WorkspaceContextPlanCore::Reject,
+{
     match context {
-        WorkspaceDecisionContext::MissingAcceptedWorkspace => {
-            WorkspaceContextPlan::BlockOnAcceptedWorkspace
+        WorkspaceDecisionContextCore::MissingAcceptedWorkspace => {
+            WorkspaceContextPlanCore::BlockOnAcceptedWorkspace
         }
-        WorkspaceDecisionContext::UniqueAcceptedWorkspace { workspace_matches_event } => {
+        WorkspaceDecisionContextCore::UniqueAcceptedWorkspace { workspace_matches_event } => {
             if workspace_matches_event {
-                WorkspaceContextPlan::Ready
+                WorkspaceContextPlanCore::Ready
             } else {
-                WorkspaceContextPlan::Reject
+                WorkspaceContextPlanCore::Reject
             }
         }
-        WorkspaceDecisionContext::RejectAmbiguousAcceptedWorkspace
-        | WorkspaceDecisionContext::RejectMalformedAcceptedWorkspace => {
-            WorkspaceContextPlan::Reject
+        WorkspaceDecisionContextCore::RejectAmbiguousAcceptedWorkspace
+        | WorkspaceDecisionContextCore::RejectMalformedAcceptedWorkspace => {
+            WorkspaceContextPlanCore::Reject
         }
     }
 }
 
-proof fn workspace_query_missing_blocks()
-    ensures
-        decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRawRows {
-                row_count: 0,
-                all_workspace_ids_equal: true,
-                representative_workspace_matches_event: false,
-                malformed: false,
-            },
-        )) == WorkspaceContextPlan::BlockOnAcceptedWorkspace,
-{
-}
+// ═══════════════════════════════════════════════════════════════════
+// Content authority
+// ═══════════════════════════════════════════════════════════════════
 
-proof fn workspace_query_unique_match_is_ready()
-    ensures
-        decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRawRows {
-                row_count: 1,
-                all_workspace_ids_equal: true,
-                representative_workspace_matches_event: true,
-                malformed: false,
-            },
-        )) == WorkspaceContextPlan::Ready,
-{
-}
-
-proof fn workspace_query_duplicate_same_workspace_rows_are_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-    workspace_matches_event: bool,
-)
-    requires
-        row_count_a > 0,
-        row_count_b > 0,
-    ensures
-        decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRawRows {
-                row_count: row_count_a,
-                all_workspace_ids_equal: true,
-                representative_workspace_matches_event: workspace_matches_event,
-                malformed: false,
-            },
-        )) == decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRawRows {
-                row_count: row_count_b,
-                all_workspace_ids_equal: true,
-                representative_workspace_matches_event: workspace_matches_event,
-                malformed: false,
-            },
-        )),
-{
-}
-
-proof fn workspace_query_unique_mismatch_rejects()
-    ensures
-        decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRawRows {
-                row_count: 1,
-                all_workspace_ids_equal: true,
-                representative_workspace_matches_event: false,
-                malformed: false,
-            },
-        )) == WorkspaceContextPlan::Reject,
-{
-}
-
-proof fn workspace_query_ambiguity_fails_closed()
-    ensures
-        decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRawRows {
-                row_count: 2,
-                all_workspace_ids_equal: false,
-                representative_workspace_matches_event: true,
-                malformed: false,
-            },
-        )) == WorkspaceContextPlan::Reject,
-{
-}
-
-proof fn workspace_query_malformation_fails_closed()
-    ensures
-        decide_workspace_context_plan(normalize_workspace_acceptance(
-            WorkspaceAcceptedRawRows {
-                row_count: 1,
-                all_workspace_ids_equal: true,
-                representative_workspace_matches_event: true,
-                malformed: true,
-            },
-        )) == WorkspaceContextPlan::Reject,
-{
-}
-
-pub enum ContentAuthorityRows {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentAuthorityRowsCore {
     NoAuthorCheckNeeded,
     MissingCurrentSigner,
     UnsupportedSignerType,
     PeerSharedSigner {
-        row_count: nat,
+        row_count: u64,
         all_signer_user_ids_equal: bool,
         representative_signer_matches_author: bool,
         malformed: bool,
     },
 }
 
-pub enum ContentAuthorityDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentAuthorityDecisionContextCore {
     NoAuthorCheckNeeded,
     RejectMissingCurrentSigner,
     RejectUnsupportedSignerType,
@@ -178,173 +133,114 @@ pub enum ContentAuthorityDecisionContext {
     RejectMalformedSignerUser,
 }
 
-pub enum ContentAuthorityPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentAuthorityPlanCore {
     Ready,
     Reject,
 }
 
-pub open spec fn normalize_content_authority(
-    rows: ContentAuthorityRows,
-) -> ContentAuthorityDecisionContext {
+pub fn normalize_content_authority_core(
+    rows: ContentAuthorityRowsCore,
+) -> (context: ContentAuthorityDecisionContextCore)
+    ensures
+        rows == ContentAuthorityRowsCore::NoAuthorCheckNeeded
+            ==> context == ContentAuthorityDecisionContextCore::NoAuthorCheckNeeded,
+        rows == ContentAuthorityRowsCore::MissingCurrentSigner
+            ==> context == ContentAuthorityDecisionContextCore::RejectMissingCurrentSigner,
+        rows == ContentAuthorityRowsCore::UnsupportedSignerType
+            ==> context == ContentAuthorityDecisionContextCore::RejectUnsupportedSignerType,
+{
     match rows {
-        ContentAuthorityRows::NoAuthorCheckNeeded => {
-            ContentAuthorityDecisionContext::NoAuthorCheckNeeded
+        ContentAuthorityRowsCore::NoAuthorCheckNeeded => {
+            ContentAuthorityDecisionContextCore::NoAuthorCheckNeeded
         }
-        ContentAuthorityRows::MissingCurrentSigner => {
-            ContentAuthorityDecisionContext::RejectMissingCurrentSigner
+        ContentAuthorityRowsCore::MissingCurrentSigner => {
+            ContentAuthorityDecisionContextCore::RejectMissingCurrentSigner
         }
-        ContentAuthorityRows::UnsupportedSignerType => {
-            ContentAuthorityDecisionContext::RejectUnsupportedSignerType
+        ContentAuthorityRowsCore::UnsupportedSignerType => {
+            ContentAuthorityDecisionContextCore::RejectUnsupportedSignerType
         }
-        ContentAuthorityRows::PeerSharedSigner {
+        ContentAuthorityRowsCore::PeerSharedSigner {
             row_count,
             all_signer_user_ids_equal,
             representative_signer_matches_author,
             malformed,
         } => {
             if malformed {
-                ContentAuthorityDecisionContext::RejectMalformedSignerUser
+                ContentAuthorityDecisionContextCore::RejectMalformedSignerUser
             } else if row_count == 0 {
-                ContentAuthorityDecisionContext::RejectMissingSignerUser
+                ContentAuthorityDecisionContextCore::RejectMissingSignerUser
             } else if all_signer_user_ids_equal {
-                ContentAuthorityDecisionContext::UniqueSignerUser {
+                ContentAuthorityDecisionContextCore::UniqueSignerUser {
                     signer_matches_author: representative_signer_matches_author,
                 }
             } else {
-                ContentAuthorityDecisionContext::RejectAmbiguousSignerUser
+                ContentAuthorityDecisionContextCore::RejectAmbiguousSignerUser
             }
         }
     }
 }
 
-pub open spec fn decide_content_authority_plan(
-    context: ContentAuthorityDecisionContext,
-) -> ContentAuthorityPlan {
+pub fn decide_content_authority_plan_core(
+    context: ContentAuthorityDecisionContextCore,
+) -> (plan: ContentAuthorityPlanCore)
+    ensures
+        context == ContentAuthorityDecisionContextCore::NoAuthorCheckNeeded
+            ==> plan == ContentAuthorityPlanCore::Ready,
+        context == (ContentAuthorityDecisionContextCore::UniqueSignerUser {
+            signer_matches_author: true,
+        }) ==> plan == ContentAuthorityPlanCore::Ready,
+        context == (ContentAuthorityDecisionContextCore::UniqueSignerUser {
+            signer_matches_author: false,
+        }) ==> plan == ContentAuthorityPlanCore::Reject,
+        context == ContentAuthorityDecisionContextCore::RejectMissingCurrentSigner
+            ==> plan == ContentAuthorityPlanCore::Reject,
+        context == ContentAuthorityDecisionContextCore::RejectUnsupportedSignerType
+            ==> plan == ContentAuthorityPlanCore::Reject,
+        context == ContentAuthorityDecisionContextCore::RejectMissingSignerUser
+            ==> plan == ContentAuthorityPlanCore::Reject,
+        context == ContentAuthorityDecisionContextCore::RejectAmbiguousSignerUser
+            ==> plan == ContentAuthorityPlanCore::Reject,
+        context == ContentAuthorityDecisionContextCore::RejectMalformedSignerUser
+            ==> plan == ContentAuthorityPlanCore::Reject,
+{
     match context {
-        ContentAuthorityDecisionContext::NoAuthorCheckNeeded => ContentAuthorityPlan::Ready,
-        ContentAuthorityDecisionContext::UniqueSignerUser { signer_matches_author } => {
+        ContentAuthorityDecisionContextCore::NoAuthorCheckNeeded => ContentAuthorityPlanCore::Ready,
+        ContentAuthorityDecisionContextCore::UniqueSignerUser { signer_matches_author } => {
             if signer_matches_author {
-                ContentAuthorityPlan::Ready
+                ContentAuthorityPlanCore::Ready
             } else {
-                ContentAuthorityPlan::Reject
+                ContentAuthorityPlanCore::Reject
             }
         }
-        ContentAuthorityDecisionContext::RejectMissingCurrentSigner
-        | ContentAuthorityDecisionContext::RejectUnsupportedSignerType
-        | ContentAuthorityDecisionContext::RejectMissingSignerUser
-        | ContentAuthorityDecisionContext::RejectAmbiguousSignerUser
-        | ContentAuthorityDecisionContext::RejectMalformedSignerUser => {
-            ContentAuthorityPlan::Reject
+        ContentAuthorityDecisionContextCore::RejectMissingCurrentSigner
+        | ContentAuthorityDecisionContextCore::RejectUnsupportedSignerType
+        | ContentAuthorityDecisionContextCore::RejectMissingSignerUser
+        | ContentAuthorityDecisionContextCore::RejectAmbiguousSignerUser
+        | ContentAuthorityDecisionContextCore::RejectMalformedSignerUser => {
+            ContentAuthorityPlanCore::Reject
         }
     }
 }
 
-proof fn content_authority_missing_current_signer_rejects()
-    ensures
-        decide_content_authority_plan(normalize_content_authority(
-            ContentAuthorityRows::MissingCurrentSigner,
-        )) == ContentAuthorityPlan::Reject,
-{
-}
+// ═══════════════════════════════════════════════════════════════════
+// Admin authority
+// ═══════════════════════════════════════════════════════════════════
 
-proof fn content_authority_unsupported_signer_type_rejects()
-    ensures
-        decide_content_authority_plan(normalize_content_authority(
-            ContentAuthorityRows::UnsupportedSignerType,
-        )) == ContentAuthorityPlan::Reject,
-{
-}
-
-proof fn content_authority_unique_match_is_ready()
-    ensures
-        decide_content_authority_plan(normalize_content_authority(
-            ContentAuthorityRows::PeerSharedSigner {
-                row_count: 1,
-                all_signer_user_ids_equal: true,
-                representative_signer_matches_author: true,
-                malformed: false,
-            },
-        )) == ContentAuthorityPlan::Ready,
-{
-}
-
-proof fn content_authority_duplicate_matching_rows_are_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-)
-    requires
-        row_count_a > 0,
-        row_count_b > 0,
-    ensures
-        decide_content_authority_plan(normalize_content_authority(
-            ContentAuthorityRows::PeerSharedSigner {
-                row_count: row_count_a,
-                all_signer_user_ids_equal: true,
-                representative_signer_matches_author: true,
-                malformed: false,
-            },
-        )) == decide_content_authority_plan(normalize_content_authority(
-            ContentAuthorityRows::PeerSharedSigner {
-                row_count: row_count_b,
-                all_signer_user_ids_equal: true,
-                representative_signer_matches_author: true,
-                malformed: false,
-            },
-        )),
-{
-}
-
-proof fn content_authority_unique_mismatch_rejects()
-    ensures
-        decide_content_authority_plan(normalize_content_authority(
-            ContentAuthorityRows::PeerSharedSigner {
-                row_count: 1,
-                all_signer_user_ids_equal: true,
-                representative_signer_matches_author: false,
-                malformed: false,
-            },
-        )) == ContentAuthorityPlan::Reject,
-{
-}
-
-proof fn content_authority_ambiguity_fails_closed()
-    ensures
-        decide_content_authority_plan(normalize_content_authority(
-            ContentAuthorityRows::PeerSharedSigner {
-                row_count: 2,
-                all_signer_user_ids_equal: false,
-                representative_signer_matches_author: true,
-                malformed: false,
-            },
-        )) == ContentAuthorityPlan::Reject,
-{
-}
-
-proof fn content_authority_malformation_fails_closed()
-    ensures
-        decide_content_authority_plan(normalize_content_authority(
-            ContentAuthorityRows::PeerSharedSigner {
-                row_count: 1,
-                all_signer_user_ids_equal: true,
-                representative_signer_matches_author: true,
-                malformed: true,
-            },
-        )) == ContentAuthorityPlan::Reject,
-{
-}
-
-pub enum AdminAuthorityRows {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAuthorityRowsCore {
     MissingCurrentSigner,
     UnsupportedSignerType,
     WorkspaceSigner {
-        row_count: nat,
+        row_count: u64,
         all_user_keys_equal: bool,
         representative_key_matches_admin_key: bool,
         malformed: bool,
     },
 }
 
-pub enum AdminAuthorityDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAuthorityDecisionContextCore {
     UniqueUserKey { admin_key_matches_user_key: bool },
     RejectMissingCurrentSigner,
     RejectUnsupportedSignerType,
@@ -353,171 +249,94 @@ pub enum AdminAuthorityDecisionContext {
     RejectMalformedUserKey,
 }
 
-pub enum AdminAuthorityPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAuthorityPlanCore {
     Ready,
     Reject,
 }
 
-pub open spec fn normalize_admin_authority(
-    rows: AdminAuthorityRows,
-) -> AdminAuthorityDecisionContext {
+pub fn normalize_admin_authority_core(
+    rows: AdminAuthorityRowsCore,
+) -> (context: AdminAuthorityDecisionContextCore)
+    ensures
+        rows == AdminAuthorityRowsCore::MissingCurrentSigner
+            ==> context == AdminAuthorityDecisionContextCore::RejectMissingCurrentSigner,
+        rows == AdminAuthorityRowsCore::UnsupportedSignerType
+            ==> context == AdminAuthorityDecisionContextCore::RejectUnsupportedSignerType,
+{
     match rows {
-        AdminAuthorityRows::MissingCurrentSigner => {
-            AdminAuthorityDecisionContext::RejectMissingCurrentSigner
+        AdminAuthorityRowsCore::MissingCurrentSigner => {
+            AdminAuthorityDecisionContextCore::RejectMissingCurrentSigner
         }
-        AdminAuthorityRows::UnsupportedSignerType => {
-            AdminAuthorityDecisionContext::RejectUnsupportedSignerType
+        AdminAuthorityRowsCore::UnsupportedSignerType => {
+            AdminAuthorityDecisionContextCore::RejectUnsupportedSignerType
         }
-        AdminAuthorityRows::WorkspaceSigner {
+        AdminAuthorityRowsCore::WorkspaceSigner {
             row_count,
             all_user_keys_equal,
             representative_key_matches_admin_key,
             malformed,
         } => {
             if malformed {
-                AdminAuthorityDecisionContext::RejectMalformedUserKey
+                AdminAuthorityDecisionContextCore::RejectMalformedUserKey
             } else if row_count == 0 {
-                AdminAuthorityDecisionContext::RejectMissingUser
+                AdminAuthorityDecisionContextCore::RejectMissingUser
             } else if all_user_keys_equal {
-                AdminAuthorityDecisionContext::UniqueUserKey {
+                AdminAuthorityDecisionContextCore::UniqueUserKey {
                     admin_key_matches_user_key: representative_key_matches_admin_key,
                 }
             } else {
-                AdminAuthorityDecisionContext::RejectAmbiguousUser
+                AdminAuthorityDecisionContextCore::RejectAmbiguousUser
             }
         }
     }
 }
 
-pub open spec fn decide_admin_authority_plan(
-    context: AdminAuthorityDecisionContext,
-) -> AdminAuthorityPlan {
+pub fn decide_admin_authority_plan_core(
+    context: AdminAuthorityDecisionContextCore,
+) -> (plan: AdminAuthorityPlanCore)
+    ensures
+        context == (AdminAuthorityDecisionContextCore::UniqueUserKey {
+            admin_key_matches_user_key: true,
+        }) ==> plan == AdminAuthorityPlanCore::Ready,
+        context == (AdminAuthorityDecisionContextCore::UniqueUserKey {
+            admin_key_matches_user_key: false,
+        }) ==> plan == AdminAuthorityPlanCore::Reject,
+        context == AdminAuthorityDecisionContextCore::RejectMissingCurrentSigner
+            ==> plan == AdminAuthorityPlanCore::Reject,
+        context == AdminAuthorityDecisionContextCore::RejectUnsupportedSignerType
+            ==> plan == AdminAuthorityPlanCore::Reject,
+        context == AdminAuthorityDecisionContextCore::RejectMissingUser
+            ==> plan == AdminAuthorityPlanCore::Reject,
+        context == AdminAuthorityDecisionContextCore::RejectAmbiguousUser
+            ==> plan == AdminAuthorityPlanCore::Reject,
+        context == AdminAuthorityDecisionContextCore::RejectMalformedUserKey
+            ==> plan == AdminAuthorityPlanCore::Reject,
+{
     match context {
-        AdminAuthorityDecisionContext::UniqueUserKey { admin_key_matches_user_key } => {
+        AdminAuthorityDecisionContextCore::UniqueUserKey { admin_key_matches_user_key } => {
             if admin_key_matches_user_key {
-                AdminAuthorityPlan::Ready
+                AdminAuthorityPlanCore::Ready
             } else {
-                AdminAuthorityPlan::Reject
+                AdminAuthorityPlanCore::Reject
             }
         }
-        AdminAuthorityDecisionContext::RejectMissingCurrentSigner
-        | AdminAuthorityDecisionContext::RejectUnsupportedSignerType
-        | AdminAuthorityDecisionContext::RejectMissingUser
-        | AdminAuthorityDecisionContext::RejectAmbiguousUser
-        | AdminAuthorityDecisionContext::RejectMalformedUserKey => {
-            AdminAuthorityPlan::Reject
+        AdminAuthorityDecisionContextCore::RejectMissingCurrentSigner
+        | AdminAuthorityDecisionContextCore::RejectUnsupportedSignerType
+        | AdminAuthorityDecisionContextCore::RejectMissingUser
+        | AdminAuthorityDecisionContextCore::RejectAmbiguousUser
+        | AdminAuthorityDecisionContextCore::RejectMalformedUserKey => {
+            AdminAuthorityPlanCore::Reject
         }
     }
 }
 
-proof fn admin_authority_matching_key_is_ready()
-    ensures
-        decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::WorkspaceSigner {
-                row_count: 1,
-                all_user_keys_equal: true,
-                representative_key_matches_admin_key: true,
-                malformed: false,
-            },
-        )) == AdminAuthorityPlan::Ready,
-{
-}
+// ═══════════════════════════════════════════════════════════════════
+// Peer-shared authority
+// ═══════════════════════════════════════════════════════════════════
 
-proof fn admin_authority_duplicate_matching_rows_are_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-)
-    requires
-        row_count_a > 0,
-        row_count_b > 0,
-    ensures
-        decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::WorkspaceSigner {
-                row_count: row_count_a,
-                all_user_keys_equal: true,
-                representative_key_matches_admin_key: true,
-                malformed: false,
-            },
-        )) == decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::WorkspaceSigner {
-                row_count: row_count_b,
-                all_user_keys_equal: true,
-                representative_key_matches_admin_key: true,
-                malformed: false,
-            },
-        )),
-{
-}
-
-proof fn admin_authority_key_mismatch_rejects()
-    ensures
-        decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::WorkspaceSigner {
-                row_count: 1,
-                all_user_keys_equal: true,
-                representative_key_matches_admin_key: false,
-                malformed: false,
-            },
-        )) == AdminAuthorityPlan::Reject,
-{
-}
-
-proof fn admin_authority_missing_current_signer_rejects()
-    ensures
-        decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::MissingCurrentSigner,
-        )) == AdminAuthorityPlan::Reject,
-{
-}
-
-proof fn admin_authority_unsupported_signer_type_rejects()
-    ensures
-        decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::UnsupportedSignerType,
-        )) == AdminAuthorityPlan::Reject,
-{
-}
-
-proof fn admin_authority_missing_user_rejects()
-    ensures
-        decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::WorkspaceSigner {
-                row_count: 0,
-                all_user_keys_equal: true,
-                representative_key_matches_admin_key: true,
-                malformed: false,
-            },
-        )) == AdminAuthorityPlan::Reject,
-{
-}
-
-proof fn admin_authority_ambiguous_user_rejects()
-    ensures
-        decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::WorkspaceSigner {
-                row_count: 2,
-                all_user_keys_equal: false,
-                representative_key_matches_admin_key: true,
-                malformed: false,
-            },
-        )) == AdminAuthorityPlan::Reject,
-{
-}
-
-proof fn admin_authority_malformed_user_key_rejects()
-    ensures
-        decide_admin_authority_plan(normalize_admin_authority(
-            AdminAuthorityRows::WorkspaceSigner {
-                row_count: 1,
-                all_user_keys_equal: true,
-                representative_key_matches_admin_key: true,
-                malformed: true,
-            },
-        )) == AdminAuthorityPlan::Reject,
-{
-}
-
-pub enum PeerSharedAuthorityRows {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSharedAuthorityRowsCore {
     MissingCurrentSigner,
     UnsupportedSignerType,
     MissingDeviceInviteBlob,
@@ -525,7 +344,8 @@ pub enum PeerSharedAuthorityRows {
     UniqueAuthorizedUser { claimed_user_matches_authorized_user: bool },
 }
 
-pub enum PeerSharedAuthorityDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSharedAuthorityDecisionContextCore {
     UniqueAuthorizedUser { claimed_user_matches_authorized_user: bool },
     RejectMissingCurrentSigner,
     RejectUnsupportedSignerType,
@@ -533,121 +353,112 @@ pub enum PeerSharedAuthorityDecisionContext {
     RejectMalformedDeviceInvite,
 }
 
-pub enum PeerSharedAuthorityPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSharedAuthorityPlanCore {
     Ready,
     Reject,
 }
 
-pub open spec fn normalize_peer_shared_authority(
-    rows: PeerSharedAuthorityRows,
-) -> PeerSharedAuthorityDecisionContext {
+pub fn normalize_peer_shared_authority_core(
+    rows: PeerSharedAuthorityRowsCore,
+) -> (context: PeerSharedAuthorityDecisionContextCore)
+    ensures
+        rows == PeerSharedAuthorityRowsCore::MissingCurrentSigner
+            ==> context == PeerSharedAuthorityDecisionContextCore::RejectMissingCurrentSigner,
+        rows == PeerSharedAuthorityRowsCore::UnsupportedSignerType
+            ==> context == PeerSharedAuthorityDecisionContextCore::RejectUnsupportedSignerType,
+        rows == PeerSharedAuthorityRowsCore::MissingDeviceInviteBlob
+            ==> context == PeerSharedAuthorityDecisionContextCore::RejectMissingDeviceInviteBlob,
+        rows == PeerSharedAuthorityRowsCore::MalformedDeviceInvite
+            ==> context == PeerSharedAuthorityDecisionContextCore::RejectMalformedDeviceInvite,
+        rows == (PeerSharedAuthorityRowsCore::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user: true,
+        }) ==> context == (PeerSharedAuthorityDecisionContextCore::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user: true,
+        }),
+        rows == (PeerSharedAuthorityRowsCore::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user: false,
+        }) ==> context == (PeerSharedAuthorityDecisionContextCore::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user: false,
+        }),
+{
     match rows {
-        PeerSharedAuthorityRows::MissingCurrentSigner => {
-            PeerSharedAuthorityDecisionContext::RejectMissingCurrentSigner
+        PeerSharedAuthorityRowsCore::MissingCurrentSigner => {
+            PeerSharedAuthorityDecisionContextCore::RejectMissingCurrentSigner
         }
-        PeerSharedAuthorityRows::UnsupportedSignerType => {
-            PeerSharedAuthorityDecisionContext::RejectUnsupportedSignerType
+        PeerSharedAuthorityRowsCore::UnsupportedSignerType => {
+            PeerSharedAuthorityDecisionContextCore::RejectUnsupportedSignerType
         }
-        PeerSharedAuthorityRows::MissingDeviceInviteBlob => {
-            PeerSharedAuthorityDecisionContext::RejectMissingDeviceInviteBlob
+        PeerSharedAuthorityRowsCore::MissingDeviceInviteBlob => {
+            PeerSharedAuthorityDecisionContextCore::RejectMissingDeviceInviteBlob
         }
-        PeerSharedAuthorityRows::MalformedDeviceInvite => {
-            PeerSharedAuthorityDecisionContext::RejectMalformedDeviceInvite
+        PeerSharedAuthorityRowsCore::MalformedDeviceInvite => {
+            PeerSharedAuthorityDecisionContextCore::RejectMalformedDeviceInvite
         }
-        PeerSharedAuthorityRows::UniqueAuthorizedUser {
+        PeerSharedAuthorityRowsCore::UniqueAuthorizedUser {
             claimed_user_matches_authorized_user,
-        } => PeerSharedAuthorityDecisionContext::UniqueAuthorizedUser {
+        } => PeerSharedAuthorityDecisionContextCore::UniqueAuthorizedUser {
             claimed_user_matches_authorized_user,
         },
     }
 }
 
-pub open spec fn decide_peer_shared_authority_plan(
-    context: PeerSharedAuthorityDecisionContext,
-) -> PeerSharedAuthorityPlan {
+pub fn decide_peer_shared_authority_plan_core(
+    context: PeerSharedAuthorityDecisionContextCore,
+) -> (plan: PeerSharedAuthorityPlanCore)
+    ensures
+        context == (PeerSharedAuthorityDecisionContextCore::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user: true,
+        }) ==> plan == PeerSharedAuthorityPlanCore::Ready,
+        context == (PeerSharedAuthorityDecisionContextCore::UniqueAuthorizedUser {
+            claimed_user_matches_authorized_user: false,
+        }) ==> plan == PeerSharedAuthorityPlanCore::Reject,
+        context == PeerSharedAuthorityDecisionContextCore::RejectMissingCurrentSigner
+            ==> plan == PeerSharedAuthorityPlanCore::Reject,
+        context == PeerSharedAuthorityDecisionContextCore::RejectUnsupportedSignerType
+            ==> plan == PeerSharedAuthorityPlanCore::Reject,
+        context == PeerSharedAuthorityDecisionContextCore::RejectMissingDeviceInviteBlob
+            ==> plan == PeerSharedAuthorityPlanCore::Reject,
+        context == PeerSharedAuthorityDecisionContextCore::RejectMalformedDeviceInvite
+            ==> plan == PeerSharedAuthorityPlanCore::Reject,
+{
     match context {
-        PeerSharedAuthorityDecisionContext::UniqueAuthorizedUser {
+        PeerSharedAuthorityDecisionContextCore::UniqueAuthorizedUser {
             claimed_user_matches_authorized_user,
         } => {
             if claimed_user_matches_authorized_user {
-                PeerSharedAuthorityPlan::Ready
+                PeerSharedAuthorityPlanCore::Ready
             } else {
-                PeerSharedAuthorityPlan::Reject
+                PeerSharedAuthorityPlanCore::Reject
             }
         }
-        PeerSharedAuthorityDecisionContext::RejectMissingCurrentSigner
-        | PeerSharedAuthorityDecisionContext::RejectUnsupportedSignerType
-        | PeerSharedAuthorityDecisionContext::RejectMissingDeviceInviteBlob
-        | PeerSharedAuthorityDecisionContext::RejectMalformedDeviceInvite => {
-            PeerSharedAuthorityPlan::Reject
+        PeerSharedAuthorityDecisionContextCore::RejectMissingCurrentSigner
+        | PeerSharedAuthorityDecisionContextCore::RejectUnsupportedSignerType
+        | PeerSharedAuthorityDecisionContextCore::RejectMissingDeviceInviteBlob
+        | PeerSharedAuthorityDecisionContextCore::RejectMalformedDeviceInvite => {
+            PeerSharedAuthorityPlanCore::Reject
         }
     }
 }
 
-proof fn peer_shared_authority_matching_user_is_ready()
-    ensures
-        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
-            PeerSharedAuthorityRows::UniqueAuthorizedUser {
-                claimed_user_matches_authorized_user: true,
-            },
-        )) == PeerSharedAuthorityPlan::Ready,
-{
-}
+// ═══════════════════════════════════════════════════════════════════
+// Deletion signer
+// ═══════════════════════════════════════════════════════════════════
 
-proof fn peer_shared_authority_user_mismatch_rejects()
-    ensures
-        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
-            PeerSharedAuthorityRows::UniqueAuthorizedUser {
-                claimed_user_matches_authorized_user: false,
-            },
-        )) == PeerSharedAuthorityPlan::Reject,
-{
-}
-
-proof fn peer_shared_authority_missing_current_signer_rejects()
-    ensures
-        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
-            PeerSharedAuthorityRows::MissingCurrentSigner,
-        )) == PeerSharedAuthorityPlan::Reject,
-{
-}
-
-proof fn peer_shared_authority_unsupported_signer_type_rejects()
-    ensures
-        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
-            PeerSharedAuthorityRows::UnsupportedSignerType,
-        )) == PeerSharedAuthorityPlan::Reject,
-{
-}
-
-proof fn peer_shared_authority_missing_device_invite_rejects()
-    ensures
-        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
-            PeerSharedAuthorityRows::MissingDeviceInviteBlob,
-        )) == PeerSharedAuthorityPlan::Reject,
-{
-}
-
-proof fn peer_shared_authority_malformed_device_invite_rejects()
-    ensures
-        decide_peer_shared_authority_plan(normalize_peer_shared_authority(
-            PeerSharedAuthorityRows::MalformedDeviceInvite,
-        )) == PeerSharedAuthorityPlan::Reject,
-{
-}
-
-pub enum DeletionSignerRows {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionSignerRowsCore {
     MissingCurrentSigner,
     AdminSigner,
     UnsupportedSignerType,
     PeerSharedSigner {
-        row_count: nat,
+        row_count: u64,
         all_signer_user_ids_equal: bool,
         malformed: bool,
     },
 }
 
-pub enum DeletionSignerDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionSignerDecisionContextCore {
     AdminSigner,
     UniquePeerSharedSignerUser,
     RejectMissingCurrentSigner,
@@ -657,156 +468,90 @@ pub enum DeletionSignerDecisionContext {
     RejectMalformedSignerUser,
 }
 
-pub enum DeletionSignerPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionSignerPlanCore {
     ReadyAdmin,
     ReadyPeerSharedUser,
     Reject,
 }
 
-pub open spec fn normalize_deletion_signer(
-    rows: DeletionSignerRows,
-) -> DeletionSignerDecisionContext {
+pub fn normalize_deletion_signer_core(
+    rows: DeletionSignerRowsCore,
+) -> (context: DeletionSignerDecisionContextCore)
+    ensures
+        rows == DeletionSignerRowsCore::MissingCurrentSigner
+            ==> context == DeletionSignerDecisionContextCore::RejectMissingCurrentSigner,
+        rows == DeletionSignerRowsCore::AdminSigner
+            ==> context == DeletionSignerDecisionContextCore::AdminSigner,
+        rows == DeletionSignerRowsCore::UnsupportedSignerType
+            ==> context == DeletionSignerDecisionContextCore::RejectUnsupportedSignerType,
+{
     match rows {
-        DeletionSignerRows::MissingCurrentSigner => {
-            DeletionSignerDecisionContext::RejectMissingCurrentSigner
+        DeletionSignerRowsCore::MissingCurrentSigner => {
+            DeletionSignerDecisionContextCore::RejectMissingCurrentSigner
         }
-        DeletionSignerRows::AdminSigner => DeletionSignerDecisionContext::AdminSigner,
-        DeletionSignerRows::UnsupportedSignerType => {
-            DeletionSignerDecisionContext::RejectUnsupportedSignerType
+        DeletionSignerRowsCore::AdminSigner => DeletionSignerDecisionContextCore::AdminSigner,
+        DeletionSignerRowsCore::UnsupportedSignerType => {
+            DeletionSignerDecisionContextCore::RejectUnsupportedSignerType
         }
-        DeletionSignerRows::PeerSharedSigner {
+        DeletionSignerRowsCore::PeerSharedSigner {
             row_count,
             all_signer_user_ids_equal,
             malformed,
         } => {
             if malformed {
-                DeletionSignerDecisionContext::RejectMalformedSignerUser
+                DeletionSignerDecisionContextCore::RejectMalformedSignerUser
             } else if row_count == 0 {
-                DeletionSignerDecisionContext::RejectMissingSignerUser
+                DeletionSignerDecisionContextCore::RejectMissingSignerUser
             } else if all_signer_user_ids_equal {
-                DeletionSignerDecisionContext::UniquePeerSharedSignerUser
+                DeletionSignerDecisionContextCore::UniquePeerSharedSignerUser
             } else {
-                DeletionSignerDecisionContext::RejectAmbiguousSignerUser
+                DeletionSignerDecisionContextCore::RejectAmbiguousSignerUser
             }
         }
     }
 }
 
-pub open spec fn decide_deletion_signer_plan(
-    context: DeletionSignerDecisionContext,
-) -> DeletionSignerPlan {
+pub fn decide_deletion_signer_plan_core(
+    context: DeletionSignerDecisionContextCore,
+) -> (plan: DeletionSignerPlanCore)
+    ensures
+        context == DeletionSignerDecisionContextCore::AdminSigner
+            ==> plan == DeletionSignerPlanCore::ReadyAdmin,
+        context == DeletionSignerDecisionContextCore::UniquePeerSharedSignerUser
+            ==> plan == DeletionSignerPlanCore::ReadyPeerSharedUser,
+        context == DeletionSignerDecisionContextCore::RejectMissingCurrentSigner
+            ==> plan == DeletionSignerPlanCore::Reject,
+        context == DeletionSignerDecisionContextCore::RejectUnsupportedSignerType
+            ==> plan == DeletionSignerPlanCore::Reject,
+        context == DeletionSignerDecisionContextCore::RejectMissingSignerUser
+            ==> plan == DeletionSignerPlanCore::Reject,
+        context == DeletionSignerDecisionContextCore::RejectAmbiguousSignerUser
+            ==> plan == DeletionSignerPlanCore::Reject,
+        context == DeletionSignerDecisionContextCore::RejectMalformedSignerUser
+            ==> plan == DeletionSignerPlanCore::Reject,
+{
     match context {
-        DeletionSignerDecisionContext::AdminSigner => DeletionSignerPlan::ReadyAdmin,
-        DeletionSignerDecisionContext::UniquePeerSharedSignerUser => {
-            DeletionSignerPlan::ReadyPeerSharedUser
+        DeletionSignerDecisionContextCore::AdminSigner => DeletionSignerPlanCore::ReadyAdmin,
+        DeletionSignerDecisionContextCore::UniquePeerSharedSignerUser => {
+            DeletionSignerPlanCore::ReadyPeerSharedUser
         }
-        DeletionSignerDecisionContext::RejectMissingCurrentSigner
-        | DeletionSignerDecisionContext::RejectUnsupportedSignerType
-        | DeletionSignerDecisionContext::RejectMissingSignerUser
-        | DeletionSignerDecisionContext::RejectAmbiguousSignerUser
-        | DeletionSignerDecisionContext::RejectMalformedSignerUser => {
-            DeletionSignerPlan::Reject
+        DeletionSignerDecisionContextCore::RejectMissingCurrentSigner
+        | DeletionSignerDecisionContextCore::RejectUnsupportedSignerType
+        | DeletionSignerDecisionContextCore::RejectMissingSignerUser
+        | DeletionSignerDecisionContextCore::RejectAmbiguousSignerUser
+        | DeletionSignerDecisionContextCore::RejectMalformedSignerUser => {
+            DeletionSignerPlanCore::Reject
         }
     }
 }
 
-proof fn deletion_signer_admin_is_ready()
-    ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::AdminSigner,
-        )) == DeletionSignerPlan::ReadyAdmin,
-{
-}
+// ═══════════════════════════════════════════════════════════════════
+// Semantic type
+// ═══════════════════════════════════════════════════════════════════
 
-proof fn deletion_signer_peer_user_is_ready()
-    ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::PeerSharedSigner {
-                row_count: 1,
-                all_signer_user_ids_equal: true,
-                malformed: false,
-            },
-        )) == DeletionSignerPlan::ReadyPeerSharedUser,
-{
-}
-
-proof fn deletion_signer_duplicate_peer_user_rows_are_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-)
-    requires
-        row_count_a > 0,
-        row_count_b > 0,
-    ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::PeerSharedSigner {
-                row_count: row_count_a,
-                all_signer_user_ids_equal: true,
-                malformed: false,
-            },
-        )) == decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::PeerSharedSigner {
-                row_count: row_count_b,
-                all_signer_user_ids_equal: true,
-                malformed: false,
-            },
-        )),
-{
-}
-
-proof fn deletion_signer_missing_current_signer_rejects()
-    ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::MissingCurrentSigner,
-        )) == DeletionSignerPlan::Reject,
-{
-}
-
-proof fn deletion_signer_unsupported_type_rejects()
-    ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::UnsupportedSignerType,
-        )) == DeletionSignerPlan::Reject,
-{
-}
-
-proof fn deletion_signer_missing_user_rejects()
-    ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::PeerSharedSigner {
-                row_count: 0,
-                all_signer_user_ids_equal: true,
-                malformed: false,
-            },
-        )) == DeletionSignerPlan::Reject,
-{
-}
-
-proof fn deletion_signer_ambiguous_user_rejects()
-    ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::PeerSharedSigner {
-                row_count: 2,
-                all_signer_user_ids_equal: false,
-                malformed: false,
-            },
-        )) == DeletionSignerPlan::Reject,
-{
-}
-
-proof fn deletion_signer_malformed_user_rejects()
-    ensures
-        decide_deletion_signer_plan(normalize_deletion_signer(
-            DeletionSignerRows::PeerSharedSigner {
-                row_count: 1,
-                all_signer_user_ids_equal: true,
-                malformed: true,
-            },
-        )) == DeletionSignerPlan::Reject,
-{
-}
-
-pub enum SemanticTypeRows {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticTypeRowsCore {
     Missing,
     UniqueKnown {
         type_check_required: bool,
@@ -818,7 +563,8 @@ pub enum SemanticTypeRows {
     Malformed,
 }
 
-pub enum SemanticTypeDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticTypeDecisionContextCore {
     Missing,
     UniqueReady,
     RejectMissingType,
@@ -828,219 +574,117 @@ pub enum SemanticTypeDecisionContext {
     RejectMalformed,
 }
 
-pub enum SemanticTypePlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticTypePlanCore {
     DepMissing,
     DepReady,
     Reject,
 }
 
-pub struct DepLoadDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepLoadDecisionContextCore {
     pub purge_sensitive_dep_is_tombstoned: bool,
-    pub semantic_type_rows: SemanticTypeRows,
+    pub semantic_type_rows: SemanticTypeRowsCore,
 }
 
-pub enum DepLoadPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepLoadPlanCore {
     Purge,
     SemanticRowsReady,
     Missing,
 }
 
-pub open spec fn normalize_semantic_type(
-    rows: SemanticTypeRows,
-) -> SemanticTypeDecisionContext {
+pub fn normalize_semantic_type_core(
+    rows: SemanticTypeRowsCore,
+) -> (context: SemanticTypeDecisionContextCore)
+    ensures
+        rows == SemanticTypeRowsCore::Missing
+            ==> context == SemanticTypeDecisionContextCore::Missing,
+        rows == SemanticTypeRowsCore::Ambiguous
+            ==> context == SemanticTypeDecisionContextCore::RejectAmbiguous,
+        rows == SemanticTypeRowsCore::Malformed
+            ==> context == SemanticTypeDecisionContextCore::RejectMalformed,
+{
     match rows {
-        SemanticTypeRows::Missing => SemanticTypeDecisionContext::Missing,
-        SemanticTypeRows::UniqueKnown {
+        SemanticTypeRowsCore::Missing => SemanticTypeDecisionContextCore::Missing,
+        SemanticTypeRowsCore::UniqueKnown {
             type_check_required,
             code_present,
             code_in_range,
             allowed_by_dep_field,
         } => {
             if !code_present && type_check_required {
-                SemanticTypeDecisionContext::RejectMissingType
+                SemanticTypeDecisionContextCore::RejectMissingType
             } else if !code_present {
-                SemanticTypeDecisionContext::UniqueReady
+                SemanticTypeDecisionContextCore::UniqueReady
             } else if !code_in_range {
-                SemanticTypeDecisionContext::RejectOutOfRange
+                SemanticTypeDecisionContextCore::RejectOutOfRange
             } else if !type_check_required || allowed_by_dep_field {
-                SemanticTypeDecisionContext::UniqueReady
+                SemanticTypeDecisionContextCore::UniqueReady
             } else {
-                SemanticTypeDecisionContext::RejectWrongType
+                SemanticTypeDecisionContextCore::RejectWrongType
             }
         }
-        SemanticTypeRows::Ambiguous => SemanticTypeDecisionContext::RejectAmbiguous,
-        SemanticTypeRows::Malformed => SemanticTypeDecisionContext::RejectMalformed,
+        SemanticTypeRowsCore::Ambiguous => SemanticTypeDecisionContextCore::RejectAmbiguous,
+        SemanticTypeRowsCore::Malformed => SemanticTypeDecisionContextCore::RejectMalformed,
     }
 }
 
-pub open spec fn decide_semantic_type_plan(
-    context: SemanticTypeDecisionContext,
-) -> SemanticTypePlan {
+pub fn decide_semantic_type_plan_core(
+    context: SemanticTypeDecisionContextCore,
+) -> (plan: SemanticTypePlanCore)
+    ensures
+        context == SemanticTypeDecisionContextCore::Missing
+            ==> plan == SemanticTypePlanCore::DepMissing,
+        context == SemanticTypeDecisionContextCore::UniqueReady
+            ==> plan == SemanticTypePlanCore::DepReady,
+        context == SemanticTypeDecisionContextCore::RejectMissingType
+            ==> plan == SemanticTypePlanCore::Reject,
+        context == SemanticTypeDecisionContextCore::RejectWrongType
+            ==> plan == SemanticTypePlanCore::Reject,
+        context == SemanticTypeDecisionContextCore::RejectOutOfRange
+            ==> plan == SemanticTypePlanCore::Reject,
+        context == SemanticTypeDecisionContextCore::RejectAmbiguous
+            ==> plan == SemanticTypePlanCore::Reject,
+        context == SemanticTypeDecisionContextCore::RejectMalformed
+            ==> plan == SemanticTypePlanCore::Reject,
+{
     match context {
-        SemanticTypeDecisionContext::Missing => SemanticTypePlan::DepMissing,
-        SemanticTypeDecisionContext::UniqueReady => SemanticTypePlan::DepReady,
-        SemanticTypeDecisionContext::RejectMissingType
-        | SemanticTypeDecisionContext::RejectWrongType
-        | SemanticTypeDecisionContext::RejectOutOfRange
-        | SemanticTypeDecisionContext::RejectAmbiguous
-        | SemanticTypeDecisionContext::RejectMalformed => SemanticTypePlan::Reject,
+        SemanticTypeDecisionContextCore::Missing => SemanticTypePlanCore::DepMissing,
+        SemanticTypeDecisionContextCore::UniqueReady => SemanticTypePlanCore::DepReady,
+        SemanticTypeDecisionContextCore::RejectMissingType
+        | SemanticTypeDecisionContextCore::RejectWrongType
+        | SemanticTypeDecisionContextCore::RejectOutOfRange
+        | SemanticTypeDecisionContextCore::RejectAmbiguous
+        | SemanticTypeDecisionContextCore::RejectMalformed => SemanticTypePlanCore::Reject,
     }
 }
 
-proof fn semantic_type_allowed_is_ready()
+pub fn decide_dep_load_plan_core(
+    context: DepLoadDecisionContextCore,
+) -> (plan: DepLoadPlanCore)
     ensures
-        decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
-            type_check_required: true,
-            code_present: true,
-            code_in_range: true,
-            allowed_by_dep_field: true,
-        })) == SemanticTypePlan::DepReady,
+        context.purge_sensitive_dep_is_tombstoned ==> plan == DepLoadPlanCore::Purge,
+        (!context.purge_sensitive_dep_is_tombstoned
+         && context.semantic_type_rows == SemanticTypeRowsCore::Missing)
+            ==> plan == DepLoadPlanCore::Missing,
+        (!context.purge_sensitive_dep_is_tombstoned
+         && context.semantic_type_rows == SemanticTypeRowsCore::Ambiguous)
+            ==> plan == DepLoadPlanCore::SemanticRowsReady,
+        (!context.purge_sensitive_dep_is_tombstoned
+         && context.semantic_type_rows == SemanticTypeRowsCore::Malformed)
+            ==> plan == DepLoadPlanCore::SemanticRowsReady,
 {
-}
-
-proof fn semantic_type_untyped_missing_code_is_ready()
-    ensures
-        decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
-            type_check_required: false,
-            code_present: false,
-            code_in_range: true,
-            allowed_by_dep_field: false,
-        })) == SemanticTypePlan::DepReady,
-{
-}
-
-proof fn semantic_type_typed_missing_code_rejects()
-    ensures
-        decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
-            type_check_required: true,
-            code_present: false,
-            code_in_range: true,
-            allowed_by_dep_field: false,
-        })) == SemanticTypePlan::Reject,
-{
-}
-
-proof fn semantic_type_wrong_type_rejects()
-    ensures
-        decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
-            type_check_required: true,
-            code_present: true,
-            code_in_range: true,
-            allowed_by_dep_field: false,
-        })) == SemanticTypePlan::Reject,
-{
-}
-
-proof fn semantic_type_out_of_range_rejects()
-    ensures
-        decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::UniqueKnown {
-            type_check_required: true,
-            code_present: true,
-            code_in_range: false,
-            allowed_by_dep_field: true,
-        })) == SemanticTypePlan::Reject,
-{
-}
-
-proof fn semantic_type_malformed_rows_reject()
-    ensures
-        decide_semantic_type_plan(normalize_semantic_type(SemanticTypeRows::Malformed))
-            == SemanticTypePlan::Reject,
-{
-}
-
-pub open spec fn decide_dep_load_plan(
-    context: DepLoadDecisionContext,
-) -> DepLoadPlan {
     if context.purge_sensitive_dep_is_tombstoned {
-        DepLoadPlan::Purge
+        DepLoadPlanCore::Purge
     } else {
         match context.semantic_type_rows {
-            SemanticTypeRows::Missing => DepLoadPlan::Missing,
-            SemanticTypeRows::UniqueKnown { .. }
-            | SemanticTypeRows::Ambiguous
-            | SemanticTypeRows::Malformed => DepLoadPlan::SemanticRowsReady,
+            SemanticTypeRowsCore::Missing => DepLoadPlanCore::Missing,
+            SemanticTypeRowsCore::UniqueKnown { .. }
+            | SemanticTypeRowsCore::Ambiguous
+            | SemanticTypeRowsCore::Malformed => DepLoadPlanCore::SemanticRowsReady,
         }
     }
-}
-
-proof fn dep_load_tombstone_precedes_missing_semantic()
-    ensures
-        decide_dep_load_plan(DepLoadDecisionContext {
-            purge_sensitive_dep_is_tombstoned: true,
-            semantic_type_rows: SemanticTypeRows::Missing,
-        }) == DepLoadPlan::Purge,
-{
-}
-
-proof fn dep_load_tombstone_precedes_unique_semantic()
-    ensures
-        decide_dep_load_plan(DepLoadDecisionContext {
-            purge_sensitive_dep_is_tombstoned: true,
-            semantic_type_rows: SemanticTypeRows::UniqueKnown {
-                type_check_required: true,
-                code_present: true,
-                code_in_range: true,
-                allowed_by_dep_field: true,
-            },
-        }) == DepLoadPlan::Purge,
-{
-}
-
-proof fn dep_load_tombstone_precedes_ambiguous_semantic()
-    ensures
-        decide_dep_load_plan(DepLoadDecisionContext {
-            purge_sensitive_dep_is_tombstoned: true,
-            semantic_type_rows: SemanticTypeRows::Ambiguous,
-        }) == DepLoadPlan::Purge,
-{
-}
-
-proof fn dep_load_tombstone_precedes_malformed_semantic()
-    ensures
-        decide_dep_load_plan(DepLoadDecisionContext {
-            purge_sensitive_dep_is_tombstoned: true,
-            semantic_type_rows: SemanticTypeRows::Malformed,
-        }) == DepLoadPlan::Purge,
-{
-}
-
-proof fn dep_load_tombstone_noninterference_with_semantic_rows(
-    rows_a: SemanticTypeRows,
-    rows_b: SemanticTypeRows,
-)
-    ensures
-        decide_dep_load_plan(DepLoadDecisionContext {
-            purge_sensitive_dep_is_tombstoned: true,
-            semantic_type_rows: rows_a,
-        }) == decide_dep_load_plan(DepLoadDecisionContext {
-            purge_sensitive_dep_is_tombstoned: true,
-            semantic_type_rows: rows_b,
-        }),
-{
-}
-
-proof fn dep_load_missing_without_tombstone()
-    ensures
-        decide_dep_load_plan(DepLoadDecisionContext {
-            purge_sensitive_dep_is_tombstoned: false,
-            semantic_type_rows: SemanticTypeRows::Missing,
-        }) == DepLoadPlan::Missing,
-{
-}
-
-proof fn dep_load_unique_semantic_ready_without_tombstone()
-    ensures
-        decide_dep_load_plan(DepLoadDecisionContext {
-            purge_sensitive_dep_is_tombstoned: false,
-            semantic_type_rows: SemanticTypeRows::UniqueKnown {
-                type_check_required: true,
-                code_present: true,
-                code_in_range: true,
-                allowed_by_dep_field: true,
-            },
-        }) == DepLoadPlan::SemanticRowsReady,
-{
 }
 
 } // verus!

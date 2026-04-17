@@ -21,6 +21,16 @@ use crate::sync::session::receive_log::{
     ReceiveLogIngestWaiter, ReceiveLogWriter,
 };
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
+
+use topo_verus_proofs::runtime::sync_engine::session::range_session::{
+    decide_selected_dep_order_plan, decide_shared_send_eligibility_plan,
+    decide_shared_send_order_policy as decide_shared_send_order_policy_for_is_last_day,
+    normalize_selected_dep_order_context, normalize_shared_send_eligibility_context,
+    SelectedDepOrderPlan, SelectedDepOrderRawRows, SharedSendEligibilityPlan,
+    SharedSendEligibilityRawRows, SharedSendOrderPolicy,
+};
+#[cfg(test)]
+use topo_verus_proofs::runtime::sync_engine::session::range_session::SelectedDepOrderDecisionContext;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::{
@@ -238,48 +248,6 @@ pub struct LiveSuppressionReceiveState {
     remote_done_notified: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedSendOrderPolicy {
-    PreserveInput,
-    NewestFirst,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SharedSendEligibilityRawRows {
-    requested_by_reconciliation: bool,
-    present_in_workspace_index: bool,
-    shared_blob_available: bool,
-    transport_shareable: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SharedSendEligibilityDecisionContext {
-    requested_by_reconciliation: bool,
-    present_in_workspace_index: bool,
-    shared_blob_available: bool,
-    transport_shareable: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedSendEligibilityPlan {
-    SendRoot,
-    SkipRoot,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SelectedDepOrderRawRows {
-    dep_is_selected: bool,
-    dep_already_emitted: bool,
-    dep_currently_visiting: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SelectedDepOrderDecisionContext {
-    dep_is_selected: bool,
-    dep_already_emitted: bool,
-    dep_currently_visiting: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NegentropyStorageCacheKey {
     db_path: String,
@@ -295,64 +263,12 @@ struct NegentropyStorageCacheEntry {
     storage: Arc<NegentropyStorageVector>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectedDepOrderPlan {
-    EmitDepBeforeRoot,
-    SkipDepEdge,
-}
-
+/// Adapter: maps the runtime's `SyncWindowKind` enum to the is_last_day flag consumed by
+/// the SMT-verified `decide_shared_send_order_policy_for_is_last_day` planner. The
+/// SyncWindowKind enum is owned by the runtime crate and cannot cross into verus-proofs
+/// without a dependency cycle, so we project it to the minimal boolean here.
 fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
-    match kind {
-        SyncWindowKind::LastDay => SharedSendOrderPolicy::NewestFirst,
-        SyncWindowKind::Old | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
-            SharedSendOrderPolicy::PreserveInput
-        }
-    }
-}
-
-fn normalize_shared_send_eligibility_context(
-    raw_rows: SharedSendEligibilityRawRows,
-) -> SharedSendEligibilityDecisionContext {
-    SharedSendEligibilityDecisionContext {
-        requested_by_reconciliation: raw_rows.requested_by_reconciliation,
-        present_in_workspace_index: raw_rows.present_in_workspace_index,
-        shared_blob_available: raw_rows.shared_blob_available,
-        transport_shareable: raw_rows.transport_shareable,
-    }
-}
-
-fn decide_shared_send_eligibility_plan(
-    context: &SharedSendEligibilityDecisionContext,
-) -> SharedSendEligibilityPlan {
-    if context.requested_by_reconciliation
-        && context.present_in_workspace_index
-        && context.shared_blob_available
-        && context.transport_shareable
-    {
-        SharedSendEligibilityPlan::SendRoot
-    } else {
-        SharedSendEligibilityPlan::SkipRoot
-    }
-}
-
-fn normalize_selected_dep_order_context(
-    raw_rows: SelectedDepOrderRawRows,
-) -> SelectedDepOrderDecisionContext {
-    SelectedDepOrderDecisionContext {
-        dep_is_selected: raw_rows.dep_is_selected,
-        dep_already_emitted: raw_rows.dep_already_emitted,
-        dep_currently_visiting: raw_rows.dep_currently_visiting,
-    }
-}
-
-fn decide_selected_dep_order_plan(
-    context: &SelectedDepOrderDecisionContext,
-) -> SelectedDepOrderPlan {
-    if context.dep_is_selected && !context.dep_already_emitted && !context.dep_currently_visiting {
-        SelectedDepOrderPlan::EmitDepBeforeRoot
-    } else {
-        SelectedDepOrderPlan::SkipDepEdge
-    }
+    decide_shared_send_order_policy_for_is_last_day(matches!(kind, SyncWindowKind::LastDay))
 }
 
 fn load_shared_index_entries(

@@ -45,29 +45,47 @@ enum BootstrapSessionFallbackPlan {
     RejectAlreadyLocalWorkspaceCandidate,
 }
 
+/// Runtime wrapper: projects the runtime's payload-carrying Context to a Verus core tag,
+/// calls the SMT-verified `decide_bootstrap_session_fallback_core_plan`, and rehydrates
+/// the `BootstrapSessionFallback` payload for the `UseFallback` case. The decision-tag
+/// mapping is SMT-checked; the payload carry is trusted (no logic, just plumbing).
 fn decide_bootstrap_session_fallback_plan(
     context: &BootstrapSessionFallbackDecisionContext,
 ) -> BootstrapSessionFallbackPlan {
-    match context {
+    use topo_verus_proofs::runtime::peering::engine::bootstrap_auth as v;
+    let (core_ctx, payload) = match context {
         BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase => {
-            BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase
+            (v::BootstrapSessionFallbackCoreContext::RejectRequiresLocalBootstrapPhase, None)
         }
         BootstrapSessionFallbackDecisionContext::MissingCandidate => {
-            BootstrapSessionFallbackPlan::RejectMissingCandidate
+            (v::BootstrapSessionFallbackCoreContext::MissingCandidate, None)
         }
         BootstrapSessionFallbackDecisionContext::UniqueCandidate {
             fallback,
             workspace_already_local_before_candidate,
-        } => {
-            if *workspace_already_local_before_candidate {
-                BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate
-            } else {
-                BootstrapSessionFallbackPlan::UseFallback(fallback.clone())
-            }
-        }
+        } => (
+            v::BootstrapSessionFallbackCoreContext::UniqueCandidate {
+                workspace_already_local_before_candidate: *workspace_already_local_before_candidate,
+            },
+            Some(fallback.clone()),
+        ),
         BootstrapSessionFallbackDecisionContext::AmbiguousCandidate => {
-            BootstrapSessionFallbackPlan::RejectAmbiguousCandidate
+            (v::BootstrapSessionFallbackCoreContext::AmbiguousCandidate, None)
         }
+    };
+    match v::decide_bootstrap_session_fallback_core_plan(core_ctx) {
+        v::BootstrapSessionFallbackCorePlan::RejectRequiresLocalBootstrapPhase =>
+            BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase,
+        v::BootstrapSessionFallbackCorePlan::RejectMissingCandidate =>
+            BootstrapSessionFallbackPlan::RejectMissingCandidate,
+        v::BootstrapSessionFallbackCorePlan::UseFallback =>
+            BootstrapSessionFallbackPlan::UseFallback(
+                payload.expect("core said UseFallback but payload is missing"),
+            ),
+        v::BootstrapSessionFallbackCorePlan::RejectAmbiguousCandidate =>
+            BootstrapSessionFallbackPlan::RejectAmbiguousCandidate,
+        v::BootstrapSessionFallbackCorePlan::RejectAlreadyLocalWorkspaceCandidate =>
+            BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate,
     }
 }
 

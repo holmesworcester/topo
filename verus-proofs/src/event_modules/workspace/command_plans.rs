@@ -1,151 +1,122 @@
 //! Formal verification of workspace command planners that consume local daemon
 //! identity query results and decide whether invite/device flows may proceed.
+//!
+//! Every `pub fn` below is executable Rust consumed by
+//! `src/event_modules/workspace/command_plans.rs`. Postconditions (`ensures`) are
+//! SMT-checked against the function body by `cargo-verus verify`.
+//!
+//! Runtime carries `[u8; 32]` / `EventId` inside `Present { .. }` variants; this Verus
+//! core reduces each state/plan to a payload-less tag. The runtime wraps the core by
+//! projecting its rich variants down to tags, calling the verified dispatcher, then
+//! rehydrating the concrete payloads on the `Use*` branches.
 
 use vstd::prelude::*;
 
 verus! {
 
-pub enum ExplicitBootstrapEndpointState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitBootstrapEndpointStateCore {
     Absent,
-    Present { endpoint_id: nat },
+    Present,
     Invalid,
 }
 
-pub enum LocalDaemonEndpointState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDaemonEndpointStateCore {
     Missing,
-    Present { endpoint_id: nat },
+    Present,
     Malformed,
 }
 
-pub struct InviteBootstrapEndpointDecisionContext {
-    pub explicit_endpoint: ExplicitBootstrapEndpointState,
-    pub local_daemon_endpoint: LocalDaemonEndpointState,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InviteBootstrapEndpointDecisionContextCore {
+    pub explicit_endpoint: ExplicitBootstrapEndpointStateCore,
+    pub local_daemon_endpoint: LocalDaemonEndpointStateCore,
 }
 
-pub enum InviteBootstrapEndpointPlan {
-    UseExplicit { endpoint_id: nat },
-    UseLocalDaemon { endpoint_id: nat },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteBootstrapEndpointPlanCore {
+    UseExplicit,
+    UseLocalDaemon,
     RejectInvalidExplicit,
     RejectMissingLocalDaemonIdentity,
     RejectMalformedLocalDaemonIdentity,
 }
 
-pub enum LocalEndpointSharedState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalEndpointSharedStateCore {
     Missing,
-    Present { event_id: nat },
+    Present,
     Malformed,
 }
 
-pub struct LocalEndpointSharedDecisionContext {
-    pub local_endpoint_shared: LocalEndpointSharedState,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalEndpointSharedDecisionContextCore {
+    pub local_endpoint_shared: LocalEndpointSharedStateCore,
 }
 
-pub enum LocalEndpointSharedPlan {
-    UseLocalEndpointShared { event_id: nat },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalEndpointSharedPlanCore {
+    UseLocalEndpointShared,
     RejectMissingLocalDaemonIdentity,
     RejectMalformedLocalDaemonIdentity,
 }
 
-pub open spec fn decide_invite_bootstrap_endpoint_plan(
-    context: InviteBootstrapEndpointDecisionContext,
-) -> InviteBootstrapEndpointPlan {
+pub fn decide_invite_bootstrap_endpoint_plan_core(
+    context: InviteBootstrapEndpointDecisionContextCore,
+) -> (plan: InviteBootstrapEndpointPlanCore)
+    ensures
+        context.explicit_endpoint == ExplicitBootstrapEndpointStateCore::Present
+            ==> plan == InviteBootstrapEndpointPlanCore::UseExplicit,
+        context.explicit_endpoint == ExplicitBootstrapEndpointStateCore::Invalid
+            ==> plan == InviteBootstrapEndpointPlanCore::RejectInvalidExplicit,
+        (context.explicit_endpoint == ExplicitBootstrapEndpointStateCore::Absent
+         && context.local_daemon_endpoint == LocalDaemonEndpointStateCore::Present)
+            ==> plan == InviteBootstrapEndpointPlanCore::UseLocalDaemon,
+        (context.explicit_endpoint == ExplicitBootstrapEndpointStateCore::Absent
+         && context.local_daemon_endpoint == LocalDaemonEndpointStateCore::Missing)
+            ==> plan == InviteBootstrapEndpointPlanCore::RejectMissingLocalDaemonIdentity,
+        (context.explicit_endpoint == ExplicitBootstrapEndpointStateCore::Absent
+         && context.local_daemon_endpoint == LocalDaemonEndpointStateCore::Malformed)
+            ==> plan == InviteBootstrapEndpointPlanCore::RejectMalformedLocalDaemonIdentity,
+{
     match context.explicit_endpoint {
-        ExplicitBootstrapEndpointState::Present { endpoint_id } => {
-            InviteBootstrapEndpointPlan::UseExplicit { endpoint_id }
+        ExplicitBootstrapEndpointStateCore::Present => {
+            InviteBootstrapEndpointPlanCore::UseExplicit
         }
-        ExplicitBootstrapEndpointState::Invalid => {
-            InviteBootstrapEndpointPlan::RejectInvalidExplicit
+        ExplicitBootstrapEndpointStateCore::Invalid => {
+            InviteBootstrapEndpointPlanCore::RejectInvalidExplicit
         }
-        ExplicitBootstrapEndpointState::Absent => {
-            match context.local_daemon_endpoint {
-                LocalDaemonEndpointState::Present { endpoint_id } => {
-                    InviteBootstrapEndpointPlan::UseLocalDaemon { endpoint_id }
-                }
-                LocalDaemonEndpointState::Missing => {
-                    InviteBootstrapEndpointPlan::RejectMissingLocalDaemonIdentity
-                }
-                LocalDaemonEndpointState::Malformed => {
-                    InviteBootstrapEndpointPlan::RejectMalformedLocalDaemonIdentity
-                }
+        ExplicitBootstrapEndpointStateCore::Absent => match context.local_daemon_endpoint {
+            LocalDaemonEndpointStateCore::Present => {
+                InviteBootstrapEndpointPlanCore::UseLocalDaemon
             }
-        }
+            LocalDaemonEndpointStateCore::Missing => {
+                InviteBootstrapEndpointPlanCore::RejectMissingLocalDaemonIdentity
+            }
+            LocalDaemonEndpointStateCore::Malformed => {
+                InviteBootstrapEndpointPlanCore::RejectMalformedLocalDaemonIdentity
+            }
+        },
     }
 }
 
-pub open spec fn decide_local_endpoint_shared_plan(
-    context: LocalEndpointSharedDecisionContext,
-) -> LocalEndpointSharedPlan {
+pub fn decide_local_endpoint_shared_plan_core(
+    context: LocalEndpointSharedDecisionContextCore,
+) -> (plan: LocalEndpointSharedPlanCore)
+    ensures
+        context.local_endpoint_shared == LocalEndpointSharedStateCore::Present
+            ==> plan == LocalEndpointSharedPlanCore::UseLocalEndpointShared,
+        context.local_endpoint_shared == LocalEndpointSharedStateCore::Missing
+            ==> plan == LocalEndpointSharedPlanCore::RejectMissingLocalDaemonIdentity,
+        context.local_endpoint_shared == LocalEndpointSharedStateCore::Malformed
+            ==> plan == LocalEndpointSharedPlanCore::RejectMalformedLocalDaemonIdentity,
+{
     match context.local_endpoint_shared {
-        LocalEndpointSharedState::Present { event_id } => {
-            LocalEndpointSharedPlan::UseLocalEndpointShared { event_id }
-        }
-        LocalEndpointSharedState::Missing => {
-            LocalEndpointSharedPlan::RejectMissingLocalDaemonIdentity
-        }
-        LocalEndpointSharedState::Malformed => {
-            LocalEndpointSharedPlan::RejectMalformedLocalDaemonIdentity
-        }
+        LocalEndpointSharedStateCore::Present => LocalEndpointSharedPlanCore::UseLocalEndpointShared,
+        LocalEndpointSharedStateCore::Missing => LocalEndpointSharedPlanCore::RejectMissingLocalDaemonIdentity,
+        LocalEndpointSharedStateCore::Malformed => LocalEndpointSharedPlanCore::RejectMalformedLocalDaemonIdentity,
     }
-}
-
-proof fn explicit_bootstrap_endpoint_wins_even_without_local_daemon_identity(endpoint_id: nat)
-    ensures
-        decide_invite_bootstrap_endpoint_plan(InviteBootstrapEndpointDecisionContext {
-            explicit_endpoint: ExplicitBootstrapEndpointState::Present { endpoint_id },
-            local_daemon_endpoint: LocalDaemonEndpointState::Missing,
-        }) == (InviteBootstrapEndpointPlan::UseExplicit { endpoint_id }),
-{
-}
-
-proof fn missing_local_daemon_identity_rejects_bootstrap_without_explicit()
-    ensures
-        decide_invite_bootstrap_endpoint_plan(InviteBootstrapEndpointDecisionContext {
-            explicit_endpoint: ExplicitBootstrapEndpointState::Absent,
-            local_daemon_endpoint: LocalDaemonEndpointState::Missing,
-        }) == InviteBootstrapEndpointPlan::RejectMissingLocalDaemonIdentity,
-{
-}
-
-proof fn malformed_local_daemon_identity_rejects_bootstrap_without_explicit()
-    ensures
-        decide_invite_bootstrap_endpoint_plan(InviteBootstrapEndpointDecisionContext {
-            explicit_endpoint: ExplicitBootstrapEndpointState::Absent,
-            local_daemon_endpoint: LocalDaemonEndpointState::Malformed,
-        }) == InviteBootstrapEndpointPlan::RejectMalformedLocalDaemonIdentity,
-{
-}
-
-proof fn invalid_explicit_bootstrap_endpoint_rejects_even_if_local_daemon_exists(endpoint_id: nat)
-    ensures
-        decide_invite_bootstrap_endpoint_plan(InviteBootstrapEndpointDecisionContext {
-            explicit_endpoint: ExplicitBootstrapEndpointState::Invalid,
-            local_daemon_endpoint: LocalDaemonEndpointState::Present { endpoint_id },
-        }) == InviteBootstrapEndpointPlan::RejectInvalidExplicit,
-{
-}
-
-proof fn local_endpoint_shared_presence_is_required(event_id: nat)
-    ensures
-        decide_local_endpoint_shared_plan(LocalEndpointSharedDecisionContext {
-            local_endpoint_shared: LocalEndpointSharedState::Present { event_id },
-        }) == (LocalEndpointSharedPlan::UseLocalEndpointShared { event_id }),
-{
-}
-
-proof fn missing_local_endpoint_shared_rejects_command_paths()
-    ensures
-        decide_local_endpoint_shared_plan(LocalEndpointSharedDecisionContext {
-            local_endpoint_shared: LocalEndpointSharedState::Missing,
-        }) == LocalEndpointSharedPlan::RejectMissingLocalDaemonIdentity,
-{
-}
-
-proof fn malformed_local_endpoint_shared_rejects_command_paths()
-    ensures
-        decide_local_endpoint_shared_plan(LocalEndpointSharedDecisionContext {
-            local_endpoint_shared: LocalEndpointSharedState::Malformed,
-        }) == LocalEndpointSharedPlan::RejectMalformedLocalDaemonIdentity,
-{
 }
 
 } // verus!

@@ -14,6 +14,18 @@ pub enum ProjectionDecision {
     AlreadyProcessed,
 }
 
+/// Exec-friendly counterpart of ProjectionDecision using u32 for the missing
+/// dependency count. Used by executable abstract models in context_loading.rs
+/// and project_one.rs where SMT-checked postconditions must apply to function
+/// bodies the compiler actually runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionDecisionCore {
+    Valid,
+    Block { missing_count: u32 },
+    Reject,
+    AlreadyProcessed,
+}
+
 /// A decision is "permanently terminal" — the event will not be re-processed.
 pub open spec fn is_permanently_terminal(d: &ProjectionDecision) -> bool {
     match d {

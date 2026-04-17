@@ -33,42 +33,10 @@ pub(crate) enum DispatchAction {
     Reconnect,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BootstrapDialRawRows {
-    pub(crate) workspace_already_local_elsewhere: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BootstrapDialDecisionContext {
-    pub(crate) workspace_already_local_elsewhere: bool,
-}
-
-/// Bootstrap dial planning decision from a single DecisionContext.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BootstrapDialPlan {
-    /// The workspace is already present locally under another tenant, so link
-    /// bootstrap endpoint/address data must be ignored.
-    IgnoreAlreadyLocalWorkspace,
-    UseBootstrapTarget,
-}
-
-pub(crate) fn normalize_bootstrap_dial_decision_context(
-    raw_rows: BootstrapDialRawRows,
-) -> BootstrapDialDecisionContext {
-    BootstrapDialDecisionContext {
-        workspace_already_local_elsewhere: raw_rows.workspace_already_local_elsewhere,
-    }
-}
-
-pub(crate) fn decide_bootstrap_dial_plan(
-    context: &BootstrapDialDecisionContext,
-) -> BootstrapDialPlan {
-    if context.workspace_already_local_elsewhere {
-        BootstrapDialPlan::IgnoreAlreadyLocalWorkspace
-    } else {
-        BootstrapDialPlan::UseBootstrapTarget
-    }
-}
+pub(crate) use topo_verus_proofs::runtime::peering::engine::bootstrap_dialer::{
+    decide_bootstrap_dial_plan, normalize_bootstrap_dial_decision_context,
+    BootstrapDialDecisionContext, BootstrapDialPlan, BootstrapDialRawRows,
+};
 
 /// Tracks outbound targets and manages cancellation of stale connect loops.
 pub(crate) struct PeerDispatcher {

@@ -215,6 +215,18 @@ fn load_context_load_disposition_raw_rows(
 fn normalize_context_load_disposition(
     raw_rows: ContextLoadDispositionRawRows,
 ) -> ContextLoadDispositionDecisionContext {
+    // Tag-level shape preservation is verified by verus-proofs; the runtime
+    // wrapper carries over the rich payloads (missing Vec, reason String,
+    // message_event_id String).
+    use topo_verus_proofs::state::projection::stages::{
+        normalize_context_load_disposition_core, ContextLoadDispositionRawRowsCore,
+    };
+    let _core = normalize_context_load_disposition_core(match &raw_rows {
+        ContextLoadDispositionRawRows::Ready => ContextLoadDispositionRawRowsCore::Ready,
+        ContextLoadDispositionRawRows::Block { .. } => ContextLoadDispositionRawRowsCore::Block,
+        ContextLoadDispositionRawRows::Reject { .. } => ContextLoadDispositionRawRowsCore::Reject,
+        ContextLoadDispositionRawRows::Purge { .. } => ContextLoadDispositionRawRowsCore::Purge,
+    });
     match raw_rows {
         ContextLoadDispositionRawRows::Ready => ContextLoadDispositionDecisionContext::Ready,
         ContextLoadDispositionRawRows::Block { missing } => {
@@ -232,42 +244,77 @@ fn normalize_context_load_disposition(
 fn decide_context_load_disposition(
     context: &ContextLoadDispositionDecisionContext,
 ) -> ContextLoadDispositionPlan {
-    match context {
-        ContextLoadDispositionDecisionContext::Ready => ContextLoadDispositionPlan::Continue,
-        ContextLoadDispositionDecisionContext::Block { missing } => {
-            ContextLoadDispositionPlan::RecordBlockAndReturn {
-                missing: missing.clone(),
-            }
-        }
-        ContextLoadDispositionDecisionContext::Reject { reason } => {
-            ContextLoadDispositionPlan::Reject {
-                reason: reason.clone(),
-            }
-        }
-        ContextLoadDispositionDecisionContext::Purge { message_event_id } => {
-            ContextLoadDispositionPlan::EmitHardPurgeAndReturn {
-                message_event_id: message_event_id.clone(),
-            }
-        }
+    // The tag-level dispatch is verified in verus-proofs; runtime rehydrates
+    // the concrete payloads on each output branch.
+    use topo_verus_proofs::state::projection::stages::{
+        decide_context_load_disposition_core, ContextLoadDispositionDecisionContextCore,
+        ContextLoadDispositionPlanCore,
+    };
+    let core_plan = decide_context_load_disposition_core(match context {
+        ContextLoadDispositionDecisionContext::Ready => ContextLoadDispositionDecisionContextCore::Ready,
+        ContextLoadDispositionDecisionContext::Block { .. } => ContextLoadDispositionDecisionContextCore::Block,
+        ContextLoadDispositionDecisionContext::Reject { .. } => ContextLoadDispositionDecisionContextCore::Reject,
+        ContextLoadDispositionDecisionContext::Purge { .. } => ContextLoadDispositionDecisionContextCore::Purge,
+    });
+    match (core_plan, context) {
+        (ContextLoadDispositionPlanCore::Continue, _) => ContextLoadDispositionPlan::Continue,
+        (
+            ContextLoadDispositionPlanCore::RecordBlockAndReturn,
+            ContextLoadDispositionDecisionContext::Block { missing },
+        ) => ContextLoadDispositionPlan::RecordBlockAndReturn {
+            missing: missing.clone(),
+        },
+        (
+            ContextLoadDispositionPlanCore::Reject,
+            ContextLoadDispositionDecisionContext::Reject { reason },
+        ) => ContextLoadDispositionPlan::Reject {
+            reason: reason.clone(),
+        },
+        (
+            ContextLoadDispositionPlanCore::EmitHardPurgeAndReturn,
+            ContextLoadDispositionDecisionContext::Purge { message_event_id },
+        ) => ContextLoadDispositionPlan::EmitHardPurgeAndReturn {
+            message_event_id: message_event_id.clone(),
+        },
+        _ => unreachable!("verified core dispatch is tag-preserving"),
     }
 }
 
 fn decide_projection_decision_effect_plan(
     context: &ProjectionDecisionEffectDecisionContext,
 ) -> ProjectionDecisionEffectPlan {
-    match context {
+    use topo_verus_proofs::state::projection::stages::{
+        decide_projection_decision_effect_plan_core, ProjectionDecisionEffectDecisionContextCore,
+        ProjectionDecisionEffectPlanCore,
+    };
+    let core_plan = decide_projection_decision_effect_plan_core(match context {
         ProjectionDecisionEffectDecisionContext::Valid => {
+            ProjectionDecisionEffectDecisionContextCore::Valid
+        }
+        ProjectionDecisionEffectDecisionContext::Block { .. } => {
+            ProjectionDecisionEffectDecisionContextCore::Block
+        }
+        ProjectionDecisionEffectDecisionContext::Reject => {
+            ProjectionDecisionEffectDecisionContextCore::Reject
+        }
+        ProjectionDecisionEffectDecisionContext::AlreadyProcessed => {
+            ProjectionDecisionEffectDecisionContextCore::AlreadyProcessed
+        }
+    });
+    match (core_plan, context) {
+        (ProjectionDecisionEffectPlanCore::ApplyWriteOpsAndEmitCommands, _) => {
             ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands
         }
-        ProjectionDecisionEffectDecisionContext::Block { missing } => {
-            ProjectionDecisionEffectPlan::EmitCommandsOnly {
-                missing: missing.clone(),
-            }
-        }
-        ProjectionDecisionEffectDecisionContext::Reject
-        | ProjectionDecisionEffectDecisionContext::AlreadyProcessed => {
+        (
+            ProjectionDecisionEffectPlanCore::EmitCommandsOnly,
+            ProjectionDecisionEffectDecisionContext::Block { missing },
+        ) => ProjectionDecisionEffectPlan::EmitCommandsOnly {
+            missing: missing.clone(),
+        },
+        (ProjectionDecisionEffectPlanCore::NoEffects, _) => {
             ProjectionDecisionEffectPlan::NoEffects
         }
+        _ => unreachable!("verified core dispatch is tag-preserving"),
     }
 }
 

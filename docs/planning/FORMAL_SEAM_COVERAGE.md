@@ -4,6 +4,38 @@ This file indexes proof-bearing `RawRows -> DecisionContext -> Plan` seams.
 It is not a replacement for `docs/PLAN.md`; it is a working map for keeping
 runtime seams, Verus mirrors, and targeted checks aligned.
 
+## Proof model: ensures on real exec fns (not abstract mirrors)
+
+As of the `verus-real-proofs` work (branch of the same name), every
+migratable seam below has its decision/normalization logic living as an
+**executable `pub fn`** inside a `verus!` block in the `topo-verus-proofs`
+path-dep crate, with `requires`/`ensures` clauses that `cargo-verus verify`
+SMT-checks against the **actual function body**. The runtime crate
+(`topo`) imports and calls those verified functions — when the runtime's
+type shape carries `String`/`Option<RuntimeEnum>`/`Vec<RuntimeStruct>`
+payloads that cannot cross into `topo-verus-proofs` without cyclic deps,
+a **verified core + runtime adapter** pattern is used: the verified
+function takes a primitive-only "core" shape, and the runtime has a thin
+unverified adapter that projects runtime → core, calls the verified fn,
+and rehydrates payloads on the way out. The decision logic is SMT-checked;
+the plumbing is trusted (isolated, inspectable).
+
+A tamper test (intentionally flipping a function body) confirmed that
+`cargo-verus verify` reports `postcondition not satisfied` when the body
+diverges from the ensures — i.e., these are real proofs about the bodies
+the runtime executes, not parallel abstract mirrors. This check runs on
+every PR via `scripts/verus_tamper_test.sh` and the
+`.github/workflows/verus-verify.yml` `verus-tamper-test` job, so the
+SMT-on-real-bodies guarantee is a living invariant rather than a
+one-time measurement.
+
+Files where the pattern could not be fully grounded (cryptographic
+signature verification, async transport lifecycle, multi-fn protocol
+invariants) retain `spec fn`s with a `_spec` suffix or live in the
+**Abstract specifications (not grounded)** section below. These encode
+system-level intent rather than single-function correctness; they should
+not be mistaken for proofs about runtime code.
+
 ## Composition Invariant Keys
 
 - `UCA`: unique current authority or reject.
@@ -36,18 +68,21 @@ runtime seams, Verus mirrors, and targeted checks aligned.
 | Persist event fanout/index planning | `src/state/pipeline/phases.rs` | `verus-proofs/src/pipeline/persist_phase.rs` | workspace cache/query returns the tenant's accepted workspace binding; missing workspace binding suppresses index and fanout targets | `WC`, `ECP` | `cargo test -j1 --lib run_persist_phase -- --nocapture`; `cargo test -j1 --lib run_persist_phase_indexes_and_fanouts_shared_message_with_cached_workspace_binding -- --nocapture`; `cargo test -j1 --lib run_persist_phase_suppresses_shared_index_and_fanout_without_workspace_binding_for_shared_message -- --nocapture`; `cargo-verus verify` |
 | Workspace command endpoint planning | `src/event_modules/workspace/command_plans.rs` | `verus-proofs/src/event_modules/workspace/command_plans.rs` | explicit bootstrap endpoint decoding occurs before planner resolution; local endpoint-shared queries must either resolve one local daemon identity or reject | `AMF`, `ECP` | `cargo test -j1 --lib invite_bootstrap_plan_rejects_missing_local_daemon_identity_without_explicit -- --nocapture`; `cargo test -j1 --lib local_endpoint_shared_plan_rejects_missing_identity -- --nocapture`; `cargo test -j1 --lib resolve_invite_bootstrap_endpoint_id_rejects_missing_daemon_identity_without_explicit -- --nocapture`; `cargo-verus verify` |
 
-## Supporting Proof Modules
+## Abstract specifications (not grounded)
 
-These modules are verified by `cargo-verus verify`, but they are not themselves
-`RawRows -> DecisionContext -> Plan` seams. They provide abstract protocol,
-composition, and pipeline obligations that the seam-local proofs can cite or
-mirror. They are not standalone claims that SQL or runtime I/O conforms without
-the runtime tests named above.
+These modules are verified by `cargo-verus verify` in the sense that the SMT
+solver accepts the proofs *inside them*, but they are **not proofs about
+runtime code**. They encode system-level or cross-function invariants that
+no single runtime function body satisfies on its own. The grounded
+verification is provided by the seam-local ensures in the `Covered Seams`
+table above; the modules below are complementary specifications of intent.
+
+Do not read entries here as "the runtime is proven to have property X";
+read them as "property X is modeled in Verus and consistent with itself".
 
 | Area | Verus Mirror | Role | Check |
 | --- | --- | --- | --- |
-| Cross-seam composition | `verus-proofs/src/composition.rs` | Abstract obligations for `UCA`, `ALB`, `WC`, `AMF`, and `ECP` across planner/executor seams. | `cargo-verus verify` |
-| Bug-hunt models | `verus-proofs/src/bug_hunt.rs` | Counterexample-oriented models for known or suspected security edges. | `cargo-verus verify` |
+| Bug-hunt counterexamples | `verus-proofs/src/bug_hunt.rs` | Proofs documenting *known* runtime bugs (TTL skew extension, empty-missing blocks, TOCTOU races, etc.). These are not correctness claims — each `finding_*` demonstrates an undesired behavior that the current runtime still exhibits. When a bug is fixed, flip the counterexample into a positive invariant on the fixing seam and remove from this file. | `cargo-verus verify` |
 | Command support | `verus-proofs/src/event_modules/content_commands.rs`; `verus-proofs/src/event_modules/workspace_commands.rs`; `verus-proofs/src/runtime/control/commands.rs` | Abstract contracts for repo command families so command entry files have explicit proof mirrors and coverage inventory. | `cargo-verus verify` |
 | Projection pipeline support | `verus-proofs/src/pipeline/batch.rs`; `verus-proofs/src/pipeline/cascade.rs`; `verus-proofs/src/pipeline/commands.rs`; `verus-proofs/src/pipeline/contract.rs`; `verus-proofs/src/pipeline/data_ingestion.rs`; `verus-proofs/src/pipeline/decision.rs`; `verus-proofs/src/pipeline/dispatch.rs`; `verus-proofs/src/pipeline/idempotency.rs` | Abstract stage ordering, effect policy, idempotency, cascade, and command precondition models. | `cargo-verus verify` |
 | Core transport/session support | `verus-proofs/src/runtime/transport/connection_lifecycle.rs`; `verus-proofs/src/runtime/transport/connection_security.rs`; `verus-proofs/src/runtime/transport/session_auth.rs`; `verus-proofs/src/runtime/transport/transport_trust.rs` | Abstract connection lifecycle, auth TTL/binding, route-admission, and trust-source models. | `cargo-verus verify` |
@@ -59,6 +94,9 @@ When adding or changing a proof-bearing seam:
 
 - Keep the runtime shape explicit: `RawRows -> DecisionContext -> Plan -> executor`.
 - Keep SQL/query correctness in runtime tests; keep normalizer/planner invariants in Verus.
+- **Write normalizers/planners as `pub fn` inside `verus!` blocks with `ensures` clauses** — not as `spec fn` mirrors. The runtime imports them via `pub use topo_verus_proofs::…`. The SMT solver checks the body against the ensures; a body change that violates the postcondition fails `cargo-verus verify`.
+- **Adapter pattern** for runtime types that carry `String`/`Option<enum>`/`Vec<struct>` payloads: expose a primitives-only `*Core` shape in `verus-proofs`, keep the runtime's richer types local, wrap with a thin runtime adapter that projects-in/calls/projects-out. The decision logic is SMT-verified; the payload rehydration is trusted.
+- If a function body really cannot be verified (cryptographic primitives, async transport, true multi-fn emergent behavior), add its spec to the **Abstract specifications (not grounded)** section with a clear note, and rename any retained spec fns with a `_spec` suffix to make the distinction visible at call sites.
 - Add at least one targeted runtime check for the raw-row edge cases the Verus model abstracts.
 - Run `python3 scripts/check_formal_seam_coverage.py` after touching this map or a proof-bearing seam.
 - Run `python3 scripts/check_command_formal_coverage.py` after touching command/projector coverage.

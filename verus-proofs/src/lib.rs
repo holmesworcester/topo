@@ -8,7 +8,6 @@
 
 use vstd::prelude::*;
 
-pub mod composition;
 pub mod event_modules;
 pub mod pipeline;
 pub mod runtime;

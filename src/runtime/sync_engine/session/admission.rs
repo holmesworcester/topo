@@ -1,5 +1,10 @@
 use rusqlite::Connection;
 
+use topo_verus_proofs::runtime::sync_engine::session::sync_admission::{
+    decide_sync_admission_core_plan, normalize_sync_admission_core_context,
+    SyncAdmissionCoreDecisionContext, SyncAdmissionCorePlan, SyncAdmissionCoreRawRows,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyncAdmissionRawRows {
     pub(crate) workspace_ids: Vec<String>,
@@ -37,36 +42,74 @@ pub(crate) fn load_sync_admission_raw_rows(
     Ok(SyncAdmissionRawRows { workspace_ids })
 }
 
+/// Adapter: projects the runtime raw-rows shape (with its `Vec<String>` workspace_ids)
+/// onto the verified core's primitive shape, delegates to the SMT-checked normalizer,
+/// and lifts the resulting classification back to the runtime decision context by
+/// re-attaching the concrete workspace_id string when the binding is unique.
 pub(crate) fn normalize_sync_admission_decision_context(
     raw_rows: &SyncAdmissionRawRows,
 ) -> SyncAdmissionDecisionContext {
     let mut workspace_ids = raw_rows.workspace_ids.clone();
     workspace_ids.sort();
     workspace_ids.dedup();
-    match workspace_ids.as_slice() {
-        [] => SyncAdmissionDecisionContext::MissingWorkspaceBinding,
-        [workspace_id] => SyncAdmissionDecisionContext::UniqueWorkspaceBinding {
-            workspace_id: workspace_id.clone(),
-        },
-        _ => SyncAdmissionDecisionContext::AmbiguousWorkspaceBinding,
+    let row_count = u32::try_from(workspace_ids.len()).unwrap_or(u32::MAX);
+    // After dedup, all_workspace_ids_equal iff there is at most one distinct id.
+    let all_workspace_ids_equal = workspace_ids.len() <= 1;
+    let core = normalize_sync_admission_core_context(SyncAdmissionCoreRawRows {
+        row_count,
+        all_workspace_ids_equal,
+    });
+    match core {
+        SyncAdmissionCoreDecisionContext::MissingWorkspaceBinding => {
+            SyncAdmissionDecisionContext::MissingWorkspaceBinding
+        }
+        SyncAdmissionCoreDecisionContext::UniqueWorkspaceBinding => {
+            let workspace_id = workspace_ids
+                .into_iter()
+                .next()
+                .expect("core classifier reports unique binding but no workspace_id rows");
+            SyncAdmissionDecisionContext::UniqueWorkspaceBinding { workspace_id }
+        }
+        SyncAdmissionCoreDecisionContext::AmbiguousWorkspaceBinding => {
+            SyncAdmissionDecisionContext::AmbiguousWorkspaceBinding
+        }
     }
 }
 
+/// Adapter: dispatches on the runtime decision context, delegating the core classification
+/// to the SMT-verified `decide_sync_admission_core_plan` and re-attaching the workspace_id
+/// string to the runtime Start plan.
 pub(crate) fn decide_sync_admission_plan(
     context: &SyncAdmissionDecisionContext,
 ) -> SyncAdmissionPlan {
-    match context {
+    let core_context = match context {
         SyncAdmissionDecisionContext::MissingWorkspaceBinding => {
-            SyncAdmissionPlan::RejectMissingWorkspaceBinding
+            SyncAdmissionCoreDecisionContext::MissingWorkspaceBinding
         }
-        SyncAdmissionDecisionContext::UniqueWorkspaceBinding { workspace_id } => {
-            SyncAdmissionPlan::Start {
-                workspace_id: workspace_id.clone(),
-            }
+        SyncAdmissionDecisionContext::UniqueWorkspaceBinding { .. } => {
+            SyncAdmissionCoreDecisionContext::UniqueWorkspaceBinding
         }
         SyncAdmissionDecisionContext::AmbiguousWorkspaceBinding => {
+            SyncAdmissionCoreDecisionContext::AmbiguousWorkspaceBinding
+        }
+    };
+    match decide_sync_admission_core_plan(&core_context) {
+        SyncAdmissionCorePlan::RejectMissingWorkspaceBinding => {
+            SyncAdmissionPlan::RejectMissingWorkspaceBinding
+        }
+        SyncAdmissionCorePlan::RejectAmbiguousWorkspaceBinding => {
             SyncAdmissionPlan::RejectAmbiguousWorkspaceBinding
         }
+        SyncAdmissionCorePlan::Start => match context {
+            SyncAdmissionDecisionContext::UniqueWorkspaceBinding { workspace_id } => {
+                SyncAdmissionPlan::Start {
+                    workspace_id: workspace_id.clone(),
+                }
+            }
+            _ => unreachable!(
+                "verified core classifier returns Start only for UniqueWorkspaceBinding"
+            ),
+        },
     }
 }
 
