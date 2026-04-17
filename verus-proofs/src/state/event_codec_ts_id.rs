@@ -22,7 +22,6 @@ verus! {
 #[cfg(verus_keep_ghost)]
 use vstd::bytes::{spec_u64_from_le_bytes, spec_u64_to_le_bytes};
 
-
 pub const TS_ID_WIRE_SIZE: usize = 41;
 
 /// Spec model of the encoded blob.
@@ -37,51 +36,13 @@ pub fn encode_ts_id(type_byte: u8, ts: u64, id: &[u8; 32]) -> (out: Vec<u8>)
 {
     let mut buf: Vec<u8> = Vec::with_capacity(TS_ID_WIRE_SIZE);
     buf.push(type_byte);
-    let ts_bytes = u64_to_le_bytes(ts);
-    let mut i: usize = 0;
-    while i < 8
-        invariant
-            ts_bytes@ == spec_u64_to_le_bytes(ts),
-            ts_bytes@.len() == 8,
-            i <= 8,
-            buf@.len() == 1 + i as int,
-            buf@[0] == type_byte,
-            forall|k: int|
-                #![trigger buf@[k + 1]]
-                0 <= k < i as int ==> buf@[k + 1] == ts_bytes@[k],
-        decreases 8 - i,
-    {
-        buf.push(ts_bytes[i]);
-        i += 1;
-    }
-    let mut j: usize = 0;
-    while j < 32
-        invariant
-            ts_bytes@ == spec_u64_to_le_bytes(ts),
-            ts_bytes@.len() == 8,
-            j <= 32,
-            buf@.len() == 9 + j as int,
-            buf@[0] == type_byte,
-            forall|k: int|
-                #![trigger buf@[k + 1]]
-                0 <= k < 8 ==> buf@[k + 1] == ts_bytes@[k],
-            forall|k: int|
-                #![trigger buf@[k + 9]]
-                0 <= k < j as int ==> buf@[k + 9] == id@[k],
-        decreases 32 - j,
-    {
-        buf.push(id[j]);
-        j += 1;
-    }
+    let ts_bytes: Vec<u8> = u64_to_le_bytes(ts);
+    buf.extend_from_slice(ts_bytes.as_slice());
+    buf.extend_from_slice(id);
     proof {
-        assert(buf@.len() == 41);
-        let expected = ts_id_wire_spec(type_byte, ts, *id);
-        assert(expected.len() == 41);
-        assert(buf@.subrange(1, 9) =~= ts_bytes@);
-        assert(buf@.subrange(9, 41) =~= id@);
-        assert(expected.subrange(1, 9) =~= spec_u64_to_le_bytes(ts));
-        assert(expected.subrange(9, 41) =~= id@);
-        assert(buf@ =~= expected);
+        // After the three appends, buf@ = [type_byte] + ts_bytes@ + id@.
+        // ts_bytes@ == spec_u64_to_le_bytes(ts) (postcondition of u64_to_le_bytes).
+        assert(buf@ =~= ts_id_wire_spec(type_byte, ts, *id));
     }
     buf
 }
