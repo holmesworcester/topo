@@ -581,7 +581,8 @@ mod tests {
     #[cfg(feature = "iroh-transport")]
     use crate::transport::{
         accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
-        load_daemon_identity_from_db, multi_workspace::transport_sni,
+        load_daemon_identity_from_db, materialize_daemon_identity_from_db,
+        multi_workspace::transport_sni,
     };
 
     #[test]
@@ -732,6 +733,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let server_db = temp.path().join("server.sqlite3");
         let client_db = temp.path().join("client.sqlite3");
+        materialize_daemon_identity_from_db(server_db.to_str().unwrap())
+            .expect("materialize server identity");
+        materialize_daemon_identity_from_db(client_db.to_str().unwrap())
+            .expect("materialize client identity");
         let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
             server_db.to_str().unwrap(),
@@ -837,6 +842,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_a = temp.path().join("a.sqlite3");
         let db_b = temp.path().join("b.sqlite3");
+        materialize_daemon_identity_from_db(db_a.to_str().unwrap())
+            .expect("materialize a identity");
+        materialize_daemon_identity_from_db(db_b.to_str().unwrap())
+            .expect("materialize b identity");
         let ep_a = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
             db_a.to_str().unwrap(),
@@ -942,6 +951,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_a = temp.path().join("a.sqlite3");
         let db_b = temp.path().join("b.sqlite3");
+        materialize_daemon_identity_from_db(db_a.to_str().unwrap())
+            .expect("materialize a identity");
+        materialize_daemon_identity_from_db(db_b.to_str().unwrap())
+            .expect("materialize b identity");
         let ep_a = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
             db_a.to_str().unwrap(),
@@ -1072,6 +1085,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let server_db = temp.path().join("server.sqlite3");
         let client_db = temp.path().join("client.sqlite3");
+        materialize_daemon_identity_from_db(server_db.to_str().unwrap())
+            .expect("materialize server identity");
+        materialize_daemon_identity_from_db(client_db.to_str().unwrap())
+            .expect("materialize client identity");
         let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
             server_db.to_str().unwrap(),

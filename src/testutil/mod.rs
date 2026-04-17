@@ -3463,6 +3463,10 @@ impl SharedDbNode {
         // Ensure tables exist (idempotent)
         let db = open_connection(db_path).expect("failed to open db");
         create_tables(&db).expect("failed to create tables");
+        // Match Peer::new(): materialize the daemon endpoint_shared/secret so
+        // production workspace commands can resolve the daemon identity.
+        crate::transport::materialize_daemon_identity(&db)
+            .expect("failed to materialize daemon identity");
         drop(db);
 
         // We need a separate identity for each tenant. The first call to
