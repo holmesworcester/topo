@@ -33,8 +33,16 @@ impl super::super::Describe for DeviceInviteEvent {
 /// [9..41]    public_key (32 bytes)
 /// [41..73]   authority_event_id (32 bytes)
 pub fn parse_device_invite(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, public_key, authority_event_id)) =
+        topo_verus_proofs::state::event_codec_ts_id2::parse_ts_id2(EVENT_TYPE_DEVICE_INVITE, blob)
+    {
+        return Ok(ParsedEvent::DeviceInvite(DeviceInviteEvent {
+            created_at_ms: ts,
+            public_key,
+            authority_event_id,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_DEVICE_INVITE, DEVICE_INVITE_FIELDS, blob)?;
-
     Ok(ParsedEvent::DeviceInvite(DeviceInviteEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         public_key: values[1].as_event_id().unwrap(),
@@ -47,18 +55,12 @@ pub fn encode_device_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         ParsedEvent::DeviceInvite(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.public_key),
-        FieldValue::EventId(e.authority_event_id),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::state::event_codec_ts_id2::encode_ts_id2(
         EVENT_TYPE_DEVICE_INVITE,
-        DEVICE_INVITE_FIELDS,
-        &values,
-    )?)
+        e.created_at_ms,
+        &e.public_key,
+        &e.authority_event_id,
+    ))
 }
 
 pub static DEVICE_INVITE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
