@@ -110,6 +110,14 @@ Design guidance:
 
 Verus proof organization mirrors runtime ownership instead of living inline in production modules. The proof tree under `verus-proofs/src/` should follow the owning Rust module shape (`runtime/...`, `state/...`, `pipeline/...`) so proof modules can be reviewed with the code they model without adding verification-only syntax to hot production files. Inline proof-style code is reserved for tiny local helpers only when it materially improves readability.
 
+Operational enforcement of this proof shape is not implicit:
+
+1. the working seam inventory lives in `docs/planning/FORMAL_SEAM_COVERAGE.md`,
+2. repo command-entry coverage lives in `docs/planning/COMMAND_FORMAL_COVERAGE.md`,
+3. the primary merge-readiness gate is `scripts/run_merge_readiness_checks.sh targeted`,
+4. that gate must run the boundary coverage tests, projector-family coverage test, and strict Verus verification before the serial runtime regressions,
+5. new proof-bearing seams, command-entry files, and new non-module Verus sources are expected to fail that primary gate until their inventories and proof mirrors are updated.
+
 For the accepted-workspace guard specifically, the context query normalizes
 `invites_accepted` by distinct `workspace_id`: zero rows block on missing
 accepted-workspace state, one distinct workspace id is the accepted binding
@@ -2133,6 +2141,13 @@ This appendix holds concrete Rust file/module references so conceptual sections 
 ## 15.4 Formal verification (Verus)
 
 Machine-checked proofs live in `verus-proofs/`. Run via `scripts/run_verus_proofs.sh`.
+
+The design intent in this document is enforced operationally by:
+
+1. `docs/planning/FORMAL_SEAM_COVERAGE.md` for proof-bearing runtime seams,
+2. `docs/planning/COMMAND_FORMAL_COVERAGE.md` for repo command-entry coverage,
+3. `scripts/run_merge_readiness_checks.sh targeted` as the primary merge-readiness gate,
+4. strict Verus verification plus the boundary/projector coverage tests inside that gate.
 
 ## 16. TODO: Automatic misbehavior detection and participant removal
 
