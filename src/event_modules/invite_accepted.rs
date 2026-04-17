@@ -78,10 +78,10 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
 
 use crate::contracts::transport_identity_contract::TransportIdentitySpec;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{
+use crate::projection::projector::{
     EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
 };
-use crate::projection::queries::{ProjectionFrameContext, ProjectionQueries};
+use crate::projection::decision_context::{ProjectionFrameContext, ProjectionQueries};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -110,7 +110,7 @@ pub fn build_projector_context(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-) -> Result<crate::projection::queries::ContextLoadResult, Box<dyn std::error::Error>> {
+) -> Result<crate::projection::decision_context::ContextLoadResult, Box<dyn std::error::Error>> {
     let ia = match parsed {
         ParsedEvent::InviteAccepted(ia) => ia,
         _ => {
@@ -122,11 +122,11 @@ pub fn build_projector_context(
 
     let ctx = queries.load_invite_accepted_context(frame, recorded_by, event_id_b64, ia)?;
     if let Some(reason) = &ctx.invite_accepted_link_workspace_mismatch_reason {
-        return Ok(crate::projection::queries::ContextLoadResult::reject(
+        return Ok(crate::projection::decision_context::ContextLoadResult::reject(
             reason.clone(),
         ));
     }
-    Ok(crate::projection::queries::ContextLoadResult::ready(ctx))
+    Ok(crate::projection::decision_context::ContextLoadResult::ready(ctx))
 }
 
 /// Pure projector: InviteAccepted — local trust-anchor binding.

@@ -27,7 +27,7 @@ fn finding_2_empty_missing_block_records_no_dep_edges_and_cascade_cannot_resolve
     // Project the workspace event — should block (no invite binding)
     let result = project_one(&conn, recorded_by, &ws_eid).unwrap();
     assert!(
-        matches!(result, ProjectionDecision::Block { .. }),
+        matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }),
         "workspace event should block without invite binding, got {:?}",
         result
     );
@@ -109,7 +109,7 @@ fn finding_3_reblock_via_project_one_retry_preserves_stale_deps_remaining() {
 
     // First projection: blocks on both A and B
     let result = project_one(&conn, recorded_by, &bench_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::Block { .. }));
+    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     let deps_remaining: i64 = conn
         .query_row(
@@ -136,7 +136,7 @@ fn finding_3_reblock_via_project_one_retry_preserves_stale_deps_remaining() {
     // Call project_one directly for E (simulating a retry command).
     // B is still missing. record_block_rows will INSERT OR IGNORE.
     let retry_result = project_one(&conn, recorded_by, &bench_eid).unwrap();
-    assert!(matches!(retry_result, ProjectionDecision::Block { .. }));
+    assert!(matches!(retry_result, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Check: deps_remaining should match actual unique missing dep edge count.
     // Before fix: deps_remaining=1 but edge_count=2 (stale A edge + B edge).

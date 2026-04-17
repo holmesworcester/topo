@@ -37,7 +37,7 @@ fn test_multi_dep_event_projects_only_when_all_resolve() {
     // Project bench first — should block on both deps
     let result = project_one(&conn, recorded_by, &bench_eid).unwrap();
     assert!(
-        matches!(result, ProjectionDecision::Block { ref missing } if missing.len() == 2),
+        matches!(result, ProjectionDecision::BlockOnMissingDeps { ref missing } if missing.len() == 2),
         "should block on 2 missing deps, got {:?}",
         result
     );
@@ -102,7 +102,7 @@ fn test_cascade_and_direct_produce_same_state() {
     let rxn_eid_c = insert_event_raw(&conn_cascade, recorded_by, &rxn_blob_c);
     // Reaction should block (message not valid yet)
     let r = project_one(&conn_cascade, recorded_by, &rxn_eid_c).unwrap();
-    assert!(matches!(r, ProjectionDecision::Block { .. }));
+    assert!(matches!(r, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Now project message — should cascade and unblock reaction
     project_one(&conn_cascade, recorded_by, &msg_eid_c).unwrap();
@@ -174,7 +174,7 @@ fn test_encrypted_inner_dep_cascade_unblock() {
     // Project encrypted event — should block on missing key_event_id dep
     let r1 = project_one(&conn, recorded_by, &enc_eid).unwrap();
     assert!(
-        matches!(r1, ProjectionDecision::Block { .. }),
+        matches!(r1, ProjectionDecision::BlockOnMissingDeps { .. }),
         "encrypted should block on missing key, got {:?}",
         r1
     );
@@ -233,7 +233,7 @@ fn test_invite_accepted_guard_retry_on_workspace() {
     // Project workspace first — should be guard-blocked (no trust anchor yet)
     let r1 = project_one(&conn, recorded_by, &ws_eid).unwrap();
     assert!(
-        matches!(r1, ProjectionDecision::Block { ref missing } if missing.is_empty()),
+        matches!(r1, ProjectionDecision::BlockOnMissingDeps { ref missing } if missing.is_empty()),
         "workspace should be guard-blocked with empty missing, got {:?}",
         r1
     );
@@ -309,7 +309,7 @@ fn test_file_slice_dep_unblocks_after_cascaded_attachment() {
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
     let r1 = project_one(&conn, recorded_by, &att_eid).unwrap();
     assert!(
-        matches!(r1, ProjectionDecision::Block { .. }),
+        matches!(r1, ProjectionDecision::BlockOnMissingDeps { .. }),
         "attachment should block on missing message dep, got {:?}",
         r1
     );
@@ -320,7 +320,7 @@ fn test_file_slice_dep_unblocks_after_cascaded_attachment() {
     let r2 = project_one(&conn, recorded_by, &fs_eid).unwrap();
     // file_slice returns Block with file_id as the synthetic dep (no descriptor yet)
     assert!(
-        matches!(r2, ProjectionDecision::Block { ref missing } if !missing.is_empty()),
+        matches!(r2, ProjectionDecision::BlockOnMissingDeps { ref missing } if !missing.is_empty()),
         "file_slice should be blocked on file_id, got {:?}",
         r2
     );
@@ -456,7 +456,7 @@ fn test_source_isomorphism_message_reaction_chain() {
     let (_rxn_b, rxn_blob_b) = make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "thumbs_up");
     let _rxn_eid_b = insert_event_raw(&conn_b, recorded_by, &rxn_blob_b);
     let r = project_one(&conn_b, recorded_by, &_rxn_eid_b).unwrap();
-    assert!(matches!(r, ProjectionDecision::Block { .. }));
+    assert!(matches!(r, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Now project message — reaction should cascade to valid
     project_one(&conn_b, recorded_by, &msg_eid_b).unwrap();
@@ -544,7 +544,7 @@ fn test_source_isomorphism_encrypted_message() {
     );
     let enc_eid_b = insert_event_raw(&conn_b, recorded_by, &enc_blob_b);
     let r_b = project_one(&conn_b, recorded_by, &enc_eid_b).unwrap();
-    assert!(matches!(r_b, ProjectionDecision::Block { .. }));
+    assert!(matches!(r_b, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Now project key — encrypted should cascade to valid
     project_one(&conn_b, recorded_by, &sk_eid_b).unwrap();
@@ -829,7 +829,7 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
 
     // Phase 1: Project encrypted — blocks on key
     let r1 = project_one(&conn_b, recorded_by, &enc_eid_b).unwrap();
-    assert!(matches!(r1, ProjectionDecision::Block { .. }));
+    assert!(matches!(r1, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Phase 2: Project key — encrypted cascades decrypt, but inner blocks on message
     project_one(&conn_b, recorded_by, &sk_eid_b).unwrap();

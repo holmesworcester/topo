@@ -10,12 +10,12 @@ use crate::event_modules::{self as events, parse_event, ParsedEvent};
 use crate::projection::apply::{
     project_one::project_one_step_with_backend, ProjectionApplyResult, ProjectionBackend,
 };
-use crate::projection::contract::{
+use crate::projection::projector::{
     CurrentSignerInfo, DeletionIntentInfo, EmitCommand, FileDescriptorInfo,
     ProjectorDecisionContext, SqlVal, WriteOp,
 };
 use crate::projection::decision::ProjectionDecision;
-use crate::projection::queries::{
+use crate::projection::decision_context::{
     admin_authority_plan_to_mismatch_reason, build_workspace_projector_decision_context,
     content_authority_plan_to_signer_user_mismatch_reason, decide_admin_authority_plan,
     decide_content_authority_plan, decide_deletion_signer_plan, decide_peer_shared_authority_plan,
@@ -885,7 +885,7 @@ fn bootstrap_decision_context(
     state: &NodeBehaviorData,
     recorded_by: &str,
     invite_event_id_b64: &str,
-) -> Option<crate::projection::contract::BootstrapDecisionContext> {
+) -> Option<crate::projection::projector::BootstrapDecisionContext> {
     let mut rows = rows_for_recorded_matching(
         state,
         "bootstrap_context",
@@ -917,7 +917,7 @@ fn bootstrap_decision_context(
             addrs.insert(addr.to_string());
         }
     }
-    Some(crate::projection::contract::BootstrapDecisionContext {
+    Some(crate::projection::projector::BootstrapDecisionContext {
         workspace_id,
         bootstrap_addrs: addrs.into_iter().collect(),
         bootstrap_spki_fingerprint,
@@ -1636,7 +1636,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
             &key_shared.wrapped_key,
         );
         Ok(ProjectorDecisionContext {
-            unwrapped_secret_material: Some(crate::projection::contract::UnwrappedSecretMaterial {
+            unwrapped_secret_material: Some(crate::projection::projector::UnwrappedSecretMaterial {
                 key_bytes: plaintext_key,
             }),
             ..ProjectorDecisionContext::default()

@@ -112,7 +112,7 @@ fn test_dep_global_existence_not_sufficient() {
     // in valid_events for tenant_b, even though the blob exists in global events table
     let r2 = project_one(&conn, tenant_b, &rxn_eid).unwrap();
     match r2 {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert!(missing.contains(&msg_eid));
         }
         other => panic!("expected Block, got {:?}", other),
@@ -228,7 +228,7 @@ fn test_cross_tenant_signer_isolation() {
 
     // Project message for tenant_b — should BLOCK (signer dep not valid for B)
     let r_b = project_one(&conn, tenant_b, &msg_eid).unwrap();
-    assert!(matches!(r_b, ProjectionDecision::Block { .. }));
+    assert!(matches!(r_b, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Verify: messages has 1 row for A, 0 for B
     let sm_a: i64 = conn
@@ -344,7 +344,7 @@ fn test_two_tenant_contexts_single_db() {
     let (_rxn, rxn_blob) = make_reaction(&conn, tenant_b, &msg_a_eid, "\u{1f44d}");
     let rxn_eid = insert_event_raw(&conn, tenant_b, &rxn_blob);
     let r_rxn = project_one(&conn, tenant_b, &rxn_eid).unwrap();
-    assert!(matches!(r_rxn, ProjectionDecision::Block { .. }));
+    assert!(matches!(r_rxn, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Now record and project tenant_a's message for tenant_b.
     // The message's signed_by references tenant_a's signer, so tenant_b also needs
@@ -359,7 +359,7 @@ fn test_two_tenant_contexts_single_db() {
     // The message's signed_by references tenant_a's identity chain which is not valid for tenant_b.
     // So it will block. This is correct cross-tenant isolation behavior.
     assert!(
-        matches!(r_msg_for_b, ProjectionDecision::Block { .. }),
+        matches!(r_msg_for_b, ProjectionDecision::BlockOnMissingDeps { .. }),
         "message should block for tenant_b due to missing signer, got {:?}",
         r_msg_for_b
     );

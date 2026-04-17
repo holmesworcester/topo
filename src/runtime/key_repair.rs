@@ -18,7 +18,7 @@ use crate::event_modules::removal::{
 use crate::event_modules::workspace::identity_ops::current_removal_frontier_for_peer;
 use crate::event_modules::workspace::load_local_authoring_context;
 use crate::event_modules::{self as events, ParsedEvent};
-use crate::projection::create::create_signed_event_synchronous;
+use crate::projection::create::create_signed_event;
 use crate::projection::encrypted::wrap_key_for_recipient;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::state::db::transport_creds::discover_local_tenants;
@@ -363,7 +363,7 @@ fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> KeyRepairResu
             rusqlite::params![&event_id_b64],
             |row| row.get(0),
         )?;
-        let _ = create_signed_event_synchronous(
+        let _ = create_signed_event(
             &conn,
             recorded_by,
             &authoring.signer_event_id,
@@ -444,7 +444,7 @@ fn emit_key_shared_responses_for_peer(
             rusqlite::params![&event_id_b64],
             |row| row.get(0),
         )?;
-        let _ = create_signed_event_synchronous(
+        let _ = create_signed_event(
             &conn,
             recorded_by,
             &authoring.signer_event_id,

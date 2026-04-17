@@ -93,7 +93,7 @@ fn backfill_valid_event_semantic_types(conn: &Connection) -> SqliteResult<()> {
 
 use super::queue::{backoff_ms, current_timestamp_ms, recover_expired_leases, QueueHealth};
 
-pub struct ProjectQueue<'a> {
+pub struct ProjectionQueue<'a> {
     conn: &'a Connection,
 }
 
@@ -174,7 +174,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-impl<'a> ProjectQueue<'a> {
+impl<'a> ProjectionQueue<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
     }
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn test_enqueue_basic() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         let inserted = pq.enqueue("peer1", "event_abc").unwrap();
         assert!(inserted);
 
@@ -509,7 +509,7 @@ mod tests {
         )
         .unwrap();
 
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         let inserted = pq.enqueue("peer1", "event_abc").unwrap();
         assert!(!inserted, "should not enqueue if already valid");
     }
@@ -522,7 +522,7 @@ mod tests {
             [],
         ).unwrap();
 
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         let inserted = pq.enqueue("peer1", "event_abc").unwrap();
         assert!(!inserted, "should not enqueue if already rejected");
     }
@@ -535,7 +535,7 @@ mod tests {
             [],
         ).unwrap();
 
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         let inserted = pq.enqueue("peer1", "event_abc").unwrap();
         assert!(!inserted, "should not enqueue if already blocked");
     }
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn test_claim_and_done() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         pq.enqueue("peer1", "event_abc").unwrap();
 
         let claimed = pq.claim_batch("peer1", 10, 30_000).unwrap();
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn test_claim_respects_lease() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         pq.enqueue("peer1", "event_abc").unwrap();
 
         // Claim with long lease
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn test_retry_with_backoff() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         pq.enqueue("peer1", "event_abc").unwrap();
 
         // Claim and then retry
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn test_recover_expired_leases() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         pq.enqueue("peer1", "event_abc").unwrap();
 
         // Set lease to the past manually
@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn test_drain_processes_all() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
 
         // Enqueue multiple items
         pq.enqueue("peer1", "event_a").unwrap();
@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn test_drain_retries_failed_items() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
 
         pq.enqueue("peer1", "event_a").unwrap();
         pq.enqueue("peer1", "event_b").unwrap();
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn test_drain_stops_on_all_failures() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
 
         pq.enqueue("peer1", "event_a").unwrap();
         pq.enqueue("peer1", "event_b").unwrap();
@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn test_drain_atomicity_no_split_state() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
 
         pq.enqueue("peer1", "event_a").unwrap();
         pq.enqueue("peer1", "event_b").unwrap();
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn test_drain_preserves_projection_writes_on_projector_failure() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
 
         pq.enqueue("peer1", "event_a").unwrap();
         pq.enqueue("peer1", "event_b").unwrap();
@@ -861,7 +861,7 @@ mod tests {
     #[test]
     fn test_drain_failure_preserves_blocked_event_deps() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
 
         pq.enqueue("peer1", "event_blocked").unwrap();
 
@@ -907,7 +907,7 @@ mod tests {
     #[test]
     fn test_enqueue_batch() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
 
         // Put one in valid_events as guard test
         conn.execute(
@@ -936,7 +936,7 @@ mod tests {
     #[test]
     fn test_queue_health() {
         let conn = setup();
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
 
         // Empty queue health
         let h = pq.health("peer1").unwrap();
@@ -970,7 +970,7 @@ mod tests {
         insert_event(&conn, "message_old", "message", 100);
         insert_event(&conn, "bulk_new", "file_slice", 500);
 
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         pq.enqueue_batch("peer1", &["bulk_new", "message_old", "message_new"])
             .unwrap();
 
@@ -1002,7 +1002,7 @@ mod tests {
         insert_event_blob(&conn, "encrypted_bulk", "encrypted", encrypted_blob, 200);
         insert_event(&conn, "message_midflight", "message", 100);
 
-        let pq = ProjectQueue::new(&conn);
+        let pq = ProjectionQueue::new(&conn);
         pq.enqueue_batch("peer1", &["encrypted_bulk", "message_midflight"])
             .unwrap();
 

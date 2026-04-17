@@ -1,8 +1,8 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::event_modules::{EVENT_TYPE_PEER_SHARED, EVENT_TYPE_USER};
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
+use crate::event_modules::{EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::decision_context::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
@@ -11,39 +11,40 @@ pub fn build_projector_context(
     event_id_b64: &str,
     parsed: &ParsedEvent,
 ) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
-    let device_invite = match parsed {
-        ParsedEvent::DeviceInvite(device_invite) => device_invite,
-        _ => return Err("device_invite context loader called for non-device_invite event".into()),
+    let user_invite = match parsed {
+        ParsedEvent::UserInvite(user_invite) => user_invite,
+        _ => return Err("user_invite context loader called for non-user_invite event".into()),
     };
 
-    let ctx =
-        queries.load_device_invite_context(frame, recorded_by, event_id_b64, device_invite)?;
+    let ctx = queries.load_user_invite_context(frame, recorded_by, event_id_b64, user_invite)?;
     let Some(current_signer) = frame.current_signer.as_ref() else {
         return Ok(ContextLoadResult::reject(
-            "missing current signer envelope for device_invite",
+            "missing current signer envelope for user_invite",
         ));
     };
+    let workspace_b64 = event_id_to_base64(&user_invite.workspace_id);
     match current_signer.semantic_type_code {
-        EVENT_TYPE_USER
-            if event_id_to_base64(&device_invite.authority_event_id) != current_signer.event_id =>
+        EVENT_TYPE_WORKSPACE
+            if current_signer.event_id != workspace_b64
+                || user_invite.authority_event_id != user_invite.workspace_id =>
         {
             Ok(ContextLoadResult::reject(
-                "bootstrap device_invite authority must match signer user event",
+                "bootstrap user_invite must use workspace as signer and authority",
             ))
         }
         EVENT_TYPE_PEER_SHARED if ctx.invite_authority_matches_signer != Some(true) => {
             Ok(ContextLoadResult::reject(
-                "peer-signed device_invite authority does not match signer user identity",
+                "peer-signed user_invite authority does not match signer admin identity",
             ))
         }
-        EVENT_TYPE_USER | EVENT_TYPE_PEER_SHARED => Ok(ContextLoadResult::ready(ctx)),
+        EVENT_TYPE_WORKSPACE | EVENT_TYPE_PEER_SHARED => Ok(ContextLoadResult::ready(ctx)),
         _ => Ok(ContextLoadResult::reject(
-            "device_invite signer must be user or peer_shared",
+            "user_invite signer must be workspace or peer_shared",
         )),
     }
 }
 
-/// Pure projector: DeviceInvite -> device_invites table.
+/// Pure projector: UserInvite -> user_invites table.
 /// When bootstrap_context is available and this event is locally created,
 /// also write pending_invite_bootstrap_trust.
 pub fn project_pure(
@@ -53,12 +54,12 @@ pub fn project_pure(
     ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
     let (public_key, created_at_ms) = match parsed {
-        ParsedEvent::DeviceInvite(di) => (&di.public_key, di.created_at_ms as i64),
-        _ => return ProjectorResult::reject("not a device_invite event".to_string()),
+        ParsedEvent::UserInvite(ui) => (&ui.public_key, ui.created_at_ms as i64),
+        _ => return ProjectorResult::reject("not a user_invite event".to_string()),
     };
 
     let mut ops = vec![WriteOp::InsertOrIgnore {
-        table: "device_invites",
+        table: "user_invites",
         columns: vec!["recorded_by", "event_id", "public_key"],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
@@ -99,29 +100,31 @@ pub fn project_pure(
 }
 
 #[cfg(test)]
-mod device_invite_projector_tests {
+mod user_invite_projector_tests {
     use super::*;
     use crate::crypto::event_id_to_base64;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::event_modules::{DeviceInviteEvent, ParsedEvent, WorkspaceEvent};
-    use crate::projection::contract::{
+    use crate::event_modules::{ParsedEvent, UserInviteEvent, WorkspaceEvent};
+    use crate::projection::projector::{
         BootstrapDecisionContext, CurrentSignerInfo, ProjectorDecisionContext, WriteOp,
     };
     use crate::projection::decision::ProjectionDecision;
-    use crate::projection::queries::ProjectionFrameContext;
+    use crate::projection::decision_context::ProjectionFrameContext;
 
-    fn bootstrap_device_invite() -> ParsedEvent {
-        ParsedEvent::DeviceInvite(DeviceInviteEvent {
+    fn bootstrap_user_invite() -> ParsedEvent {
+        ParsedEvent::UserInvite(UserInviteEvent {
             created_at_ms: 1,
             public_key: [9u8; 32],
+            workspace_id: [2u8; 32],
             authority_event_id: [2u8; 32],
         })
     }
 
-    fn peer_signed_device_invite() -> ParsedEvent {
-        ParsedEvent::DeviceInvite(DeviceInviteEvent {
+    fn peer_signed_user_invite() -> ParsedEvent {
+        ParsedEvent::UserInvite(UserInviteEvent {
             created_at_ms: 1,
             public_key: [9u8; 32],
+            workspace_id: [2u8; 32],
             authority_event_id: [4u8; 32],
         })
     }
@@ -144,11 +147,22 @@ mod device_invite_projector_tests {
     }
 
     #[test]
-    fn test_device_invite_writes_pending_trust() {
+    fn test_user_invite_basic_valid() {
         let result = project_pure(
             "peer1",
             "invite-event",
-            &bootstrap_device_invite(),
+            &bootstrap_user_invite(),
+            &ProjectorDecisionContext::default(),
+        );
+        assert_valid(&result, 1);
+    }
+
+    #[test]
+    fn test_user_invite_writes_pending_trust() {
+        let result = project_pure(
+            "peer1",
+            "invite-event",
+            &bootstrap_user_invite(),
             &local_bootstrap_ctx(),
         );
         assert_valid(&result, 2);
@@ -159,20 +173,21 @@ mod device_invite_projector_tests {
     }
 
     #[test]
-    fn test_device_invite_no_pending_when_not_local() {
+    fn test_user_invite_no_pending_when_not_local() {
         let mut ctx = local_bootstrap_ctx();
         ctx.is_local_create = false;
 
-        let result = project_pure("peer1", "invite-event", &bootstrap_device_invite(), &ctx);
+        let result = project_pure("peer1", "invite-event", &bootstrap_user_invite(), &ctx);
         assert_valid(&result, 1);
     }
 
     #[test]
-    fn test_device_invite_rejects_bootstrap_authority_mismatch() {
-        let event = ParsedEvent::DeviceInvite(DeviceInviteEvent {
+    fn test_user_invite_rejects_bootstrap_signer_mismatch() {
+        let event = ParsedEvent::UserInvite(UserInviteEvent {
             created_at_ms: 1,
             public_key: [9u8; 32],
-            authority_event_id: [6u8; 32],
+            workspace_id: [2u8; 32],
+            authority_event_id: [2u8; 32],
         });
         let conn = open_in_memory().expect("open db");
         create_tables(&conn).expect("create tables");
@@ -180,8 +195,8 @@ mod device_invite_projector_tests {
             &conn,
             &ProjectionFrameContext {
                 current_signer: Some(CurrentSignerInfo {
-                    event_id: event_id_to_base64(&[2u8; 32]),
-                    semantic_type_code: EVENT_TYPE_USER,
+                    event_id: event_id_to_base64(&[7u8; 32]),
+                    semantic_type_code: EVENT_TYPE_WORKSPACE,
                 }),
                 ..ProjectionFrameContext::default()
             },
@@ -193,12 +208,43 @@ mod device_invite_projector_tests {
         assert!(matches!(
             result,
             ContextLoadResult::Reject { ref reason }
-                if reason.contains("bootstrap device_invite authority must match signer user event")
+                if reason.contains("bootstrap user_invite must use workspace as signer and authority")
         ));
     }
 
     #[test]
-    fn test_device_invite_rejects_peer_signed_authority_mismatch() {
+    fn test_user_invite_rejects_bootstrap_authority_mismatch() {
+        let event = ParsedEvent::UserInvite(UserInviteEvent {
+            created_at_ms: 1,
+            public_key: [9u8; 32],
+            workspace_id: [2u8; 32],
+            authority_event_id: [6u8; 32],
+        });
+        let conn = open_in_memory().expect("open db");
+        create_tables(&conn).expect("create tables");
+        let result = build_projector_context(
+            &conn,
+            &ProjectionFrameContext {
+                current_signer: Some(CurrentSignerInfo {
+                    event_id: event_id_to_base64(&[2u8; 32]),
+                    semantic_type_code: EVENT_TYPE_WORKSPACE,
+                }),
+                ..ProjectionFrameContext::default()
+            },
+            "peer1",
+            "invite-event",
+            &event,
+        )
+        .expect("context load");
+        assert!(matches!(
+            result,
+            ContextLoadResult::Reject { ref reason }
+                if reason.contains("bootstrap user_invite must use workspace as signer and authority")
+        ));
+    }
+
+    #[test]
+    fn test_user_invite_rejects_peer_signed_authority_mismatch() {
         let conn = open_in_memory().expect("open db");
         create_tables(&conn).expect("create tables");
         let result = build_projector_context(
@@ -212,18 +258,18 @@ mod device_invite_projector_tests {
             },
             "peer1",
             "invite-event",
-            &peer_signed_device_invite(),
+            &peer_signed_user_invite(),
         )
         .expect("context load");
         assert!(matches!(
             result,
             ContextLoadResult::Reject { ref reason }
-                if reason.contains("peer-signed device_invite authority does not match signer user identity")
+                if reason.contains("peer-signed user_invite authority does not match signer admin identity")
         ));
     }
 
     #[test]
-    fn test_device_invite_rejects_non_device_invite_event() {
+    fn test_user_invite_rejects_non_user_invite_event() {
         let other = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 1,
             public_key: [0u8; 32],

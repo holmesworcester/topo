@@ -13,8 +13,8 @@ mod tests {
         build_projector_context, project_pure, InviteAcceptedEvent,
     };
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::{EmitCommand, SqlVal, WriteOp};
-    use topo::projection::queries::ProjectionFrameContext;
+    use topo::projection::projector::{EmitCommand, SqlVal, WriteOp};
+    use topo::projection::decision_context::ProjectionFrameContext;
 
     const PEER: &str = "peer_joiner";
 

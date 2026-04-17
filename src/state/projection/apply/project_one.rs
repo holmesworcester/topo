@@ -84,7 +84,7 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
             backend.record_rejection(recorded_by, &event_id_b64, reason)?;
             return Ok((decision, Some(parsed)));
         }
-        ProjectionDecision::Block { ref missing } => {
+        ProjectionDecision::BlockOnMissingDeps { ref missing } => {
             backend.mark_guard_blocked(&event_id_b64)?;
             let _ = missing;
             return Ok((decision, Some(parsed)));

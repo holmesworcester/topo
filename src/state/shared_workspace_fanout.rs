@@ -4,7 +4,7 @@ use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::store::{insert_recorded_event, lookup_workspace_id};
 use crate::event_modules::ShareScope;
 use crate::projection::apply::project_one;
-use crate::state::db::project_queue::ProjectQueue;
+use crate::state::db::projection_queue::ProjectionQueue;
 
 const FANOUT_SOURCE_PREFIX: &str = "same_workspace_fanout";
 
@@ -531,7 +531,7 @@ pub(crate) fn fanout_shared_event_enqueue(
     conn: &Connection,
     fanout: &SharedEventFanout,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let pq = ProjectQueue::new(conn);
+    let pq = ProjectionQueue::new(conn);
     let event_id_b64 = event_id_to_base64(&fanout.event_id);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?

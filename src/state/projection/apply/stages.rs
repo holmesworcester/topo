@@ -6,8 +6,8 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
-use crate::projection::contract::EmitCommand;
-use crate::projection::queries::{
+use crate::projection::projector::EmitCommand;
+use crate::projection::decision_context::{
     decide_semantic_type_plan, normalize_semantic_type, ContextLoadResult, DepLoadResult,
     ProjectionFrameContext, SemanticTypePlan,
 };
@@ -276,7 +276,7 @@ fn load_projection_decision_effect_raw_rows(
 ) -> ProjectionDecisionEffectRawRows {
     match decision {
         ProjectionDecision::Valid => ProjectionDecisionEffectRawRows::Valid,
-        ProjectionDecision::Block { missing } => ProjectionDecisionEffectRawRows::Block {
+        ProjectionDecision::BlockOnMissingDeps { missing } => ProjectionDecisionEffectRawRows::Block {
             missing: missing.clone(),
         },
         ProjectionDecision::Reject { .. } => ProjectionDecisionEffectRawRows::Reject,
@@ -412,7 +412,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
             if !missing.is_empty() {
                 backend.record_block(recorded_by, event_id_b64, &missing)?;
             }
-            return Ok((ProjectionDecision::Block { missing }, None, false));
+            return Ok((ProjectionDecision::BlockOnMissingDeps { missing }, None, false));
         }
         ContextLoadDispositionPlan::Reject { reason } => {
             return Ok((ProjectionDecision::Reject { reason }, None, false));
@@ -771,7 +771,7 @@ mod tests {
     fn projection_decision_effect_plan_does_not_apply_writes_for_blocks() {
         let missing = vec![[0x22; 32]];
         let context = normalize_projection_decision_effect_context(
-            load_projection_decision_effect_raw_rows(&ProjectionDecision::Block {
+            load_projection_decision_effect_raw_rows(&ProjectionDecision::BlockOnMissingDeps {
                 missing: missing.clone(),
             }),
         );

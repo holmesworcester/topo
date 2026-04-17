@@ -1,6 +1,6 @@
 use crate::crypto::event_id_from_base64;
 use crate::db::open_connection;
-use crate::db::project_queue::ProjectQueue;
+use crate::db::projection_queue::ProjectionQueue;
 use crate::projection::apply::project_one;
 use crate::tuning::low_mem_mode;
 
@@ -35,7 +35,7 @@ pub(super) fn drain_project_queue_on_connection(
         let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 0");
     }
 
-    let pq = ProjectQueue::new(db);
+    let pq = ProjectionQueue::new(db);
     let tenant = tenant_id.to_string();
 
     let result = pq.drain_with_limit(&tenant, batch_size, |conn, event_id_b64| {

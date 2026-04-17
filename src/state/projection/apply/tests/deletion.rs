@@ -1709,7 +1709,7 @@ fn test_hard_purge_failure_rolls_back_and_retries_from_project_queue() {
     let msg_b64 = event_id_to_base64(&msg_eid);
     let rxn_b64 = event_id_to_base64(&rxn_eid);
 
-    let pq = crate::state::db::project_queue::ProjectQueue::new(&conn);
+    let pq = crate::state::db::projection_queue::ProjectionQueue::new(&conn);
     pq.enqueue(recorded_by, &del_b64).unwrap();
 
     crate::state::projection::purge::set_test_fail_after_steps(Some(2));

@@ -50,8 +50,8 @@ pub(crate) use crate::event_modules::{
 use crate::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
 use crate::projection::apply::project_one;
 use crate::projection::create::{
-    create_encrypted_event_staged, create_encrypted_event_synchronous, create_event_staged,
-    create_event_synchronous, create_signed_event_staged, create_signed_event_synchronous,
+    create_encrypted_event_staged, create_encrypted_event, create_event_staged,
+    create_event, create_signed_event_staged, create_signed_event,
     event_id_or_blocked, CreateEventError,
 };
 pub(crate) use crate::state::db::queue::current_timestamp_ms_u64;
@@ -1259,7 +1259,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms_u64(),
             key_bytes,
         });
-        create_event_synchronous(&db, &self.identity, &sk).expect("failed to create key_secret")
+        create_event(&db, &self.identity, &sk).expect("failed to create key_secret")
     }
 
     /// Create a KeySecret event with deterministic key bytes and timestamp.
@@ -1275,7 +1275,7 @@ impl Peer {
             created_at_ms,
             key_bytes,
         });
-        create_event_synchronous(&db, &self.identity, &sk).expect("failed to create key_secret")
+        create_event(&db, &self.identity, &sk).expect("failed to create key_secret")
     }
 
     /// Create an encrypted message. The inner message is signed with the PeerShared key,
@@ -1307,7 +1307,7 @@ impl Peer {
             // SQLITE_BUSY so realistic graph tests remain stable under the
             // default cargo scheduler.
             let _ = db.busy_timeout(Duration::from_secs(30));
-            match event_id_or_blocked(create_encrypted_event_synchronous(
+            match event_id_or_blocked(create_encrypted_event(
                 &db,
                 &self.identity,
                 key_event_id,
@@ -1385,7 +1385,7 @@ impl Peer {
             public_key,
             name: "test-workspace".to_string(),
         });
-        create_event_synchronous(&db, &self.identity, &ws)
+        create_event(&db, &self.identity, &ws)
     }
 
     /// Record the local invite-link workspace binding that InviteAccepted
@@ -1419,7 +1419,7 @@ impl Peer {
             invite_event_id: *invite_event_id,
             workspace_id,
         });
-        create_event_synchronous(&db, &self.identity, &ia)
+        create_event(&db, &self.identity, &ia)
             .expect("failed to create invite_accepted")
     }
 
@@ -1437,7 +1437,7 @@ impl Peer {
             invite_event_id: *invite_event_id,
             workspace_id,
         });
-        create_event_synchronous(&db, &self.identity, &ia)
+        create_event(&db, &self.identity, &ia)
     }
 
     fn ensure_local_tenant_event_id(&self, db: &rusqlite::Connection) -> EventId {
@@ -1457,7 +1457,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms_u64(),
             public_key: peer_key.verifying_key().to_bytes(),
         });
-        create_event_synchronous(db, &self.identity, &tenant_evt).expect("failed to create tenant")
+        create_event(db, &self.identity, &tenant_evt).expect("failed to create tenant")
     }
 
     /// Create a UserInvite event (signed by workspace key). Returns the event ID.
@@ -1595,7 +1595,7 @@ impl Peer {
             public_key: admin_public_key,
             user_event_id: *user_event_id,
         });
-        create_signed_event_synchronous(&db, &self.identity, workspace_id, &evt, signing_key)
+        create_signed_event(&db, &self.identity, workspace_id, &evt, signing_key)
             .expect("failed to create admin")
     }
 
@@ -1631,7 +1631,7 @@ impl Peer {
             unwrap_key_event_id: *unwrap_key_event_id,
             wrapped_key,
         });
-        create_signed_event_synchronous(
+        create_signed_event(
             &db,
             &self.identity,
             peer_shared_event_id,
@@ -1654,7 +1654,7 @@ impl Peer {
                 author_id: self.author_id,
                 content: format!("Message {} from {}", i, self.name),
             });
-            event_id_or_blocked(create_encrypted_event_synchronous(
+            event_id_or_blocked(create_encrypted_event(
                 &db,
                 &self.identity,
                 &key_event_id,
@@ -1684,7 +1684,7 @@ impl Peer {
                 author_id: self.author_id,
                 content: format!("Spread message {} from {}", i, self.name),
             });
-            event_id_or_blocked(create_encrypted_event_synchronous(
+            event_id_or_blocked(create_encrypted_event(
                 &db,
                 &self.identity,
                 &key_event_id,

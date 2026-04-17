@@ -9,7 +9,7 @@ mod tests {
     use topo::event_modules::reaction::ReactionEvent;
     use topo::event_modules::reaction::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::queries::ProjectionFrameContext;
+    use topo::projection::decision_context::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "rxn_event_1";
@@ -28,7 +28,7 @@ mod tests {
     #[test]
     fn test_reaction_valid() {
         let parsed = make_reaction();
-        let ctx = topo::projection::contract::ProjectorDecisionContext {
+        let ctx = topo::projection::projector::ProjectorDecisionContext {
             current_owner_event_id: Some(b64(&[1u8; 32])),
             ..Default::default()
         };
@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn test_reaction_rejects_owner_mismatch() {
         let parsed = make_reaction();
-        let ctx = topo::projection::contract::ProjectorDecisionContext {
+        let ctx = topo::projection::projector::ProjectorDecisionContext {
             current_owner_event_id: Some(b64(&[9u8; 32])),
             ..Default::default()
         };

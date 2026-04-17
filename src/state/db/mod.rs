@@ -7,7 +7,7 @@ pub mod local_client_ops;
 pub mod need_queue;
 pub mod negentropy_cache;
 pub mod observability;
-pub mod project_queue;
+pub mod projection_queue;
 pub mod queue;
 pub mod schema;
 pub mod sql_types;
@@ -112,7 +112,7 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     dep_index::ensure_schema(conn)?;
     event_display::ensure_schema(conn)?;
     iroh_log::ensure_schema(conn)?;
-    project_queue::ensure_schema(conn)?;
+    projection_queue::ensure_schema(conn)?;
     health::ensure_schema(conn)?;
     negentropy_cache::ensure_schema(conn)?;
     sync_log::ensure_schema(conn)?;

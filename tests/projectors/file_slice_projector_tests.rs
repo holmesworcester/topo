@@ -12,8 +12,8 @@ mod tests {
     use topo::event_modules::file_slice::FileSliceEvent;
     use topo::event_modules::file_slice::{build_projector_context, project_pure};
     use topo::event_modules::{ParsedEvent, EVENT_TYPE_FILE_SLICE};
-    use topo::projection::contract::FileDescriptorInfo;
-    use topo::projection::queries::ProjectionFrameContext;
+    use topo::projection::projector::FileDescriptorInfo;
+    use topo::projection::decision_context::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "fs_event_1";
@@ -50,7 +50,7 @@ mod tests {
         let parsed = make_file_slice([1u8; 32]);
         let mut ctx = empty_ctx(); // no file_descriptors
         ctx.current_owner_event_id = Some(b64(&[9u8; 32]));
-        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+        ctx.current_signer = Some(topo::projection::projector::CurrentSignerInfo {
             event_id: b64(&[3u8; 32]),
             semantic_type_code: EVENT_TYPE_FILE_SLICE,
         });
@@ -69,11 +69,11 @@ mod tests {
     fn test_file_slice_context_purges_when_owner_message_deleted() {
         let parsed = make_file_slice([1u8; 32]);
         let root_message = b64(&[9u8; 32]);
-        let queries = queries_with_ctx(topo::projection::contract::ProjectorDecisionContext {
+        let queries = queries_with_ctx(topo::projection::projector::ProjectorDecisionContext {
             purge_message_event_id: Some(root_message.clone()),
             file_descriptors: vec![descriptor(&root_message, &b64(&[3u8; 32]), "key_1")],
             current_owner_event_id: Some(root_message.clone()),
-            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+            current_signer: Some(topo::projection::projector::CurrentSignerInfo {
                 event_id: b64(&[3u8; 32]),
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,
             }),
@@ -95,10 +95,10 @@ mod tests {
     fn test_file_slice_context_ready_when_owner_message_live() {
         let parsed = make_file_slice([1u8; 32]);
         let root_message = b64(&[9u8; 32]);
-        let queries = queries_with_ctx(topo::projection::contract::ProjectorDecisionContext {
+        let queries = queries_with_ctx(topo::projection::projector::ProjectorDecisionContext {
             file_descriptors: vec![descriptor(&root_message, &b64(&[3u8; 32]), "key_1")],
             current_owner_event_id: Some(root_message),
-            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+            current_signer: Some(topo::projection::projector::CurrentSignerInfo {
                 event_id: b64(&[3u8; 32]),
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,
             }),
@@ -128,7 +128,7 @@ mod tests {
         let parsed = make_file_slice([1u8; 32]);
         let mut ctx = ctx_with_file_descriptors(vec![descriptor(&owner_b64, &signer_b64, "key_1")]);
         ctx.current_owner_event_id = Some(owner_b64);
-        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+        ctx.current_signer = Some(topo::projection::projector::CurrentSignerInfo {
             event_id: b64(&signer),
             semantic_type_code: EVENT_TYPE_FILE_SLICE,
         });
@@ -148,7 +148,7 @@ mod tests {
         let mut ctx =
             ctx_with_file_descriptors(vec![descriptor(&owner_b64, &different_signer_b64, "key_1")]);
         ctx.current_owner_event_id = Some(owner_b64);
-        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+        ctx.current_signer = Some(topo::projection::projector::CurrentSignerInfo {
             event_id: b64(&[3u8; 32]),
             semantic_type_code: EVENT_TYPE_FILE_SLICE,
         });
@@ -165,7 +165,7 @@ mod tests {
         let mut ctx =
             ctx_with_file_descriptors(vec![descriptor(&b64(&[8u8; 32]), &signer_b64, "key_1")]);
         ctx.current_owner_event_id = Some(b64(&[9u8; 32]));
-        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+        ctx.current_signer = Some(topo::projection::projector::CurrentSignerInfo {
             event_id: b64(&signer),
             semantic_type_code: EVENT_TYPE_FILE_SLICE,
         });
@@ -180,10 +180,10 @@ mod tests {
         let signer_b64 = b64(&signer);
         let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
-        let ctx = topo::projection::contract::ProjectorDecisionContext {
+        let ctx = topo::projection::projector::ProjectorDecisionContext {
             file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_expected")],
             current_owner_event_id: Some(owner_b64),
-            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+            current_signer: Some(topo::projection::projector::CurrentSignerInfo {
                 event_id: b64(&signer),
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,
             }),
@@ -203,10 +203,10 @@ mod tests {
         let signer_b64 = b64(&signer);
         let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
-        let ctx = topo::projection::contract::ProjectorDecisionContext {
+        let ctx = topo::projection::projector::ProjectorDecisionContext {
             file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_1")],
             current_owner_event_id: Some(owner_b64),
-            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+            current_signer: Some(topo::projection::projector::CurrentSignerInfo {
                 event_id: b64(&signer),
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,
             }),
@@ -226,10 +226,10 @@ mod tests {
         let signer_b64 = b64(&signer);
         let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
-        let ctx = topo::projection::contract::ProjectorDecisionContext {
+        let ctx = topo::projection::projector::ProjectorDecisionContext {
             file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_1")],
             current_owner_event_id: Some(owner_b64),
-            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+            current_signer: Some(topo::projection::projector::CurrentSignerInfo {
                 event_id: b64(&signer),
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,
             }),

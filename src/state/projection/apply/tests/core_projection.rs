@@ -138,7 +138,7 @@ fn key_shared_blocks_on_missing_frontier_then_projects() {
 
     let decision = project_one(&conn, recorded_by, &key_shared_eid).unwrap();
     match decision {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert!(
                 missing.contains(&removal_eid),
                 "missing frontier dep expected"
@@ -619,7 +619,7 @@ fn test_project_reaction_blocked() {
 
     let result = project_one(&conn, recorded_by, &rxn_eid).unwrap();
     match result {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             // May block on fake_target (and possibly signed_by dep)
             assert!(missing.contains(&fake_target));
         }
@@ -668,7 +668,7 @@ fn test_project_unblock_cascade() {
 
     // Project reaction — should block
     let result = project_one(&conn, recorded_by, &rxn_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::Block { .. }));
+    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Now insert and project the message
     let msg_eid2 = insert_event_raw(&conn, recorded_by, &msg_blob);
@@ -748,7 +748,7 @@ fn test_duplicate_dep_ids_unblock_correctly() {
     insert_event_raw(&conn, recorded_by, &root_blob);
     insert_event_raw(&conn, recorded_by, &dup_blob);
     let result = project_one(&conn, recorded_by, &dup_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::Block { .. }));
+    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // deps_remaining must be 1 (unique), not 2 (raw)
     let dup_b64 = event_id_to_base64(&dup_eid);
@@ -833,11 +833,11 @@ fn test_multi_blocker() {
     // Both should block
     assert!(matches!(
         project_one(&conn, recorded_by, &rxn1_eid).unwrap(),
-        ProjectionDecision::Block { .. }
+        ProjectionDecision::BlockOnMissingDeps { .. }
     ));
     assert!(matches!(
         project_one(&conn, recorded_by, &rxn2_eid).unwrap(),
-        ProjectionDecision::Block { .. }
+        ProjectionDecision::BlockOnMissingDeps { .. }
     ));
 
     // Insert msg1 — rxn1 unblocks, rxn2 stays blocked
