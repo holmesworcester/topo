@@ -7,8 +7,8 @@
 pub mod fixtures {
     use topo::event_modules::{
         AdminEvent, DeviceInviteEvent, FileEvent, FileSliceEvent, InviteAcceptedEvent,
-        KeyRequestEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
-        UserInviteEvent, WorkspaceEvent,
+        KeyRequestEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent,
+        ReactionEvent, UserInviteEvent, WorkspaceEvent,
     };
     use topo::projection::projector::{
         BootstrapDecisionContext, CurrentSignerInfo, EmitCommand, FileDescriptorInfo,

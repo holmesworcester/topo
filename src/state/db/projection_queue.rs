@@ -26,6 +26,14 @@ fn project_queue_has_column(conn: &Connection, column: &str) -> SqliteResult<boo
     Ok(names.iter().any(|name| name == column))
 }
 
+fn blocked_events_has_column(conn: &Connection, column: &str) -> SqliteResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(blocked_events)")?;
+    let names = stmt
+        .query_map([], |row| get_text(row, 1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
 fn load_project_priority(
     conn: &Connection,
     event_id_b64: &str,
@@ -128,6 +136,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE TABLE IF NOT EXISTS blocked_events (
             peer_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
+            workspace_id TEXT,
             deps_remaining INTEGER NOT NULL,
             PRIMARY KEY (peer_id, event_id)
         );
@@ -167,6 +176,12 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     if !project_queue_has_column(conn, "priority_ts")? {
         conn.execute(
             "ALTER TABLE project_queue ADD COLUMN priority_ts INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !blocked_events_has_column(conn, "workspace_id")? {
+        conn.execute(
+            "ALTER TABLE blocked_events ADD COLUMN workspace_id TEXT",
             [],
         )?;
     }

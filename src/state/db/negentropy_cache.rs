@@ -43,6 +43,11 @@ fn covered_week_epoch_bounds(
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     let sql = format!(
         "
+        CREATE TABLE IF NOT EXISTS negentropy_dep_epoch (
+            workspace_id TEXT PRIMARY KEY,
+            epoch INTEGER NOT NULL DEFAULT 0
+        ) WITHOUT ROWID;
+
         CREATE TABLE IF NOT EXISTS negentropy_day_epoch (
             workspace_id TEXT NOT NULL,
             day_start_ms INTEGER NOT NULL,
@@ -90,11 +95,45 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             ON CONFLICT(workspace_id, week_start_ms) DO UPDATE SET
                 epoch = epoch + 1;
         END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_negentropy_dep_epoch_insert
+        AFTER INSERT ON shared_event_deps
+        BEGIN
+            INSERT INTO negentropy_dep_epoch (workspace_id, epoch)
+            VALUES (NEW.workspace_id, 1)
+            ON CONFLICT(workspace_id) DO UPDATE SET
+                epoch = epoch + 1;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_negentropy_dep_epoch_delete
+        AFTER DELETE ON shared_event_deps
+        BEGIN
+            INSERT INTO negentropy_dep_epoch (workspace_id, epoch)
+            VALUES (OLD.workspace_id, 1)
+            ON CONFLICT(workspace_id) DO UPDATE SET
+                epoch = epoch + 1;
+        END;
         ",
         day_ms = DAY_MS,
     );
     conn.execute_batch(&sql)?;
     Ok(())
+}
+
+pub fn workspace_dep_epoch(conn: &Connection, workspace_id: &str) -> SqliteResult<u64> {
+    let epoch: i64 = conn.query_row(
+        "SELECT COALESCE(
+             (
+                 SELECT epoch
+                 FROM negentropy_dep_epoch
+                 WHERE workspace_id = ?1
+             ),
+             0
+         )",
+        params![workspace_id],
+        |row| row.get(0),
+    )?;
+    Ok(epoch.max(0) as u64)
 }
 
 pub fn sum_day_epochs(
@@ -206,5 +245,32 @@ mod tests {
             sum_day_epochs(&conn, workspace_id, day_start_ms, tomorrow_start_ms).unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn dep_epoch_tracks_shared_dep_mutations() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "ws";
+
+        assert_eq!(workspace_dep_epoch(&conn, workspace_id).unwrap(), 0);
+
+        conn.execute(
+            "INSERT INTO shared_event_deps (workspace_id, event_id, dep_event_id)
+             VALUES (?1, ?2, ?3)",
+            params![workspace_id, "event-a", "dep-a"],
+        )
+        .unwrap();
+        assert_eq!(workspace_dep_epoch(&conn, workspace_id).unwrap(), 1);
+
+        conn.execute(
+            "DELETE FROM shared_event_deps
+             WHERE workspace_id = ?1
+               AND event_id = ?2
+               AND dep_event_id = ?3",
+            params![workspace_id, "event-a", "dep-a"],
+        )
+        .unwrap();
+        assert_eq!(workspace_dep_epoch(&conn, workspace_id).unwrap(), 2);
     }
 }

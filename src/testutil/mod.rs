@@ -307,13 +307,38 @@ fn copy_projected_events_for_tenant(
         .expect("failed to copy event into destination db");
         insert_recorded_event(dst_db, tenant_id, eid, now_ms, "test-bootstrap")
             .expect("failed to record copied event for tenant");
-        project_one(dst_db, tenant_id, eid).unwrap_or_else(|err| {
+        let projection_recorder =
+            projection_recorder_for_copied_event(&event_type, &blob, tenant_id, &eid_b64);
+        project_one(dst_db, &projection_recorder, eid).unwrap_or_else(|err| {
             panic!(
-                "failed to project copied event {} for tenant {}: {}",
-                eid_b64, tenant_id, err
+                "failed to project copied event {} for tenant {} via {}: {}",
+                eid_b64, tenant_id, projection_recorder, err
             )
         });
     }
+}
+
+fn projection_recorder_for_copied_event(
+    event_type: &str,
+    blob: &[u8],
+    default_recorder: &str,
+    event_id_b64: &str,
+) -> String {
+    if event_type != "endpoint_shared" {
+        return default_recorder.to_string();
+    }
+
+    let parsed =
+        crate::event_modules::endpoint_shared::parse_endpoint_shared(blob).unwrap_or_else(|err| {
+            panic!("failed to parse copied endpoint_shared event {event_id_b64}: {err}")
+        });
+    let endpoint_shared = match parsed {
+        crate::event_modules::ParsedEvent::EndpointShared(event) => event,
+        _ => unreachable!("endpoint_shared parser returned wrong variant"),
+    };
+    crate::event_modules::endpoint_shared::endpoint_id_from_public_key_bytes(
+        &endpoint_shared.public_key,
+    )
 }
 
 fn list_shared_event_ids_for_tenant(db: &rusqlite::Connection, tenant_id: &str) -> Vec<EventId> {
@@ -655,8 +680,8 @@ impl Peer {
             create_invite_link, parse_bootstrap_address,
         };
 
-        // Create a bare peer with DB tables but NO transport identity.
-        // svc_accept_invite will install the invite-derived identity.
+        // Match real daemon startup so invite acceptance can resolve the local
+        // endpoint identity before the invite-derived workspace identity exists.
         let tempdir = tempfile::tempdir().expect("failed to create tempdir");
         let db_path = tempdir
             .path()
@@ -667,6 +692,8 @@ impl Peer {
         {
             let db = open_connection(&db_path).expect("failed to open db");
             create_tables(&db).expect("failed to create tables");
+            crate::transport::materialize_daemon_identity(&db)
+                .expect("failed to materialize daemon identity");
         }
         let mut peer = Self {
             name: name.to_string(),
@@ -939,6 +966,8 @@ impl Peer {
         {
             let db = open_connection(&db_path).expect("failed to open db");
             create_tables(&db).expect("failed to create tables");
+            crate::transport::materialize_daemon_identity(&db)
+                .expect("failed to materialize daemon identity");
         }
         let mut peer = Self {
             name: name.to_string(),
@@ -1712,9 +1741,6 @@ impl Peer {
         };
 
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let workspace_id = crate::db::store::lookup_workspace_id(&db, &self.identity)
-            .expect("missing trust anchor workspace_id for file-slice benchmark");
-
         // Parent message
         let key_event_id = self.content_key_event_id(&db);
 
@@ -1756,80 +1782,30 @@ impl Peer {
         });
         let _att_eid = self.create_encrypted_signed_event_synchronous(&key_event_id, &att);
 
-        // Batch-create file slices inside a transaction
+        // Batch-create file slices inside a transaction using the production
+        // Signed(Encrypted(FileSlice)) path so the harness tracks runtime wire
+        // invariants instead of hand-assembling wrappers.
         let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
         let signing_key = self.signing_key().clone();
+        let signer_eid = self.signer_eid();
 
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..total_slices as u32 {
-            // Use a single timestamp for both the blob's created_at and the
-            // neg_items ts. If these diverge, the sink's batch_writer (which
-            // extracts created_at from the blob) inserts a different neg_items
-            // key than the source, causing negentropy to never converge.
-            let created_at = current_timestamp_ms_u64();
-            let fs = ParsedEvent::FileSlice(FileSliceEvent {
-                created_at_ms: created_at,
+            let enc = ParsedEvent::FileSlice(FileSliceEvent {
+                created_at_ms: current_timestamp_ms_u64(),
                 file_id,
                 slice_number: i,
                 ciphertext: ciphertext.clone(),
             });
-            let inner_blob = crate::projection::create::encode_signed_wrapper_blob(
-                &fs,
-                &self.signer_eid(),
-                &signing_key,
+            crate::projection::create::create_encrypted_event_synchronous_with_owner(
+                &db,
+                &self.identity,
+                &key_event_id,
+                Some(&msg_eid),
+                &enc,
+                Some((&signer_eid, &signing_key)),
             )
-            .expect("failed to encode signed file_slice");
-
-            let key_bytes: Vec<u8> = db
-                .query_row(
-                    "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
-                    rusqlite::params![&self.identity, event_id_to_base64(&key_event_id)],
-                    |row| crate::db::sql_types::get_blob(row, 0),
-                )
-                .expect("failed to load content key bytes");
-            let mut key_arr = [0u8; 32];
-            key_arr.copy_from_slice(&key_bytes);
-            let (nonce, ciphertext, auth_tag) =
-                crate::projection::encrypted::encrypt_event_blob(&key_arr, &inner_blob)
-                    .expect("failed to encrypt file_slice");
-            let enc = ParsedEvent::Encrypted(crate::event_modules::EncryptedEvent {
-                created_at_ms: current_timestamp_ms_u64(),
-                key_event_id,
-                owner_event_id: msg_eid,
-                inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
-                nonce,
-                ciphertext,
-                auth_tag,
-            });
-            let blob =
-                crate::event_modules::encode_event(&enc).expect("failed to encode encrypted");
-
-            let event_id = crate::crypto::hash_event(&blob);
-            let event_id_b64 = event_id_to_base64(&event_id);
-
-            // Insert into events, neg_items, recorded_events — all use the
-            // same created_at that is embedded in the blob so that the
-            // neg_items (ts, id) key matches what a receiving batch_writer
-            // would extract from the blob.
-            db.execute(
-                "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-                 VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-                rusqlite::params![&event_id_b64, "encrypted", blob.as_slice(), created_at as i64, created_at as i64],
-            ).expect("failed to insert file_slice event");
-            db.execute(
-                "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
-                rusqlite::params![&workspace_id, created_at as i64, event_id.as_slice()],
-            )
-            .expect("failed to insert neg_item");
-            db.execute(
-                "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-                 VALUES (?1, ?2, ?3, 'local')",
-                rusqlite::params![&self.identity, &event_id_b64, created_at as i64],
-            )
-            .expect("failed to insert recorded_event");
-
-            // Project (validates decryption, signature, and authorization chain)
-            project_one(&db, &self.identity, &event_id).expect("failed to project file_slice");
+            .expect("failed to create file_slice");
         }
         db.execute("COMMIT", []).expect("failed to commit");
 
@@ -3938,6 +3914,7 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
         // neg_storage scope and don't create duplicates when the target later
         // receives the same events from sync (which inserts with target ws_id).
         let tgt_ws_id = crate::db::store::lookup_workspace_id(&tgt_db, &target.identity);
+        let now_ms = current_timestamp_ms_u64() as i64;
         tgt_db.execute("BEGIN", []).expect("failed to begin");
 
         for (event_id, event_type, blob, share_scope, created_at, inserted_at) in &events {
@@ -3946,6 +3923,10 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![event_id, event_type, blob.as_slice(), share_scope, created_at, inserted_at],
             ).expect("failed to insert event");
+            if let Some(eid) = event_id_from_base64(event_id) {
+                insert_recorded_event(&tgt_db, &target.identity, &eid, now_ms, "test-clone")
+                    .expect("failed to insert recorded_event");
+            }
         }
 
         for (_workspace_id, ts, id) in &neg_items {
@@ -4260,5 +4241,23 @@ mod fingerprint_tests {
                 excluded
             );
         }
+    }
+
+    #[tokio::test]
+    async fn clone_events_to_marks_cloned_file_slices_recorded_for_target() {
+        let source = Peer::new_with_identity("clone-src");
+        let target = Peer::new_in_workspace("clone-tgt", &source).await;
+        let peers = vec![source, target];
+        converge_workspace_transport_graph(&peers).await;
+
+        let expected_slices = 4;
+        peers[0].batch_create_file_slices(expected_slices);
+        clone_events_to(&peers[0], &[&peers[1]]);
+
+        assert_eq!(
+            peers[1].file_slice_event_count(),
+            expected_slices as i64,
+            "cloned targets must record copied file slices as file-slice transport blobs",
+        );
     }
 }

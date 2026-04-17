@@ -65,7 +65,9 @@ fn rpc_read_timeout(method: &RpcMethod) -> Duration {
     match method {
         // Large file sends are synchronous daemon work and can legitimately
         // take minutes in debug builds or on slower disks.
-        RpcMethod::SendFile { .. } => Duration::from_secs(10 * 60),
+        RpcMethod::SendFile { .. }
+        | RpcMethod::CreateWorkspace { .. }
+        | RpcMethod::GenerateFiles { .. } => Duration::from_secs(10 * 60),
         _ => Duration::from_secs(120),
     }
 }

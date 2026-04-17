@@ -7,13 +7,10 @@ use negentropy::{
 };
 use rusqlite::Connection;
 
-use crate::crypto::EventId;
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::dep_index::list_shared_event_deps;
-use crate::db::negentropy_cache::{sum_day_epochs, sum_week_epochs};
+use crate::db::negentropy_cache::{sum_day_epochs, sum_week_epochs, workspace_dep_epoch};
 use crate::db::store::Store;
-use crate::sync::session::receive_log::{
-    load_pending_receive_overlay_entries, PendingReceiveOverlayEntry,
-};
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 
 const CONTROL_PHASE1: u8 = 1;
@@ -38,8 +35,10 @@ pub(crate) enum DepSyncControlPayload {
 pub(crate) struct RangeDepStorage {
     roots: Vec<Item>,
     dep_search_enabled: bool,
-    dep_closure_by_root: Arc<HashMap<EventId, Arc<Vec<EventId>>>>,
-    dep_slice_cache: Mutex<HashMap<(usize, usize), Arc<Vec<EventId>>>>,
+    dep_candidate_closure_by_root: Arc<HashMap<EventId, Arc<Vec<EventId>>>>,
+    present_dep_closure_by_root: Arc<HashMap<EventId, Arc<Vec<EventId>>>>,
+    dep_candidate_slice_cache: Mutex<HashMap<(usize, usize), Arc<Vec<EventId>>>>,
+    present_dep_slice_cache: Mutex<HashMap<(usize, usize), Arc<Vec<EventId>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -61,7 +60,7 @@ impl RangeDepStorage {
     #[allow(dead_code)]
     pub(crate) fn dep_ids(&self, begin: usize, end: usize) -> Result<Vec<Id>, negentropy::Error> {
         Ok(self
-            .dep_ids_for_slice(begin, end)
+            .candidate_dep_ids_for_slice(begin, end)
             .iter()
             .map(|event_id| Id::from_byte_array(*event_id))
             .collect())
@@ -74,7 +73,7 @@ impl RangeDepStorage {
         let selected_roots = root_ids.iter().copied().collect::<HashSet<_>>();
         let mut dep_ids = BTreeSet::new();
         for root_id in root_ids {
-            if let Some(closure) = self.dep_closure_by_root.get(root_id) {
+            if let Some(closure) = self.dep_candidate_closure_by_root.get(root_id) {
                 for dep_id in closure.iter().copied() {
                     if !selected_roots.contains(&dep_id) {
                         dep_ids.insert(dep_id);
@@ -83,49 +82,6 @@ impl RangeDepStorage {
             }
         }
         dep_ids.into_iter().collect()
-    }
-
-    fn with_pending_roots(
-        &self,
-        pending_entries: &[PendingReceiveOverlayEntry],
-    ) -> Arc<RangeDepStorage> {
-        let mut seen = self
-            .roots
-            .iter()
-            .map(|item| item.id.to_bytes())
-            .collect::<HashSet<_>>();
-        let mut roots = self.roots.clone();
-        let mut added = false;
-        for pending in pending_entries {
-            if seen.insert(pending.event_id) {
-                roots.push(Item::with_timestamp_and_id(
-                    pending.created_at_ms.max(0) as u64,
-                    Id::from_byte_array(pending.event_id),
-                ));
-                added = true;
-            }
-        }
-
-        if !added {
-            return Arc::new(self.clone_without_cache());
-        }
-
-        roots.sort_by(|left, right| left.cmp(right));
-        Arc::new(RangeDepStorage {
-            roots,
-            dep_search_enabled: self.dep_search_enabled,
-            dep_closure_by_root: self.dep_closure_by_root.clone(),
-            dep_slice_cache: Mutex::new(HashMap::new()),
-        })
-    }
-
-    fn clone_without_cache(&self) -> RangeDepStorage {
-        RangeDepStorage {
-            roots: self.roots.clone(),
-            dep_search_enabled: self.dep_search_enabled,
-            dep_closure_by_root: self.dep_closure_by_root.clone(),
-            dep_slice_cache: Mutex::new(HashMap::new()),
-        }
     }
 
     fn combined_fingerprint_for_slice(
@@ -137,15 +93,15 @@ impl RangeDepStorage {
         if !self.dep_search_enabled {
             return fingerprint_ids(root_ids);
         }
-        let dep_ids_for_slice = self.dep_ids_for_slice(begin, end);
+        let dep_ids_for_slice = self.present_dep_ids_for_slice(begin, end);
         let dep_ids = dep_ids_for_slice.iter().copied().map(Id::from_byte_array);
         fingerprint_ids(root_ids.chain(dep_ids))
     }
 
-    fn dep_ids_for_slice(&self, begin: usize, end: usize) -> Arc<Vec<EventId>> {
+    fn candidate_dep_ids_for_slice(&self, begin: usize, end: usize) -> Arc<Vec<EventId>> {
         {
             let cache = self
-                .dep_slice_cache
+                .dep_candidate_slice_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(cached) = cache.get(&(begin, end)) {
@@ -159,7 +115,7 @@ impl RangeDepStorage {
             .collect::<HashSet<_>>();
         let mut dep_ids = BTreeSet::new();
         for root in &self.roots[begin..end] {
-            if let Some(closure) = self.dep_closure_by_root.get(&root.id.to_bytes()) {
+            if let Some(closure) = self.dep_candidate_closure_by_root.get(&root.id.to_bytes()) {
                 for dep_id in closure.iter().copied() {
                     if !root_ids.contains(&dep_id) {
                         dep_ids.insert(dep_id);
@@ -170,7 +126,42 @@ impl RangeDepStorage {
 
         let dep_ids = Arc::new(dep_ids.into_iter().collect::<Vec<_>>());
         let mut cache = self
-            .dep_slice_cache
+            .dep_candidate_slice_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert((begin, end), dep_ids.clone());
+        dep_ids
+    }
+
+    fn present_dep_ids_for_slice(&self, begin: usize, end: usize) -> Arc<Vec<EventId>> {
+        {
+            let cache = self
+                .present_dep_slice_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = cache.get(&(begin, end)) {
+                return cached.clone();
+            }
+        }
+
+        let root_ids = self.roots[begin..end]
+            .iter()
+            .map(|item| item.id.to_bytes())
+            .collect::<HashSet<_>>();
+        let mut dep_ids = BTreeSet::new();
+        for root in &self.roots[begin..end] {
+            if let Some(closure) = self.present_dep_closure_by_root.get(&root.id.to_bytes()) {
+                for dep_id in closure.iter().copied() {
+                    if !root_ids.contains(&dep_id) {
+                        dep_ids.insert(dep_id);
+                    }
+                }
+            }
+        }
+
+        let dep_ids = Arc::new(dep_ids.into_iter().collect::<Vec<_>>());
+        let mut cache = self
+            .present_dep_slice_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.insert((begin, end), dep_ids.clone());
@@ -221,16 +212,11 @@ impl DepReconcileRangeStorage for RangeDepStorage {
 
 pub(crate) fn build_range_dep_storage(
     conn: &Connection,
-    db_path: &str,
+    _db_path: &str,
     workspace_id: &str,
     range: SyncWindow,
 ) -> Result<Arc<RangeDepStorage>, String> {
-    let base = load_cached_range_dep_storage(conn, db_path, workspace_id, range)?;
-    let pending = pending_entries_in_range(db_path, workspace_id, range);
-    if pending.is_empty() {
-        return Ok(base);
-    }
-    Ok(base.with_pending_roots(&pending))
+    load_cached_range_dep_storage(conn, _db_path, workspace_id, range)
 }
 
 fn build_durable_range_dep_storage(
@@ -241,7 +227,9 @@ fn build_durable_range_dep_storage(
     let entries = load_shared_index_entries(conn, workspace_id, range)?;
     let dep_search_enabled = !matches!(range.kind, SyncWindowKind::Old);
     let mut direct_dep_cache = HashMap::<EventId, Vec<EventId>>::new();
-    let mut closure_cache = HashMap::<EventId, Arc<Vec<EventId>>>::new();
+    let mut candidate_closure_cache = HashMap::<EventId, Arc<Vec<EventId>>>::new();
+    let mut present_closure_cache = HashMap::<EventId, Arc<Vec<EventId>>>::new();
+    let mut shared_presence_cache = HashMap::<EventId, bool>::new();
     if dep_search_enabled {
         for (_, event_id) in &entries {
             let mut visiting = HashSet::new();
@@ -250,7 +238,17 @@ fn build_durable_range_dep_storage(
                 workspace_id,
                 *event_id,
                 &mut direct_dep_cache,
-                &mut closure_cache,
+                &mut candidate_closure_cache,
+                &mut visiting,
+            )?;
+            let mut visiting = HashSet::new();
+            let _ = compute_present_transitive_dep_closure(
+                conn,
+                workspace_id,
+                *event_id,
+                &mut direct_dep_cache,
+                &mut present_closure_cache,
+                &mut shared_presence_cache,
                 &mut visiting,
             )?;
         }
@@ -269,8 +267,10 @@ fn build_durable_range_dep_storage(
     Ok(RangeDepStorage {
         roots,
         dep_search_enabled,
-        dep_closure_by_root: Arc::new(closure_cache),
-        dep_slice_cache: Mutex::new(HashMap::new()),
+        dep_candidate_closure_by_root: Arc::new(candidate_closure_cache),
+        present_dep_closure_by_root: Arc::new(present_closure_cache),
+        dep_candidate_slice_cache: Mutex::new(HashMap::new()),
+        present_dep_slice_cache: Mutex::new(HashMap::new()),
     })
 }
 
@@ -421,6 +421,86 @@ fn compute_transitive_dep_closure(
     Ok(closure)
 }
 
+fn compute_present_transitive_dep_closure(
+    conn: &Connection,
+    workspace_id: &str,
+    event_id: EventId,
+    direct_dep_cache: &mut HashMap<EventId, Vec<EventId>>,
+    closure_cache: &mut HashMap<EventId, Arc<Vec<EventId>>>,
+    shared_presence_cache: &mut HashMap<EventId, bool>,
+    visiting: &mut HashSet<EventId>,
+) -> Result<Arc<Vec<EventId>>, String> {
+    if let Some(cached) = closure_cache.get(&event_id) {
+        return Ok(cached.clone());
+    }
+    if !visiting.insert(event_id) {
+        return Ok(Arc::new(Vec::new()));
+    }
+
+    let direct_deps = if let Some(cached) = direct_dep_cache.get(&event_id) {
+        cached.clone()
+    } else {
+        let deps = list_shared_event_deps(conn, workspace_id, &event_id)
+            .map_err(|e| format!("load shared deps for {}: {e}", hex::encode(event_id)))?;
+        direct_dep_cache.insert(event_id, deps.clone());
+        deps
+    };
+
+    let mut closure = BTreeSet::new();
+    for dep_id in direct_deps {
+        if !shared_event_present_locally(conn, dep_id, shared_presence_cache)? {
+            continue;
+        }
+        closure.insert(dep_id);
+        let nested = compute_present_transitive_dep_closure(
+            conn,
+            workspace_id,
+            dep_id,
+            direct_dep_cache,
+            closure_cache,
+            shared_presence_cache,
+            visiting,
+        )?;
+        for nested_dep in nested.iter().copied() {
+            closure.insert(nested_dep);
+        }
+    }
+
+    visiting.remove(&event_id);
+    let closure = Arc::new(closure.into_iter().collect::<Vec<_>>());
+    closure_cache.insert(event_id, closure.clone());
+    Ok(closure)
+}
+
+fn shared_event_present_locally(
+    conn: &Connection,
+    event_id: EventId,
+    shared_presence_cache: &mut HashMap<EventId, bool>,
+) -> Result<bool, String> {
+    if let Some(cached) = shared_presence_cache.get(&event_id) {
+        return Ok(*cached);
+    }
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM events
+                 WHERE event_id = ?1
+                   AND share_scope = 'shared'
+             )",
+            rusqlite::params![event_id_to_base64(&event_id)],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            format!(
+                "load shared event presence for {}: {e}",
+                hex::encode(event_id)
+            )
+        })?;
+    shared_presence_cache.insert(event_id, present);
+    Ok(present)
+}
+
 fn dep_range_storage_cache(
 ) -> &'static Mutex<HashMap<DepRangeStorageCacheKey, DepRangeStorageCacheEntry>> {
     static CACHE: OnceLock<Mutex<HashMap<DepRangeStorageCacheKey, DepRangeStorageCacheEntry>>> =
@@ -445,13 +525,15 @@ fn current_range_epoch(
     workspace_id: &str,
     range: SyncWindow,
 ) -> Result<u64, String> {
+    let dep_epoch = workspace_dep_epoch(conn, workspace_id)
+        .map_err(|e| format!("load dep-sync dep epoch: {e}"))?;
     let Some(ts_max_exclusive_ms) = range.ts_max_exclusive() else {
-        return Ok(0);
+        return Ok(dep_epoch);
     };
-    match range.kind {
+    let base_epoch = match range.kind {
         SyncWindowKind::LastDay | SyncWindowKind::LastWeek => {
             let Some(ts_min_inclusive_ms) = range.ts_min() else {
-                return Ok(0);
+                return Ok(dep_epoch);
             };
             sum_day_epochs(conn, workspace_id, ts_min_inclusive_ms, ts_max_exclusive_ms)
                 .map_err(|e| format!("load dep-sync day epochs: {e}"))
@@ -462,7 +544,8 @@ fn current_range_epoch(
         }
         SyncWindowKind::Old => sum_week_epochs(conn, workspace_id, None, ts_max_exclusive_ms)
             .map_err(|e| format!("load dep-sync old epochs: {e}")),
-    }
+    }?;
+    Ok(base_epoch.saturating_add(dep_epoch))
 }
 
 fn cached_dep_storage_matches(
@@ -558,33 +641,4 @@ fn load_shared_index_entries(
     }
 
     Ok(entries)
-}
-
-fn pending_entries_in_range(
-    db_path: &str,
-    workspace_id: &str,
-    range: SyncWindow,
-) -> Vec<PendingReceiveOverlayEntry> {
-    load_pending_receive_overlay_entries(db_path, workspace_id, range.kind)
-        .into_iter()
-        .filter(|pending| sync_window_contains_ts(range, pending.created_at_ms))
-        .collect()
-}
-
-fn sync_window_contains_ts(range: SyncWindow, created_at_ms: i64) -> bool {
-    if range
-        .ts_min()
-        .map(|ts_min| created_at_ms < ts_min)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    if range
-        .ts_max_exclusive()
-        .map(|ts_max| created_at_ms >= ts_max)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    true
 }

@@ -129,8 +129,7 @@ mod tests {
     fn react_returns_response_for_created_message_target() {
         let conn = open_in_memory().expect("open in-memory db");
         create_tables(&conn).expect("create tables");
-        crate::transport::materialize_daemon_identity(&conn)
-            .expect("materialize daemon identity");
+        crate::transport::materialize_daemon_identity(&conn).expect("materialize daemon identity");
 
         let workspace =
             create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create ws");

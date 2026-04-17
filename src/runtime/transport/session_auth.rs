@@ -105,7 +105,6 @@ enum BootstrapFallbackInvitePlan {
     RejectMissingCandidate,
     UseInvite { invite_event_id: String },
     RejectAmbiguousCandidate,
-    RejectAlreadyLocalWorkspaceCandidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,16 +244,10 @@ fn decide_bootstrap_fallback_invite_plan(
         }
         BootstrapFallbackInviteDecisionContext::UniqueCandidate {
             invite_event_id,
-            workspace_already_local_before_candidate,
-        } => {
-            if *workspace_already_local_before_candidate {
-                BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
-            } else {
-                BootstrapFallbackInvitePlan::UseInvite {
-                    invite_event_id: invite_event_id.clone(),
-                }
-            }
-        }
+            workspace_already_local_before_candidate: _,
+        } => BootstrapFallbackInvitePlan::UseInvite {
+            invite_event_id: invite_event_id.clone(),
+        },
         BootstrapFallbackInviteDecisionContext::AmbiguousCandidate => {
             BootstrapFallbackInvitePlan::RejectAmbiguousCandidate
         }
@@ -1153,8 +1146,7 @@ pub fn resolve_bootstrap_fallback_invite_for_daemon(
         match decide_bootstrap_fallback_invite_plan(&decision_context) {
             BootstrapFallbackInvitePlan::UseInvite { invite_event_id } => Some(invite_event_id),
             BootstrapFallbackInvitePlan::RejectMissingCandidate
-            | BootstrapFallbackInvitePlan::RejectAmbiguousCandidate
-            | BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate => None,
+            | BootstrapFallbackInvitePlan::RejectAmbiguousCandidate => None,
         },
     )
 }
@@ -1593,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_fallback_invite_plan_rejects_candidate_created_after_workspace_was_local() {
+    fn bootstrap_fallback_invite_plan_keeps_unique_candidate_even_if_workspace_is_already_local() {
         let decision_context =
             normalize_bootstrap_fallback_invite_decision_context(&BootstrapFallbackInviteRawRows {
                 candidates: vec![BootstrapFallbackInviteCandidate {
@@ -1610,7 +1602,9 @@ mod tests {
         );
         assert_eq!(
             decide_bootstrap_fallback_invite_plan(&decision_context),
-            BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
+            BootstrapFallbackInvitePlan::UseInvite {
+                invite_event_id: "invite-1".to_string(),
+            }
         );
     }
 
@@ -1638,7 +1632,9 @@ mod tests {
         );
         assert_eq!(
             decide_bootstrap_fallback_invite_plan(&decision_context),
-            BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
+            BootstrapFallbackInvitePlan::UseInvite {
+                invite_event_id: "invite-1".to_string(),
+            }
         );
     }
 
@@ -2337,7 +2333,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bootstrap_fallback_invite_for_daemon_skips_pending_same_workspace_candidate() {
+    fn resolve_bootstrap_fallback_invite_for_daemon_keeps_pending_same_workspace_candidate() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("client.sqlite3");
         let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
@@ -2374,11 +2370,11 @@ mod tests {
             resolve_bootstrap_fallback_invite_for_daemon(&db, &recorded_by, &remote_daemon_peer_id)
                 .unwrap();
 
-        assert_eq!(invite, None);
+        assert_eq!(invite.as_deref(), Some("pending-bootstrap"));
     }
 
     #[test]
-    fn resolve_bootstrap_fallback_invite_for_daemon_skips_accepted_same_workspace_candidate() {
+    fn resolve_bootstrap_fallback_invite_for_daemon_keeps_accepted_same_workspace_candidate() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("client.sqlite3");
         let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
@@ -2417,7 +2413,7 @@ mod tests {
             resolve_bootstrap_fallback_invite_for_daemon(&db, &recorded_by, &remote_daemon_peer_id)
                 .unwrap();
 
-        assert_eq!(invite, None);
+        assert_eq!(invite.as_deref(), Some("invite-bootstrap"));
     }
 
     #[test]

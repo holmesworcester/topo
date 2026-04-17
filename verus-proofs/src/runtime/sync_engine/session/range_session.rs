@@ -1,4 +1,4 @@
-//! Formal verification of range-session index and send-order policy selection.
+//! Formal verification of durable range-session index and send-order policy selection.
 
 use vstd::prelude::*;
 
@@ -185,6 +185,14 @@ proof fn shared_sync_entry_normalizer_preserves_query_facts(
             cache_epoch_matches,
             cache_bounds_match,
         }),
+{
+}
+
+proof fn shared_sync_entry_plan_candidate_count_is_durable_root_count(
+    context: SharedSyncEntryDecisionContext,
+)
+    ensures
+        decide_shared_sync_entry_plan(&context).candidate_root_count == context.root_entry_count,
 {
 }
 

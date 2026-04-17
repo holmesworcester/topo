@@ -105,6 +105,7 @@ pub(crate) fn record_block_rows(
     recorded_by: &str,
     event_id_b64: &str,
     missing: &[EventId],
+    workspace_id: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut missing = missing.to_vec();
     missing.sort_unstable();
@@ -132,9 +133,14 @@ pub(crate) fn record_block_rows(
     // the current missing set, even if a prior blocked_events row exists
     // with a stale counter from an earlier block.
     conn.execute(
-        "INSERT OR REPLACE INTO blocked_events (peer_id, event_id, deps_remaining)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
+        "INSERT OR REPLACE INTO blocked_events (peer_id, event_id, workspace_id, deps_remaining)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            recorded_by,
+            event_id_b64,
+            workspace_id,
+            missing.len() as i64
+        ],
     )?;
     let _ = EventTimeline::new(conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
     Ok(())
@@ -697,9 +703,19 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let blocked_events_has_workspace_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0
+                 FROM pragma_table_info('blocked_events')
+                 WHERE name = 'workspace_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert!(blocked_events_exists);
         assert!(blocked_event_deps_exists);
+        assert!(blocked_events_has_workspace_id);
     }
 
     #[test]

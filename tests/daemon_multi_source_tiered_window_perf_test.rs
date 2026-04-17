@@ -90,6 +90,7 @@ fn inherited_tier_env() -> Vec<(String, String)> {
         "TOPO_LIVE_SUPPRESSION_EVENT_ID_CAP",
         "TOPO_LIVE_SUPPRESSION_SEND_BATCH_SIZE",
         "TOPO_LIVE_SUPPRESSION_BATCH_SETTLE_MS",
+        "TOPO_TRACE_DEP_SEND_IDS",
     ]
     .into_iter()
     .filter_map(|key| {
