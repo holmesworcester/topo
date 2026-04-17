@@ -486,12 +486,33 @@ pub fn parse_event(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 }
 
 /// Encode a ParsedEvent using the global registry.
+///
+/// In debug builds, immediately parses the produced blob and asserts the resulting
+/// event's type code matches the original. A mismatch would indicate encoder/decoder
+/// drift and fires the verified `event_type_code_preserved` predicate from
+/// `topo_verus_proofs::state::command_roundtrip`.
 pub fn encode_event(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let type_code = event.event_type_code();
     let meta = registry()
         .lookup(type_code)
         .ok_or(EventError::UnknownType(type_code))?;
-    (meta.encode)(event)
+    let blob = (meta.encode)(event)?;
+
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(parsed) = parse_event(&blob) {
+            let roundtripped = parsed.event_type_code();
+            assert!(
+                topo_verus_proofs::state::command_roundtrip::event_type_code_preserved(
+                    type_code,
+                    roundtripped,
+                ),
+                "encode/parse type-code drift: encoded as {type_code} but re-parsed as {roundtripped}"
+            );
+        }
+    }
+
+    Ok(blob)
 }
 
 /// Generic post-projection-drain hooks.

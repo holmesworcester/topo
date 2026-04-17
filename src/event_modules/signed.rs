@@ -22,18 +22,23 @@ impl super::Describe for SignedEvent {
 }
 
 pub fn outer_payload(blob: &[u8]) -> Option<&[u8]> {
-    if blob.first().copied() != Some(EVENT_TYPE_SIGNED) || blob.len() < 1 + 32 + 64 + 1 {
+    if !topo_verus_proofs::state::signed_event_structure::is_well_formed_signed_prefix(blob) {
         return None;
     }
-    Some(&blob[33..blob.len() - 64])
+    let (start, end) =
+        topo_verus_proofs::state::signed_event_structure::signed_body_range(blob.len());
+    Some(&blob[start..end])
 }
 
 pub fn outer_signer_event_id(blob: &[u8]) -> Option<[u8; 32]> {
-    if blob.first().copied() != Some(EVENT_TYPE_SIGNED) || blob.len() < 1 + 32 + 64 + 1 {
+    if !topo_verus_proofs::state::signed_event_structure::is_well_formed_signed_prefix(blob) {
         return None;
     }
     let mut out = [0u8; 32];
-    out.copy_from_slice(&blob[1..33]);
+    out.copy_from_slice(
+        &blob[topo_verus_proofs::state::signed_event_structure::SIGNER_ID_OFFSET
+            ..topo_verus_proofs::state::signed_event_structure::SIGNER_ID_END],
+    );
     Some(out)
 }
 
