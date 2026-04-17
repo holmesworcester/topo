@@ -1,3 +1,9 @@
+//! SQLite schema, connection pragmas, and per-table access modules. `open_connection`
+//! applies the canonical WAL + perf pragmas. Every event module's projected state lives in
+//! a sibling module here or in its own `event_modules/<type>/mod.rs::ensure_schema`; the
+//! durable runtime queues ([`projection_queue`], [`need_queue`]) and shared queue
+//! helpers ([`queue`]) also live here.
+
 pub mod daemon_identity;
 pub mod dep_index;
 pub mod event_display;

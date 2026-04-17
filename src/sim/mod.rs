@@ -1,3 +1,8 @@
+//! Deterministic in-process simulation harness for testing multi-peer scenarios without
+//! running real daemons. Hosts the node-behavior engine ([`node_behavior`]), scenario and
+//! [`topology`] builders, a virtual [`clock`], [`pair_sync`] for reconciliation trials,
+//! and the `key_repair` / `large_graph_sample` trial helpers used by integration tests.
+
 pub mod clock;
 pub mod hash_graph;
 pub mod key_repair;

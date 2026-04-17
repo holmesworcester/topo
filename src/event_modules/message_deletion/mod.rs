@@ -1,3 +1,8 @@
+//! `message_deletion` event (type 7): tombstones a message by `event_id` and cascades a
+//! hard-purge of that message's reactions and attachments. Authorization derives from the
+//! outer signer identity (the message's author via `peer_shared`, or any workspace
+//! `admin`); forward and reverse replay produce identical post-cascade state.
+
 pub mod commands;
 pub mod projector;
 pub mod queries;

@@ -1,3 +1,10 @@
+//! Pipeline-level integration tests for the projection apply engine. Each submodule
+//! covers one concern area: `cascade` (Kahn unblock), `core_projection` (happy-path
+//! projector dispatch), `dep_sync`, `deletion`, `encryption`, `file_slice`, `identity`,
+//! `invite`, `removal_rotation`, `tenant`, and `verus_findings` (Verus-driven edge
+//! cases). These run a real SQLite + real projectors, unlike unit tests in
+//! `tests/projectors/` which stub the pipeline.
+
 use super::project_one::project_one;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
 use crate::db::{

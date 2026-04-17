@@ -1,3 +1,7 @@
+//! `user_invite` event (type 10): an invite that authorizes a new user to join a workspace
+//! (bootstrap and ongoing invites). Wire `type_name` remains the historical
+//! `user_invite_shared` for durable on-the-wire compatibility.
+
 pub mod projector;
 pub mod wire;
 

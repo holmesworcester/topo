@@ -1,3 +1,6 @@
+//! `reaction` event (type 2): an emoji reaction authored by a user on a target message.
+//! Many reactions per target are natural — each is a distinct event keyed by its own id.
+
 pub mod commands;
 pub mod projector;
 pub mod queries;

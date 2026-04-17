@@ -1,3 +1,8 @@
+//! `file` event (type 24): metadata record for a file attachment on a message — filename,
+//! mime type, total size, slice count, BAO root hash, and the content-key event id. The
+//! actual ciphertext lives in `file_slice` events; file and slices are linked by a shared
+//! random `file_id` carried by both.
+
 pub mod projector;
 pub mod queries;
 pub mod wire;

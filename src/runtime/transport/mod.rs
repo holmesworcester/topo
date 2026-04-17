@@ -1,3 +1,9 @@
+//! Daemon-scoped QUIC transport. Handles connection lifecycle, SPKI-pinned daemon
+//! identity, mTLS, and workspace-scoped stream multiplexing over a single daemon-level
+//! connection. Exactly one backend feature (`iroh-transport` or `tor-transport`) must be
+//! enabled at build time — the feature-gated `connection_lifecycle` / `peering_boundary`
+//! submodules select the active backend.
+
 pub mod cert;
 pub mod connection;
 pub mod daemon_identity;

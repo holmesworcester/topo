@@ -1,3 +1,7 @@
+//! `file_slice` event (type 25): one BAO-verified ciphertext chunk of a larger file. Many
+//! slices per `file` event; this is the bulk-IO event type that dominates large-payload sync
+//! throughput and low-memory budgets.
+
 pub mod projector;
 mod stats;
 pub mod wire;

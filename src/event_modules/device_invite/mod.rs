@@ -1,3 +1,7 @@
+//! `device_invite` event (type 12): an invite that binds a new device/peer to an existing
+//! user on the workspace. The wire `type_name` remains the historical `peer_invite_shared`
+//! for durable on-the-wire compatibility; see the canonical-naming note in DESIGN.md.
+
 pub mod projector;
 pub mod wire;
 

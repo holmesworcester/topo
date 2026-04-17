@@ -273,7 +273,14 @@ For reactive data flows, the daemon provides a local subscription engine. Fronte
 
 ## Adding Event-Layer Functionality
 
-This is the concrete workflow for adding a user-facing feature as event-layer functionality, using a new multi-valued message attachment type (`message_unfurl`) as the example. The same flow applies to `message_reply` (or any other "many per message" relation): one canonical event per attachment item, all keyed by `message_id`.
+This section is the fastest path from "I have a feature idea" to working code. It walks through adding a new event type end-to-end, using a new multi-valued message attachment type (`message_unfurl`) as the worked example. The same flow applies to `message_reply` or any other "many per message" relation: one canonical event per item, all keyed by `message_id`.
+
+Prerequisites — concepts you should skim before starting:
+
+- [§1.2 Event format](#12-event-format) — fixed-length wire layout via declarative field specs
+- [§4.1 Single projector entrypoint](#41-single-projector-entrypoint) and [§4.2 Pure functional projector contract](#42-pure-functional-projector-contract) — how events become rows
+- [§5 Dependency Blocking and Unblocking](#5-dependency-blocking-and-unblocking) — why deps are declared in meta, not enforced by the projector
+- **Project-to-own-table rule** (in Motivation): a projector only writes its own table; cross-event effects flow through emitted events.
 
 ### Example Feature: Multi-Valued `message_unfurl`
 
@@ -285,50 +292,62 @@ Do not mutate the `message` row in place to add unfurls.
 
 ### 1. Create The Event Module
 
-Add a new module directory:
+Add a new module directory mirroring existing modules like [`reaction/`](/home/holmes/poc-7/src/event_modules/reaction/):
 
 ```text
 src/event_modules/message_unfurl/
-  mod.rs
-  wire.rs
-  projector.rs
-  queries.rs
+  mod.rs        // ensure_schema, re-exports
+  wire.rs       // FieldSpec layout, parse/encode, EventTypeMeta static
+  projector.rs  // pure projector + context loader
+  queries.rs    // read helpers
+  commands.rs   // (optional) user-facing send/emit
 ```
 
-Model and wire format in [wire.rs](/home/holmes/poc-7/src/event_modules/file/wire.rs)-style:
+Wire layout uses declarative `FieldSpec` — no hand-written offsets. Signed events do NOT carry signature bytes in the inner struct; the `Signed` wrapper (type 35) holds `signer_event_id` and the 64-byte signature. In `wire.rs`:
 
 ```rust
+pub const MESSAGE_UNFURL_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("message_id"),
+    FieldSpec::Text("url", 512),
+    FieldSpec::Text("title", 256),
+    FieldSpec::Text("image_url", 512),
+];
+pub const MESSAGE_UNFURL_WIRE_SIZE: usize = wire_size_for_fields(MESSAGE_UNFURL_FIELDS);
+
 pub struct MessageUnfurlEvent {
     pub created_at_ms: u64,
-    pub message_id: [u8; 32],   // dep: message
-    pub url: String,            // fixed-size text slot
-    pub title: String,          // fixed-size text slot
-    pub image_url: String,      // fixed-size text slot, "" when absent
-    pub signed_by: [u8; 32],    // dep: signer
-    pub signer_type: u8,
-    pub signature: [u8; 64],
+    pub message_id: [u8; 32],
+    pub url: String,
+    pub title: String,
+    pub image_url: String,
 }
 
-pub static MESSAGE_UNFURL_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_MESSAGE_UNFURL,
-    type_name: "message_unfurl",
-    projection_table: "message_unfurls",
-    share_scope: ShareScope::Shared,
-    dep_fields: &["message_id", "signed_by"],
-    dep_field_type_codes: &[&[1], &[]], // message, signer-resolved
-    signer_required: true,
-    signature_byte_len: 64,
-    encryptable: true,
-    parse: parse_message_unfurl,
-    encode: encode_message_unfurl,
-    projector: super::projector::project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
-};
+pub static MESSAGE_UNFURL_META: EventTypeMeta =
+    crate::event_modules::registry::event_type_meta! {
+        type_code: EVENT_TYPE_MESSAGE_UNFURL,
+        type_name: "message_unfurl",
+        projection_table: "message_unfurls",
+        share_scope: ShareScope::Shared,
+        dep_fields: &["message_id"],
+        dep_field_type_codes: &[&[EVENT_TYPE_MESSAGE]],
+        signer_required: true,
+        signature_byte_len: 0,   // 0 for inner events; Signed wrapper holds the sig
+        encryptable: true,
+        parse: parse_message_unfurl,
+        encode: encode_message_unfurl,
+        projector: super::projector::project_pure,
+        context_loader: crate::event_modules::registry::load_empty_context,
+    };
 ```
+
+Notes:
+- `signer_required: true` means the event must arrive wrapped in `Signed`; signer identity is the signer chain resolved from the wrapper's `signer_event_id`, so it does not appear in `dep_fields`.
+- Use `load_empty_context` when the projector needs no extra row context; otherwise write a `build_projector_context` that calls a typed loader on `ProjectionQueries` (see [reaction/projector.rs](/home/holmes/poc-7/src/event_modules/reaction/projector.rs)).
 
 ### 2. Add Projection Table + Projector
 
-In `message_unfurl/mod.rs`, define schema with tenant scope and message fanout index:
+In `message_unfurl/mod.rs`, define schema with tenant scope (`recorded_by` in PK) and a message fanout index:
 
 ```sql
 CREATE TABLE IF NOT EXISTS message_unfurls (
@@ -339,77 +358,78 @@ CREATE TABLE IF NOT EXISTS message_unfurls (
   title TEXT NOT NULL,
   image_url TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  signer_event_id TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (recorded_by, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_msg_unfurls_message
   ON message_unfurls(recorded_by, message_id);
 ```
 
-In `message_unfurl/projector.rs`, emit `InsertOrIgnore` into `message_unfurls`.  
-This is what makes "many unfurls per message" natural: multiple events with same `message_id`, different `event_id`.
+In `message_unfurl/projector.rs`, return `ProjectorResult::valid(ops)` with a single `WriteOp::InsertOrIgnore` into `message_unfurls`. This is what makes "many unfurls per message" natural: multiple events with the same `message_id` and different `event_id`. The projector must be pure — no direct SQL, no reads outside the supplied `ProjectorDecisionContext`.
 
 ### 3. Register The Type In Core Event Registry
 
-Update [mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs):
+Update [src/event_modules/mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs):
 
-1. `pub mod message_unfurl;`
-2. `pub use message_unfurl::MessageUnfurlEvent;`
-3. Allocate a new `EVENT_TYPE_MESSAGE_UNFURL` code.
-4. Add `message_unfurl::ensure_schema(conn)?` to `ensure_schema`.
-5. Add `ParsedEvent::MessageUnfurl(...)`.
-6. Add entries in `dep_field_values`, `event_type_code`, and `signer_fields`.
-7. Add `&message_unfurl::MESSAGE_UNFURL_META` to `registry()`.
+1. `pub mod message_unfurl;` and `pub use message_unfurl::MessageUnfurlEvent;`
+2. Allocate a new `EVENT_TYPE_MESSAGE_UNFURL: u8 = N;` constant (pick the next free code).
+3. Call `message_unfurl::ensure_schema(conn)?` from `ensure_schema`.
+4. Add a `ParsedEvent::MessageUnfurl(MessageUnfurlEvent)` variant.
+5. Add match arms in `ParsedEvent::created_at_ms`, `dep_field_values`, `event_type_code`, and `human_fields`.
+6. Add `&message_unfurl::MESSAGE_UNFURL_META` to the `registry()` slice.
 
-If encryptable, also add wire size mapping in [common.rs](/home/holmes/poc-7/src/event_modules/layout/common.rs) `encrypted_inner_wire_size(...)`.
+Additional wiring required by the registry-coverage tests — these are not optional:
+
+- `formal_projector_family()` in the `mod.rs` test block — every registered code must be assigned to a Verus-covered family, or `test_registry_formal_projector_coverage` fails.
+- The `test_registry_encryptable_coverage` and `test_registry_transport_privacy_coverage` expectations in `mod.rs` — update the expected code lists to include the new type.
+
+Conditional on the event's shape:
+
+- [layout/common.rs](/home/holmes/poc-7/src/event_modules/layout/common.rs) `encrypted_inner_wire_size(...)` — add a size mapping if `encryptable: true`.
+- `EventTypeMeta::transport_privacy()` in [registry.rs](/home/holmes/poc-7/src/event_modules/registry.rs) — extend the match if this event must ride encrypted on the wire (e.g., user content).
 
 ### 4. Add Queries And Include In Message View
 
-Create `message_unfurl::queries::list_for_message(...)` (same pattern as [queries.rs](/home/holmes/poc-7/src/event_modules/file/queries.rs)).
+Create `message_unfurl::queries::list_for_message(...)` (same pattern as [file/queries.rs](/home/holmes/poc-7/src/event_modules/file/queries.rs)).
 
-Then update [queries.rs](/home/holmes/poc-7/src/event_modules/message/queries.rs):
+Then update [message/queries.rs](/home/holmes/poc-7/src/event_modules/message/queries.rs):
 
 1. import `message_unfurl`,
 2. fetch unfurls alongside reactions/attachments,
-3. add `unfurls: Vec<UnfurlSummary>` to [mod.rs](/home/holmes/poc-7/src/event_modules/message/mod.rs) `MessageItem`, where each `UnfurlSummary` carries `url`, `title`, and `image_url`.
+3. add `unfurls: Vec<UnfurlSummary>` to `MessageItem` in [message/mod.rs](/home/holmes/poc-7/src/event_modules/message/mod.rs), where each `UnfurlSummary` carries `url`, `title`, and `image_url`.
 
 This is the only place the "messages API shape" changes; canonical history remains event-sourced.
 
 ### 5. Add Command Path
 
-Add a command entrypoint where user-facing sends are already implemented:
+Add a command entrypoint where user-facing sends are already implemented — either in [message/commands.rs](/home/holmes/poc-7/src/event_modules/message/commands.rs) or a focused `message_unfurl/commands.rs`.
 
-1. either in [commands.rs](/home/holmes/poc-7/src/event_modules/message/commands.rs),
-2. or a focused `message_unfurl/commands.rs`.
-
-Use `create_signed_event_synchronous(...)` to emit one `message_unfurl` event per unfurl.  
-If the message does not exist yet, the unfurl event blocks and later unblocks via normal cascade.
+Use `create_signed_event(...)` from [src/state/projection/create.rs](/home/holmes/poc-7/src/state/projection/create.rs) to emit one `message_unfurl` event per unfurl; for content that must be encrypted on the wire, use `create_encrypted_event(...)` — when passed signer info, it produces `Signed(Encrypted(inner))` (outer Signed wrapping the Encrypted envelope). If the message does not exist yet, the unfurl event blocks on `message_id` and later unblocks via the normal Kahn cascade ([§5.2](#52-counter-based-kahn-cascade-unblock)). The staged variants (`create_signed_event_staged`, `create_encrypted_event_staged`) return `Ok` rather than `Err` on missing deps — use them when the caller tolerates deferred projection.
 
 ### 6. Wire RPC/CLI To The New Command
 
 If this feature is externally callable:
 
-1. add RPC method variant in [protocol.rs](/home/holmes/poc-7/src/runtime/control/rpc/protocol.rs),
-2. add catalog entry in [catalog.rs](/home/holmes/poc-7/src/runtime/control/rpc/catalog.rs),
-3. add dispatch handler in [server.rs](/home/holmes/poc-7/src/runtime/control/rpc/server.rs),
-4. add CLI handler in [main.rs](/home/holmes/poc-7/src/runtime/control/main.rs) using `rpc_require_daemon()`.
+1. add an `RpcMethod` variant in [protocol.rs](/home/holmes/poc-7/src/runtime/control/rpc/protocol.rs),
+2. add a `MethodInfo` catalog entry in [catalog.rs](/home/holmes/poc-7/src/runtime/control/rpc/catalog.rs),
+3. add a dispatch handler in [server.rs](/home/holmes/poc-7/src/runtime/control/rpc/server.rs),
+4. add a CLI handler in [main.rs](/home/holmes/poc-7/src/runtime/control/main.rs) calling through `rpc_require_daemon(...)`.
 
 The CLI must always go through RPC — never open the database directly for workspace queries. No event logic belongs in RPC/service routing; those layers orchestrate only.
 
 ### 7. Tests You Add In The Same Change
 
-1. Roundtrip/meta tests in [mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs) (parse/encode, dep fields, signer fields, registry lookup).
-2. Projector tests in `tests/projectors/` for valid insert + dep/signer blocking behavior.
-3. Pipeline integration tests in `src/state/projection/apply/tests/` for unblock/cascade behavior.
+1. Roundtrip/meta tests in [src/event_modules/mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs) (parse/encode, dep fields, registry lookup, encryptable/transport-privacy/formal-family coverage).
+2. Pure-projector tests in [tests/projectors/](/home/holmes/poc-7/tests/projectors/) — valid-input projection and rejects over the pure contract (no pipeline).
+3. Pipeline integration tests in [src/state/projection/apply/tests/](/home/holmes/poc-7/src/state/projection/apply/tests/) — dep/signer blocking, unblock cascade, and encrypt/decrypt flow against a real DB.
 4. Scenario/API test proving messages can return multiple unfurls for one message.
 
 ### `message_reply` Variant
 
 If you implement reply references instead of unfurls, use the same flow with:
 
-1. `message_reply` event fields: `message_id`, `target_message_id`, signer fields,
-2. deps: `["message_id", "target_message_id", "signed_by"]`,
-3. projection table keyed by `(recorded_by, event_id)` with index on `(recorded_by, message_id)`.
+1. `message_reply` inner fields: `message_id`, `target_message_id` (both `EventId`), plus any reply metadata,
+2. `dep_fields: &["message_id", "target_message_id"]` (signer is still resolved via the Signed wrapper, not declared here),
+3. projection table keyed by `(recorded_by, event_id)` with an index on `(recorded_by, message_id)`.
 
 You still get "multiple replies attached to one message" by emitting multiple `message_reply` events with the same `message_id`.
 

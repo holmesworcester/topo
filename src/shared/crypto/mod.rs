@@ -1,3 +1,8 @@
+//! Cross-layer cryptographic primitives: BLAKE3 event IDs and the `EventId` type alias,
+//! Ed25519 signing/verification, AES-256-GCM encryption, base64 helpers for event-ID
+//! display, BAO verified streaming ([`bao_verify`]), and SPKI fingerprinting used for
+//! pinning transport identity.
+
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
