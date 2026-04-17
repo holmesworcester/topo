@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::db::queue::current_timestamp_ms;
-use crate::state::pipeline::{ingest_now_result, ImmediateIngestResult};
+use crate::state::pipeline::{ImmediateIngestResult, ingest_now_result};
 use crate::tuning::low_mem_mode;
 
 const DIRECT_INGEST_PENDING_BYTES_CAP: usize = 32 * 1024 * 1024;
@@ -22,7 +22,6 @@ struct DirectIngestInner {
 
 struct DirectIngestState {
     inner: Mutex<DirectIngestInner>,
-    wake: Condvar,
     byte_budget: Arc<Semaphore>,
 }
 
@@ -80,7 +79,6 @@ fn direct_ingest_state(db_path: &str) -> Arc<DirectIngestState> {
         .or_insert_with(|| {
             Arc::new(DirectIngestState {
                 inner: Mutex::new(DirectIngestInner::default()),
-                wake: Condvar::new(),
                 byte_budget: Arc::new(Semaphore::new(direct_ingest_pending_bytes_cap())),
             })
         })
@@ -158,7 +156,6 @@ pub async fn enqueue_direct_ingest_waiter(
             spawn_worker = true;
         }
     }
-    state.wake.notify_all();
     if spawn_worker {
         spawn_direct_ingest_worker(db_path, &state)?;
     }
@@ -167,22 +164,20 @@ pub async fn enqueue_direct_ingest_waiter(
 
 fn direct_ingest_worker(db_path: String, state: Arc<DirectIngestState>) {
     loop {
-        let next_job = {
+        let Some(mut job) = ({
             let mut inner = state
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            loop {
-                if let Some(job) = inner.pending.pop_front() {
-                    break Some(job);
+            match inner.pending.pop_front() {
+                Some(job) => Some(job),
+                None => {
+                    inner.worker_running = false;
+                    None
                 }
-                inner.worker_running = false;
-                return;
             }
-        };
-
-        let Some(mut job) = next_job else {
-            continue;
+        }) else {
+            return;
         };
         let first_stored_at_ms = current_timestamp_ms();
         for item in &mut job.batch {
