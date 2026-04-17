@@ -18,9 +18,7 @@ use crate::sync::session::range_session::{
     open_live_suppression_session, order_phase2_then_phase1_shared_event_ids_for_send_for_peer,
     send_selected_events, spawn_receive_task,
 };
-use crate::sync::session::receive_log::{
-    acquire_peer_session_ingest_guard, wait_for_ingest_waiters,
-};
+use crate::sync::session::receive::{acquire_peer_session_ingest_guard, wait_for_ingest_waiters};
 use crate::sync::session::windowing::{
     decode_sync_window_kind, encode_initial_neg_open, is_low_mem_allowed_window,
     mark_outbound_window_completed, restrict_outbound_windows_to_last_week, select_outbound_window,

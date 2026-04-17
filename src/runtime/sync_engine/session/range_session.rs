@@ -14,7 +14,7 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::store::Store;
 use crate::protocol::{neg_id_to_event_id, Frame, MSG_TYPE_EVENT};
 use crate::sync::session::logging::SyncRunRxCapture;
-use crate::sync::session::receive_log::{enqueue_direct_ingest_waiter, IngestWaiter};
+use crate::sync::session::receive::{enqueue_direct_ingest_waiter, IngestWaiter};
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
@@ -3324,7 +3324,7 @@ mod tests {
                 .expect("sibling suppression delivery before ingest wait"),
             event_id
         );
-        crate::sync::session::receive_log::wait_for_ingest_waiters(result.ingest_waiters)
+        crate::sync::session::receive::wait_for_ingest_waiters(result.ingest_waiters)
             .await
             .unwrap();
         assert_eq!(
