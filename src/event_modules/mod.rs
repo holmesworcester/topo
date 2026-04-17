@@ -1,3 +1,8 @@
+//! Event type registry, wire-format parsing, and the `ParsedEvent` enum that flows through
+//! the projection pipeline. One submodule per event type; shared helpers live in
+//! [`layout`] and [`registry`]. `registry()` builds the static table consulted by the
+//! pipeline to parse, encrypt-wrap, and project each type.
+
 pub mod admin;
 pub mod bench_dep;
 pub mod encrypted;

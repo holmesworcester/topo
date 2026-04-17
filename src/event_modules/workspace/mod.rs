@@ -1,3 +1,8 @@
+//! `workspace` event (type 8): bootstraps a workspace and its root trust anchor. Hosts the
+//! bootstrap/join/invite-link authoring commands ([`commands`], [`invite_link`],
+//! [`identity_ops`]) that drive identity-layer setup, plus the decision-context/pure-planner
+//! shape described in DESIGN.md §"Context Queries And Pure Planners".
+
 pub mod authoring;
 pub mod bootstrap_address;
 mod command_plans;

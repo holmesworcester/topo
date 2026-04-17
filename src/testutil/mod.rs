@@ -1,3 +1,8 @@
+//! Test harness utilities used across integration and CLI tests. Hosts the `DaemonGuard`
+//! RAII wrapper that kills leaked daemon processes on panic, the `Peer` / `SharedDbNode`
+//! fixtures used to drive multi-peer scenarios, and the helpers that spawn, dial, and
+//! assert against `topo` daemons from Rust tests.
+
 pub(crate) use std::net::SocketAddr;
 use std::process::Child;
 pub(crate) use std::time::{Duration, Instant};

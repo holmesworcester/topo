@@ -1,3 +1,8 @@
+//! Event ingest pipeline. Batches incoming blobs, runs the persist phase in a single
+//! SQLite transaction ([`phases`]), then drives post-commit effects ([`effects`]) and
+//! [`drain`]s the projection queue. The separation keeps WAL-write work tight so the
+//! sync engine's long-running reader connection does not contend with projection writes.
+
 mod drain;
 mod effects;
 mod phases;

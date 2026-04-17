@@ -1,3 +1,8 @@
+//! Peering runtime — the connection-orchestration layer above the transport. [`engine`]
+//! runs the per-node state machine (spawned via `run_node`); [`loops`] hosts the accept
+//! and connect loops that drive it. Transport-layer concerns (QUIC, mTLS, NAT traversal)
+//! stay inside `runtime::transport`.
+
 pub mod engine;
 pub mod loops;
 
