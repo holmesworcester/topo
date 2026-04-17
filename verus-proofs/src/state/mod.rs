@@ -1,6 +1,7 @@
 pub mod cascade_invariant;
 pub mod command_roundtrip;
 pub mod encrypted_event_structure;
+pub mod event_codec_ts_id;
 pub mod event_id_integrity;
 pub mod pipeline;
 pub mod projection;

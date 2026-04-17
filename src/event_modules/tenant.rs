@@ -32,12 +32,24 @@ impl super::Describe for TenantEvent {
 }
 
 pub fn parse_tenant(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    let values = decode_fields(EVENT_TYPE_TENANT, TENANT_FIELDS, blob)?;
-
-    Ok(ParsedEvent::Tenant(TenantEvent {
-        created_at_ms: values[0].as_timestamp().unwrap(),
-        public_key: values[1].as_event_id().unwrap(),
-    }))
+    // Verus-verified parser for the (type_byte + u64 + [u8;32]) shape; returns
+    // Some iff the blob length and type byte match. See
+    // verus-proofs/src/state/event_codec_ts_id.rs.
+    match topo_verus_proofs::state::event_codec_ts_id::parse_ts_id(EVENT_TYPE_TENANT, blob) {
+        Some((created_at_ms, public_key)) => Ok(ParsedEvent::Tenant(TenantEvent {
+            created_at_ms,
+            public_key,
+        })),
+        None => {
+            // Fall back to the generic decoder to produce the same error variants
+            // existing tests expect (TooShort / TrailingData / WrongType).
+            let values = decode_fields(EVENT_TYPE_TENANT, TENANT_FIELDS, blob)?;
+            Ok(ParsedEvent::Tenant(TenantEvent {
+                created_at_ms: values[0].as_timestamp().unwrap(),
+                public_key: values[1].as_event_id().unwrap(),
+            }))
+        }
+    }
 }
 
 pub fn encode_tenant(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
@@ -45,13 +57,12 @@ pub fn encode_tenant(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::Tenant(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.public_key),
-    ];
-
-    Ok(encode_fields(EVENT_TYPE_TENANT, TENANT_FIELDS, &values)?)
+    // Verus-verified encoder; output is SMT-proven to round-trip through `parse_ts_id`.
+    Ok(topo_verus_proofs::state::event_codec_ts_id::encode_ts_id(
+        EVENT_TYPE_TENANT,
+        e.created_at_ms,
+        &e.public_key,
+    ))
 }
 
 use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
