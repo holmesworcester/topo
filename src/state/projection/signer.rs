@@ -91,6 +91,30 @@ pub fn resolve_signer_key(
 fn signer_identity_from_parsed(
     parsed: &ParsedEvent,
 ) -> Result<(u8, [u8; 32]), Box<dyn std::error::Error>> {
+    // Verus-verified structural gate: only explicitly whitelisted event types carry
+    // public keys intended for signing. Any other type code must be rejected — using
+    // a content event as a signer would break the signer-key lookup or (worse)
+    // let an attacker substitute content for a key. See
+    // verus-proofs/src/state/signer_chain.rs::is_valid_signer_type.
+    let type_code = parsed.event_type_code();
+    use topo_verus_proofs::state::{projector_registry, signer_chain};
+    if let Some(code_enum) = runtime_type_code_to_enum(type_code) {
+        if !signer_chain::is_valid_signer_type(code_enum) {
+            return Err(format!(
+                "signer event type_code={type_code} is not a supported signer identity type \
+                 (verified whitelist: Workspace, UserInvite, DeviceInvite, User, PeerShared, Admin)"
+            )
+            .into());
+        }
+    } else {
+        return Err(format!(
+            "signer event type_code={type_code} is not a supported signer identity type \
+             (unregistered event type)"
+        )
+        .into());
+    }
+    let _ = projector_registry::EventTypeCode::Signed; // keep import alive
+
     let identity = match parsed {
         ParsedEvent::Workspace(event) => {
             (crate::event_modules::EVENT_TYPE_WORKSPACE, event.public_key)
@@ -110,6 +134,9 @@ fn signer_identity_from_parsed(
         ),
         ParsedEvent::Admin(event) => (crate::event_modules::EVENT_TYPE_ADMIN, event.public_key),
         other => {
+            // Unreachable: the verified whitelist above already rejected this.
+            // Kept as a defense-in-depth, in case the whitelist and the match here
+            // fall out of sync (which would trip the bound at compile time anyway).
             return Err(format!(
                 "signer event type_code={} is not a supported signer identity type",
                 other.event_type_code()
@@ -118,6 +145,43 @@ fn signer_identity_from_parsed(
         }
     };
     Ok(identity)
+}
+
+/// Trusted extractor: u8 type code → Verus EventTypeCode enum.
+/// Mirrors the extractor in event_modules/mod.rs::tests::type_code_to_enum.
+fn runtime_type_code_to_enum(
+    type_code: u8,
+) -> Option<topo_verus_proofs::state::projector_registry::EventTypeCode> {
+    use crate::event_modules::*;
+    use topo_verus_proofs::state::projector_registry::EventTypeCode;
+    match type_code {
+        EVENT_TYPE_MESSAGE => Some(EventTypeCode::Message),
+        EVENT_TYPE_REACTION => Some(EventTypeCode::Reaction),
+        EVENT_TYPE_ENCRYPTED => Some(EventTypeCode::Encrypted),
+        EVENT_TYPE_KEY_SECRET => Some(EventTypeCode::KeySecret),
+        EVENT_TYPE_MESSAGE_DELETION => Some(EventTypeCode::MessageDeletion),
+        EVENT_TYPE_WORKSPACE => Some(EventTypeCode::Workspace),
+        EVENT_TYPE_INVITE_ACCEPTED => Some(EventTypeCode::InviteAccepted),
+        EVENT_TYPE_USER_INVITE => Some(EventTypeCode::UserInvite),
+        EVENT_TYPE_DEVICE_INVITE => Some(EventTypeCode::DeviceInvite),
+        EVENT_TYPE_USER => Some(EventTypeCode::User),
+        EVENT_TYPE_PEER_SHARED => Some(EventTypeCode::PeerShared),
+        EVENT_TYPE_ADMIN => Some(EventTypeCode::Admin),
+        EVENT_TYPE_KEY_SHARED => Some(EventTypeCode::KeyShared),
+        EVENT_TYPE_FILE => Some(EventTypeCode::File),
+        EVENT_TYPE_FILE_SLICE => Some(EventTypeCode::FileSlice),
+        EVENT_TYPE_BENCH_DEP => Some(EventTypeCode::BenchDep),
+        EVENT_TYPE_PEER_SECRET => Some(EventTypeCode::PeerSecret),
+        EVENT_TYPE_INVITE_SECRET => Some(EventTypeCode::InviteSecret),
+        EVENT_TYPE_TENANT => Some(EventTypeCode::Tenant),
+        EVENT_TYPE_KEY_REQUEST => Some(EventTypeCode::KeyRequest),
+        EVENT_TYPE_REMOVAL => Some(EventTypeCode::Removal),
+        EVENT_TYPE_KEY_ROTATION => Some(EventTypeCode::KeyRotation),
+        EVENT_TYPE_ENDPOINT_SECRET => Some(EventTypeCode::EndpointSecret),
+        EVENT_TYPE_ENDPOINT_SHARED => Some(EventTypeCode::EndpointShared),
+        EVENT_TYPE_SIGNED => Some(EventTypeCode::Signed),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

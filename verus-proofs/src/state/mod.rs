@@ -9,5 +9,6 @@ pub mod projector_result_discipline;
 pub mod queue_backoff;
 pub mod shared_workspace_fanout;
 pub mod signed_event_structure;
+pub mod signer_chain;
 pub mod tenant_isolation;
 pub mod writeop_idempotency;

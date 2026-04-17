@@ -500,15 +500,29 @@ pub fn encode_event(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
     #[cfg(debug_assertions)]
     {
-        if let Ok(parsed) = parse_event(&blob) {
-            let roundtripped = parsed.event_type_code();
-            assert!(
-                topo_verus_proofs::state::command_roundtrip::event_type_code_preserved(
-                    type_code,
-                    roundtripped,
-                ),
-                "encode/parse type-code drift: encoded as {type_code} but re-parsed as {roundtripped}"
-            );
+        match parse_event(&blob) {
+            Ok(parsed) => {
+                let type_code_ok =
+                    topo_verus_proofs::state::command_roundtrip::event_type_code_preserved(
+                        type_code,
+                        parsed.event_type_code(),
+                    );
+                let full_equality_ok = parsed == *event;
+                assert!(
+                    topo_verus_proofs::state::command_roundtrip::encoder_roundtrip_ok(
+                        type_code_ok,
+                        full_equality_ok,
+                    ),
+                    "encode/parse round-trip mismatch for type {type_code}: \
+                     type_code_ok={type_code_ok} full_equality_ok={full_equality_ok}",
+                );
+            }
+            Err(e) => {
+                panic!(
+                    "encode/parse round-trip: encode produced a blob that parse rejects \
+                     (type {type_code}, error: {e:?})"
+                );
+            }
         }
     }
 
