@@ -83,26 +83,22 @@ where
     unreachable!("loop returns on success or final error");
 }
 
+/// Execute BEGIN IMMEDIATE with busy-retry. Used by `TxnGuard::begin`.
+pub fn begin_immediate_with_retry(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    with_sqlite_busy_retry(|| conn.execute("BEGIN IMMEDIATE", []).map(|_| ()))
+}
+
+/// Closure-style helper — delegates to `TxnGuard` under the hood for Drop-safety.
+/// Retained for backward compatibility with existing call sites; new code should
+/// prefer `TxnGuard::begin` / `commit` directly.
 pub fn with_immediate_tx<T, F>(conn: &rusqlite::Connection, mut op: F) -> rusqlite::Result<T>
 where
     F: FnMut() -> rusqlite::Result<T>,
 {
-    if !conn.is_autocommit() {
-        return op();
-    }
-    with_sqlite_busy_retry(|| {
-        conn.execute("BEGIN IMMEDIATE", [])?;
-        match op() {
-            Ok(value) => {
-                conn.execute("COMMIT", [])?;
-                Ok(value)
-            }
-            Err(err) => {
-                let _ = conn.execute("ROLLBACK", []);
-                Err(err)
-            }
-        }
-    })
+    let guard = super::txn_guard::TxnGuard::begin(conn)?;
+    let value = op()?;
+    guard.commit()?;
+    Ok(value)
 }
 
 pub fn with_immediate_tx_result<T, E, F>(conn: &rusqlite::Connection, mut op: F) -> Result<T, E>
@@ -110,21 +106,10 @@ where
     F: FnMut() -> Result<T, E>,
     E: From<rusqlite::Error>,
 {
-    if !conn.is_autocommit() {
-        return op();
-    }
-
-    with_sqlite_busy_retry(|| conn.execute("BEGIN IMMEDIATE", []).map(|_| ())).map_err(E::from)?;
-    match op() {
-        Ok(value) => {
-            conn.execute("COMMIT", []).map_err(E::from)?;
-            Ok(value)
-        }
-        Err(err) => {
-            let _ = conn.execute("ROLLBACK", []);
-            Err(err)
-        }
-    }
+    let guard = super::txn_guard::TxnGuard::begin(conn).map_err(E::from)?;
+    let value = op()?;
+    guard.commit().map_err(E::from)?;
+    Ok(value)
 }
 
 /// Calculate backoff delay: base_ms * 2^min(attempts, max_attempts).

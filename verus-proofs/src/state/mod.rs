@@ -11,4 +11,5 @@ pub mod shared_workspace_fanout;
 pub mod signed_event_structure;
 pub mod signer_chain;
 pub mod tenant_isolation;
+pub mod txn_state_machine;
 pub mod writeop_idempotency;
