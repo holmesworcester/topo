@@ -11,7 +11,7 @@ use crate::event_modules::file_slice::{
     BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES, MAX_FILE_BYTES,
 };
 use crate::projection::create::{
-    create_encrypted_event_synchronous, create_encrypted_event_synchronous_with_owner,
+    create_encrypted_event, create_encrypted_event_with_owner,
 };
 use crate::service::open_db_for_peer;
 use crate::state::db::queue::current_timestamp_ms_u64;
@@ -235,7 +235,7 @@ pub fn create(
         content: cmd.content,
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
-    let eid = create_encrypted_event_synchronous(
+    let eid = create_encrypted_event(
         db,
         recorded_by,
         &key_event_id,
@@ -297,7 +297,7 @@ pub fn create_deletion(
         target_event_id: cmd.target_event_id,
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
-    let eid = create_encrypted_event_synchronous(
+    let eid = create_encrypted_event(
         db,
         recorded_by,
         &key_event_id,
@@ -495,7 +495,7 @@ pub fn generate_files_for_peer(
                 "blob_bytes overflow".into()
             })?;
 
-        create_encrypted_event_synchronous_with_owner(
+        create_encrypted_event_with_owner(
             &db,
             &recorded_by,
             &key_event_id,
@@ -519,7 +519,7 @@ pub fn generate_files_for_peer(
         })?;
 
         for slice_number in 0..slices_per_file {
-            create_encrypted_event_synchronous_with_owner(
+            create_encrypted_event_with_owner(
                 &db,
                 &recorded_by,
                 &key_event_id,
@@ -729,7 +729,7 @@ fn send_file_for_peer_inner(
             let key_event_id =
                 workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
 
-            create_encrypted_event_synchronous_with_owner(
+            create_encrypted_event_with_owner(
                 &db,
                 &recorded_by,
                 &key_event_id,
@@ -783,7 +783,7 @@ fn send_file_for_peer_inner(
                     )?;
                 remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
 
-                create_encrypted_event_synchronous_with_owner(
+                create_encrypted_event_with_owner(
                     &db,
                     &recorded_by,
                     &key_event_id,
@@ -813,7 +813,7 @@ fn send_file_for_peer_inner(
                 )?;
                 let ciphertext =
                     vec![(bad_idx as u8).wrapping_add(0xA5); FILE_SLICE_CIPHERTEXT_BYTES];
-                create_encrypted_event_synchronous_with_owner(
+                create_encrypted_event_with_owner(
                     &db,
                     &recorded_by,
                     &key_event_id,

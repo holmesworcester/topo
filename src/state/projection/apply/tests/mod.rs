@@ -15,7 +15,7 @@ use crate::event_modules::{
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::state::projection::create::{
-    create_event_staged, create_event_synchronous, create_signed_event_synchronous,
+    create_event_staged, create_event, create_signed_event,
     encode_signed_wrapper_blob, project_event, store_event_only,
 };
 use aes_gcm::aead::Aead;
@@ -189,7 +189,7 @@ pub(super) fn canonical_test_event_id(
 }
 
 /// Insert a blob into events + shared_event_index + recorded_events (simulating what
-/// batch_writer or create_event_synchronous does before calling project_one).
+/// batch_writer or create_event does before calling project_one).
 pub(super) fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
     let blob = wrap_test_content_blob(conn, recorded_by, blob);
     ensure_test_wrapper_key_for_blob(conn, recorded_by, &blob);
@@ -277,7 +277,7 @@ pub(super) fn setup_tenant_event(conn: &Connection, recorded_by: &str) -> EventI
         created_at_ms: now_ms(),
         public_key: peer_key.verifying_key().to_bytes(),
     });
-    create_event_synchronous(conn, recorded_by, &tenant_event).unwrap()
+    create_event(conn, recorded_by, &tenant_event).unwrap()
 }
 
 pub(super) fn append_invite_link_workspace_context(
@@ -325,7 +325,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         invite_event_id: net_eid,
         workspace_id: net_eid,
     });
-    create_event_synchronous(conn, recorded_by, &ia_event).unwrap();
+    create_event(conn, recorded_by, &ia_event).unwrap();
     project_event(conn, recorded_by, &net_eid).unwrap();
     mark_valid_for_test(conn, recorded_by, &net_eid, net_event.event_type_code());
 
@@ -340,7 +340,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
     };
     let uib_event = ParsedEvent::UserInvite(uib);
     let uib_eid =
-        create_signed_event_synchronous(conn, recorded_by, &net_eid, &uib_event, &workspace_key)
+        create_signed_event(conn, recorded_by, &net_eid, &uib_event, &workspace_key)
             .unwrap();
 
     // 5. User (signed by invite key)
@@ -353,7 +353,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
     };
     let ub_event = ParsedEvent::User(ub);
     let ub_eid =
-        create_signed_event_synchronous(conn, recorded_by, &uib_eid, &ub_event, &invite_key)
+        create_signed_event(conn, recorded_by, &uib_eid, &ub_event, &invite_key)
             .unwrap();
 
     // 6. DeviceInvite (signed by user key)
@@ -366,7 +366,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
     let dif_eid =
-        create_signed_event_synchronous(conn, recorded_by, &ub_eid, &dif_event, &user_key).unwrap();
+        create_signed_event(conn, recorded_by, &ub_eid, &dif_event, &user_key).unwrap();
 
     // 7. EndpointShared (self-signed, endpoint-scoped)
     let endpoint_key = SigningKey::generate(&mut rng);
@@ -375,7 +375,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
     );
     let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
     let endpoint_shared_event_id =
-        create_event_synchronous(conn, &endpoint_id, &endpoint_event).unwrap();
+        create_event(conn, &endpoint_id, &endpoint_event).unwrap();
 
     // 8. PeerShared (signed by device_invite key)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -388,7 +388,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         device_name: "device".to_string(),
     };
     let psf_event = ParsedEvent::PeerShared(psf);
-    let psf_eid = create_signed_event_synchronous(
+    let psf_eid = create_signed_event(
         conn,
         recorded_by,
         &dif_eid,
@@ -546,7 +546,7 @@ pub(super) fn ensure_test_endpoint_shared(conn: &Connection) -> EventId {
     let event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
         endpoint_key.to_bytes(),
     );
-    create_event_synchronous(conn, &endpoint_id, &event).unwrap()
+    create_event(conn, &endpoint_id, &event).unwrap()
 }
 
 fn make_message_signed(

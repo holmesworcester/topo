@@ -1,6 +1,6 @@
 use crate::event_modules::ParsedEvent;
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::decision_context::{
     decide_workspace_context_plan, workspace_context_plan_to_load_result, ContextLoadResult,
     ProjectionFrameContext, ProjectionQueries,
 };

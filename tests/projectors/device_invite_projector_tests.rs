@@ -7,8 +7,8 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::peer_invite_shared::project_pure;
-    use topo::event_modules::peer_invite_shared::DeviceInviteEvent;
+    use topo::event_modules::device_invite::project_pure;
+    use topo::event_modules::device_invite::DeviceInviteEvent;
     use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_inviter";

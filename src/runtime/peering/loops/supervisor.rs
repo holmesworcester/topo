@@ -13,7 +13,7 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::project_queue::ProjectQueue;
+use crate::db::projection_queue::ProjectionQueue;
 use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
@@ -81,7 +81,7 @@ pub(super) fn run_startup_preflight(
         info!("Purged {} expired endpoint observations", purged);
     }
 
-    let project_queue = ProjectQueue::new(&db);
+    let project_queue = ProjectionQueue::new(&db);
     let recovered = project_queue.recover_expired().unwrap_or(0);
     if recovered > 0 {
         info!("Recovered {} expired project_queue leases", recovered);

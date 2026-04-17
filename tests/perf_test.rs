@@ -422,7 +422,7 @@ fn inject_messages_batched(
     use std::time::{SystemTime, UNIX_EPOCH};
     use topo::db::open_connection;
     use topo::event_modules::{MessageEvent, ParsedEvent};
-    use topo::projection::create::create_encrypted_event_synchronous;
+    use topo::projection::create::create_encrypted_event;
     use topo::projection::create::CreateEventError;
     use topo::state::db::queue::SQLITE_BUSY_RETRY_BASE_MS;
 
@@ -445,7 +445,7 @@ fn inject_messages_batched(
             });
             let mut created = None;
             for attempt in 0..8 {
-                match create_encrypted_event_synchronous(
+                match create_encrypted_event(
                     &db,
                     recorded_by,
                     &key_event_id,
@@ -463,7 +463,7 @@ fn inject_messages_batched(
                             SQLITE_BUSY_RETRY_BASE_MS << attempt,
                         ));
                     }
-                    Err(err) => panic!("create_encrypted_event_synchronous failed: {err:?}"),
+                    Err(err) => panic!("create_encrypted_event failed: {err:?}"),
                 }
             }
             assert!(

@@ -3,7 +3,7 @@ use super::layout::field_spec::{
 };
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_ENDPOINT_SHARED};
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::{Connection, OptionalExtension};
 
 pub const ENDPOINT_SHARED_FIELDS: &[FieldSpec] = &[
@@ -301,7 +301,7 @@ pub static ENDPOINT_SHARED_META: EventTypeMeta = EventTypeMeta {
 mod tests {
     use super::*;
     use crate::event_modules::{encode_event, parse_event};
-    use crate::projection::create::create_event_synchronous;
+    use crate::projection::create::create_event;
 
     #[test]
     fn test_roundtrip_endpoint_shared() {
@@ -328,8 +328,8 @@ mod tests {
             crate::event_modules::endpoint_secret::deterministic_endpoint_secret_event([0x61; 32]);
         let local_endpoint_id =
             crate::event_modules::endpoint_secret::endpoint_id_from_private_key_bytes(&[0x61; 32]);
-        create_event_synchronous(&conn, &local_endpoint_id, &local_secret).unwrap();
-        create_event_synchronous(
+        create_event(&conn, &local_endpoint_id, &local_secret).unwrap();
+        create_event(
             &conn,
             &local_endpoint_id,
             &deterministic_endpoint_shared_event([0x61; 32]),
@@ -338,7 +338,7 @@ mod tests {
 
         let remote_endpoint_id =
             crate::event_modules::endpoint_secret::endpoint_id_from_private_key_bytes(&[0x62; 32]);
-        create_event_synchronous(
+        create_event(
             &conn,
             &remote_endpoint_id,
             &deterministic_endpoint_shared_event([0x62; 32]),

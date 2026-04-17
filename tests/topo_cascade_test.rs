@@ -154,7 +154,7 @@ fn run_topo_cascade(n: usize) {
         assert!(
             matches!(
                 result,
-                topo::projection::decision::ProjectionDecision::Block { .. }
+                topo::projection::decision::ProjectionDecision::BlockOnMissingDeps { .. }
             ),
             "event {} should block, got {:?}",
             i,

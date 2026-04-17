@@ -90,7 +90,7 @@ fn test_encrypted_blocks_on_missing_key() {
 
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
     match result {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert_eq!(missing.len(), 1);
             assert_eq!(missing[0], sk_eid);
         }
@@ -125,7 +125,7 @@ fn test_encrypted_unblocks_when_key_arrives() {
 
     // Project → Block
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::Block { .. }));
+    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Now insert and project the secret key
     insert_event_raw(&conn, recorded_by, &sk_blob);
@@ -450,7 +450,7 @@ fn test_encrypted_inner_dep_blocks() {
 
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
     match result {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert!(missing.contains(&fake_target));
         }
         other => panic!("expected Block on inner dep, got {:?}", other),
@@ -497,7 +497,7 @@ fn test_encrypted_inner_dep_unblocks() {
 
     // Project → Block on inner dep (message)
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::Block { .. }));
+    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
 
     // Now insert and project the message
     let inserted_msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
@@ -591,7 +591,7 @@ fn test_encrypted_cross_tenant_isolation() {
     // before it can even reach the encrypted wrapper key dependency.
     let r_b = project_one(&conn, tenant_b, &enc_eid).unwrap();
     match r_b {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert_eq!(missing.len(), 1);
             assert_eq!(missing[0], signer_eid);
         }
@@ -1060,7 +1060,7 @@ fn test_encrypted_file_slice_blocks_on_missing_descriptor() {
 
     // Should block on the synthetic file_id dependency.
     assert!(
-        matches!(result, ProjectionDecision::Block { .. }),
+        matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }),
         "encrypted file_slice should block without descriptor, got {:?}",
         result
     );
@@ -1120,7 +1120,7 @@ fn test_encrypted_inner_signer_dep_missing_blocks() {
     // doesn't exist in valid_events, this should block on the missing dep.
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
     match result {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert!(
                 missing.contains(&fake_signer_eid),
                 "should block on missing signer dep"

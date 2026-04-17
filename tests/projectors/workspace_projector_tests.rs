@@ -10,7 +10,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::workspace::{build_projector_context, project_pure, WorkspaceEvent};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::queries::ProjectionFrameContext;
+    use topo::projection::decision_context::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
 

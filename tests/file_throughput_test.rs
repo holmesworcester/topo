@@ -13,7 +13,7 @@ use topo::event_modules::{
     file_slice::{FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES},
     FileEvent, FileSliceEvent, ParsedEvent,
 };
-use topo::projection::create::create_encrypted_event_synchronous;
+use topo::projection::create::create_encrypted_event;
 use topo::testutil::Peer;
 
 fn now_ms() -> u64 {
@@ -44,7 +44,7 @@ fn run_file_throughput(file_size_bytes: usize) {
     let file_id = [0xF0; 32];
 
     // Create and project encrypted file descriptor first (required for file_slice auth).
-    let att_eid = create_encrypted_event_synchronous(
+    let att_eid = create_encrypted_event(
         &conn,
         recorded_by,
         &sk_eid,
@@ -71,7 +71,7 @@ fn run_file_throughput(file_size_bytes: usize) {
 
     // Encode + encrypt + store + project all file slices.
     for i in 0..total_slices as u32 {
-        create_encrypted_event_synchronous(
+        create_encrypted_event(
             &conn,
             recorded_by,
             &sk_eid,

@@ -111,7 +111,7 @@ impl ProjectorResult {
     /// Convenience: create a Block result (no writes, no commands).
     pub fn block(missing: Vec<[u8; 32]>) -> Self {
         Self {
-            decision: super::decision::ProjectionDecision::Block { missing },
+            decision: super::decision::ProjectionDecision::BlockOnMissingDeps { missing },
             write_ops: Vec::new(),
             emit_commands: Vec::new(),
             suppress_sharing: false,

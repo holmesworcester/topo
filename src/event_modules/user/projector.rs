@@ -1,5 +1,5 @@
 use super::super::ParsedEvent;
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: User -> users table.
 pub fn project_pure(

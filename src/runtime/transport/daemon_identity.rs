@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 use super::generate_self_signed_cert_from_signing_key;
-use crate::projection::create::create_event_synchronous;
+use crate::projection::create::create_event;
 
 pub const MISSING_DAEMON_IDENTITY_ERROR: &str = "daemon identity not found; start the daemon first";
 pub const INCONSISTENT_DAEMON_IDENTITY_ERROR: &str =
@@ -115,7 +115,7 @@ fn ensure_endpoint_secret_row(
             private_key_bytes,
         );
 
-        create_event_synchronous(conn, &endpoint_id, &event)
+        create_event(conn, &endpoint_id, &event)
             .map_err(|e| sqlite_other(e.to_string()))?;
 
         crate::event_modules::endpoint_secret::load_local_endpoint_secret(conn)
@@ -158,7 +158,7 @@ fn ensure_endpoint_shared_row(
             let event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
                 secret_row.private_key_bytes,
             );
-            create_event_synchronous(conn, &secret_row.endpoint_id, &event)
+            create_event(conn, &secret_row.endpoint_id, &event)
                 .map_err(|e| sqlite_other(e.to_string()))?;
         }
 

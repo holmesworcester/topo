@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use crate::crypto::event_id_to_base64;
 pub use crate::crypto::{sign_event_bytes, verify_ed25519_signature};
 use crate::event_modules::{parse_event, ParsedEvent};
-use crate::projection::contract::CurrentSignerInfo;
+use crate::projection::projector::CurrentSignerInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSigner {

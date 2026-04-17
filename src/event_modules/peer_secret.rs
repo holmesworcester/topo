@@ -66,7 +66,7 @@ pub fn encode_peer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 use crate::contracts::transport_identity_contract::TransportIdentitySpec;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{
+use crate::projection::projector::{
     EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
 };
 use rusqlite::Connection;

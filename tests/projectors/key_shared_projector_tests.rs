@@ -11,7 +11,7 @@ mod tests {
     use topo::event_modules::key_shared::{project_pure, KeySharedEvent};
     use topo::event_modules::removal::frontier_hash_from_refs;
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::{
+    use topo::projection::projector::{
         EmitCommand, ProjectorDecisionContext, UnwrappedSecretMaterial,
     };
 

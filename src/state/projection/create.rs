@@ -5,15 +5,17 @@ use super::apply::project_one;
 use super::decision::ProjectionDecision;
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::store::{
-    insert_event, insert_recorded_event, insert_shared_event_index_entry_if_shared,
-    lookup_workspace_id,
+    insert_event, insert_recorded_event, insert_recorded_event_checked,
+    insert_shared_event_index_entry_if_shared, lookup_workspace_id,
 };
 use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
 use crate::event_modules::{self as events, registry, ParsedEvent, TransportPrivacy};
 use crate::event_modules::{EncryptedEvent, SignedEvent};
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
-use crate::state::shared_workspace_fanout::fanout_stored_shared_event_inline;
+use crate::state::shared_workspace_fanout::{
+    fanout_stored_shared_event_immediate, fanout_stored_shared_event_inline,
+};
 use ed25519_dalek::SigningKey;
 
 #[derive(Debug)]
@@ -192,7 +194,7 @@ fn project_stored_event_outcome(
                 outcome: CreateAttemptOutcome::Success(*event_id),
             })
         }
-        ProjectionDecision::Block { missing } => Ok(StoredProjectionOutcome {
+        ProjectionDecision::BlockOnMissingDeps { missing } => Ok(StoredProjectionOutcome {
             outcome: CreateAttemptOutcome::Blocked {
                 event_id: *event_id,
                 missing,
@@ -264,7 +266,7 @@ fn store_blob_and_project(
 
 /// Create a new event: encode, hash, write to events/shared_event_index/recorded_events,
 /// then project via `project_one`. Returns the event_id on success.
-pub fn create_event_synchronous(
+pub fn create_event(
     conn: &Connection,
     recorded_by: &str,
     event: &ParsedEvent,
@@ -311,7 +313,7 @@ pub(crate) fn encode_signed_wrapper_blob(
 
 /// Create a signed event by wrapping the inner event in a Signed envelope,
 /// signing the canonical wrapper bytes, then storing and projecting the outer blob.
-pub fn create_signed_event_synchronous(
+pub fn create_signed_event(
     conn: &Connection,
     recorded_by: &str,
     signer_event_id: &EventId,
@@ -427,30 +429,20 @@ pub fn project_event(
     project_event_outcome(conn, recorded_by, event_id)?.into_result()
 }
 
-/// Project a previously-stored event, tolerating Block results (staged flow).
-/// Returns event_id on Valid, AlreadyProcessed, or Block.
-pub fn project_event_staged(
-    conn: &Connection,
-    recorded_by: &str,
-    event_id: &EventId,
-) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(project_event(conn, recorded_by, event_id))
-}
-
 /// Create an encrypted event: encode inner event, optionally sign it,
 /// resolve encryption key from key_secrets, encrypt, build EncryptedEvent
 /// wrapper, then store and project.
 ///
 /// If signer info is provided, the encrypted wrapper is itself wrapped in an
 /// outer Signed envelope, producing Signed(Encrypted(inner)).
-pub fn create_encrypted_event_synchronous(
+pub fn create_encrypted_event(
     conn: &Connection,
     recorded_by: &str,
     key_event_id: &EventId,
     inner_event: &ParsedEvent,
     signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
-    create_encrypted_event_synchronous_with_owner(
+    create_encrypted_event_with_owner(
         conn,
         recorded_by,
         key_event_id,
@@ -463,7 +455,7 @@ pub fn create_encrypted_event_synchronous(
 /// Create an encrypted event with optional outer owner linkage for convergent
 /// dependent deletion. `owner_event_id` is carried in wrapper metadata and may
 /// be zero/absent for root content or delete intents.
-pub fn create_encrypted_event_synchronous_with_owner(
+pub fn create_encrypted_event_with_owner(
     conn: &Connection,
     recorded_by: &str,
     key_event_id: &EventId,
@@ -530,14 +522,14 @@ pub fn create_encrypted_event_synchronous_with_owner(
 
     // 5. Store either the plaintext encrypted wrapper or Signed(Encrypted(inner)).
     match signer {
-        Some((signer_event_id, signing_key)) => create_signed_event_synchronous(
+        Some((signer_event_id, signing_key)) => create_signed_event(
             conn,
             recorded_by,
             signer_event_id,
             &wrapper,
             signing_key,
         ),
-        None => create_event_synchronous(conn, recorded_by, &wrapper),
+        None => create_event(conn, recorded_by, &wrapper),
     }
 }
 
@@ -551,7 +543,7 @@ pub fn create_encrypted_event_staged(
     inner_event: &ParsedEvent,
     signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(create_encrypted_event_synchronous(
+    event_id_or_blocked(create_encrypted_event(
         conn,
         recorded_by,
         key_event_id,
@@ -569,7 +561,7 @@ pub fn create_event_staged(
     recorded_by: &str,
     event: &ParsedEvent,
 ) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(create_event_synchronous(conn, recorded_by, event))
+    event_id_or_blocked(create_event(conn, recorded_by, event))
 }
 
 /// Staged signed create: persist and enqueue a signed event even if it is Blocked.
@@ -583,13 +575,133 @@ pub fn create_signed_event_staged(
     event: &ParsedEvent,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(create_signed_event_synchronous(
+    event_id_or_blocked(create_signed_event(
         conn,
         recorded_by,
         signer_event_id,
         event,
         signing_key,
     ))
+}
+
+struct EmitOutcome {
+    event_id: EventId,
+}
+
+/// Emit a deterministic event: compute blob, hash to event_id, check if already
+/// exists, if not: store in events/shared_event_index/recorded_events and project via project_one.
+/// Returns the event_id regardless of whether it was newly created or already existed.
+///
+/// This follows the emitted-event rule: "emit canonical event X only (to events +
+/// normal queue flow), let X project through X's own projector."
+pub fn emit_deterministic_event(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+) -> Result<EventId, Box<dyn std::error::Error>> {
+    let blob = events::encode_event(event).map_err(|e| format!("encode error: {}", e))?;
+    emit_deterministic_blob(conn, recorded_by, &blob)
+}
+
+/// Emit a deterministic canonical blob through the normal event pipeline.
+pub fn emit_deterministic_blob(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+) -> Result<EventId, Box<dyn std::error::Error>> {
+    let emitted = if conn.is_autocommit() {
+        crate::state::db::queue::with_immediate_tx_result(conn, || {
+            emit_deterministic_blob_in_tx(conn, recorded_by, blob)
+        })?
+    } else {
+        emit_deterministic_blob_in_tx(conn, recorded_by, blob)?
+    };
+    Ok(emitted.event_id)
+}
+
+fn emit_deterministic_blob_in_tx(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+) -> Result<EmitOutcome, Box<dyn std::error::Error>> {
+    if blob.is_empty() {
+        return Err("deterministic blob cannot be empty".into());
+    }
+    let event_id = hash_event(blob);
+    let event_id_b64 = event_id_to_base64(&event_id);
+
+    let type_code = blob[0];
+    let meta = registry()
+        .lookup(type_code)
+        .ok_or_else(|| format!("unknown type code {}", type_code))?;
+
+    let created_at_ms = events::extract_created_at_ms(blob)
+        .ok_or("deterministic blob too short to contain created_at_ms")?
+        as i64;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+        rusqlite::params![&event_id_b64],
+        |row| row.get(0),
+    )?;
+
+    if !exists {
+        insert_event(
+            conn,
+            &event_id,
+            meta.type_name,
+            blob,
+            meta.share_scope,
+            created_at_ms,
+            now_ms,
+        )?;
+        let ws_id_for_neg = if meta.type_name == "workspace" {
+            Some(crate::crypto::event_id_to_base64(&event_id))
+        } else {
+            lookup_workspace_id(conn, recorded_by)
+        };
+        if let Some(ws_id) = ws_id_for_neg {
+            insert_shared_event_index_entry_if_shared(
+                conn,
+                meta.share_scope,
+                created_at_ms,
+                &event_id,
+                &ws_id,
+                blob,
+            )?;
+        } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared
+            && meta.type_name != "endpoint_shared"
+        {
+            tracing::warn!(
+                "no accepted workspace binding for {}, shared event {} missing from shared_event_index",
+                recorded_by,
+                crate::crypto::event_id_to_base64(&event_id)
+            );
+        }
+    }
+
+    let _ = insert_recorded_event_checked(conn, recorded_by, &event_id, now_ms, "emitted")?;
+
+    match project_one(conn, recorded_by, &event_id) {
+        Ok(ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed) => {
+            fanout_stored_shared_event_immediate(conn, recorded_by, &event_id)
+                .map_err(|e| format!("same-workspace fanout failed: {}", e))?;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                "emit_deterministic_blob projection error for {}: {}",
+                event_id_b64,
+                e
+            );
+        }
+    }
+
+    Ok(EmitOutcome { event_id })
 }
 
 #[cfg(test)]
@@ -659,7 +771,7 @@ mod tests {
             created_at_ms: now_ms(),
             public_key: peer_key.verifying_key().to_bytes(),
         });
-        let tenant_eid = create_event_synchronous(conn, recorded_by, &tenant_evt).unwrap();
+        let tenant_eid = create_event(conn, recorded_by, &tenant_evt).unwrap();
 
         let workspace_key = SigningKey::generate(&mut rng);
         let workspace_pub = workspace_key.verifying_key().to_bytes();
@@ -677,7 +789,7 @@ mod tests {
             invite_event_id: net_eid,
             workspace_id: net_eid,
         });
-        let _ia_eid = create_event_synchronous(conn, recorded_by, &ia_event).unwrap();
+        let _ia_eid = create_event(conn, recorded_by, &ia_event).unwrap();
 
         // Re-project workspace now that accepted-workspace binding exists
         project_one(conn, recorded_by, &net_eid).unwrap();
@@ -690,7 +802,7 @@ mod tests {
             authority_event_id: net_eid,
         });
         let uib_eid =
-            create_signed_event_synchronous(conn, recorded_by, &net_eid, &uib, &workspace_key)
+            create_signed_event(conn, recorded_by, &net_eid, &uib, &workspace_key)
                 .unwrap();
 
         let user_key = SigningKey::generate(&mut rng);
@@ -700,7 +812,7 @@ mod tests {
             username: "test-user".to_string(),
         });
         let ub_eid =
-            create_signed_event_synchronous(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
+            create_signed_event(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
 
         let device_invite_key = SigningKey::generate(&mut rng);
         let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
@@ -709,7 +821,7 @@ mod tests {
             authority_event_id: ub_eid,
         });
         let dif_eid =
-            create_signed_event_synchronous(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
+            create_signed_event(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
 
         let endpoint_key = SigningKey::generate(&mut rng);
         let endpoint_event =
@@ -718,7 +830,7 @@ mod tests {
             );
         let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
         let endpoint_shared_event_id =
-            create_event_synchronous(conn, &endpoint_id, &endpoint_event).unwrap();
+            create_event(conn, &endpoint_id, &endpoint_event).unwrap();
 
         let peer_shared_key = SigningKey::generate(&mut rng);
         let psf = ParsedEvent::PeerShared(PeerSharedEvent {
@@ -729,7 +841,7 @@ mod tests {
             device_name: "test-device".to_string(),
         });
         let psf_eid =
-            create_signed_event_synchronous(conn, recorded_by, &dif_eid, &psf, &device_invite_key)
+            create_signed_event(conn, recorded_by, &dif_eid, &psf, &device_invite_key)
                 .unwrap();
         conn.execute(
             "INSERT INTO peer_secrets
@@ -769,7 +881,7 @@ mod tests {
             content: "hello".to_string(),
         });
 
-        let eid = create_encrypted_event_synchronous(
+        let eid = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -830,7 +942,7 @@ mod tests {
             author_id: user_event_id,
             content: "target".to_string(),
         });
-        let msg_eid = create_encrypted_event_synchronous(
+        let msg_eid = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -845,7 +957,7 @@ mod tests {
             author_id: user_event_id,
             emoji: "\u{1f44d}".to_string(),
         });
-        let rxn_eid = create_encrypted_event_synchronous(
+        let rxn_eid = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -891,7 +1003,7 @@ mod tests {
         });
 
         // Event is stored but blocked — returns Blocked error with event_id
-        let err = create_encrypted_event_synchronous(
+        let err = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -938,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_signed_event_synchronous_rejects_plaintext_content() {
+    fn test_create_signed_event_rejects_plaintext_content() {
         let conn = setup();
         let recorded_by = "peer1";
 
@@ -953,7 +1065,7 @@ mod tests {
         });
 
         let err =
-            create_signed_event_synchronous(&conn, recorded_by, &signer_eid, &msg, &signing_key)
+            create_signed_event(&conn, recorded_by, &signer_eid, &msg, &signing_key)
                 .expect_err("plaintext content should be rejected");
         match err {
             CreateEventError::Rejected { reason, .. } => {
@@ -964,8 +1076,8 @@ mod tests {
     }
 
     #[test]
-    fn test_create_encrypted_event_synchronous_returns_blocked_error() {
-        // Verify strict API: create_signed_event_synchronous returns Err(Blocked) for
+    fn test_create_encrypted_event_returns_blocked_error() {
+        // Verify strict API: create_signed_event returns Err(Blocked) for
         // events with missing dependencies.
         let conn = setup();
         let recorded_by = "peer1";
@@ -986,7 +1098,7 @@ mod tests {
             author_id: user_event_id,
             emoji: "x".to_string(),
         });
-        let result = create_encrypted_event_synchronous(
+        let result = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -1065,7 +1177,7 @@ mod tests {
         assert!(!in_valid, "blocked event should not be in valid_events");
     }
 
-    /// PLAN §6.4 contract: `create_event_synchronous` returns Ok only for Valid events.
+    /// PLAN §6.4 contract: `create_event` returns Ok only for Valid events.
     /// A message with all deps satisfied must return Ok(event_id) and be in valid_events.
     #[test]
     fn test_create_event_sync_contract_valid_only() {
@@ -1086,7 +1198,7 @@ mod tests {
             author_id: user_event_id,
             content: "contract-valid".to_string(),
         });
-        let result = create_encrypted_event_synchronous(
+        let result = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -1114,7 +1226,7 @@ mod tests {
         );
     }
 
-    /// PLAN §6.4 contract: `create_event_synchronous` returns Err(Blocked) with event_id
+    /// PLAN §6.4 contract: `create_event` returns Err(Blocked) with event_id
     /// and missing deps when a dependency is unresolved.
     #[test]
     fn test_create_event_sync_contract_blocked_returns_err_with_event_id() {
@@ -1135,7 +1247,7 @@ mod tests {
             author_id: user_event_id,
             emoji: "z".to_string(),
         });
-        let result = create_encrypted_event_synchronous(
+        let result = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -1189,7 +1301,7 @@ mod tests {
             content: "no origin recovery rows".to_string(),
         });
 
-        let event_id = create_encrypted_event_synchronous(
+        let event_id = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -1230,7 +1342,7 @@ mod tests {
             content: "timestamp preserved".to_string(),
         });
 
-        let event_id = create_encrypted_event_synchronous(
+        let event_id = create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,
@@ -1270,7 +1382,7 @@ mod tests {
             emoji: "!".to_string(),
         });
 
-        let event_id = match create_encrypted_event_synchronous(
+        let event_id = match create_encrypted_event(
             &conn,
             recorded_by,
             &key_event_id,

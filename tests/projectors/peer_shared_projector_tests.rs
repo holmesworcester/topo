@@ -13,7 +13,7 @@ mod tests {
     use topo::event_modules::peer_shared::project_pure;
     use topo::event_modules::peer_shared::PeerSharedEvent;
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::{SqlVal, WriteOp};
+    use topo::projection::projector::{SqlVal, WriteOp};
 
     const PEER: &str = "peer_alice";
 

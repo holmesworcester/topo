@@ -54,7 +54,7 @@ pub fn encode_tenant(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(encode_fields(EVENT_TYPE_TENANT, TENANT_FIELDS, &values)?)
 }
 
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {

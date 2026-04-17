@@ -1,5 +1,5 @@
 use crate::crypto::EventId;
-use crate::projection::create::create_encrypted_event_synchronous_with_owner;
+use crate::projection::create::create_encrypted_event_with_owner;
 use crate::service::open_db_for_peer;
 use crate::state::db::queue::current_timestamp_ms_u64;
 use ed25519_dalek::SigningKey;
@@ -33,7 +33,7 @@ pub fn create(
     });
     let key_event_id =
         super::super::workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
-    let eid = create_encrypted_event_synchronous_with_owner(
+    let eid = create_encrypted_event_with_owner(
         db,
         recorded_by,
         &key_event_id,

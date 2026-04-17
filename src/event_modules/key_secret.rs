@@ -85,7 +85,7 @@ pub fn deterministic_key_secret_event_id(key_bytes: &[u8; 32]) -> EventId {
 
 // === Projector (event-module locality) ===
 
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {

@@ -177,7 +177,7 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 // === Projector (event-module locality) ===
 
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult};
 
 /// Encrypted events are handled by the pipeline before projector dispatch.
 /// If this function is reached, it means the encrypted event was not decrypted.

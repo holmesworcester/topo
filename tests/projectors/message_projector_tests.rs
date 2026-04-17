@@ -10,8 +10,8 @@ mod tests {
     use topo::event_modules::message::MessageEvent;
     use topo::event_modules::message::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::{DeletionIntentInfo, EmitCommand};
-    use topo::projection::queries::ProjectionFrameContext;
+    use topo::projection::projector::{DeletionIntentInfo, EmitCommand};
+    use topo::projection::decision_context::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "msg_event_1";
@@ -65,7 +65,7 @@ mod tests {
         let author = [2u8; 32];
         let author_b64 = b64(&author);
         let parsed = make_message(author);
-        let ctx = topo::projection::contract::ProjectorDecisionContext {
+        let ctx = topo::projection::projector::ProjectorDecisionContext {
             deletion_intents: vec![DeletionIntentInfo {
                 deletion_event_id: "del_event_1".to_string(),
                 author_id: author_b64,
@@ -94,7 +94,7 @@ mod tests {
     fn test_message_ignores_wrong_author_deletion_intent() {
         let author = [2u8; 32];
         let parsed = make_message(author);
-        let ctx = topo::projection::contract::ProjectorDecisionContext {
+        let ctx = topo::projection::projector::ProjectorDecisionContext {
             deletion_intents: vec![DeletionIntentInfo {
                 deletion_event_id: "del_event_2".to_string(),
                 author_id: b64(&[99u8; 32]), // different author
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn test_message_rejects_outer_owner_event_id() {
         let parsed = make_message([2u8; 32]);
-        let ctx = topo::projection::contract::ProjectorDecisionContext {
+        let ctx = topo::projection::projector::ProjectorDecisionContext {
             current_owner_event_id: Some(b64(&[9u8; 32])),
             ..Default::default()
         };
