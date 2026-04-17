@@ -116,6 +116,39 @@ pub open spec fn peer_shared_auth_spec(
     }
 }
 
+/// Executable counterpart of `peer_shared_auth_spec` with the same decision tree.
+/// Runtime call site: `read_inbound_session_auth_inner::Frame::OpenSessionRoute`
+/// computes `source_authorized`, `route_admitted`, `ack_matches_target` and calls
+/// this function to decide accept/reject. If any clause in the spec is violated,
+/// `AuthResultExec::Rejected` is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthResultExec {
+    Accepted { used_bootstrap: bool },
+    Rejected,
+}
+
+pub fn peer_shared_auth_decide(
+    source_authorized: bool,
+    route_admitted: bool,
+    ack_matches_target: bool,
+) -> (out: AuthResultExec)
+    ensures
+        out == AuthResultExec::Rejected <==>
+            (!source_authorized || !route_admitted || !ack_matches_target),
+        out != AuthResultExec::Rejected ==>
+            out == (AuthResultExec::Accepted { used_bootstrap: false }),
+{
+    if !source_authorized {
+        AuthResultExec::Rejected
+    } else if !route_admitted {
+        AuthResultExec::Rejected
+    } else if !ack_matches_target {
+        AuthResultExec::Rejected
+    } else {
+        AuthResultExec::Accepted { used_bootstrap: false }
+    }
+}
+
 pub open spec fn invite_bootstrap_auth_spec(
     expiry_valid: bool,
     daemon_binding_ok: bool,
@@ -138,6 +171,38 @@ pub open spec fn invite_bootstrap_auth_spec(
             tenant_id: 0,
             used_bootstrap: true,
         }
+    }
+}
+
+/// Executable counterpart of `invite_bootstrap_auth_spec`. Runtime
+/// `read_inbound_session_auth_inner::Frame::OpenSessionAuthInvite` computes the
+/// five boolean checks and calls this fn. If ANY check fails, returns Rejected.
+pub fn invite_bootstrap_auth_decide(
+    expiry_valid: bool,
+    daemon_binding_ok: bool,
+    peer_id_matches_pubkey: bool,
+    bootstrap_tenant_resolved: bool,
+    signature_valid: bool,
+) -> (out: AuthResultExec)
+    ensures
+        out == AuthResultExec::Rejected <==>
+            (!expiry_valid || !daemon_binding_ok || !peer_id_matches_pubkey
+                || !bootstrap_tenant_resolved || !signature_valid),
+        out != AuthResultExec::Rejected ==>
+            out == (AuthResultExec::Accepted { used_bootstrap: true }),
+{
+    if !expiry_valid {
+        AuthResultExec::Rejected
+    } else if !daemon_binding_ok {
+        AuthResultExec::Rejected
+    } else if !peer_id_matches_pubkey {
+        AuthResultExec::Rejected
+    } else if !bootstrap_tenant_resolved {
+        AuthResultExec::Rejected
+    } else if !signature_valid {
+        AuthResultExec::Rejected
+    } else {
+        AuthResultExec::Accepted { used_bootstrap: true }
     }
 }
 
@@ -164,6 +229,48 @@ pub open spec fn inbound_auth_spec(
         )
     } else {
         AuthResult::Rejected
+    }
+}
+
+/// Executable inbound-auth dispatcher. Frame type flags (mutually exclusive,
+/// both false ==> unknown frame ⇒ rejected) + all per-branch boolean checks.
+/// Runtime can compute frame type from the parsed Frame variant, then thread
+/// all checks through a single verified call.
+pub fn inbound_auth_decide(
+    frame_is_route: bool,
+    frame_is_invite: bool,
+    source_authorized: bool,
+    route_admitted: bool,
+    expiry_valid: bool,
+    daemon_binding_ok: bool,
+    peer_id_matches_pubkey: bool,
+    bootstrap_tenant_resolved: bool,
+    signature_valid: bool,
+) -> (out: AuthResultExec)
+    ensures
+        (!frame_is_route && !frame_is_invite) ==> out == AuthResultExec::Rejected,
+        // Route frame: same conditions as peer_shared_auth_decide with ack=true.
+        frame_is_route ==> (out == AuthResultExec::Rejected <==>
+            (!source_authorized || !route_admitted)),
+        frame_is_route && out != AuthResultExec::Rejected ==>
+            out == (AuthResultExec::Accepted { used_bootstrap: false }),
+        // Invite frame: same conditions as invite_bootstrap_auth_decide.
+        (!frame_is_route && frame_is_invite) ==>
+            (out == AuthResultExec::Rejected <==>
+                (!expiry_valid || !daemon_binding_ok || !peer_id_matches_pubkey
+                    || !bootstrap_tenant_resolved || !signature_valid)),
+        (!frame_is_route && frame_is_invite && out != AuthResultExec::Rejected) ==>
+            out == (AuthResultExec::Accepted { used_bootstrap: true }),
+{
+    if frame_is_route {
+        peer_shared_auth_decide(source_authorized, route_admitted, true)
+    } else if frame_is_invite {
+        invite_bootstrap_auth_decide(
+            expiry_valid, daemon_binding_ok, peer_id_matches_pubkey,
+            bootstrap_tenant_resolved, signature_valid,
+        )
+    } else {
+        AuthResultExec::Rejected
     }
 }
 

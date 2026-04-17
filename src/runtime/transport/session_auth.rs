@@ -991,6 +991,27 @@ async fn read_inbound_session_auth_inner(
                 decide_inbound_route_auth(&normalize_inbound_route_auth_decision_context(
                     InboundRouteAuthRawRows { route_authorized },
                 ));
+
+            // Protocol-level cross-check: verified peer_shared_auth_decide with
+            // source_authorized=route_authorized, route_admitted=true, ack=true.
+            // OpenSessionRoute has no separate ack frame; the spec's third flag
+            // is modeled as always-true for this code path.
+            {
+                use topo_verus_proofs::runtime::transport::session_auth::{
+                    peer_shared_auth_decide, AuthResultExec,
+                };
+                let spec_outcome = peer_shared_auth_decide(route_authorized, true, true);
+                let runtime_accepts =
+                    !matches!(decision, InboundRouteAuthDecision::RejectUnauthorized);
+                let spec_accepts = matches!(spec_outcome, AuthResultExec::Accepted { .. });
+                debug_assert_eq!(
+                    runtime_accepts, spec_accepts,
+                    "peer_shared_auth_decide disagrees with InboundRouteAuthDecision: \
+                     route_authorized={}",
+                    route_authorized,
+                );
+            }
+
             if matches!(decision, InboundRouteAuthDecision::RejectUnauthorized) {
                 return Err(format!(
                     "session route not admitted for tenant {} peer {} on daemon {}",
@@ -1041,6 +1062,11 @@ async fn read_inbound_session_auth_inner(
             let cached_tenant_id = daemon_connection.and_then(|conn| {
                 conn.accepted_bootstrap_tenant(&invite_event_id_b64, &remote_peer_id)
             });
+            let bootstrap_tenant_resolved = !matches!(
+                &tenant_resolution,
+                BootstrapSessionTenantDecisionContext::MissingTenantBinding
+                    | BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding,
+            ) || cached_tenant_id.is_some();
             let decision = decide_inbound_bootstrap_auth(
                 &normalize_inbound_bootstrap_auth_decision_context(InboundBootstrapAuthRawRows {
                     tenant_resolution,
@@ -1051,6 +1077,41 @@ async fn read_inbound_session_auth_inner(
                     invite_signature_valid,
                 }),
             );
+
+            // Protocol-level cross-check: the Verus-verified `invite_bootstrap_auth_decide`
+            // takes the same five primitive flags and returns Accepted iff ALL are true.
+            // If the richer InboundBootstrapAuthDecision disagrees with this protocol-level
+            // outcome, we have drift between runtime and spec.
+            // See verus-proofs/src/runtime/transport/session_auth.rs::invite_bootstrap_auth_decide.
+            {
+                use topo_verus_proofs::runtime::transport::session_auth::{
+                    invite_bootstrap_auth_decide, AuthResultExec,
+                };
+                let spec_outcome = invite_bootstrap_auth_decide(
+                    expiry_valid,
+                    daemon_binding_valid,
+                    claimed_peer_matches_key,
+                    bootstrap_tenant_resolved,
+                    invite_signature_valid,
+                );
+                let runtime_accepts = matches!(
+                    decision,
+                    InboundBootstrapAuthDecision::AcceptResolvedTenant { .. }
+                        | InboundBootstrapAuthDecision::AcceptCachedTenant { .. }
+                );
+                let spec_accepts = matches!(spec_outcome, AuthResultExec::Accepted { .. });
+                debug_assert_eq!(
+                    runtime_accepts, spec_accepts,
+                    "protocol-level invite_bootstrap_auth_decide disagrees with runtime \
+                     InboundBootstrapAuthDecision: expiry_valid={} daemon_binding_valid={} \
+                     peer_id_matches_pubkey={} tenant_resolved={} signature_valid={}",
+                    expiry_valid,
+                    daemon_binding_valid,
+                    claimed_peer_matches_key,
+                    bootstrap_tenant_resolved,
+                    invite_signature_valid,
+                );
+            }
             let tenant_id = match decision {
                 InboundBootstrapAuthDecision::AcceptResolvedTenant { tenant_id }
                 | InboundBootstrapAuthDecision::AcceptCachedTenant { tenant_id } => tenant_id,
