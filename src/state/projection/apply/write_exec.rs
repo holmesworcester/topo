@@ -1,6 +1,67 @@
 use super::super::contract::{EmitCommand, SqlVal, WriteOp};
 use crate::crypto::event_id_from_base64;
 use rusqlite::Connection;
+use topo_verus_proofs::state::tenant_isolation::{
+    check_writes_tenant_isolated, WriteOpTenantView,
+};
+
+/// Trusted extractor: build a `WriteOpTenantView` from a `WriteOp` given the executing
+/// tenant. Looks for a column (or where-clause key) named `recorded_by`; if present,
+/// compares its value to `executing_tenant`. If absent, the view's `has_recorded_by`
+/// is `false` and the verified check allows the write through — those writes target
+/// tables that do not participate in the tenant-scope dimension (schema metadata, etc).
+fn writeop_tenant_view(op: &WriteOp, executing_tenant: &str) -> WriteOpTenantView {
+    match op {
+        WriteOp::InsertOrIgnore {
+            columns, values, ..
+        } => {
+            for (idx, col) in columns.iter().enumerate() {
+                if *col == "recorded_by" {
+                    let matches = matches!(values.get(idx), Some(SqlVal::Text(s)) if s == executing_tenant);
+                    return WriteOpTenantView {
+                        has_recorded_by: true,
+                        recorded_by_matches_executing: matches,
+                    };
+                }
+            }
+            WriteOpTenantView {
+                has_recorded_by: false,
+                recorded_by_matches_executing: false,
+            }
+        }
+        WriteOp::Delete { where_clause, .. } => {
+            for (col, val) in where_clause {
+                if *col == "recorded_by" {
+                    let matches = matches!(val, SqlVal::Text(s) if s == executing_tenant);
+                    return WriteOpTenantView {
+                        has_recorded_by: true,
+                        recorded_by_matches_executing: matches,
+                    };
+                }
+            }
+            WriteOpTenantView {
+                has_recorded_by: false,
+                recorded_by_matches_executing: false,
+            }
+        }
+    }
+}
+
+/// Enforce tenant isolation on a batch of WriteOps before execution.
+/// Panics if the Verus-verified `check_writes_tenant_isolated` rejects the batch —
+/// a rejection means a projector emitted cross-tenant writes, which is a hard bug
+/// and must not be silently recovered from.
+pub(crate) fn assert_writes_tenant_isolated(executing_tenant: &str, ops: &[WriteOp]) {
+    let views: Vec<WriteOpTenantView> = ops
+        .iter()
+        .map(|op| writeop_tenant_view(op, executing_tenant))
+        .collect();
+    if !check_writes_tenant_isolated(&views) {
+        panic!(
+            "tenant isolation violation: projector running as {executing_tenant} emitted WriteOp(s) with recorded_by != {executing_tenant}",
+        );
+    }
+}
 
 /// Execute a list of WriteOps against the database.
 ///

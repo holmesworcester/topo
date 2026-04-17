@@ -16,9 +16,6 @@ pub mod state;
 // Bug-hunting proofs
 pub mod bug_hunt;
 
-// Keep the most commonly imported proof helpers available at the crate root
-// while the proof tree moves to mirrored module ownership.
-pub use pipeline::contract;
 pub use pipeline::decision;
 
 verus! {

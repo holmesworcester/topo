@@ -703,6 +703,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
     );
     match decide_projection_decision_effect_plan(&projection_decision_effect_context) {
         ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands => {
+            super::write_exec::assert_writes_tenant_isolated(recorded_by, &result.write_ops);
             backend.execute_write_ops(&result.write_ops)?;
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
