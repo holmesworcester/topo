@@ -25,8 +25,8 @@ enum PersistEventKind {
 }
 
 use topo_verus_proofs::state::pipeline::persist_validation::{
-    decide_persist_validation_plan, normalize_persist_validation, PersistValidationDecisionContext,
-    PersistValidationPlan, PersistValidationRawRows,
+    decide_persist_validation_plan, normalize_persist_validation, PersistValidationPlan,
+    PersistValidationRawRows,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -18,14 +18,9 @@ use crate::sync::session::receive::{enqueue_direct_ingest_waiter, IngestWaiter};
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 
 use topo_verus_proofs::runtime::sync_engine::session::range_session::{
-    decide_selected_dep_order_plan, decide_shared_send_eligibility_plan,
-    decide_shared_send_order_policy as decide_shared_send_order_policy_for_is_last_day,
-    normalize_selected_dep_order_context, normalize_shared_send_eligibility_context,
-    SelectedDepOrderPlan, SelectedDepOrderRawRows, SharedSendEligibilityPlan,
-    SharedSendEligibilityRawRows, SharedSendOrderPolicy,
+    decide_shared_send_eligibility_plan, normalize_shared_send_eligibility_context,
+    SharedSendEligibilityPlan, SharedSendEligibilityRawRows,
 };
-#[cfg(test)]
-use topo_verus_proofs::runtime::sync_engine::session::range_session::SelectedDepOrderDecisionContext;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::{
@@ -220,14 +215,6 @@ struct NegentropyStorageCacheEntry {
     ts_min_inclusive_ms: Option<i64>,
     ts_max_exclusive_ms: Option<i64>,
     storage: Arc<NegentropyStorageVector>,
-}
-
-/// Adapter: maps the runtime's `SyncWindowKind` enum to the is_last_day flag consumed by
-/// the SMT-verified `decide_shared_send_order_policy_for_is_last_day` planner. The
-/// SyncWindowKind enum is owned by the runtime crate and cannot cross into verus-proofs
-/// without a dependency cycle, so we project it to the minimal boolean here.
-fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
-    decide_shared_send_order_policy_for_is_last_day(matches!(kind, SyncWindowKind::LastDay))
 }
 
 fn load_shared_index_entries(

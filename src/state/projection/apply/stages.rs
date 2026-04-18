@@ -733,7 +733,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
         };
         let kind = match &result.decision {
             ProjectionDecision::Valid => ProjectionDecisionKind::Valid,
-            ProjectionDecision::Block { .. } => ProjectionDecisionKind::Block,
+            ProjectionDecision::BlockOnMissingDeps { .. } => ProjectionDecisionKind::Block,
             ProjectionDecision::Reject { .. } => ProjectionDecisionKind::Reject,
             ProjectionDecision::AlreadyProcessed => ProjectionDecisionKind::AlreadyProcessed,
         };

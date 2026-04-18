@@ -112,6 +112,7 @@ enum BootstrapFallbackInvitePlan {
     RejectMissingCandidate,
     UseInvite { invite_event_id: String },
     RejectAmbiguousCandidate,
+    RejectAlreadyLocalWorkspaceCandidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1402,7 +1403,8 @@ pub fn resolve_bootstrap_fallback_invite_for_daemon(
         match decide_bootstrap_fallback_invite_plan(&decision_context) {
             BootstrapFallbackInvitePlan::UseInvite { invite_event_id } => Some(invite_event_id),
             BootstrapFallbackInvitePlan::RejectMissingCandidate
-            | BootstrapFallbackInvitePlan::RejectAmbiguousCandidate => None,
+            | BootstrapFallbackInvitePlan::RejectAmbiguousCandidate
+            | BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate => None,
         },
     )
 }
