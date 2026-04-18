@@ -78,27 +78,23 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::KeyShared(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.key_event_id),
-        FieldValue::U8(e.frontier_count),
-        FieldValue::EventId(e.frontier_ref_1),
-        FieldValue::EventId(e.frontier_ref_2),
-        FieldValue::EventId(e.frontier_ref_3),
-        FieldValue::EventId(e.frontier_ref_4),
-        FieldValue::EventId(e.frontier_hash),
-        FieldValue::EventId(e.delivery_target_id),
-        FieldValue::EventId(e.recipient_event_id),
-        FieldValue::EventId(e.unwrap_key_event_id),
-        FieldValue::EventId(e.wrapped_key),
-    ];
-
-    Ok(encode_fields(
-        EVENT_TYPE_KEY_SHARED,
-        KEY_SHARED_FIELDS,
-        &values,
-    )?)
+    Ok(
+        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_u8_id9(
+            EVENT_TYPE_KEY_SHARED,
+            e.created_at_ms,
+            &e.key_event_id,
+            e.frontier_count,
+            &e.frontier_ref_1,
+            &e.frontier_ref_2,
+            &e.frontier_ref_3,
+            &e.frontier_ref_4,
+            &e.frontier_hash,
+            &e.delivery_target_id,
+            &e.recipient_event_id,
+            &e.unwrap_key_event_id,
+            &e.wrapped_key,
+        ),
+    )
 }
 
 use crate::crypto::event_id_to_base64;

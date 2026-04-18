@@ -33,8 +33,18 @@ impl super::super::Describe for UserEvent {
 }
 
 pub fn parse_user(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, public_key, name_slot)) =
+        topo_verus_proofs::state::event_codec_shapes::parse_ts_id_fb64(EVENT_TYPE_USER, blob)
+    {
+        let username = crate::event_modules::layout::common::read_text_slot(&name_slot)
+            .map_err(EventError::TextSlot)?;
+        return Ok(ParsedEvent::User(UserEvent {
+            created_at_ms: ts,
+            public_key,
+            username,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_USER, USER_FIELDS, blob)?;
-
     Ok(ParsedEvent::User(UserEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         public_key: values[1].as_event_id().unwrap(),
@@ -47,14 +57,17 @@ pub fn encode_user(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::User(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.public_key),
-        FieldValue::Text(e.username.clone()),
-    ];
-
-    Ok(encode_fields(EVENT_TYPE_USER, USER_FIELDS, &values)?)
+    let mut name_slot: [u8; NAME_BYTES] = [0u8; NAME_BYTES];
+    crate::event_modules::layout::common::write_text_slot(&e.username, &mut name_slot)
+        .map_err(EventError::TextSlot)?;
+    Ok(
+        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_fb64(
+            EVENT_TYPE_USER,
+            e.created_at_ms,
+            &e.public_key,
+            &name_slot,
+        ),
+    )
 }
 
 pub static USER_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

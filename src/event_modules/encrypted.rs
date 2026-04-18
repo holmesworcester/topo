@@ -160,20 +160,17 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ));
     }
 
-    let total = encrypted_wire_size(expected_ct_size);
-    let mut buf = vec![0u8; total];
-
-    buf[off::TYPE_CODE] = EVENT_TYPE_ENCRYPTED;
-    buf[off::CREATED_AT..off::KEY_EVENT_ID].copy_from_slice(&enc.created_at_ms.to_le_bytes());
-    buf[off::KEY_EVENT_ID..off::OWNER_EVENT_ID].copy_from_slice(&enc.key_event_id);
-    buf[off::OWNER_EVENT_ID..off::INNER_TYPE_CODE].copy_from_slice(&enc.owner_event_id);
-    buf[off::INNER_TYPE_CODE] = enc.inner_type_code;
-    buf[off::NONCE..off::CIPHERTEXT].copy_from_slice(&enc.nonce);
-    buf[off::CIPHERTEXT..off::CIPHERTEXT + expected_ct_size].copy_from_slice(&enc.ciphertext);
-    let auth_tag_start = off::CIPHERTEXT + expected_ct_size;
-    buf[auth_tag_start..auth_tag_start + ENCRYPTED_AUTH_TAG_BYTES].copy_from_slice(&enc.auth_tag);
-
-    Ok(buf)
+    Ok(
+        topo_verus_proofs::state::event_codec_shapes::encode_encrypted_envelope(
+            enc.created_at_ms,
+            &enc.key_event_id,
+            &enc.owner_event_id,
+            enc.inner_type_code,
+            &enc.nonce,
+            &enc.ciphertext,
+            &enc.auth_tag,
+        ),
+    )
 }
 
 // === Projector (event-module locality) ===

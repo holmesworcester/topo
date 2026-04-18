@@ -108,12 +108,13 @@ pub fn encode_signed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ));
     }
 
-    let mut out = Vec::with_capacity(1 + 32 + signed.payload.len() + 64);
-    out.push(EVENT_TYPE_SIGNED);
-    out.extend_from_slice(&signed.signer_event_id);
-    out.extend_from_slice(&signed.payload);
-    out.extend_from_slice(&signed.signature);
-    Ok(out)
+    Ok(
+        topo_verus_proofs::state::event_codec_shapes::encode_signed_envelope(
+            &signed.signer_event_id,
+            &signed.payload,
+            &signed.signature,
+        ),
+    )
 }
 
 use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult};
