@@ -38,8 +38,20 @@ impl super::super::Describe for WorkspaceEvent {
 /// [9..41]  public_key (32 bytes)
 /// [41..105] name (64 bytes, UTF-8 zero-padded)
 pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    // Verified byte-level parser for [type][u64 ts][id:32][fb:64]; UTF-8 validation
+    // of the 64-byte text slot is layered on top via read_text_slot.
+    if let Some((ts, public_key, name_slot)) =
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_fb64(EVENT_TYPE_WORKSPACE, blob)
+    {
+        let name = crate::event_modules::layout::common::read_text_slot(&name_slot)
+            .map_err(EventError::TextSlot)?;
+        return Ok(ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: ts,
+            public_key,
+            name,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_WORKSPACE, WORKSPACE_FIELDS, blob)?;
-
     Ok(ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         public_key: values[1].as_event_id().unwrap(),
@@ -52,18 +64,20 @@ pub fn encode_workspace(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::Workspace(w) => w,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(ws.created_at_ms),
-        FieldValue::EventId(ws.public_key),
-        FieldValue::Text(ws.name.clone()),
-    ];
-
-    Ok(encode_fields(
-        EVENT_TYPE_WORKSPACE,
-        WORKSPACE_FIELDS,
-        &values,
-    )?)
+    // Prepare the 64-byte text slot (UTF-8 bytes + zero padding) via the trusted
+    // write_text_slot helper, then hand the fixed-size byte array to the verified
+    // byte-level encoder for the rest of the blob.
+    let mut name_slot: [u8; NAME_BYTES] = [0u8; NAME_BYTES];
+    crate::event_modules::layout::common::write_text_slot(&ws.name, &mut name_slot)
+        .map_err(EventError::TextSlot)?;
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_fb64(
+            EVENT_TYPE_WORKSPACE,
+            ws.created_at_ms,
+            &ws.public_key,
+            &name_slot,
+        ),
+    )
 }
 
 pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {

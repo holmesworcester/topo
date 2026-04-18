@@ -33,52 +33,19 @@ use super::{
 };
 
 pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
-const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DialFailureRawRows {
-    has_connected_once: bool,
-    stale_dial_failure: bool,
-    consecutive_stale_dial_failures: u32,
-    warn_on_startup_stale_failure: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DialFailureDecisionContext {
-    has_connected_once: bool,
-    stale_dial_failure: bool,
-    consecutive_stale_dial_failures: u32,
-    warn_on_startup_stale_failure: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DialFailurePlan {
-    ReturnStaleTarget {
-        should_warn: bool,
-        next_consecutive_stale_dial_failures: u32,
-    },
-    Retry {
-        should_warn: bool,
-        next_consecutive_stale_dial_failures: u32,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SessionOpenFailurePlan {
-    Break,
-    EvictAndBreak,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionOpenFailureRawRows {
-    connection_lost: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionOpenFailureDecisionContext {
-    connection_lost: bool,
-}
+pub use topo_verus_proofs::runtime::peering::loops::connect::{
+    decide_dial_failure_plan, decide_session_open_failure_plan, decide_session_retry_plan,
+    normalize_dial_failure_decision_context, normalize_session_open_failure_decision_context,
+    normalize_session_retry_decision_context, DialFailurePlan, DialFailureRawRows,
+    SessionOpenFailurePlan, SessionOpenFailureRawRows, SessionRetryPlan, SessionRetryRawRows,
+};
+#[cfg(test)]
+use topo_verus_proofs::runtime::peering::loops::connect::{
+    should_warn_for_connect_failure, DialFailureDecisionContext,
+    SessionOpenFailureDecisionContext, SessionRetryDecisionContext, STALE_DIAL_FAILURE_THRESHOLD,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionAuthFailureRawRows {
@@ -96,22 +63,6 @@ struct SessionAuthFailureDecisionContext {
 struct SessionAuthFailurePlan {
     next_auth_plan_override: Option<OutboundSessionAuthPlan>,
     evict_live_connection: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionRetryRawRows {
-    session_stats_present: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionRetryDecisionContext {
-    session_stats_present: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SessionRetryPlan {
-    NoDelay,
-    Delay(Duration),
 }
 fn describe_outbound_session_auth_plan(plan: &OutboundSessionAuthPlan) -> String {
     match plan {
@@ -142,61 +93,6 @@ fn should_evict_closed_daemon_connection(
     is_connection_lost_message(message)
 }
 
-fn normalize_dial_failure_decision_context(
-    raw_rows: DialFailureRawRows,
-) -> DialFailureDecisionContext {
-    DialFailureDecisionContext {
-        has_connected_once: raw_rows.has_connected_once,
-        stale_dial_failure: raw_rows.stale_dial_failure,
-        consecutive_stale_dial_failures: raw_rows.consecutive_stale_dial_failures,
-        warn_on_startup_stale_failure: raw_rows.warn_on_startup_stale_failure,
-    }
-}
-
-fn decide_dial_failure_plan(context: &DialFailureDecisionContext) -> DialFailurePlan {
-    let should_warn = should_warn_for_connect_failure(
-        context.has_connected_once,
-        context.stale_dial_failure,
-        context.warn_on_startup_stale_failure,
-    );
-    let next_consecutive_stale_dial_failures = if context.stale_dial_failure {
-        context.consecutive_stale_dial_failures + 1
-    } else {
-        0
-    };
-    if context.stale_dial_failure
-        && next_consecutive_stale_dial_failures >= STALE_DIAL_FAILURE_THRESHOLD
-    {
-        DialFailurePlan::ReturnStaleTarget {
-            should_warn,
-            next_consecutive_stale_dial_failures,
-        }
-    } else {
-        DialFailurePlan::Retry {
-            should_warn,
-            next_consecutive_stale_dial_failures,
-        }
-    }
-}
-
-fn normalize_session_open_failure_decision_context(
-    raw_rows: SessionOpenFailureRawRows,
-) -> SessionOpenFailureDecisionContext {
-    SessionOpenFailureDecisionContext {
-        connection_lost: raw_rows.connection_lost,
-    }
-}
-
-fn decide_session_open_failure_plan(
-    context: &SessionOpenFailureDecisionContext,
-) -> SessionOpenFailurePlan {
-    if context.connection_lost {
-        SessionOpenFailurePlan::EvictAndBreak
-    } else {
-        SessionOpenFailurePlan::Break
-    }
-}
-
 fn normalize_session_auth_failure_decision_context(
     raw_rows: SessionAuthFailureRawRows,
 ) -> SessionAuthFailureDecisionContext {
@@ -206,14 +102,29 @@ fn normalize_session_auth_failure_decision_context(
     }
 }
 
+/// Runtime wrapper: delegates the core flag/flag decision to the Verus-verified
+/// `decide_session_auth_failure_core_plan`, then rehydrates the `Option<String>` invite id
+/// into a concrete `OutboundSessionAuthPlan::InviteBootstrap` if the verified plan says to
+/// override. The core logic (override ↔ has_retry_invite, evict ↔ connection_lost) is SMT-checked.
 fn decide_session_auth_failure_plan(
     context: SessionAuthFailureDecisionContext,
 ) -> SessionAuthFailurePlan {
-    SessionAuthFailurePlan {
-        next_auth_plan_override: context
+    let core = topo_verus_proofs::runtime::peering::loops::connect::decide_session_auth_failure_core_plan(
+        topo_verus_proofs::runtime::peering::loops::connect::SessionAuthFailureCoreContext {
+            connection_lost: context.connection_lost,
+            has_bootstrap_retry_invite: context.bootstrap_retry_invite.is_some(),
+        },
+    );
+    let next_auth_plan_override = if core.next_auth_plan_override {
+        context
             .bootstrap_retry_invite
-            .map(|invite_event_id| OutboundSessionAuthPlan::InviteBootstrap { invite_event_id }),
-        evict_live_connection: context.connection_lost,
+            .map(|invite_event_id| OutboundSessionAuthPlan::InviteBootstrap { invite_event_id })
+    } else {
+        None
+    };
+    SessionAuthFailurePlan {
+        next_auth_plan_override,
+        evict_live_connection: core.evict_live_connection,
     }
 }
 
@@ -222,22 +133,6 @@ fn load_session_retry_raw_rows(
 ) -> SessionRetryRawRows {
     SessionRetryRawRows {
         session_stats_present: session_stats.is_some(),
-    }
-}
-
-fn normalize_session_retry_decision_context(
-    raw_rows: SessionRetryRawRows,
-) -> SessionRetryDecisionContext {
-    SessionRetryDecisionContext {
-        session_stats_present: raw_rows.session_stats_present,
-    }
-}
-
-fn decide_session_retry_plan(context: &SessionRetryDecisionContext) -> SessionRetryPlan {
-    if context.session_stats_present {
-        SessionRetryPlan::NoDelay
-    } else {
-        SessionRetryPlan::Delay(Duration::from_millis(250))
     }
 }
 
@@ -645,7 +540,7 @@ async fn connect_loop_inner(
             let session_retry_plan = decide_session_retry_plan(&session_retry_context);
             let session_retry_delay = match session_retry_plan {
                 SessionRetryPlan::NoDelay => Duration::ZERO,
-                SessionRetryPlan::Delay(delay) => delay,
+                SessionRetryPlan::DelayMs(ms) => Duration::from_millis(ms as u64),
             };
             if !session_retry_delay.is_zero() {
                 tokio::select! {
@@ -826,14 +721,6 @@ fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {
             false
         }
     }
-}
-
-fn should_warn_for_connect_failure(
-    has_connected_once: bool,
-    stale_dial_failure: bool,
-    warn_on_startup_stale_failure: bool,
-) -> bool {
-    has_connected_once || !stale_dial_failure || warn_on_startup_stale_failure
 }
 
 struct DialOutcome {
@@ -1068,7 +955,7 @@ mod tests {
                 if raw.session_stats_present {
                     SessionRetryPlan::NoDelay
                 } else {
-                    SessionRetryPlan::Delay(Duration::from_millis(250))
+                    SessionRetryPlan::DelayMs(250)
                 }
             );
         }

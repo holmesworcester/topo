@@ -79,6 +79,18 @@ pub fn deterministic_endpoint_shared_event_id(private_key_bytes: &[u8; 32]) -> [
 }
 
 pub fn parse_endpoint_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, public_key, signature)) =
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_fb64(
+            EVENT_TYPE_ENDPOINT_SHARED,
+            blob,
+        )
+    {
+        return Ok(ParsedEvent::EndpointShared(EndpointSharedEvent {
+            created_at_ms: ts,
+            public_key,
+            signature,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_ENDPOINT_SHARED, ENDPOINT_SHARED_FIELDS, blob)?;
     let signature = {
         let bytes = values[2].as_fixed_bytes().unwrap();
@@ -98,12 +110,22 @@ pub fn encode_endpoint_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         ParsedEvent::EndpointShared(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
+    return Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_fb64(
+            EVENT_TYPE_ENDPOINT_SHARED,
+            e.created_at_ms,
+            &e.public_key,
+            &e.signature,
+        ),
+    );
 
+    #[allow(unreachable_code)]
     let values = vec![
         FieldValue::Timestamp(e.created_at_ms),
         FieldValue::EventId(e.public_key),
         FieldValue::FixedBytes(e.signature.to_vec()),
     ];
+    #[allow(unreachable_code)]
     Ok(encode_fields(
         EVENT_TYPE_ENDPOINT_SHARED,
         ENDPOINT_SHARED_FIELDS,

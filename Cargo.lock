@@ -5484,6 +5484,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "topo-verus-proofs",
  "tor-cell",
  "tor-hscrypto",
  "tor-hsservice",
@@ -5492,6 +5493,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x509-parser",
+]
+
+[[package]]
+name = "topo-verus-proofs"
+version = "0.1.0"
+dependencies = [
+ "vstd",
 ]
 
 [[package]]
@@ -6900,6 +6908,59 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "verus_builtin"
+version = "0.0.0-2026-03-22-0106"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c58c30c86f93b011fa7f0b42e5b303e50e89cd425e401773120b7cc0e9a96e55"
+
+[[package]]
+name = "verus_builtin_macros"
+version = "0.0.0-2026-03-17-2326"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46f1f1ee124e0bcb5cec79836ff015d138ea53bff51839a85b8364cdc8b79232"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.116",
+ "synstructure",
+ "verus_prettyplease",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_prettyplease"
+version = "0.0.0-2026-03-15-0111"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eadebc1e3b522b32c178fd2fb882e691880ff983415497232c74aa9b72bc0b65"
+dependencies = [
+ "proc-macro2",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_state_machines_macros"
+version = "0.0.0-2026-03-15-0111"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b824c6405f8e8a063ca4a26fca1f454cb02de0c1c4da685e3e7f1974899129d5"
+dependencies = [
+ "indexmap 1.9.3",
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_syn"
+version = "0.0.0-2026-03-15-0111"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1694faf01f89e1abc996da7b8d24a4e0d1ebd70147dc659e7a5dd680af696772"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "visibility"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6915,6 +6976,17 @@ name = "void"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
+
+[[package]]
+name = "vstd"
+version = "0.0.0-2026-03-22-0106"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebf1e69cd4f6439a56b415ecdbfc3db69ad76560bd139683aeb29ed51452542f"
+dependencies = [
+ "verus_builtin",
+ "verus_builtin_macros",
+ "verus_state_machines_macros",
+]
 
 [[package]]
 name = "walkdir"

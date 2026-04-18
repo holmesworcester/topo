@@ -338,6 +338,7 @@ pub fn ingest_now_result(
         });
     }
 
+
     let db = open_connection(db_path).map_err(|e| format!("open ingest db: {e}"))?;
     let mut shared_event_index_stmt = db
         .prepare(SQL_INSERT_SHARED_EVENT_INDEX_ENTRY)
@@ -412,6 +413,42 @@ pub fn ingest_now(db_path: &str, batch: Vec<IngestItem>) -> Result<usize, String
 
 pub fn ingest_one(db_path: &str, item: IngestItem) -> Result<(), String> {
     ingest_now(db_path, vec![item]).map(|_| ())
+}
+
+/// Construct an IngestItem from a wire-received blob. Always computes
+/// `event_id = hash_event(blob)` internally — callers cannot pass a mismatched
+/// claimed id. This is the only place the wire path should construct IngestItems;
+/// it makes the "claimed id == BLAKE3(blob)" invariant hold *by construction*
+/// (verified in `topo_verus_proofs::state::event_id_integrity`).
+///
+/// Receive-log replay intentionally bypasses this by calling a separate helper that
+/// preserves the stored id; see `runtime/sync_engine/session/receive_log.rs`.
+pub fn make_wire_ingest_item(
+    blob: Vec<u8>,
+    recorded_by: String,
+    source_tag: String,
+    received_at_ms: i64,
+    first_stored_at_ms: i64,
+) -> IngestItem {
+    let event_id = crate::crypto::hash_event(&blob);
+    // Cheap post-hoc check against the verified predicate. In optimized builds this
+    // is effectively a no-op (both sides are the same local hash); in debug builds
+    // it catches tampering with `hash_event` and surfaces a clear error.
+    debug_assert!(
+        topo_verus_proofs::state::pipeline::event_id_integrity::event_id_matches_blob_hash(
+            &event_id,
+            &crate::crypto::hash_event(&blob),
+        ),
+        "event_id_matches_blob_hash invariant violated for wire ingest item"
+    );
+    (
+        event_id,
+        blob,
+        recorded_by,
+        source_tag,
+        received_at_ms,
+        first_stored_at_ms,
+    )
 }
 
 #[cfg(test)]

@@ -5,6 +5,13 @@ use tracing::debug;
 
 use crate::tuning::{low_mem_mode, sync_last_day_only_mode};
 
+pub use topo_verus_proofs::runtime::sync_engine::session::windowing::{
+    decide_cold_tier_plan, decide_select_outbound_window_plan, normalize_cold_tier_context,
+    normalize_select_outbound_window_context, ColdTierDecisionContext, ColdTierPlan,
+    ColdTierRawRows, SelectOutboundWindowDecisionContext, SelectOutboundWindowPlan,
+    SelectOutboundWindowRawRows,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncWindowKind {
     Old = 0,
@@ -61,44 +68,6 @@ struct PlannerState {
     single_peer_phase: SinglePeerPhase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColdTierRawRows {
-    global_low_mem_mode: bool,
-    restrict_to_low_mem_windows: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColdTierDecisionContext {
-    global_low_mem_mode: bool,
-    restrict_to_low_mem_windows: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColdTierPlan {
-    Default,
-    LowMemOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SelectOutboundWindowRawRows {
-    last_day_only_mode: bool,
-    normalized_live_peer_count: usize,
-    peer_is_priority_owner: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SelectOutboundWindowDecisionContext {
-    last_day_only_mode: bool,
-    normalized_live_peer_count: usize,
-    peer_is_priority_owner: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectOutboundWindowPlan {
-    LastDayOnly,
-    PerPeerCadence,
-}
-
 fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
     static STATE: OnceLock<Mutex<HashMap<String, PlannerState>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -131,45 +100,10 @@ fn cold_tier_order(planner: &PlannerState) -> &'static [SyncWindowKind] {
     cold_tier_order_for_plan(decide_cold_tier_plan(&context))
 }
 
-fn normalize_cold_tier_context(raw_rows: ColdTierRawRows) -> ColdTierDecisionContext {
-    ColdTierDecisionContext {
-        global_low_mem_mode: raw_rows.global_low_mem_mode,
-        restrict_to_low_mem_windows: raw_rows.restrict_to_low_mem_windows,
-    }
-}
-
-fn normalize_select_outbound_window_context(
-    raw_rows: SelectOutboundWindowRawRows,
-) -> SelectOutboundWindowDecisionContext {
-    SelectOutboundWindowDecisionContext {
-        last_day_only_mode: raw_rows.last_day_only_mode,
-        normalized_live_peer_count: raw_rows.normalized_live_peer_count,
-        peer_is_priority_owner: raw_rows.peer_is_priority_owner,
-    }
-}
-
-fn decide_cold_tier_plan(context: &ColdTierDecisionContext) -> ColdTierPlan {
-    if context.global_low_mem_mode || context.restrict_to_low_mem_windows {
-        ColdTierPlan::LowMemOnly
-    } else {
-        ColdTierPlan::Default
-    }
-}
-
 fn cold_tier_order_for_plan(plan: ColdTierPlan) -> &'static [SyncWindowKind] {
     match plan {
         ColdTierPlan::Default => &DEFAULT_COLD_TIER_ORDER,
         ColdTierPlan::LowMemOnly => &LOW_MEM_COLD_TIER_ORDER,
-    }
-}
-
-fn decide_select_outbound_window_plan(
-    context: &SelectOutboundWindowDecisionContext,
-) -> SelectOutboundWindowPlan {
-    if context.last_day_only_mode {
-        SelectOutboundWindowPlan::LastDayOnly
-    } else {
-        SelectOutboundWindowPlan::PerPeerCadence
     }
 }
 
@@ -249,7 +183,7 @@ pub fn select_outbound_window(
     let plan = decide_select_outbound_window_plan(&normalize_select_outbound_window_context(
         SelectOutboundWindowRawRows {
             last_day_only_mode: sync_last_day_only_mode(),
-            normalized_live_peer_count: live_peer_count,
+            normalized_live_peer_count: u32::try_from(live_peer_count).unwrap_or(u32::MAX),
             peer_is_priority_owner: false,
         },
     ));

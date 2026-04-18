@@ -1,39 +1,54 @@
 //! Formal verification of inbound route/bootstrap admission planning.
+//!
+//! Every `pub fn` below is executable Rust consumed by
+//! `src/runtime/transport/session_auth.rs`. Postconditions (`ensures`) are
+//! SMT-checked against the function body by `cargo-verus verify`.
 
 use vstd::prelude::*;
 
 verus! {
 
+/// Primitive core of the bootstrap-session-tenant raw rows — carries only a
+/// row count and an equality flag. The runtime aggregates its
+/// `Vec<String>` of tenant ids into this core before calling the verified
+/// planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapSessionTenantRawRows {
-    pub row_count: nat,
+    pub row_count: u32,
     pub all_tenant_ids_equal: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapSessionTenantDecisionContext {
     MissingTenantBinding,
     UniqueTenantBinding,
     AmbiguousTenantBinding,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapSessionTenantPlan {
     RejectMissingTenantBinding,
     Accept,
     RejectAmbiguousTenantBinding,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundRouteAuthRawRows {
     pub route_authorized: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundRouteAuthDecisionContext {
     pub route_authorized: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundRouteAuthDecision {
     RejectUnauthorized,
     Accept,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundBootstrapAuthRawRows {
     pub tenant_resolution: BootstrapSessionTenantDecisionContext,
     pub has_cached_tenant: bool,
@@ -43,6 +58,7 @@ pub struct InboundBootstrapAuthRawRows {
     pub invite_signature_valid: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundBootstrapAuthDecisionContext {
     pub tenant_resolution: BootstrapSessionTenantDecisionContext,
     pub has_cached_tenant: bool,
@@ -52,6 +68,7 @@ pub struct InboundBootstrapAuthDecisionContext {
     pub invite_signature_valid: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundBootstrapAuthDecision {
     RejectInvalidAuth,
     AcceptResolvedTenant,
@@ -59,9 +76,17 @@ pub enum InboundBootstrapAuthDecision {
     RejectTenantResolution,
 }
 
-pub open spec fn normalize_bootstrap_session_tenant_decision_context(
+pub fn normalize_bootstrap_session_tenant_decision_context(
     raw_rows: BootstrapSessionTenantRawRows,
-) -> BootstrapSessionTenantDecisionContext {
+) -> (context: BootstrapSessionTenantDecisionContext)
+    ensures
+        raw_rows.row_count == 0
+            ==> context == BootstrapSessionTenantDecisionContext::MissingTenantBinding,
+        (raw_rows.row_count > 0 && raw_rows.all_tenant_ids_equal)
+            ==> context == BootstrapSessionTenantDecisionContext::UniqueTenantBinding,
+        (raw_rows.row_count > 0 && !raw_rows.all_tenant_ids_equal)
+            ==> context == BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding,
+{
     if raw_rows.row_count == 0 {
         BootstrapSessionTenantDecisionContext::MissingTenantBinding
     } else if raw_rows.all_tenant_ids_equal {
@@ -71,9 +96,17 @@ pub open spec fn normalize_bootstrap_session_tenant_decision_context(
     }
 }
 
-pub open spec fn decide_bootstrap_session_tenant_plan(
-    context: BootstrapSessionTenantDecisionContext,
-) -> BootstrapSessionTenantPlan {
+pub fn decide_bootstrap_session_tenant_plan(
+    context: &BootstrapSessionTenantDecisionContext,
+) -> (plan: BootstrapSessionTenantPlan)
+    ensures
+        *context == BootstrapSessionTenantDecisionContext::MissingTenantBinding
+            ==> plan == BootstrapSessionTenantPlan::RejectMissingTenantBinding,
+        *context == BootstrapSessionTenantDecisionContext::UniqueTenantBinding
+            ==> plan == BootstrapSessionTenantPlan::Accept,
+        *context == BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding
+            ==> plan == BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding,
+{
     match context {
         BootstrapSessionTenantDecisionContext::MissingTenantBinding => {
             BootstrapSessionTenantPlan::RejectMissingTenantBinding
@@ -87,17 +120,23 @@ pub open spec fn decide_bootstrap_session_tenant_plan(
     }
 }
 
-pub open spec fn normalize_inbound_route_auth_decision_context(
+pub fn normalize_inbound_route_auth_decision_context(
     raw_rows: InboundRouteAuthRawRows,
-) -> InboundRouteAuthDecisionContext {
+) -> (context: InboundRouteAuthDecisionContext)
+    ensures context.route_authorized == raw_rows.route_authorized,
+{
     InboundRouteAuthDecisionContext {
         route_authorized: raw_rows.route_authorized,
     }
 }
 
-pub open spec fn decide_inbound_route_auth(
+pub fn decide_inbound_route_auth(
     context: &InboundRouteAuthDecisionContext,
-) -> InboundRouteAuthDecision {
+) -> (decision: InboundRouteAuthDecision)
+    ensures
+        context.route_authorized ==> decision == InboundRouteAuthDecision::Accept,
+        !context.route_authorized ==> decision == InboundRouteAuthDecision::RejectUnauthorized,
+{
     if context.route_authorized {
         InboundRouteAuthDecision::Accept
     } else {
@@ -105,9 +144,17 @@ pub open spec fn decide_inbound_route_auth(
     }
 }
 
-pub open spec fn normalize_inbound_bootstrap_auth_decision_context(
+pub fn normalize_inbound_bootstrap_auth_decision_context(
     raw_rows: InboundBootstrapAuthRawRows,
-) -> InboundBootstrapAuthDecisionContext {
+) -> (context: InboundBootstrapAuthDecisionContext)
+    ensures
+        context.tenant_resolution == raw_rows.tenant_resolution,
+        context.has_cached_tenant == raw_rows.has_cached_tenant,
+        context.expiry_valid == raw_rows.expiry_valid,
+        context.daemon_binding_valid == raw_rows.daemon_binding_valid,
+        context.claimed_peer_matches_key == raw_rows.claimed_peer_matches_key,
+        context.invite_signature_valid == raw_rows.invite_signature_valid,
+{
     InboundBootstrapAuthDecisionContext {
         tenant_resolution: raw_rows.tenant_resolution,
         has_cached_tenant: raw_rows.has_cached_tenant,
@@ -118,9 +165,40 @@ pub open spec fn normalize_inbound_bootstrap_auth_decision_context(
     }
 }
 
-pub open spec fn decide_inbound_bootstrap_auth(
+pub fn decide_inbound_bootstrap_auth(
     context: &InboundBootstrapAuthDecisionContext,
-) -> InboundBootstrapAuthDecision {
+) -> (decision: InboundBootstrapAuthDecision)
+    ensures
+        // Any failing primitive auth check rejects before tenant resolution.
+        (!context.expiry_valid
+            || !context.daemon_binding_valid
+            || !context.claimed_peer_matches_key
+            || !context.invite_signature_valid)
+            ==> decision == InboundBootstrapAuthDecision::RejectInvalidAuth,
+        // Unique tenant binding (with all auth checks valid) accepts the resolved tenant.
+        (context.expiry_valid
+            && context.daemon_binding_valid
+            && context.claimed_peer_matches_key
+            && context.invite_signature_valid
+            && context.tenant_resolution == BootstrapSessionTenantDecisionContext::UniqueTenantBinding)
+            ==> decision == InboundBootstrapAuthDecision::AcceptResolvedTenant,
+        // Missing or ambiguous tenant resolution with a cached tenant accepts the cache.
+        (context.expiry_valid
+            && context.daemon_binding_valid
+            && context.claimed_peer_matches_key
+            && context.invite_signature_valid
+            && context.tenant_resolution != BootstrapSessionTenantDecisionContext::UniqueTenantBinding
+            && context.has_cached_tenant)
+            ==> decision == InboundBootstrapAuthDecision::AcceptCachedTenant,
+        // Missing or ambiguous tenant resolution with no cached tenant rejects.
+        (context.expiry_valid
+            && context.daemon_binding_valid
+            && context.claimed_peer_matches_key
+            && context.invite_signature_valid
+            && context.tenant_resolution != BootstrapSessionTenantDecisionContext::UniqueTenantBinding
+            && !context.has_cached_tenant)
+            ==> decision == InboundBootstrapAuthDecision::RejectTenantResolution,
+{
     if !context.expiry_valid
         || !context.daemon_binding_valid
         || !context.claimed_peer_matches_key
@@ -142,161 +220,6 @@ pub open spec fn decide_inbound_bootstrap_auth(
             }
         }
     }
-}
-
-proof fn inbound_route_rejects_unauthorized()
-    ensures
-        decide_inbound_route_auth(&InboundRouteAuthDecisionContext {
-            route_authorized: false,
-        }) == InboundRouteAuthDecision::RejectUnauthorized,
-{
-}
-
-proof fn inbound_route_accepts_authorized()
-    ensures
-        decide_inbound_route_auth(&InboundRouteAuthDecisionContext {
-            route_authorized: true,
-        }) == InboundRouteAuthDecision::Accept,
-{
-}
-
-proof fn inbound_route_auth_normalizer_preserves_query_facts(route_authorized: bool)
-    ensures
-        normalize_inbound_route_auth_decision_context(InboundRouteAuthRawRows {
-            route_authorized,
-        }) == (InboundRouteAuthDecisionContext {
-            route_authorized,
-        }),
-{
-}
-
-proof fn inbound_bootstrap_auth_normalizer_preserves_query_facts(
-    tenant_resolution: BootstrapSessionTenantDecisionContext,
-    has_cached_tenant: bool,
-    expiry_valid: bool,
-    daemon_binding_valid: bool,
-    claimed_peer_matches_key: bool,
-    invite_signature_valid: bool,
-)
-    ensures
-        normalize_inbound_bootstrap_auth_decision_context(InboundBootstrapAuthRawRows {
-            tenant_resolution,
-            has_cached_tenant,
-            expiry_valid,
-            daemon_binding_valid,
-            claimed_peer_matches_key,
-            invite_signature_valid,
-        }) == (InboundBootstrapAuthDecisionContext {
-            tenant_resolution,
-            has_cached_tenant,
-            expiry_valid,
-            daemon_binding_valid,
-            claimed_peer_matches_key,
-            invite_signature_valid,
-        }),
-{
-}
-
-proof fn bootstrap_session_tenant_normalizes_empty_to_missing()
-    ensures
-        normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
-            row_count: 0,
-            all_tenant_ids_equal: true,
-        }) == BootstrapSessionTenantDecisionContext::MissingTenantBinding,
-{
-}
-
-proof fn bootstrap_session_tenant_normalizes_equal_rows_to_unique(row_count: nat)
-    requires row_count > 0
-    ensures
-        normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
-            row_count,
-            all_tenant_ids_equal: true,
-        }) == BootstrapSessionTenantDecisionContext::UniqueTenantBinding,
-        decide_bootstrap_session_tenant_plan(
-            normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
-                row_count,
-                all_tenant_ids_equal: true,
-            })
-        ) == BootstrapSessionTenantPlan::Accept,
-{
-}
-
-proof fn bootstrap_session_tenant_duplicate_row_count_is_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-)
-    requires
-        row_count_a > 0,
-        row_count_b > 0,
-    ensures
-        decide_bootstrap_session_tenant_plan(
-            normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
-                row_count: row_count_a,
-                all_tenant_ids_equal: true,
-            })
-        ) == decide_bootstrap_session_tenant_plan(
-            normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
-                row_count: row_count_b,
-                all_tenant_ids_equal: true,
-            })
-        ),
-{
-}
-
-proof fn bootstrap_session_tenant_normalizes_mixed_rows_to_ambiguous(row_count: nat)
-    requires row_count > 0
-    ensures
-        normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
-            row_count,
-            all_tenant_ids_equal: false,
-        }) == BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding,
-        decide_bootstrap_session_tenant_plan(
-            normalize_bootstrap_session_tenant_decision_context(BootstrapSessionTenantRawRows {
-                row_count,
-                all_tenant_ids_equal: false,
-            })
-        ) == BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding,
-{
-}
-
-proof fn inbound_bootstrap_rejects_invalid_auth_even_with_cached_tenant()
-    ensures
-        decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
-            tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
-            has_cached_tenant: true,
-            expiry_valid: false,
-            daemon_binding_valid: true,
-            claimed_peer_matches_key: true,
-            invite_signature_valid: true,
-        }) == InboundBootstrapAuthDecision::RejectInvalidAuth,
-{
-}
-
-proof fn inbound_bootstrap_accepts_cached_tenant_after_resolution_loss()
-    ensures
-        decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
-            tenant_resolution: BootstrapSessionTenantDecisionContext::MissingTenantBinding,
-            has_cached_tenant: true,
-            expiry_valid: true,
-            daemon_binding_valid: true,
-            claimed_peer_matches_key: true,
-            invite_signature_valid: true,
-        }) == InboundBootstrapAuthDecision::AcceptCachedTenant,
-{
-}
-
-proof fn inbound_bootstrap_accepts_resolved_tenant_without_cache()
-    ensures
-        decide_inbound_bootstrap_auth(&InboundBootstrapAuthDecisionContext {
-            tenant_resolution: BootstrapSessionTenantDecisionContext::UniqueTenantBinding,
-            has_cached_tenant: false,
-            expiry_valid: true,
-            daemon_binding_valid: true,
-            claimed_peer_matches_key: true,
-            invite_signature_valid: true,
-        }) == InboundBootstrapAuthDecision::AcceptResolvedTenant,
-{
 }
 
 } // verus!

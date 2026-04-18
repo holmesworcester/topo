@@ -17,8 +17,15 @@ use ed25519_dalek::SigningKey;
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::debug;
 
-pub const MAX_SESSION_AUTH_TTL_MS: u64 = 5 * 60 * 1000;
-const SESSION_AUTH_CLOCK_SKEW_MS: u64 = 30 * 1000;
+/// Re-export verified protocol constants and primitive predicates so the runtime's
+/// TTL/binding checks (`validate_expiry`, `ensure_daemon_binding`) go through the
+/// SMT-checked core in `topo_verus_proofs::runtime::transport::session_auth`.
+pub use topo_verus_proofs::runtime::transport::session_auth::{
+    daemon_binding_valid as verified_daemon_binding_valid,
+    expiry_is_valid as verified_expiry_is_valid, MAX_SESSION_AUTH_TTL_MS,
+    SESSION_AUTH_CLOCK_SKEW_MS,
+};
+
 const MAX_SESSION_AUTH_FRAME_BYTES: usize = 4096;
 
 const INVITE_SIGNING_DOMAIN: &[u8] = b"poc7-session-auth-v1-invite";
@@ -105,6 +112,7 @@ enum BootstrapFallbackInvitePlan {
     RejectMissingCandidate,
     UseInvite { invite_event_id: String },
     RejectAmbiguousCandidate,
+    RejectAlreadyLocalWorkspaceCandidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,28 +189,64 @@ fn normalize_bootstrap_session_tenant_decision_context(
     let mut tenant_ids = raw_rows.tenant_ids.clone();
     tenant_ids.sort();
     tenant_ids.dedup();
-    match tenant_ids.as_slice() {
-        [] => BootstrapSessionTenantDecisionContext::MissingTenantBinding,
-        [tenant_id] => BootstrapSessionTenantDecisionContext::UniqueTenantBinding {
-            tenant_id: tenant_id.clone(),
-        },
-        _ => BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding,
+    // Delegate the primitive row-count / uniqueness decision to the verified core,
+    // then rehydrate the String tenant_id payload on the runtime side.
+    use topo_verus_proofs::runtime::transport::inbound_session_auth::{
+        normalize_bootstrap_session_tenant_decision_context as verified_normalize_tenant,
+        BootstrapSessionTenantDecisionContext as VerifiedTenantCtx,
+        BootstrapSessionTenantRawRows as VerifiedTenantRows,
+    };
+    let verified_rows = VerifiedTenantRows {
+        row_count: u32::try_from(tenant_ids.len()).unwrap_or(u32::MAX),
+        all_tenant_ids_equal: tenant_ids.len() <= 1,
+    };
+    match verified_normalize_tenant(verified_rows) {
+        VerifiedTenantCtx::MissingTenantBinding => {
+            BootstrapSessionTenantDecisionContext::MissingTenantBinding
+        }
+        VerifiedTenantCtx::UniqueTenantBinding => {
+            BootstrapSessionTenantDecisionContext::UniqueTenantBinding {
+                tenant_id: tenant_ids.into_iter().next().expect("unique row has tenant"),
+            }
+        }
+        VerifiedTenantCtx::AmbiguousTenantBinding => {
+            BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding
+        }
     }
 }
 
 fn decide_bootstrap_session_tenant_plan(
     context: &BootstrapSessionTenantDecisionContext,
 ) -> BootstrapSessionTenantPlan {
-    match context {
+    use topo_verus_proofs::runtime::transport::inbound_session_auth::{
+        decide_bootstrap_session_tenant_plan as verified_decide_tenant,
+        BootstrapSessionTenantDecisionContext as VerifiedTenantCtx,
+        BootstrapSessionTenantPlan as VerifiedTenantPlan,
+    };
+    let verified_ctx = match context {
         BootstrapSessionTenantDecisionContext::MissingTenantBinding => {
-            BootstrapSessionTenantPlan::RejectMissingTenantBinding
+            VerifiedTenantCtx::MissingTenantBinding
         }
-        BootstrapSessionTenantDecisionContext::UniqueTenantBinding { tenant_id } => {
-            BootstrapSessionTenantPlan::Accept {
-                tenant_id: tenant_id.clone(),
-            }
+        BootstrapSessionTenantDecisionContext::UniqueTenantBinding { .. } => {
+            VerifiedTenantCtx::UniqueTenantBinding
         }
         BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding => {
+            VerifiedTenantCtx::AmbiguousTenantBinding
+        }
+    };
+    match verified_decide_tenant(&verified_ctx) {
+        VerifiedTenantPlan::RejectMissingTenantBinding => {
+            BootstrapSessionTenantPlan::RejectMissingTenantBinding
+        }
+        VerifiedTenantPlan::Accept => match context {
+            BootstrapSessionTenantDecisionContext::UniqueTenantBinding { tenant_id } => {
+                BootstrapSessionTenantPlan::Accept {
+                    tenant_id: tenant_id.clone(),
+                }
+            }
+            _ => unreachable!("verified Accept requires UniqueTenantBinding"),
+        },
+        VerifiedTenantPlan::RejectAmbiguousTenantBinding => {
             BootstrapSessionTenantPlan::RejectAmbiguousTenantBinding
         }
     }
@@ -224,32 +268,82 @@ fn normalize_bootstrap_fallback_invite_decision_context(
         }
         normalized.push(candidate);
     }
-    match normalized.as_slice() {
-        [] => BootstrapFallbackInviteDecisionContext::MissingCandidate,
-        [candidate] => BootstrapFallbackInviteDecisionContext::UniqueCandidate {
-            invite_event_id: candidate.invite_event_id.clone(),
-            workspace_already_local_before_candidate: candidate
-                .workspace_already_local_before_candidate,
+    // Delegate the primitive count-based decision to the verified core, then rehydrate
+    // the String `invite_event_id` and boolean flag on the runtime side.
+    use topo_verus_proofs::runtime::transport::outbound_session_auth::{
+        normalize_bootstrap_fallback_invite_decision_context as verified_normalize_fallback,
+        BootstrapFallbackInviteDecisionContext as VerifiedFallbackCtx,
+        BootstrapFallbackInviteRawRows as VerifiedFallbackRows,
+    };
+    let distinct_candidate_count = u32::try_from(normalized.len()).unwrap_or(u32::MAX);
+    let unique_workspace_flag = normalized
+        .first()
+        .map(|c| c.workspace_already_local_before_candidate)
+        .unwrap_or(false);
+    let verified_rows = VerifiedFallbackRows {
+        candidate_row_count: u32::try_from(raw_rows.candidates.len()).unwrap_or(u32::MAX),
+        distinct_candidate_count,
+        unique_distinct_candidate_workspace_already_local_before_candidate: unique_workspace_flag,
+    };
+    match verified_normalize_fallback(verified_rows) {
+        VerifiedFallbackCtx::MissingCandidate => {
+            BootstrapFallbackInviteDecisionContext::MissingCandidate
+        }
+        VerifiedFallbackCtx::UniqueCandidate {
+            workspace_already_local_before_candidate,
+        } => BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+            invite_event_id: normalized
+                .into_iter()
+                .next()
+                .expect("unique candidate")
+                .invite_event_id,
+            workspace_already_local_before_candidate,
         },
-        _ => BootstrapFallbackInviteDecisionContext::AmbiguousCandidate,
+        VerifiedFallbackCtx::AmbiguousCandidate => {
+            BootstrapFallbackInviteDecisionContext::AmbiguousCandidate
+        }
     }
 }
 
 fn decide_bootstrap_fallback_invite_plan(
     context: &BootstrapFallbackInviteDecisionContext,
 ) -> BootstrapFallbackInvitePlan {
-    match context {
+    use topo_verus_proofs::runtime::transport::outbound_session_auth::{
+        decide_bootstrap_fallback_invite_plan as verified_decide_fallback,
+        BootstrapFallbackInviteDecisionContext as VerifiedFallbackCtx,
+        BootstrapFallbackInvitePlan as VerifiedFallbackPlan,
+    };
+    let verified_ctx = match context {
         BootstrapFallbackInviteDecisionContext::MissingCandidate => {
-            BootstrapFallbackInvitePlan::RejectMissingCandidate
+            VerifiedFallbackCtx::MissingCandidate
         }
         BootstrapFallbackInviteDecisionContext::UniqueCandidate {
-            invite_event_id,
-            workspace_already_local_before_candidate: _,
-        } => BootstrapFallbackInvitePlan::UseInvite {
-            invite_event_id: invite_event_id.clone(),
+            workspace_already_local_before_candidate,
+            ..
+        } => VerifiedFallbackCtx::UniqueCandidate {
+            workspace_already_local_before_candidate: *workspace_already_local_before_candidate,
         },
         BootstrapFallbackInviteDecisionContext::AmbiguousCandidate => {
+            VerifiedFallbackCtx::AmbiguousCandidate
+        }
+    };
+    match verified_decide_fallback(&verified_ctx) {
+        VerifiedFallbackPlan::RejectMissingCandidate => {
+            BootstrapFallbackInvitePlan::RejectMissingCandidate
+        }
+        VerifiedFallbackPlan::UseInvite => match context {
+            BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+                invite_event_id, ..
+            } => BootstrapFallbackInvitePlan::UseInvite {
+                invite_event_id: invite_event_id.clone(),
+            },
+            _ => unreachable!("verified UseInvite requires UniqueCandidate"),
+        },
+        VerifiedFallbackPlan::RejectAmbiguousCandidate => {
             BootstrapFallbackInvitePlan::RejectAmbiguousCandidate
+        }
+        VerifiedFallbackPlan::RejectAlreadyLocalWorkspaceCandidate => {
+            BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
         }
     }
 }
@@ -278,24 +372,30 @@ fn normalize_outbound_session_auth_decision_context(
 fn decide_outbound_session_auth_decision(
     context: &OutboundSessionAuthDecisionContext,
 ) -> OutboundSessionAuthDecision {
-    match &context.requested_plan {
-        OutboundSessionAuthPlan::PeerShared { .. } => OutboundSessionAuthDecision::KeepRequested,
-        OutboundSessionAuthPlan::InviteBootstrap { .. } => {
-            if context.bootstrap_auth_still_valid {
-                if context.remote_session_peer_authorized
-                    && (context.bound_daemon_matches_remote
-                        || context.daemon_connection_admits_route)
-                {
-                    return OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission;
-                }
-                return OutboundSessionAuthDecision::KeepRequested;
-            }
-
-            if context.bound_daemon_matches_remote && context.remote_session_peer_authorized {
-                return OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse;
-            }
-
-            OutboundSessionAuthDecision::KeepRequested
+    use topo_verus_proofs::runtime::transport::outbound_session_auth::{
+        decide_outbound_session_auth_decision as verified_decide,
+        OutboundSessionAuthDecision as VerifiedDecision,
+        OutboundSessionAuthDecisionContext as VerifiedCtx,
+        RequestedSessionAuthPlan as VerifiedRequested,
+    };
+    let requested = match &context.requested_plan {
+        OutboundSessionAuthPlan::PeerShared { .. } => VerifiedRequested::PeerShared,
+        OutboundSessionAuthPlan::InviteBootstrap { .. } => VerifiedRequested::InviteBootstrap,
+    };
+    let verified_ctx = VerifiedCtx {
+        requested_plan: requested,
+        bootstrap_auth_still_valid: context.bootstrap_auth_still_valid,
+        daemon_connection_admits_route: context.daemon_connection_admits_route,
+        bound_daemon_matches_remote: context.bound_daemon_matches_remote,
+        remote_session_peer_authorized: context.remote_session_peer_authorized,
+    };
+    match verified_decide(&verified_ctx) {
+        VerifiedDecision::KeepRequested => OutboundSessionAuthDecision::KeepRequested,
+        VerifiedDecision::UpgradeToPeerSharedAfterRouteAdmission => {
+            OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
+        }
+        VerifiedDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
+            OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse
         }
     }
 }
@@ -304,32 +404,63 @@ fn plan_for_outbound_session_auth_decision(
     context: &OutboundSessionAuthDecisionContext,
     decision: &OutboundSessionAuthDecision,
 ) -> OutboundSessionAuthPlan {
-    match decision {
-        OutboundSessionAuthDecision::KeepRequested => context.requested_plan.clone(),
-        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
-        | OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
-            OutboundSessionAuthPlan::PeerShared {
-                target_peer_id: context.remote_session_peer_id.clone(),
-            }
+    use topo_verus_proofs::runtime::transport::outbound_session_auth::{
+        plan_for_outbound_session_auth_decision as verified_plan_for,
+        OutboundSessionAuthDecision as VerifiedDecision,
+        RequestedSessionAuthPlan as VerifiedRequested,
+        ResolvedSessionAuthPlan as VerifiedResolved,
+    };
+    let requested = match &context.requested_plan {
+        OutboundSessionAuthPlan::PeerShared { .. } => VerifiedRequested::PeerShared,
+        OutboundSessionAuthPlan::InviteBootstrap { .. } => VerifiedRequested::InviteBootstrap,
+    };
+    let verified_decision = match decision {
+        OutboundSessionAuthDecision::KeepRequested => VerifiedDecision::KeepRequested,
+        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission => {
+            VerifiedDecision::UpgradeToPeerSharedAfterRouteAdmission
         }
+        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
+            VerifiedDecision::UpgradeToPeerSharedAfterBootstrapLapse
+        }
+    };
+    match verified_plan_for(requested, verified_decision) {
+        VerifiedResolved::PeerShared => OutboundSessionAuthPlan::PeerShared {
+            target_peer_id: context.remote_session_peer_id.clone(),
+        },
+        VerifiedResolved::InviteBootstrap => context.requested_plan.clone(),
     }
 }
 
 fn normalize_inbound_route_auth_decision_context(
     raw_rows: InboundRouteAuthRawRows,
 ) -> InboundRouteAuthDecisionContext {
+    use topo_verus_proofs::runtime::transport::inbound_session_auth::{
+        normalize_inbound_route_auth_decision_context as verified_normalize_route,
+        InboundRouteAuthRawRows as VerifiedRouteRows,
+    };
+    let verified =
+        verified_normalize_route(VerifiedRouteRows {
+            route_authorized: raw_rows.route_authorized,
+        });
     InboundRouteAuthDecisionContext {
-        route_authorized: raw_rows.route_authorized,
+        route_authorized: verified.route_authorized,
     }
 }
 
 fn decide_inbound_route_auth(
     context: &InboundRouteAuthDecisionContext,
 ) -> InboundRouteAuthDecision {
-    if context.route_authorized {
-        InboundRouteAuthDecision::Accept
-    } else {
-        InboundRouteAuthDecision::RejectUnauthorized
+    use topo_verus_proofs::runtime::transport::inbound_session_auth::{
+        decide_inbound_route_auth as verified_decide_route,
+        InboundRouteAuthDecision as VerifiedRouteDecision,
+        InboundRouteAuthDecisionContext as VerifiedRouteCtx,
+    };
+    let verified_ctx = VerifiedRouteCtx {
+        route_authorized: context.route_authorized,
+    };
+    match verified_decide_route(&verified_ctx) {
+        VerifiedRouteDecision::Accept => InboundRouteAuthDecision::Accept,
+        VerifiedRouteDecision::RejectUnauthorized => InboundRouteAuthDecision::RejectUnauthorized,
     }
 }
 
@@ -349,29 +480,51 @@ fn normalize_inbound_bootstrap_auth_decision_context(
 fn decide_inbound_bootstrap_auth(
     context: &InboundBootstrapAuthDecisionContext,
 ) -> InboundBootstrapAuthDecision {
-    if !context.expiry_valid
-        || !context.daemon_binding_valid
-        || !context.claimed_peer_matches_key
-        || !context.invite_signature_valid
-    {
-        return InboundBootstrapAuthDecision::RejectInvalidAuth;
-    }
-
-    match &context.tenant_resolution {
-        BootstrapSessionTenantDecisionContext::UniqueTenantBinding { tenant_id } => {
-            InboundBootstrapAuthDecision::AcceptResolvedTenant {
-                tenant_id: tenant_id.clone(),
-            }
+    use topo_verus_proofs::runtime::transport::inbound_session_auth::{
+        decide_inbound_bootstrap_auth as verified_decide_bootstrap,
+        BootstrapSessionTenantDecisionContext as VerifiedTenantCtx,
+        InboundBootstrapAuthDecision as VerifiedBootstrapDecision,
+        InboundBootstrapAuthDecisionContext as VerifiedBootstrapCtx,
+    };
+    let tenant_resolution = match &context.tenant_resolution {
+        BootstrapSessionTenantDecisionContext::MissingTenantBinding => {
+            VerifiedTenantCtx::MissingTenantBinding
         }
-        BootstrapSessionTenantDecisionContext::MissingTenantBinding
-        | BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding => {
-            if let Some(tenant_id) = &context.cached_tenant_id {
-                InboundBootstrapAuthDecision::AcceptCachedTenant {
+        BootstrapSessionTenantDecisionContext::UniqueTenantBinding { .. } => {
+            VerifiedTenantCtx::UniqueTenantBinding
+        }
+        BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding => {
+            VerifiedTenantCtx::AmbiguousTenantBinding
+        }
+    };
+    let verified_ctx = VerifiedBootstrapCtx {
+        tenant_resolution,
+        has_cached_tenant: context.cached_tenant_id.is_some(),
+        expiry_valid: context.expiry_valid,
+        daemon_binding_valid: context.daemon_binding_valid,
+        claimed_peer_matches_key: context.claimed_peer_matches_key,
+        invite_signature_valid: context.invite_signature_valid,
+    };
+    match verified_decide_bootstrap(&verified_ctx) {
+        VerifiedBootstrapDecision::RejectInvalidAuth => {
+            InboundBootstrapAuthDecision::RejectInvalidAuth
+        }
+        VerifiedBootstrapDecision::AcceptResolvedTenant => match &context.tenant_resolution {
+            BootstrapSessionTenantDecisionContext::UniqueTenantBinding { tenant_id } => {
+                InboundBootstrapAuthDecision::AcceptResolvedTenant {
                     tenant_id: tenant_id.clone(),
                 }
-            } else {
-                InboundBootstrapAuthDecision::RejectTenantResolution
             }
+            _ => unreachable!("verified AcceptResolvedTenant requires UniqueTenantBinding"),
+        },
+        VerifiedBootstrapDecision::AcceptCachedTenant => match &context.cached_tenant_id {
+            Some(tenant_id) => InboundBootstrapAuthDecision::AcceptCachedTenant {
+                tenant_id: tenant_id.clone(),
+            },
+            None => unreachable!("verified AcceptCachedTenant requires cached_tenant_id"),
+        },
+        VerifiedBootstrapDecision::RejectTenantResolution => {
+            InboundBootstrapAuthDecision::RejectTenantResolution
         }
     }
 }
@@ -413,10 +566,13 @@ fn decode_hex32(
 
 fn validate_expiry(expires_at_ms: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms()?;
-    if expires_at_ms + SESSION_AUTH_CLOCK_SKEW_MS < now {
-        return Err("session auth expired".into());
-    }
-    if expires_at_ms > now + MAX_SESSION_AUTH_TTL_MS + SESSION_AUTH_CLOCK_SKEW_MS {
+    // Delegate the window check to the verus-verified `expiry_is_valid`. The
+    // two failure modes share the same boolean, so we distinguish them here
+    // for better error messages.
+    if !verified_expiry_is_valid(expires_at_ms, now) {
+        if expires_at_ms < now && now.saturating_sub(expires_at_ms) > SESSION_AUTH_CLOCK_SKEW_MS {
+            return Err("session auth expired".into());
+        }
         return Err("session auth expiry exceeds maximum TTL".into());
     }
     Ok(())
@@ -428,13 +584,53 @@ fn ensure_daemon_binding(
     local_daemon_peer_id: &[u8; 32],
     remote_daemon_peer_id: &[u8; 32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if auth_local_daemon_peer_id != local_daemon_peer_id {
-        return Err("session auth local daemon fingerprint mismatch".into());
-    }
-    if auth_remote_daemon_peer_id != remote_daemon_peer_id {
-        return Err("session auth remote daemon fingerprint mismatch".into());
+    // Byte-for-byte equality on 32-byte fingerprints. We forward the
+    // decision to the verus-verified `daemon_binding_valid` helper by
+    // hashing each fingerprint down to a u64 per side so both sides feed
+    // the same primitive predicate; a collision-free identity mapping
+    // suffices here because we split the comparison into two independent
+    // u64 tests (the predicate is `a == a' && b == b'`).
+    let binding_ok = verified_daemon_binding_valid(
+        u64_fingerprint_slot(auth_local_daemon_peer_id, 0),
+        u64_fingerprint_slot(auth_remote_daemon_peer_id, 0),
+        u64_fingerprint_slot(local_daemon_peer_id, 0),
+        u64_fingerprint_slot(remote_daemon_peer_id, 0),
+    ) && verified_daemon_binding_valid(
+        u64_fingerprint_slot(auth_local_daemon_peer_id, 1),
+        u64_fingerprint_slot(auth_remote_daemon_peer_id, 1),
+        u64_fingerprint_slot(local_daemon_peer_id, 1),
+        u64_fingerprint_slot(remote_daemon_peer_id, 1),
+    ) && verified_daemon_binding_valid(
+        u64_fingerprint_slot(auth_local_daemon_peer_id, 2),
+        u64_fingerprint_slot(auth_remote_daemon_peer_id, 2),
+        u64_fingerprint_slot(local_daemon_peer_id, 2),
+        u64_fingerprint_slot(remote_daemon_peer_id, 2),
+    ) && verified_daemon_binding_valid(
+        u64_fingerprint_slot(auth_local_daemon_peer_id, 3),
+        u64_fingerprint_slot(auth_remote_daemon_peer_id, 3),
+        u64_fingerprint_slot(local_daemon_peer_id, 3),
+        u64_fingerprint_slot(remote_daemon_peer_id, 3),
+    );
+    if !binding_ok {
+        if auth_local_daemon_peer_id != local_daemon_peer_id {
+            return Err("session auth local daemon fingerprint mismatch".into());
+        }
+        if auth_remote_daemon_peer_id != remote_daemon_peer_id {
+            return Err("session auth remote daemon fingerprint mismatch".into());
+        }
     }
     Ok(())
+}
+
+/// Project a 32-byte fingerprint into the primitive `u64` slots the verus
+/// `daemon_binding_valid` predicate expects. Each 64-bit slot is an
+/// independent sub-segment of the fingerprint; equality of all four slots
+/// is byte-for-byte equality of the full fingerprint.
+fn u64_fingerprint_slot(fingerprint: &[u8; 32], slot: usize) -> u64 {
+    let base = slot * 8;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&fingerprint[base..base + 8]);
+    u64::from_le_bytes(buf)
 }
 
 fn encode_invite_signing_bytes(auth: &OpenSessionAuthInvite) -> Vec<u8> {
@@ -795,6 +991,27 @@ async fn read_inbound_session_auth_inner(
                 decide_inbound_route_auth(&normalize_inbound_route_auth_decision_context(
                     InboundRouteAuthRawRows { route_authorized },
                 ));
+
+            // Protocol-level cross-check: verified peer_shared_auth_decide with
+            // source_authorized=route_authorized, route_admitted=true, ack=true.
+            // OpenSessionRoute has no separate ack frame; the spec's third flag
+            // is modeled as always-true for this code path.
+            {
+                use topo_verus_proofs::runtime::transport::session_auth::{
+                    peer_shared_auth_decide, AuthResultExec,
+                };
+                let spec_outcome = peer_shared_auth_decide(route_authorized, true, true);
+                let runtime_accepts =
+                    !matches!(decision, InboundRouteAuthDecision::RejectUnauthorized);
+                let spec_accepts = matches!(spec_outcome, AuthResultExec::Accepted { .. });
+                debug_assert_eq!(
+                    runtime_accepts, spec_accepts,
+                    "peer_shared_auth_decide disagrees with InboundRouteAuthDecision: \
+                     route_authorized={}",
+                    route_authorized,
+                );
+            }
+
             if matches!(decision, InboundRouteAuthDecision::RejectUnauthorized) {
                 return Err(format!(
                     "session route not admitted for tenant {} peer {} on daemon {}",
@@ -845,6 +1062,11 @@ async fn read_inbound_session_auth_inner(
             let cached_tenant_id = daemon_connection.and_then(|conn| {
                 conn.accepted_bootstrap_tenant(&invite_event_id_b64, &remote_peer_id)
             });
+            let bootstrap_tenant_resolved = !matches!(
+                &tenant_resolution,
+                BootstrapSessionTenantDecisionContext::MissingTenantBinding
+                    | BootstrapSessionTenantDecisionContext::AmbiguousTenantBinding,
+            ) || cached_tenant_id.is_some();
             let decision = decide_inbound_bootstrap_auth(
                 &normalize_inbound_bootstrap_auth_decision_context(InboundBootstrapAuthRawRows {
                     tenant_resolution,
@@ -855,6 +1077,41 @@ async fn read_inbound_session_auth_inner(
                     invite_signature_valid,
                 }),
             );
+
+            // Protocol-level cross-check: the Verus-verified `invite_bootstrap_auth_decide`
+            // takes the same five primitive flags and returns Accepted iff ALL are true.
+            // If the richer InboundBootstrapAuthDecision disagrees with this protocol-level
+            // outcome, we have drift between runtime and spec.
+            // See verus-proofs/src/runtime/transport/session_auth.rs::invite_bootstrap_auth_decide.
+            {
+                use topo_verus_proofs::runtime::transport::session_auth::{
+                    invite_bootstrap_auth_decide, AuthResultExec,
+                };
+                let spec_outcome = invite_bootstrap_auth_decide(
+                    expiry_valid,
+                    daemon_binding_valid,
+                    claimed_peer_matches_key,
+                    bootstrap_tenant_resolved,
+                    invite_signature_valid,
+                );
+                let runtime_accepts = matches!(
+                    decision,
+                    InboundBootstrapAuthDecision::AcceptResolvedTenant { .. }
+                        | InboundBootstrapAuthDecision::AcceptCachedTenant { .. }
+                );
+                let spec_accepts = matches!(spec_outcome, AuthResultExec::Accepted { .. });
+                debug_assert_eq!(
+                    runtime_accepts, spec_accepts,
+                    "protocol-level invite_bootstrap_auth_decide disagrees with runtime \
+                     InboundBootstrapAuthDecision: expiry_valid={} daemon_binding_valid={} \
+                     peer_id_matches_pubkey={} tenant_resolved={} signature_valid={}",
+                    expiry_valid,
+                    daemon_binding_valid,
+                    claimed_peer_matches_key,
+                    bootstrap_tenant_resolved,
+                    invite_signature_valid,
+                );
+            }
             let tenant_id = match decision {
                 InboundBootstrapAuthDecision::AcceptResolvedTenant { tenant_id }
                 | InboundBootstrapAuthDecision::AcceptCachedTenant { tenant_id } => tenant_id,
@@ -1146,7 +1403,8 @@ pub fn resolve_bootstrap_fallback_invite_for_daemon(
         match decide_bootstrap_fallback_invite_plan(&decision_context) {
             BootstrapFallbackInvitePlan::UseInvite { invite_event_id } => Some(invite_event_id),
             BootstrapFallbackInvitePlan::RejectMissingCandidate
-            | BootstrapFallbackInvitePlan::RejectAmbiguousCandidate => None,
+            | BootstrapFallbackInvitePlan::RejectAmbiguousCandidate
+            | BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate => None,
         },
     )
 }

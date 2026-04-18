@@ -1,23 +1,33 @@
-//! Formal verification of active bootstrap fallback selection.
+//! Bootstrap-auth fallback decision — verified core.
+//!
+//! Runtime `normalize_bootstrap_session_fallback_decision_context` sorts+dedups
+//! `Vec<BootstrapSessionFallbackCandidate>` (String-bearing structs). That sort/dedup logic
+//! stays runtime-only — it can't cross into verus-proofs without importing String-heavy types.
+//! What we verify here is the *decision* step: given a classified tag (post-normalization),
+//! produce the right Plan tag. The runtime adapter carries the `BootstrapSessionFallback`
+//! payload through for the UseFallback case.
 
 use vstd::prelude::*;
 
 verus! {
 
+// ───────────── Invite bootstrap fallback (simpler seam) ─────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootstrapFallbackInviteRawRows {
-    pub candidate_row_count: nat,
-    pub distinct_candidate_count: nat,
+    pub candidate_row_count: u32,
+    pub distinct_candidate_count: u32,
     pub unique_distinct_candidate_workspace_already_local_before_candidate: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapFallbackInviteDecisionContext {
     MissingCandidate,
-    UniqueCandidate {
-        workspace_already_local_before_candidate: bool,
-    },
+    UniqueCandidate { workspace_already_local_before_candidate: bool },
     AmbiguousCandidate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapFallbackInvitePlan {
     RejectMissingCandidate,
     UseInvite,
@@ -25,9 +35,20 @@ pub enum BootstrapFallbackInvitePlan {
     RejectAlreadyLocalWorkspaceCandidate,
 }
 
-pub open spec fn normalize_bootstrap_fallback_invite_decision_context(
+pub fn normalize_bootstrap_fallback_invite_decision_context(
     raw_rows: BootstrapFallbackInviteRawRows,
-) -> BootstrapFallbackInviteDecisionContext {
+) -> (context: BootstrapFallbackInviteDecisionContext)
+    ensures
+        raw_rows.distinct_candidate_count == 0
+            ==> context == BootstrapFallbackInviteDecisionContext::MissingCandidate,
+        raw_rows.distinct_candidate_count == 1
+            ==> context == (BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+                workspace_already_local_before_candidate:
+                    raw_rows.unique_distinct_candidate_workspace_already_local_before_candidate,
+            }),
+        raw_rows.distinct_candidate_count > 1
+            ==> context == BootstrapFallbackInviteDecisionContext::AmbiguousCandidate,
+{
     if raw_rows.distinct_candidate_count == 0 {
         BootstrapFallbackInviteDecisionContext::MissingCandidate
     } else if raw_rows.distinct_candidate_count == 1 {
@@ -40,13 +61,26 @@ pub open spec fn normalize_bootstrap_fallback_invite_decision_context(
     }
 }
 
-pub open spec fn decide_bootstrap_fallback_invite_plan(
+pub fn decide_bootstrap_fallback_invite_plan(
     context: BootstrapFallbackInviteDecisionContext,
-) -> BootstrapFallbackInvitePlan {
+) -> (plan: BootstrapFallbackInvitePlan)
+    ensures
+        match context {
+            BootstrapFallbackInviteDecisionContext::MissingCandidate =>
+                plan == BootstrapFallbackInvitePlan::RejectMissingCandidate,
+            BootstrapFallbackInviteDecisionContext::UniqueCandidate { workspace_already_local_before_candidate } =>
+                if workspace_already_local_before_candidate {
+                    plan == BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
+                } else {
+                    plan == BootstrapFallbackInvitePlan::UseInvite
+                },
+            BootstrapFallbackInviteDecisionContext::AmbiguousCandidate =>
+                plan == BootstrapFallbackInvitePlan::RejectAmbiguousCandidate,
+        },
+{
     match context {
-        BootstrapFallbackInviteDecisionContext::MissingCandidate => {
-            BootstrapFallbackInvitePlan::RejectMissingCandidate
-        }
+        BootstrapFallbackInviteDecisionContext::MissingCandidate =>
+            BootstrapFallbackInvitePlan::RejectMissingCandidate,
         BootstrapFallbackInviteDecisionContext::UniqueCandidate {
             workspace_already_local_before_candidate,
         } => {
@@ -56,144 +90,28 @@ pub open spec fn decide_bootstrap_fallback_invite_plan(
                 BootstrapFallbackInvitePlan::UseInvite
             }
         }
-        BootstrapFallbackInviteDecisionContext::AmbiguousCandidate => {
-            BootstrapFallbackInvitePlan::RejectAmbiguousCandidate
-        }
+        BootstrapFallbackInviteDecisionContext::AmbiguousCandidate =>
+            BootstrapFallbackInvitePlan::RejectAmbiguousCandidate,
     }
 }
 
-proof fn bootstrap_fallback_normalizes_missing_candidates()
-    ensures
-        normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-            candidate_row_count: 0,
-            distinct_candidate_count: 0,
-            unique_distinct_candidate_workspace_already_local_before_candidate: false,
-        }) == BootstrapFallbackInviteDecisionContext::MissingCandidate,
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: 0,
-                distinct_candidate_count: 0,
-                unique_distinct_candidate_workspace_already_local_before_candidate: false,
-            })
-        ) == BootstrapFallbackInvitePlan::RejectMissingCandidate,
-{
-}
+// ───────────── Session-level bootstrap fallback (decision core only) ─────────────
+//
+// The *normalize* step (sort+dedup Vec<BootstrapSessionFallbackCandidate>) is String-heavy
+// and stays in the runtime. Here we verify the post-normalization decision: given a core
+// classification tag, produce the right core plan tag. Runtime adapter carries the
+// BootstrapSessionFallback payload.
 
-proof fn bootstrap_fallback_rejects_unique_same_workspace_candidate()
-    ensures
-        normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-            candidate_row_count: 1,
-            distinct_candidate_count: 1,
-            unique_distinct_candidate_workspace_already_local_before_candidate: true,
-        }) == (BootstrapFallbackInviteDecisionContext::UniqueCandidate {
-            workspace_already_local_before_candidate: true,
-        }),
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: 1,
-                distinct_candidate_count: 1,
-                unique_distinct_candidate_workspace_already_local_before_candidate: true,
-            })
-        ) == BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate,
-{
-}
-
-proof fn bootstrap_fallback_duplicate_rows_preserve_same_workspace_rejection(
-    candidate_row_count: nat,
-)
-    requires
-        candidate_row_count > 1,
-    ensures
-        normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-            candidate_row_count,
-            distinct_candidate_count: 1,
-            unique_distinct_candidate_workspace_already_local_before_candidate: true,
-        }) == (BootstrapFallbackInviteDecisionContext::UniqueCandidate {
-            workspace_already_local_before_candidate: true,
-        }),
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count,
-                distinct_candidate_count: 1,
-                unique_distinct_candidate_workspace_already_local_before_candidate: true,
-            })
-        ) == BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate,
-{
-}
-
-proof fn bootstrap_fallback_duplicate_row_count_is_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-    distinct_candidate_count: nat,
-    workspace_already_local_before_candidate: bool,
-)
-    ensures
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: row_count_a,
-                distinct_candidate_count,
-                unique_distinct_candidate_workspace_already_local_before_candidate:
-                    workspace_already_local_before_candidate,
-            })
-        ) == decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: row_count_b,
-                distinct_candidate_count,
-                unique_distinct_candidate_workspace_already_local_before_candidate:
-                    workspace_already_local_before_candidate,
-            })
-        ),
-{
-}
-
-proof fn bootstrap_fallback_accepts_unique_nonlocal_candidate()
-    ensures
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: 1,
-                distinct_candidate_count: 1,
-                unique_distinct_candidate_workspace_already_local_before_candidate: false,
-            })
-        ) == BootstrapFallbackInvitePlan::UseInvite,
-{
-}
-
-proof fn bootstrap_fallback_rejects_ambiguous_candidates(candidate_count: nat)
-    requires candidate_count > 1
-    ensures
-        normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-            candidate_row_count: candidate_count,
-            distinct_candidate_count: candidate_count,
-            unique_distinct_candidate_workspace_already_local_before_candidate: false,
-        }) == BootstrapFallbackInviteDecisionContext::AmbiguousCandidate,
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: candidate_count,
-                distinct_candidate_count: candidate_count,
-                unique_distinct_candidate_workspace_already_local_before_candidate: false,
-            })
-        ) == BootstrapFallbackInvitePlan::RejectAmbiguousCandidate,
-{
-}
-
-pub struct BootstrapSessionFallbackRawRows {
-    pub require_local_bootstrap_phase: bool,
-    pub local_bootstrap_phase: bool,
-    pub candidate_row_count: nat,
-    pub distinct_candidate_count: nat,
-    pub unique_distinct_candidate_workspace_already_local_before_candidate: bool,
-}
-
-pub enum BootstrapSessionFallbackDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapSessionFallbackCoreContext {
     RejectRequiresLocalBootstrapPhase,
     MissingCandidate,
-    UniqueCandidate {
-        workspace_already_local_before_candidate: bool,
-    },
+    UniqueCandidate { workspace_already_local_before_candidate: bool },
     AmbiguousCandidate,
 }
 
-pub enum BootstrapSessionFallbackPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapSessionFallbackCorePlan {
     RejectRequiresLocalBootstrapPhase,
     RejectMissingCandidate,
     UseFallback,
@@ -201,166 +119,42 @@ pub enum BootstrapSessionFallbackPlan {
     RejectAlreadyLocalWorkspaceCandidate,
 }
 
-pub open spec fn normalize_bootstrap_session_fallback_decision_context(
-    raw_rows: BootstrapSessionFallbackRawRows,
-) -> BootstrapSessionFallbackDecisionContext {
-    if raw_rows.require_local_bootstrap_phase && !raw_rows.local_bootstrap_phase {
-        BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase
-    } else if raw_rows.distinct_candidate_count == 0 {
-        BootstrapSessionFallbackDecisionContext::MissingCandidate
-    } else if raw_rows.distinct_candidate_count == 1 {
-        BootstrapSessionFallbackDecisionContext::UniqueCandidate {
-            workspace_already_local_before_candidate:
-                raw_rows.unique_distinct_candidate_workspace_already_local_before_candidate,
-        }
-    } else {
-        BootstrapSessionFallbackDecisionContext::AmbiguousCandidate
-    }
-}
-
-pub open spec fn decide_bootstrap_session_fallback_plan(
-    context: BootstrapSessionFallbackDecisionContext,
-) -> BootstrapSessionFallbackPlan {
+pub fn decide_bootstrap_session_fallback_core_plan(
+    context: BootstrapSessionFallbackCoreContext,
+) -> (plan: BootstrapSessionFallbackCorePlan)
+    ensures
+        match context {
+            BootstrapSessionFallbackCoreContext::RejectRequiresLocalBootstrapPhase =>
+                plan == BootstrapSessionFallbackCorePlan::RejectRequiresLocalBootstrapPhase,
+            BootstrapSessionFallbackCoreContext::MissingCandidate =>
+                plan == BootstrapSessionFallbackCorePlan::RejectMissingCandidate,
+            BootstrapSessionFallbackCoreContext::UniqueCandidate { workspace_already_local_before_candidate } =>
+                if workspace_already_local_before_candidate {
+                    plan == BootstrapSessionFallbackCorePlan::RejectAlreadyLocalWorkspaceCandidate
+                } else {
+                    plan == BootstrapSessionFallbackCorePlan::UseFallback
+                },
+            BootstrapSessionFallbackCoreContext::AmbiguousCandidate =>
+                plan == BootstrapSessionFallbackCorePlan::RejectAmbiguousCandidate,
+        },
+{
     match context {
-        BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase => {
-            BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase
-        }
-        BootstrapSessionFallbackDecisionContext::MissingCandidate => {
-            BootstrapSessionFallbackPlan::RejectMissingCandidate
-        }
-        BootstrapSessionFallbackDecisionContext::UniqueCandidate {
+        BootstrapSessionFallbackCoreContext::RejectRequiresLocalBootstrapPhase =>
+            BootstrapSessionFallbackCorePlan::RejectRequiresLocalBootstrapPhase,
+        BootstrapSessionFallbackCoreContext::MissingCandidate =>
+            BootstrapSessionFallbackCorePlan::RejectMissingCandidate,
+        BootstrapSessionFallbackCoreContext::UniqueCandidate {
             workspace_already_local_before_candidate,
         } => {
             if workspace_already_local_before_candidate {
-                BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate
+                BootstrapSessionFallbackCorePlan::RejectAlreadyLocalWorkspaceCandidate
             } else {
-                BootstrapSessionFallbackPlan::UseFallback
+                BootstrapSessionFallbackCorePlan::UseFallback
             }
         }
-        BootstrapSessionFallbackDecisionContext::AmbiguousCandidate => {
-            BootstrapSessionFallbackPlan::RejectAmbiguousCandidate
-        }
+        BootstrapSessionFallbackCoreContext::AmbiguousCandidate =>
+            BootstrapSessionFallbackCorePlan::RejectAmbiguousCandidate,
     }
-}
-
-proof fn bootstrap_session_fallback_rejects_when_local_bootstrap_phase_required_but_missing()
-    ensures
-        decide_bootstrap_session_fallback_plan(
-            normalize_bootstrap_session_fallback_decision_context(
-                BootstrapSessionFallbackRawRows {
-                    require_local_bootstrap_phase: true,
-                    local_bootstrap_phase: false,
-                    candidate_row_count: 1,
-                    distinct_candidate_count: 1,
-                    unique_distinct_candidate_workspace_already_local_before_candidate: false,
-                },
-            )
-        ) == BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase,
-{
-}
-
-proof fn bootstrap_session_fallback_rejects_unique_same_workspace_candidate()
-    ensures
-        decide_bootstrap_session_fallback_plan(
-            normalize_bootstrap_session_fallback_decision_context(
-                BootstrapSessionFallbackRawRows {
-                    require_local_bootstrap_phase: false,
-                    local_bootstrap_phase: false,
-                    candidate_row_count: 1,
-                    distinct_candidate_count: 1,
-                    unique_distinct_candidate_workspace_already_local_before_candidate: true,
-                },
-            )
-        ) == BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate,
-{
-}
-
-proof fn bootstrap_session_fallback_duplicate_rows_preserve_same_workspace_rejection(
-    candidate_row_count: nat,
-)
-    requires
-        candidate_row_count > 1,
-    ensures
-        decide_bootstrap_session_fallback_plan(
-            normalize_bootstrap_session_fallback_decision_context(
-                BootstrapSessionFallbackRawRows {
-                    require_local_bootstrap_phase: false,
-                    local_bootstrap_phase: false,
-                    candidate_row_count,
-                    distinct_candidate_count: 1,
-                    unique_distinct_candidate_workspace_already_local_before_candidate: true,
-                },
-            )
-        ) == BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate,
-{
-}
-
-proof fn bootstrap_session_fallback_duplicate_row_count_is_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-    require_local_bootstrap_phase: bool,
-    local_bootstrap_phase: bool,
-    distinct_candidate_count: nat,
-    workspace_already_local_before_candidate: bool,
-)
-    ensures
-        decide_bootstrap_session_fallback_plan(
-            normalize_bootstrap_session_fallback_decision_context(
-                BootstrapSessionFallbackRawRows {
-                    require_local_bootstrap_phase,
-                    local_bootstrap_phase,
-                    candidate_row_count: row_count_a,
-                    distinct_candidate_count,
-                    unique_distinct_candidate_workspace_already_local_before_candidate:
-                        workspace_already_local_before_candidate,
-                },
-            )
-        ) == decide_bootstrap_session_fallback_plan(
-            normalize_bootstrap_session_fallback_decision_context(
-                BootstrapSessionFallbackRawRows {
-                    require_local_bootstrap_phase,
-                    local_bootstrap_phase,
-                    candidate_row_count: row_count_b,
-                    distinct_candidate_count,
-                    unique_distinct_candidate_workspace_already_local_before_candidate:
-                        workspace_already_local_before_candidate,
-                },
-            )
-        ),
-{
-}
-
-proof fn bootstrap_session_fallback_accepts_unique_nonlocal_candidate()
-    ensures
-        decide_bootstrap_session_fallback_plan(
-            normalize_bootstrap_session_fallback_decision_context(
-                BootstrapSessionFallbackRawRows {
-                    require_local_bootstrap_phase: false,
-                    local_bootstrap_phase: false,
-                    candidate_row_count: 1,
-                    distinct_candidate_count: 1,
-                    unique_distinct_candidate_workspace_already_local_before_candidate: false,
-                },
-            )
-        ) == BootstrapSessionFallbackPlan::UseFallback,
-{
-}
-
-proof fn bootstrap_session_fallback_rejects_ambiguous_candidates(candidate_count: nat)
-    requires candidate_count > 1
-    ensures
-        decide_bootstrap_session_fallback_plan(
-            normalize_bootstrap_session_fallback_decision_context(
-                BootstrapSessionFallbackRawRows {
-                    require_local_bootstrap_phase: false,
-                    local_bootstrap_phase: false,
-                    candidate_row_count: candidate_count,
-                    distinct_candidate_count: candidate_count,
-                    unique_distinct_candidate_workspace_already_local_before_candidate: false,
-                },
-            )
-        ) == BootstrapSessionFallbackPlan::RejectAmbiguousCandidate,
-{
 }
 
 } // verus!

@@ -24,27 +24,10 @@ enum PersistEventKind {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistValidationRawRows {
-    MissingCreatedAt,
-    MissingTypeCode,
-    UnknownType { type_code: u8 },
-    KnownType { created_at_ms: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistValidationDecisionContext {
-    RejectMissingCreatedAt,
-    RejectMissingTypeCode,
-    RejectUnknownType,
-    Ready { created_at_ms: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PersistValidationPlan {
-    Skip,
-    Continue { created_at_ms: u64 },
-}
+use topo_verus_proofs::state::pipeline::persist_validation::{
+    decide_persist_validation_plan, normalize_persist_validation, PersistValidationPlan,
+    PersistValidationRawRows,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistEventRawRows {
@@ -96,42 +79,6 @@ fn load_persist_validation_raw_rows(
     (raw_rows, meta)
 }
 
-#[inline]
-fn normalize_persist_validation(
-    raw_rows: PersistValidationRawRows,
-) -> PersistValidationDecisionContext {
-    match raw_rows {
-        PersistValidationRawRows::MissingCreatedAt => {
-            PersistValidationDecisionContext::RejectMissingCreatedAt
-        }
-        PersistValidationRawRows::MissingTypeCode => {
-            PersistValidationDecisionContext::RejectMissingTypeCode
-        }
-        PersistValidationRawRows::UnknownType { .. } => {
-            PersistValidationDecisionContext::RejectUnknownType
-        }
-        PersistValidationRawRows::KnownType { created_at_ms } => {
-            PersistValidationDecisionContext::Ready { created_at_ms }
-        }
-    }
-}
-
-#[inline]
-fn decide_persist_validation_plan(
-    context: &PersistValidationDecisionContext,
-) -> PersistValidationPlan {
-    match context {
-        PersistValidationDecisionContext::Ready { created_at_ms } => {
-            PersistValidationPlan::Continue {
-                created_at_ms: *created_at_ms,
-            }
-        }
-        PersistValidationDecisionContext::RejectMissingCreatedAt
-        | PersistValidationDecisionContext::RejectMissingTypeCode
-        | PersistValidationDecisionContext::RejectUnknownType => PersistValidationPlan::Skip,
-    }
-}
-
 fn persist_event_kind(type_name: &str) -> PersistEventKind {
     match type_name {
         "workspace" => PersistEventKind::Workspace,
@@ -150,20 +97,43 @@ fn normalize_persist_event(raw_rows: PersistEventRawRows) -> PersistEventDecisio
 }
 
 fn decide_persist_event_plan(context: &PersistEventDecisionContext) -> PersistEventPlan {
-    let workspace_target = match (context.share_scope, context.event_kind) {
-        (ShareScope::Local, _) | (ShareScope::Shared, PersistEventKind::EndpointShared) => {
-            PersistWorkspaceTarget::Skip
-        }
-        (ShareScope::Shared, PersistEventKind::Workspace) => PersistWorkspaceTarget::EventId,
-        (ShareScope::Shared, PersistEventKind::Other) => match &context.workspace_binding {
+    // The tag-level persist dispatch (which workspace-target variant and which
+    // priority lane) is verified in verus-proofs; the runtime rehydrates the
+    // concrete `workspace_binding: Option<String>` into `WorkspaceBinding(String)`
+    // when the verified core selects that branch.
+    use topo_verus_proofs::state::pipeline::phases::{
+        decide_persist_event_plan_core, PersistEventDecisionContextCore, ShareScopeCore,
+        WorkspaceTargetCore,
+    };
+    let type_name_is_workspace = matches!(context.event_kind, PersistEventKind::Workspace);
+    let type_name_is_endpoint_shared =
+        matches!(context.event_kind, PersistEventKind::EndpointShared);
+    let core_plan = decide_persist_event_plan_core(&PersistEventDecisionContextCore {
+        share_scope: match context.share_scope {
+            ShareScope::Shared => ShareScopeCore::Shared,
+            ShareScope::Local => ShareScopeCore::Secret,
+        },
+        type_name_is_endpoint_shared,
+        type_name_is_workspace,
+        is_file_slice: context.is_file_slice,
+        has_workspace_binding: context.workspace_binding.is_some(),
+    });
+
+    let workspace_target = match core_plan.shared_index_workspace {
+        WorkspaceTargetCore::Skip => PersistWorkspaceTarget::Skip,
+        WorkspaceTargetCore::MissingBinding => PersistWorkspaceTarget::MissingBinding,
+        WorkspaceTargetCore::EventId => PersistWorkspaceTarget::EventId,
+        WorkspaceTargetCore::WorkspaceBinding => match &context.workspace_binding {
             Some(workspace_id) => PersistWorkspaceTarget::WorkspaceBinding(workspace_id.clone()),
-            None => PersistWorkspaceTarget::MissingBinding,
+            None => unreachable!(
+                "verified core returned WorkspaceBinding but runtime has no workspace_binding"
+            ),
         },
     };
 
     PersistEventPlan {
         shared_index_workspace: workspace_target.clone(),
-        priority_lane: if context.is_file_slice { 2 } else { 1 },
+        priority_lane: core_plan.priority_lane as i64,
         fanout_workspace: workspace_target,
     }
 }

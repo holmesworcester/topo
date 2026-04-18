@@ -28,8 +28,16 @@ impl super::super::Describe for AdminEvent {
 }
 
 pub fn parse_admin(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, public_key, user_event_id)) =
+        topo_verus_proofs::event_modules::layout::ts_id2::parse_ts_id2(EVENT_TYPE_ADMIN, blob)
+    {
+        return Ok(ParsedEvent::Admin(AdminEvent {
+            created_at_ms: ts,
+            public_key,
+            user_event_id,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_ADMIN, ADMIN_FIELDS, blob)?;
-
     Ok(ParsedEvent::Admin(AdminEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         public_key: values[1].as_event_id().unwrap(),
@@ -42,14 +50,12 @@ pub fn encode_admin(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::Admin(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.public_key),
-        FieldValue::EventId(e.user_event_id),
-    ];
-
-    Ok(encode_fields(EVENT_TYPE_ADMIN, ADMIN_FIELDS, &values)?)
+    Ok(topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
+        EVENT_TYPE_ADMIN,
+        e.created_at_ms,
+        &e.public_key,
+        &e.user_event_id,
+    ))
 }
 
 pub static ADMIN_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

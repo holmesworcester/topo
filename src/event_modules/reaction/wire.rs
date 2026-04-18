@@ -38,8 +38,22 @@ impl super::super::Describe for ReactionEvent {
 }
 
 pub fn parse_reaction(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, target_event_id, author_id, emoji_slot)) =
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id2_fb64(
+            EVENT_TYPE_REACTION,
+            blob,
+        )
+    {
+        let emoji = crate::event_modules::layout::common::read_text_slot(&emoji_slot)
+            .map_err(EventError::TextSlot)?;
+        return Ok(ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: ts,
+            target_event_id,
+            author_id,
+            emoji,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_REACTION, REACTION_FIELDS, blob)?;
-
     Ok(ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         target_event_id: values[1].as_event_id().unwrap(),
@@ -53,19 +67,18 @@ pub fn encode_reaction(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::Reaction(r) => r,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(rxn.created_at_ms),
-        FieldValue::EventId(rxn.target_event_id),
-        FieldValue::EventId(rxn.author_id),
-        FieldValue::Text(rxn.emoji.clone()),
-    ];
-
-    Ok(encode_fields(
-        EVENT_TYPE_REACTION,
-        REACTION_FIELDS,
-        &values,
-    )?)
+    let mut emoji_slot: [u8; REACTION_EMOJI_BYTES] = [0u8; REACTION_EMOJI_BYTES];
+    crate::event_modules::layout::common::write_text_slot(&rxn.emoji, &mut emoji_slot)
+        .map_err(EventError::TextSlot)?;
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id2_fb64(
+            EVENT_TYPE_REACTION,
+            rxn.created_at_ms,
+            &rxn.target_event_id,
+            &rxn.author_id,
+            &emoji_slot,
+        ),
+    )
 }
 
 pub static REACTION_TYPE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

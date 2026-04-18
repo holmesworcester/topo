@@ -22,17 +22,18 @@ use encrypted_offsets as off;
 pub const NO_OWNER_EVENT_ID: [u8; 32] = [0u8; 32];
 
 pub fn outer_inner_type_code(blob: &[u8]) -> Option<u8> {
-    if blob.first().copied() != Some(EVENT_TYPE_ENCRYPTED) {
+    if !topo_verus_proofs::event_modules::encrypted::is_well_formed_encrypted_header(blob) {
         return None;
     }
     blob.get(off::INNER_TYPE_CODE).copied()
 }
 
 pub fn outer_owner_event_id(blob: &[u8]) -> Option<[u8; 32]> {
-    if blob.first().copied() != Some(EVENT_TYPE_ENCRYPTED) {
+    if !topo_verus_proofs::event_modules::encrypted::is_well_formed_encrypted_header(blob) {
         return None;
     }
-    let owner = blob.get(off::OWNER_EVENT_ID..off::INNER_TYPE_CODE)?;
+    let (start, end) = topo_verus_proofs::event_modules::encrypted::owner_event_id_range();
+    let owner = blob.get(start..end)?;
     let mut out = [0u8; 32];
     out.copy_from_slice(owner);
     Some(out)
@@ -159,20 +160,17 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ));
     }
 
-    let total = encrypted_wire_size(expected_ct_size);
-    let mut buf = vec![0u8; total];
-
-    buf[off::TYPE_CODE] = EVENT_TYPE_ENCRYPTED;
-    buf[off::CREATED_AT..off::KEY_EVENT_ID].copy_from_slice(&enc.created_at_ms.to_le_bytes());
-    buf[off::KEY_EVENT_ID..off::OWNER_EVENT_ID].copy_from_slice(&enc.key_event_id);
-    buf[off::OWNER_EVENT_ID..off::INNER_TYPE_CODE].copy_from_slice(&enc.owner_event_id);
-    buf[off::INNER_TYPE_CODE] = enc.inner_type_code;
-    buf[off::NONCE..off::CIPHERTEXT].copy_from_slice(&enc.nonce);
-    buf[off::CIPHERTEXT..off::CIPHERTEXT + expected_ct_size].copy_from_slice(&enc.ciphertext);
-    let auth_tag_start = off::CIPHERTEXT + expected_ct_size;
-    buf[auth_tag_start..auth_tag_start + ENCRYPTED_AUTH_TAG_BYTES].copy_from_slice(&enc.auth_tag);
-
-    Ok(buf)
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_encrypted_envelope(
+            enc.created_at_ms,
+            &enc.key_event_id,
+            &enc.owner_event_id,
+            enc.inner_type_code,
+            &enc.nonce,
+            &enc.ciphertext,
+            &enc.auth_tag,
+        ),
+    )
 }
 
 // === Projector (event-module locality) ===

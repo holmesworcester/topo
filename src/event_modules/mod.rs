@@ -491,12 +491,47 @@ pub fn parse_event(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 }
 
 /// Encode a ParsedEvent using the global registry.
+///
+/// In debug builds, immediately parses the produced blob and asserts the resulting
+/// event's type code matches the original. A mismatch would indicate encoder/decoder
+/// drift and fires the verified `event_type_code_preserved` predicate from
+/// `topo_verus_proofs::state::command_roundtrip`.
 pub fn encode_event(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let type_code = event.event_type_code();
     let meta = registry()
         .lookup(type_code)
         .ok_or(EventError::UnknownType(type_code))?;
-    (meta.encode)(event)
+    let blob = (meta.encode)(event)?;
+
+    #[cfg(debug_assertions)]
+    {
+        match parse_event(&blob) {
+            Ok(parsed) => {
+                let type_code_ok =
+                    topo_verus_proofs::event_modules::roundtrip::event_type_code_preserved(
+                        type_code,
+                        parsed.event_type_code(),
+                    );
+                let full_equality_ok = parsed == *event;
+                assert!(
+                    topo_verus_proofs::event_modules::roundtrip::encoder_roundtrip_ok(
+                        type_code_ok,
+                        full_equality_ok,
+                    ),
+                    "encode/parse round-trip mismatch for type {type_code}: \
+                     type_code_ok={type_code_ok} full_equality_ok={full_equality_ok}",
+                );
+            }
+            Err(e) => {
+                panic!(
+                    "encode/parse round-trip: encode produced a blob that parse rejects \
+                     (type {type_code}, error: {e:?})"
+                );
+            }
+        }
+    }
+
+    Ok(blob)
 }
 
 /// Generic post-projection-drain hooks.
@@ -583,54 +618,50 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum FormalProjectorFamily {
-        BasicInsert,
-        Content,
-        EnvelopeOnlyReject,
-        InviteBootstrap,
-        InviteAccepted,
-        PeerShared,
-        KeyDelivery,
-        SignerFrontier,
-        FileSlice,
-        EndpointRoot,
-        NoWrite,
-    }
+    use topo_verus_proofs::event_modules::registry::{
+        formal_family_of, EventTypeCode, FormalProjectorFamily,
+    };
 
-    fn formal_projector_family(type_code: u8) -> Option<FormalProjectorFamily> {
+    /// Trusted extractor: runtime `u8` type code → Verus `EventTypeCode` variant.
+    /// Retired codes (e.g., PEER at 23) intentionally return None. If a new event
+    /// type is added to the runtime registry, add both a constant and a branch
+    /// here AND a variant in `verus-proofs/src/state/projector_registry.rs`.
+    fn type_code_to_enum(type_code: u8) -> Option<EventTypeCode> {
         match type_code {
-            EVENT_TYPE_MESSAGE | EVENT_TYPE_REACTION | EVENT_TYPE_MESSAGE_DELETION => {
-                Some(FormalProjectorFamily::Content)
-            }
-            EVENT_TYPE_SIGNED | EVENT_TYPE_ENCRYPTED => {
-                Some(FormalProjectorFamily::EnvelopeOnlyReject)
-            }
-            EVENT_TYPE_WORKSPACE
-            | EVENT_TYPE_USER
-            | EVENT_TYPE_ADMIN
-            | EVENT_TYPE_KEY_SECRET
-            | EVENT_TYPE_INVITE_SECRET
-            | EVENT_TYPE_TENANT
-            | EVENT_TYPE_FILE => Some(FormalProjectorFamily::BasicInsert),
-            EVENT_TYPE_USER_INVITE | EVENT_TYPE_DEVICE_INVITE => {
-                Some(FormalProjectorFamily::InviteBootstrap)
-            }
-            EVENT_TYPE_INVITE_ACCEPTED => Some(FormalProjectorFamily::InviteAccepted),
-            EVENT_TYPE_PEER_SHARED => Some(FormalProjectorFamily::PeerShared),
-            EVENT_TYPE_KEY_REQUEST | EVENT_TYPE_KEY_SHARED => {
-                Some(FormalProjectorFamily::KeyDelivery)
-            }
-            EVENT_TYPE_REMOVAL | EVENT_TYPE_KEY_ROTATION => {
-                Some(FormalProjectorFamily::SignerFrontier)
-            }
-            EVENT_TYPE_FILE_SLICE => Some(FormalProjectorFamily::FileSlice),
-            EVENT_TYPE_PEER_SECRET | EVENT_TYPE_ENDPOINT_SECRET | EVENT_TYPE_ENDPOINT_SHARED => {
-                Some(FormalProjectorFamily::EndpointRoot)
-            }
-            EVENT_TYPE_BENCH_DEP => Some(FormalProjectorFamily::NoWrite),
+            EVENT_TYPE_MESSAGE => Some(EventTypeCode::Message),
+            EVENT_TYPE_REACTION => Some(EventTypeCode::Reaction),
+            EVENT_TYPE_ENCRYPTED => Some(EventTypeCode::Encrypted),
+            EVENT_TYPE_KEY_SECRET => Some(EventTypeCode::KeySecret),
+            EVENT_TYPE_MESSAGE_DELETION => Some(EventTypeCode::MessageDeletion),
+            EVENT_TYPE_WORKSPACE => Some(EventTypeCode::Workspace),
+            EVENT_TYPE_INVITE_ACCEPTED => Some(EventTypeCode::InviteAccepted),
+            EVENT_TYPE_USER_INVITE => Some(EventTypeCode::UserInvite),
+            EVENT_TYPE_DEVICE_INVITE => Some(EventTypeCode::DeviceInvite),
+            EVENT_TYPE_USER => Some(EventTypeCode::User),
+            EVENT_TYPE_PEER_SHARED => Some(EventTypeCode::PeerShared),
+            EVENT_TYPE_ADMIN => Some(EventTypeCode::Admin),
+            EVENT_TYPE_KEY_SHARED => Some(EventTypeCode::KeyShared),
+            EVENT_TYPE_FILE => Some(EventTypeCode::File),
+            EVENT_TYPE_FILE_SLICE => Some(EventTypeCode::FileSlice),
+            EVENT_TYPE_BENCH_DEP => Some(EventTypeCode::BenchDep),
+            EVENT_TYPE_PEER_SECRET => Some(EventTypeCode::PeerSecret),
+            EVENT_TYPE_INVITE_SECRET => Some(EventTypeCode::InviteSecret),
+            EVENT_TYPE_TENANT => Some(EventTypeCode::Tenant),
+            EVENT_TYPE_KEY_REQUEST => Some(EventTypeCode::KeyRequest),
+            EVENT_TYPE_REMOVAL => Some(EventTypeCode::Removal),
+            EVENT_TYPE_KEY_ROTATION => Some(EventTypeCode::KeyRotation),
+            EVENT_TYPE_ENDPOINT_SECRET => Some(EventTypeCode::EndpointSecret),
+            EVENT_TYPE_ENDPOINT_SHARED => Some(EventTypeCode::EndpointShared),
+            EVENT_TYPE_SIGNED => Some(EventTypeCode::Signed),
             _ => None,
         }
+    }
+
+    /// Thin wrapper: delegates to the Verus-verified exhaustive `formal_family_of`.
+    /// Totality over `EventTypeCode` is SMT-checked — every registered code has an
+    /// assigned family by construction.
+    fn formal_projector_family(type_code: u8) -> Option<FormalProjectorFamily> {
+        type_code_to_enum(type_code).map(formal_family_of)
     }
 
     #[test]

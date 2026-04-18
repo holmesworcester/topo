@@ -134,36 +134,41 @@ pub(super) fn normalize_target_dispatch_decision_context(
     }
 }
 
+/// Runtime wrapper: projects the runtime's richer types into the Verus-verified core,
+/// calls the SMT-checked decision, then lifts the core plan back into runtime enum variants.
+/// The decision logic (Skip-reason classification, Spawn boolean fields) is verified.
 pub(super) fn decide_target_dispatch_plan(
     context: &TargetDispatchDecisionContext,
 ) -> TargetDispatchPlan {
-    if !context.should_initiate_connect {
-        return TargetDispatchPlan::Skip(TargetDispatchSkipReason::SourceNotInitiated);
-    }
-
-    if matches!(context.incoming_source, TargetIngressSourceKind::Bootstrap)
-        && context.has_active_higher_precedence_worker
-        && !context.bootstrap_phase
-    {
-        return TargetDispatchPlan::Skip(TargetDispatchSkipReason::LowerPrecedenceThanActiveWorker);
-    }
-
-    match context.dispatch_action {
-        DispatchAction::Skip => TargetDispatchPlan::Skip(TargetDispatchSkipReason::DispatcherNoop),
-        DispatchAction::Connect => TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
-            cancel_existing_dispatch_key: false,
-            cancel_bootstrap_prefix: matches!(
-                context.incoming_source,
-                TargetIngressSourceKind::KnownPeer
-            ) && !context.bootstrap_phase,
-        }),
-        DispatchAction::Reconnect => TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
-            cancel_existing_dispatch_key: true,
-            cancel_bootstrap_prefix: matches!(
-                context.incoming_source,
-                TargetIngressSourceKind::KnownPeer
-            ) && !context.bootstrap_phase,
-        }),
+    use topo_verus_proofs::runtime::peering::engine::target_dispatch as v;
+    let core_action = match context.dispatch_action {
+        DispatchAction::Skip => v::CoreDispatchAction::Skip,
+        DispatchAction::Connect => v::CoreDispatchAction::Connect,
+        DispatchAction::Reconnect => v::CoreDispatchAction::Reconnect,
+    };
+    let core_source = match context.incoming_source {
+        TargetIngressSourceKind::Bootstrap => v::TargetSourceKind::Bootstrap,
+        TargetIngressSourceKind::KnownPeer => v::TargetSourceKind::KnownPeer,
+    };
+    let core_ctx = v::TargetDispatchCoreContext {
+        incoming_source: core_source,
+        should_initiate_connect: context.should_initiate_connect,
+        bootstrap_phase: context.bootstrap_phase,
+        has_active_higher_precedence_worker: context.has_active_higher_precedence_worker,
+        dispatch_action: core_action,
+    };
+    match v::decide_target_dispatch_core_plan(&core_ctx) {
+        v::TargetDispatchCorePlan::Skip(v::TargetDispatchCoreSkipReason::SourceNotInitiated) =>
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::SourceNotInitiated),
+        v::TargetDispatchCorePlan::Skip(v::TargetDispatchCoreSkipReason::LowerPrecedenceThanActiveWorker) =>
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::LowerPrecedenceThanActiveWorker),
+        v::TargetDispatchCorePlan::Skip(v::TargetDispatchCoreSkipReason::DispatcherNoop) =>
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::DispatcherNoop),
+        v::TargetDispatchCorePlan::Spawn(spawn) =>
+            TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
+                cancel_existing_dispatch_key: spawn.cancel_existing_dispatch_key,
+                cancel_bootstrap_prefix: spawn.cancel_bootstrap_prefix,
+            }),
     }
 }
 

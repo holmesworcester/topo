@@ -83,7 +83,7 @@ For security-sensitive runtime behavior, the preferred shape is:
 
 The normalizer should collapse live runtime state into the smallest stable decision context that still determines behavior. Avoid planners that reach back into SQLite, inspect the network directly, or depend on hidden ambient state after the decision context is loaded.
 
-This shape is important for proofs. Verus can prove local planner properties such as noninterference, rejection on ambiguity, or "already-local means no bootstrap" directly over the decision-context-to-plan function. TLA can then model retries, refresh loops, cancellation, and cross-component composition around that planner without needing to model SQL internals in full detail.
+This shape is important for proofs. Verus proves local planner properties such as noninterference, rejection on ambiguity, or "already-local means no bootstrap" directly over the decision-context-to-plan function — **as `ensures` clauses on the executable `pub fn` that the runtime actually calls**, not as separate abstract mirrors. See `### Verus Proof Model` below for details. TLA then models retries, refresh loops, cancellation, and cross-component composition around that planner without needing to model SQL internals in full detail.
 
 Here `DecisionContext` means a normalized decision context, not a full database snapshot. It should be a small typed value built from one query (or one fixed set of query rows) that contains only the facts relevant to one decision. Raw query rows may still be messy or redundant; the `DecisionContext` is the compact ADT that removes impossible combinations and names ambiguity explicitly.
 
@@ -108,15 +108,25 @@ Design guidance:
 3. executors should not add extra authority decisions beyond the emitted plan,
 4. when a behavior needs a proof, prefer introducing a context-query seam rather than proving over ad-hoc interleaved SQL and network logic.
 
-Verus proof organization mirrors runtime ownership instead of living inline in production modules. The proof tree under `verus-proofs/src/` should follow the owning Rust module shape (`runtime/...`, `state/...`, `pipeline/...`) so proof modules can be reviewed with the code they model without adding verification-only syntax to hot production files. Inline proof-style code is reserved for tiny local helpers only when it materially improves readability.
+Verus proof organization mirrors runtime ownership instead of living inline in production modules. The proof tree under `verus-proofs/src/` follows the owning Rust module shape (`runtime/...`, `state/...`, `pipeline/...`) so proof modules can be reviewed with the code they model without adding verification-only syntax to hot production files. Inline proof-style code is reserved for tiny local helpers only when it materially improves readability.
 
 Operational enforcement of this proof shape is not implicit:
 
 1. the working seam inventory lives in `docs/planning/FORMAL_SEAM_COVERAGE.md`,
 2. repo command-entry coverage lives in `docs/planning/COMMAND_FORMAL_COVERAGE.md`,
 3. the primary merge-readiness gate is `scripts/run_merge_readiness_checks.sh targeted`,
-4. that gate must run the boundary coverage tests, projector-family coverage test, and strict Verus verification before the serial runtime regressions,
+4. that gate must run the boundary coverage tests, projector-family coverage test, strict Verus verification, and the tamper test (`scripts/verus_tamper_test.sh`) before the serial runtime regressions,
 5. new proof-bearing seams, command-entry files, and new non-module Verus sources are expected to fail that primary gate until their inventories and proof mirrors are updated.
+
+### Verus Proof Model
+
+The `topo-verus-proofs` crate is a **path-dep of `topo`**, not an abstract parallel mirror. Every migratable seam's normalizer/planner is an executable `pub fn` inside a `verus!` block, with `requires`/`ensures` clauses that `cargo-verus verify` SMT-checks against the actual function body. The runtime imports those functions via `pub use topo_verus_proofs::...` and calls them directly — so a body change that violates an `ensures` fails the merge gate.
+
+Where the runtime's type shape carries `String`/`Option<RuntimeEnum>`/`Vec<RuntimeStruct>` payloads that cannot cross the crate boundary without a cyclic dep, we use a **verified core + runtime adapter** pattern: the Verus fn takes a primitive-only `*Core` shape and produces a `*Core` plan; the runtime has a thin unverified adapter that projects runtime → core, calls the verified fn, and rehydrates the payload on the way out. The decision logic is SMT-verified; the adapter is trusted and small enough to review by eye.
+
+The **tamper test** (`scripts/verus_tamper_test.sh`) flips an ensures-protected function body to violate its postcondition, asserts that `cargo-verus verify` reports "postcondition not satisfied", and restores the body. This makes the "SMT actually checks the body" guarantee a living invariant — if the ensures mechanism ever stops biting (e.g., a Verus upgrade that silently lets bad bodies through), the merge gate fails.
+
+The earlier approach — abstract `spec fn` mirrors of runtime functions with separate `proof fn` lemmas over the mirrors — is **deprecated**. Such proofs pass SMT but make no claim about the runtime body; drift between mirror and runtime was caught only by paired unit tests and path-linter scripts. Any remaining `spec fn`s in `verus-proofs/` are either (a) intermediate predicates cited by ensures clauses on grounded exec fns, or (b) clearly labeled protocol/shape invariants that have no single-function counterpart (e.g., `session_auth.rs`'s `*_spec` frame-shape predicates). The `bug_hunt.rs` module intentionally retains proofs of known *bugs* as a living counterexample log; when a bug is fixed, the counterexample flips to a positive invariant on the fixing seam.
 
 For the accepted-workspace guard specifically, the context query normalizes
 `invites_accepted` by distinct `workspace_id`: zero rows block on missing

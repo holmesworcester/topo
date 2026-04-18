@@ -8,19 +8,10 @@ pub const MISSING_DAEMON_IDENTITY_ERROR: &str = "daemon identity not found; star
 pub const INCONSISTENT_DAEMON_IDENTITY_ERROR: &str =
     "daemon identity is inconsistent: endpoint_shared exists without endpoint_secret";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DaemonIdentityMaterializationDecisionContext {
-    endpoint_secret_present: bool,
-    endpoint_shared_present: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DaemonIdentityMaterializationPlan {
-    AlreadyMaterialized,
-    CreateSecretAndShared,
-    CreateSharedFromExistingSecret,
-    RejectSharedWithoutSecret,
-}
+use topo_verus_proofs::runtime::transport::daemon_identity::{
+    decide_daemon_identity_materialization_plan, DaemonIdentityMaterializationDecisionContext,
+    DaemonIdentityMaterializationPlan,
+};
 
 fn sqlite_other(msg: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(msg.into())))
@@ -74,20 +65,6 @@ fn load_daemon_identity_materialization_decision_context(
         endpoint_secret_present: raw_endpoint_secret_present(conn)?,
         endpoint_shared_present: raw_endpoint_shared_present(conn)?,
     })
-}
-
-fn decide_daemon_identity_materialization_plan(
-    context: &DaemonIdentityMaterializationDecisionContext,
-) -> DaemonIdentityMaterializationPlan {
-    match (
-        context.endpoint_secret_present,
-        context.endpoint_shared_present,
-    ) {
-        (true, true) => DaemonIdentityMaterializationPlan::AlreadyMaterialized,
-        (false, false) => DaemonIdentityMaterializationPlan::CreateSecretAndShared,
-        (true, false) => DaemonIdentityMaterializationPlan::CreateSharedFromExistingSecret,
-        (false, true) => DaemonIdentityMaterializationPlan::RejectSharedWithoutSecret,
-    }
 }
 fn ensure_endpoint_secret_row(
     conn: &Connection,

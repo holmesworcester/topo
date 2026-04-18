@@ -29,8 +29,18 @@ pub const MESSAGE_DELETION_WIRE_SIZE: usize = wire_size_for_fields(MESSAGE_DELET
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  target_event_id (32 bytes)
 pub fn parse_message_deletion(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((created_at_ms, target_event_id)) =
+        topo_verus_proofs::event_modules::layout::ts_id::parse_ts_id(
+            EVENT_TYPE_MESSAGE_DELETION,
+            blob,
+        )
+    {
+        return Ok(ParsedEvent::MessageDeletion(MessageDeletionEvent {
+            created_at_ms,
+            target_event_id,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_MESSAGE_DELETION, MESSAGE_DELETION_FIELDS, blob)?;
-
     Ok(ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         target_event_id: values[1].as_event_id().unwrap(),
@@ -42,17 +52,11 @@ pub fn encode_message_deletion(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
         ParsedEvent::MessageDeletion(d) => d,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(del.created_at_ms),
-        FieldValue::EventId(del.target_event_id),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
         EVENT_TYPE_MESSAGE_DELETION,
-        MESSAGE_DELETION_FIELDS,
-        &values,
-    )?)
+        del.created_at_ms,
+        &del.target_event_id,
+    ))
 }
 
 pub static MESSAGE_DELETION_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

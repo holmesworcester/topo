@@ -441,7 +441,7 @@ fn blocked_shared_root_persists_missing_dep_edges_for_dep_sync() {
     let blocked_root = insert_event_raw(&conn, recorded_by, &blob);
 
     match project_one(&conn, recorded_by, &blocked_root).unwrap() {
-        ProjectionDecision::Block { missing } => assert_eq!(missing, vec![missing_dep]),
+        ProjectionDecision::BlockOnMissingDeps { missing } => assert_eq!(missing, vec![missing_dep]),
         other => panic!("expected blocked projection, got {:?}", other),
     }
     reindex_shared_event_at(&conn, &workspace_id, blocked_root, now_ms);
@@ -509,7 +509,7 @@ fn blocked_shared_root_uses_indexed_workspace_when_invite_binding_is_missing() {
     .unwrap();
 
     match project_one(&conn, recorded_by, &blocked_root).unwrap() {
-        ProjectionDecision::Block { missing } => assert_eq!(missing, vec![missing_dep]),
+        ProjectionDecision::BlockOnMissingDeps { missing } => assert_eq!(missing, vec![missing_dep]),
         other => panic!("expected blocked projection, got {:?}", other),
     }
 

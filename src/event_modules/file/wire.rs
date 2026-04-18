@@ -160,27 +160,25 @@ pub fn encode_file(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
     validate_file_metadata(att.blob_bytes, att.total_slices, att.slice_bytes)?;
 
-    if att.filename.as_bytes().len() > FILE_FILENAME_BYTES {
-        return Err(EventError::ContentTooLong(att.filename.as_bytes().len()));
-    }
-    if att.mime_type.as_bytes().len() > FILE_MIME_BYTES {
-        return Err(EventError::ContentTooLong(att.mime_type.as_bytes().len()));
-    }
-
-    let values = vec![
-        FieldValue::Timestamp(att.created_at_ms),
-        FieldValue::EventId(att.message_id),
-        FieldValue::EventId(att.file_id),
-        FieldValue::U64(att.blob_bytes),
-        FieldValue::U32(att.total_slices),
-        FieldValue::U32(att.slice_bytes),
-        FieldValue::EventId(att.root_hash),
-        FieldValue::EventId(att.key_event_id),
-        FieldValue::Text(att.filename.clone()),
-        FieldValue::Text(att.mime_type.clone()),
-    ];
-
-    Ok(encode_fields(EVENT_TYPE_FILE, FILE_FIELDS, &values)?)
+    let mut filename_slot: [u8; FILE_FILENAME_BYTES] = [0u8; FILE_FILENAME_BYTES];
+    crate::event_modules::layout::common::write_text_slot(&att.filename, &mut filename_slot)
+        .map_err(EventError::TextSlot)?;
+    let mut mime_slot: [u8; FILE_MIME_BYTES] = [0u8; FILE_MIME_BYTES];
+    crate::event_modules::layout::common::write_text_slot(&att.mime_type, &mut mime_slot)
+        .map_err(EventError::TextSlot)?;
+    Ok(topo_verus_proofs::event_modules::layout::shapes::encode_file_v1(
+        EVENT_TYPE_FILE,
+        att.created_at_ms,
+        &att.message_id,
+        &att.file_id,
+        att.blob_bytes,
+        att.total_slices,
+        att.slice_bytes,
+        &att.root_hash,
+        &att.key_event_id,
+        &filename_slot,
+        &mime_slot,
+    ))
 }
 
 pub static FILE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

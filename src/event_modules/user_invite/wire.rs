@@ -36,8 +36,17 @@ impl super::super::Describe for UserInviteEvent {
 }
 
 pub fn parse_user_invite(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, public_key, workspace_id, authority_event_id)) =
+        topo_verus_proofs::event_modules::layout::ts_id3::parse_ts_id3(EVENT_TYPE_USER_INVITE, blob)
+    {
+        return Ok(ParsedEvent::UserInvite(UserInviteEvent {
+            created_at_ms: ts,
+            public_key,
+            workspace_id,
+            authority_event_id,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_USER_INVITE, USER_INVITE_FIELDS, blob)?;
-
     Ok(ParsedEvent::UserInvite(UserInviteEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         public_key: values[1].as_event_id().unwrap(),
@@ -51,19 +60,13 @@ pub fn encode_user_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::UserInvite(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.public_key),
-        FieldValue::EventId(e.workspace_id),
-        FieldValue::EventId(e.authority_event_id),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id3::encode_ts_id3(
         EVENT_TYPE_USER_INVITE,
-        USER_INVITE_FIELDS,
-        &values,
-    )?)
+        e.created_at_ms,
+        &e.public_key,
+        &e.workspace_id,
+        &e.authority_event_id,
+    ))
 }
 
 pub static USER_INVITE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

@@ -109,6 +109,21 @@ pub fn frontier_refs_from_slots(
 }
 
 pub fn parse_removal(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, removed_member_ref, parent_count, p1, p2, p3, p4, fh, rb)) =
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id6(EVENT_TYPE_REMOVAL, blob)
+    {
+        return Ok(ParsedEvent::Removal(RemovalEvent {
+            created_at_ms: ts,
+            removed_member_ref,
+            parent_count,
+            parent_1: p1,
+            parent_2: p2,
+            parent_3: p3,
+            parent_4: p4,
+            frontier_hash: fh,
+            removed_by: rb,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_REMOVAL, REMOVAL_FIELDS, blob)?;
     Ok(ParsedEvent::Removal(RemovalEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
@@ -124,22 +139,24 @@ pub fn parse_removal(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 }
 
 pub fn encode_removal(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
-    let removal = match event {
+    let r = match event {
         ParsedEvent::Removal(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
-    let values = vec![
-        FieldValue::Timestamp(removal.created_at_ms),
-        FieldValue::EventId(removal.removed_member_ref),
-        FieldValue::U8(removal.parent_count),
-        FieldValue::EventId(removal.parent_1),
-        FieldValue::EventId(removal.parent_2),
-        FieldValue::EventId(removal.parent_3),
-        FieldValue::EventId(removal.parent_4),
-        FieldValue::EventId(removal.frontier_hash),
-        FieldValue::EventId(removal.removed_by),
-    ];
-    Ok(encode_fields(EVENT_TYPE_REMOVAL, REMOVAL_FIELDS, &values)?)
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u8_id6(
+            EVENT_TYPE_REMOVAL,
+            r.created_at_ms,
+            &r.removed_member_ref,
+            r.parent_count,
+            &r.parent_1,
+            &r.parent_2,
+            &r.parent_3,
+            &r.parent_4,
+            &r.frontier_hash,
+            &r.removed_by,
+        ),
+    )
 }
 
 use crate::crypto::event_id_to_base64;

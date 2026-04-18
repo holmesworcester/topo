@@ -25,8 +25,8 @@ Changes to this document require TLA+ model re-verification.
 | 17 | Retired (code reserved) | — | — | — | — | — | — | — |
 | 18 | Admin | Admin | 170B | Shared | No | Yes | 64 | 1 (workspace) |
 | 19 | Retired (code reserved) | — | — | — | — | — | — | — |
-| 20 | UserRemoved | UserRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
-| 21 | PeerRemoved | PeerRemoved | 138B | Shared | No | Yes | 64 | 5 (peer_shared) |
+| 20 | Retired (code reserved; previously UserRemoved, now unified into Removal at 31) | — | — | — | — | — | — | — |
+| 21 | Retired (code reserved; previously PeerRemoved, now unified into Removal at 31) | — | — | — | — | — | — | — |
 | 22 | SecretShared | SecretShared | 234B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 23 | Peer | Peer | 73B | Local | No | No | 0 | — |
 | 24 | MessageAttachment | — | 633B | Shared | Yes | Yes | 64 | runtime (1..5) |
@@ -35,6 +35,19 @@ Changes to this document require TLA+ model re-verification.
 | 27 | LocalSignerSecret | PeerPrivkey | 74B | Local | No | No | 0 | — |
 | 28 | InvitePrivkey | InvitePrivkey | 73B | Local | No | No | 0 | — |
 | 29 | Tenant | Tenant | 41B | Local | No | No | 0 | — |
+| 30 | KeyRequest | NON_MODELED | 201B | Shared | No | Yes | 64 | runtime (signer chain) |
+| 31 | Removal | NON_MODELED | 234B | Shared | No | Yes | 64 | runtime (signer chain) |
+| 32 | KeyRotation | NON_MODELED | 234B | Shared | No | Yes | 64 | runtime (signer chain) |
+| 33 | EndpointSecret | NON_MODELED (tracked in EndpointBootstrapRoute.tla) | 41B | Local | No | No | 0 | — |
+| 34 | EndpointShared | NON_MODELED (tracked in EndpointBootstrapRoute.tla) | 105B | Shared | No | Self-signed | 64 | self (Ed25519 over blob prefix) |
+| 35 | Signed | (envelope) | variable | — | — | Yes | 64 | — |
+
+Runtime type codes 30-35 were added after the initial EventGraphSchema.tla
+model was frozen. They are tracked in separate TLA models (EndpointBootstrapRoute
+for 33-34) or marked `NON_MODELED` in the conformance matrix pending future
+TLA extension. The Verus proof layer in `verus-proofs/` grounds their wire
+structure via verified encoders in
+`verus-proofs/src/event_modules/layout/` regardless of TLA coverage.
 
 ## Signer Type Resolution
 

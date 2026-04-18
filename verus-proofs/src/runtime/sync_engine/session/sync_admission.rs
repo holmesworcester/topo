@@ -1,153 +1,77 @@
-//! Formal verification of post-auth sync admission.
+//! Formal verification of post-auth sync admission — verified core.
 //!
-//! The runtime queries accepted workspace binding state, normalizes it into a
-//! DecisionContext, and uses a pure planner to decide whether shared sync may
-//! start.
+//! The runtime queries accepted workspace binding state and then classifies it into one of
+//! three outcomes: no binding, a unique binding, or an ambiguous (multi-workspace) binding.
+//! The runtime's raw rows and decision context carry `String` workspace ids that can't cross
+//! into verus-proofs without cyclic deps, so this module exposes a *core* classifier over
+//! only the abstract shape (row_count + all_workspace_ids_equal). The runtime wraps this
+//! with a thin adapter that re-attaches the concrete workspace_id string for Start plans.
 
 use vstd::prelude::*;
 
 verus! {
 
-pub struct SyncAdmissionRawRows {
-    pub row_count: nat,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncAdmissionCoreRawRows {
+    pub row_count: u32,
     pub all_workspace_ids_equal: bool,
-    pub representative_workspace_id: nat,
 }
 
-pub enum SyncAdmissionDecisionContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncAdmissionCoreDecisionContext {
     MissingWorkspaceBinding,
-    UniqueWorkspaceBinding { workspace_id: nat },
+    UniqueWorkspaceBinding,
     AmbiguousWorkspaceBinding,
 }
 
-pub enum SyncAdmissionPlan {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncAdmissionCorePlan {
     RejectMissingWorkspaceBinding,
     RejectAmbiguousWorkspaceBinding,
-    Start { workspace_id: nat },
+    Start,
 }
 
-pub open spec fn normalize_sync_admission_decision_context(
-    raw_rows: &SyncAdmissionRawRows,
-) -> SyncAdmissionDecisionContext {
+pub fn normalize_sync_admission_core_context(
+    raw_rows: SyncAdmissionCoreRawRows,
+) -> (context: SyncAdmissionCoreDecisionContext)
+    ensures
+        raw_rows.row_count == 0 ==> context == SyncAdmissionCoreDecisionContext::MissingWorkspaceBinding,
+        (raw_rows.row_count > 0 && raw_rows.all_workspace_ids_equal)
+            ==> context == SyncAdmissionCoreDecisionContext::UniqueWorkspaceBinding,
+        (raw_rows.row_count > 0 && !raw_rows.all_workspace_ids_equal)
+            ==> context == SyncAdmissionCoreDecisionContext::AmbiguousWorkspaceBinding,
+{
     if raw_rows.row_count == 0 {
-        SyncAdmissionDecisionContext::MissingWorkspaceBinding
+        SyncAdmissionCoreDecisionContext::MissingWorkspaceBinding
     } else if raw_rows.all_workspace_ids_equal {
-        SyncAdmissionDecisionContext::UniqueWorkspaceBinding {
-            workspace_id: raw_rows.representative_workspace_id,
-        }
+        SyncAdmissionCoreDecisionContext::UniqueWorkspaceBinding
     } else {
-        SyncAdmissionDecisionContext::AmbiguousWorkspaceBinding
+        SyncAdmissionCoreDecisionContext::AmbiguousWorkspaceBinding
     }
 }
 
-pub open spec fn decide_sync_admission_plan(
-    context: &SyncAdmissionDecisionContext,
-) -> SyncAdmissionPlan {
+pub fn decide_sync_admission_core_plan(
+    context: &SyncAdmissionCoreDecisionContext,
+) -> (plan: SyncAdmissionCorePlan)
+    ensures
+        *context == SyncAdmissionCoreDecisionContext::MissingWorkspaceBinding
+            ==> plan == SyncAdmissionCorePlan::RejectMissingWorkspaceBinding,
+        *context == SyncAdmissionCoreDecisionContext::UniqueWorkspaceBinding
+            ==> plan == SyncAdmissionCorePlan::Start,
+        *context == SyncAdmissionCoreDecisionContext::AmbiguousWorkspaceBinding
+            ==> plan == SyncAdmissionCorePlan::RejectAmbiguousWorkspaceBinding,
+{
     match context {
-        SyncAdmissionDecisionContext::MissingWorkspaceBinding => {
-            SyncAdmissionPlan::RejectMissingWorkspaceBinding
+        SyncAdmissionCoreDecisionContext::MissingWorkspaceBinding => {
+            SyncAdmissionCorePlan::RejectMissingWorkspaceBinding
         }
-        SyncAdmissionDecisionContext::UniqueWorkspaceBinding { workspace_id } => {
-            SyncAdmissionPlan::Start {
-                workspace_id: *workspace_id,
-            }
+        SyncAdmissionCoreDecisionContext::UniqueWorkspaceBinding => {
+            SyncAdmissionCorePlan::Start
         }
-        SyncAdmissionDecisionContext::AmbiguousWorkspaceBinding => {
-            SyncAdmissionPlan::RejectAmbiguousWorkspaceBinding
+        SyncAdmissionCoreDecisionContext::AmbiguousWorkspaceBinding => {
+            SyncAdmissionCorePlan::RejectAmbiguousWorkspaceBinding
         }
     }
-}
-
-proof fn proof_sync_admission_normalize_empty_to_missing()
-    ensures
-        normalize_sync_admission_decision_context(&SyncAdmissionRawRows {
-            row_count: 0,
-            all_workspace_ids_equal: true,
-            representative_workspace_id: 0,
-        }) == SyncAdmissionDecisionContext::MissingWorkspaceBinding,
-{
-}
-
-proof fn proof_sync_admission_normalize_equal_rows_to_unique(
-    row_count: nat,
-    workspace_id: nat,
-)
-    requires row_count > 0
-    ensures
-        normalize_sync_admission_decision_context(&SyncAdmissionRawRows {
-            row_count,
-            all_workspace_ids_equal: true,
-            representative_workspace_id: workspace_id,
-        }) == (SyncAdmissionDecisionContext::UniqueWorkspaceBinding { workspace_id }),
-{
-}
-
-proof fn proof_sync_admission_duplicate_row_count_is_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-    workspace_id: nat,
-)
-    requires
-        row_count_a > 0,
-        row_count_b > 0,
-    ensures
-        decide_sync_admission_plan(&normalize_sync_admission_decision_context(
-            &SyncAdmissionRawRows {
-                row_count: row_count_a,
-                all_workspace_ids_equal: true,
-                representative_workspace_id: workspace_id,
-            },
-        )) == decide_sync_admission_plan(&normalize_sync_admission_decision_context(
-            &SyncAdmissionRawRows {
-                row_count: row_count_b,
-                all_workspace_ids_equal: true,
-                representative_workspace_id: workspace_id,
-            },
-        )),
-        decide_sync_admission_plan(&normalize_sync_admission_decision_context(
-            &SyncAdmissionRawRows {
-                row_count: row_count_a,
-                all_workspace_ids_equal: true,
-                representative_workspace_id: workspace_id,
-            },
-        )) == (SyncAdmissionPlan::Start { workspace_id }),
-{
-}
-
-proof fn proof_sync_admission_normalize_mixed_rows_to_ambiguous(
-    row_count: nat,
-    representative_workspace_id: nat,
-)
-    requires row_count > 0
-    ensures
-        normalize_sync_admission_decision_context(&SyncAdmissionRawRows {
-            row_count,
-            all_workspace_ids_equal: false,
-            representative_workspace_id,
-        }) == SyncAdmissionDecisionContext::AmbiguousWorkspaceBinding,
-{
-}
-
-proof fn proof_sync_admission_rejects_missing_workspace_binding()
-    ensures
-        decide_sync_admission_plan(&SyncAdmissionDecisionContext::MissingWorkspaceBinding)
-            == SyncAdmissionPlan::RejectMissingWorkspaceBinding,
-{
-}
-
-proof fn proof_sync_admission_rejects_ambiguous_workspace_binding()
-    ensures
-        decide_sync_admission_plan(&SyncAdmissionDecisionContext::AmbiguousWorkspaceBinding)
-            == SyncAdmissionPlan::RejectAmbiguousWorkspaceBinding,
-{
-}
-
-proof fn proof_sync_admission_starts_with_unique_workspace_binding(workspace_id: nat)
-    ensures
-        decide_sync_admission_plan(&SyncAdmissionDecisionContext::UniqueWorkspaceBinding {
-            workspace_id,
-        }) == (SyncAdmissionPlan::Start { workspace_id }),
-{
 }
 
 } // verus!

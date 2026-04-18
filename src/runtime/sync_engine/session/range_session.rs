@@ -16,6 +16,11 @@ use crate::protocol::{neg_id_to_event_id, Frame, MSG_TYPE_EVENT};
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive::{enqueue_direct_ingest_waiter, IngestWaiter};
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
+
+use topo_verus_proofs::runtime::sync_engine::session::range_session::{
+    decide_shared_send_eligibility_plan, normalize_shared_send_eligibility_context,
+    SharedSendEligibilityPlan, SharedSendEligibilityRawRows,
+};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::{
@@ -197,28 +202,6 @@ pub struct LiveSuppressionReceiveState {
     remote_done_notified: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SharedSendEligibilityRawRows {
-    requested_by_reconciliation: bool,
-    present_in_workspace_index: bool,
-    shared_blob_available: bool,
-    transport_shareable: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SharedSendEligibilityDecisionContext {
-    requested_by_reconciliation: bool,
-    present_in_workspace_index: bool,
-    shared_blob_available: bool,
-    transport_shareable: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedSendEligibilityPlan {
-    SendRoot,
-    SkipRoot,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NegentropyStorageCacheKey {
     db_path: String,
@@ -232,31 +215,6 @@ struct NegentropyStorageCacheEntry {
     ts_min_inclusive_ms: Option<i64>,
     ts_max_exclusive_ms: Option<i64>,
     storage: Arc<NegentropyStorageVector>,
-}
-
-fn normalize_shared_send_eligibility_context(
-    raw_rows: SharedSendEligibilityRawRows,
-) -> SharedSendEligibilityDecisionContext {
-    SharedSendEligibilityDecisionContext {
-        requested_by_reconciliation: raw_rows.requested_by_reconciliation,
-        present_in_workspace_index: raw_rows.present_in_workspace_index,
-        shared_blob_available: raw_rows.shared_blob_available,
-        transport_shareable: raw_rows.transport_shareable,
-    }
-}
-
-fn decide_shared_send_eligibility_plan(
-    context: &SharedSendEligibilityDecisionContext,
-) -> SharedSendEligibilityPlan {
-    if context.requested_by_reconciliation
-        && context.present_in_workspace_index
-        && context.shared_blob_available
-        && context.transport_shareable
-    {
-        SharedSendEligibilityPlan::SendRoot
-    } else {
-        SharedSendEligibilityPlan::SkipRoot
-    }
 }
 
 fn load_shared_index_entries(

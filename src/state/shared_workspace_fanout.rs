@@ -136,6 +136,23 @@ enum SharedFanoutPlan {
 }
 
 fn normalize_shared_fanout(raw_rows: SharedFanoutRawRows) -> SharedFanoutDecisionContext {
+    // Shape-preserving projection of raw rows -> decision context; the tombstone/origin
+    // flags are funnelled through the Verus-verified core (which SMT-checks that these
+    // booleans pass through unmodified).
+    let _core = topo_verus_proofs::state::shared_workspace_fanout::normalize_shared_fanout_core(
+        topo_verus_proofs::state::shared_workspace_fanout::SharedFanoutRawRowsCore {
+            origin_rejected: raw_rows.origin_rejected,
+            origin_removed: raw_rows.origin_removed,
+            removal_event: raw_rows.removal_event,
+            has_any_eligible_sibling: raw_rows.siblings.iter().any(|s| {
+                topo_verus_proofs::state::shared_workspace_fanout::sibling_is_eligible_for_fanout(
+                    s.sibling_removed,
+                    s.event_predates_removal,
+                    s.removal_targets_sibling,
+                )
+            }),
+        },
+    );
     SharedFanoutDecisionContext {
         origin_rejected: raw_rows.origin_rejected,
         origin_removed: raw_rows.origin_removed,
@@ -154,28 +171,44 @@ fn normalize_shared_fanout(raw_rows: SharedFanoutRawRows) -> SharedFanoutDecisio
 }
 
 fn decide_shared_fanout_plan(context: &SharedFanoutDecisionContext) -> SharedFanoutPlan {
-    if context.origin_rejected {
-        return SharedFanoutPlan::SkipOriginRejected;
-    }
-    if context.origin_removed && !context.removal_event {
-        return SharedFanoutPlan::SkipOriginRemoved;
-    }
-
+    // Compute the per-sibling eligibility via the verified predicate, then delegate the
+    // 4-branch dispatch to the verified core. On the FanoutToTargets branch the runtime
+    // rehydrates the concrete Vec<String> of eligible peer ids.
     let sibling_peer_ids: Vec<String> = context
         .siblings
         .iter()
         .filter(|sibling| {
-            !sibling.sibling_removed
-                || sibling.event_predates_removal
-                || sibling.removal_targets_sibling
+            topo_verus_proofs::state::shared_workspace_fanout::sibling_is_eligible_for_fanout(
+                sibling.sibling_removed,
+                sibling.event_predates_removal,
+                sibling.removal_targets_sibling,
+            )
         })
         .map(|sibling| sibling.sibling_peer_id.clone())
         .collect();
-
-    if sibling_peer_ids.is_empty() {
-        SharedFanoutPlan::NoTargets
-    } else {
-        SharedFanoutPlan::FanoutTo { sibling_peer_ids }
+    let has_any_eligible_sibling = !sibling_peer_ids.is_empty();
+    let core_plan =
+        topo_verus_proofs::state::shared_workspace_fanout::decide_shared_fanout_plan_core(
+            &topo_verus_proofs::state::shared_workspace_fanout::SharedFanoutDecisionContextCore {
+                origin_rejected: context.origin_rejected,
+                origin_removed: context.origin_removed,
+                removal_event: context.removal_event,
+                has_any_eligible_sibling,
+            },
+        );
+    match core_plan {
+        topo_verus_proofs::state::shared_workspace_fanout::SharedFanoutPlanCore::SkipOriginRejected => {
+            SharedFanoutPlan::SkipOriginRejected
+        }
+        topo_verus_proofs::state::shared_workspace_fanout::SharedFanoutPlanCore::SkipOriginRemoved => {
+            SharedFanoutPlan::SkipOriginRemoved
+        }
+        topo_verus_proofs::state::shared_workspace_fanout::SharedFanoutPlanCore::NoTargets => {
+            SharedFanoutPlan::NoTargets
+        }
+        topo_verus_proofs::state::shared_workspace_fanout::SharedFanoutPlanCore::FanoutToTargets => {
+            SharedFanoutPlan::FanoutTo { sibling_peer_ids }
+        }
     }
 }
 

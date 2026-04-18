@@ -83,24 +83,19 @@ pub fn encode_bench_dep(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         return Err(EventError::ContentTooLong(b.dep_ids.len()));
     }
 
-    // Build dep_slots as 320 bytes (10 × 32), remaining slots stay zero
-    let mut slot_bytes = vec![0u8; BENCH_DEP_SLOTS_BYTES];
+    let mut slot_bytes: [u8; 320] = [0u8; 320];
     for (i, id) in b.dep_ids.iter().enumerate() {
         let start = 32 * i;
         slot_bytes[start..start + 32].copy_from_slice(id);
     }
-
-    let values = vec![
-        FieldValue::Timestamp(b.created_at_ms),
-        FieldValue::FixedBytes(slot_bytes),
-        FieldValue::FixedBytes(b.payload.to_vec()),
-    ];
-
-    Ok(encode_fields(
-        EVENT_TYPE_BENCH_DEP,
-        BENCH_DEP_FIELDS,
-        &values,
-    )?)
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_fb320_fb16(
+            EVENT_TYPE_BENCH_DEP,
+            b.created_at_ms,
+            &slot_bytes,
+            &b.payload,
+        ),
+    )
 }
 
 // === Projector (event-module locality) ===

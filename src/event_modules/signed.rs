@@ -22,18 +22,23 @@ impl super::Describe for SignedEvent {
 }
 
 pub fn outer_payload(blob: &[u8]) -> Option<&[u8]> {
-    if blob.first().copied() != Some(EVENT_TYPE_SIGNED) || blob.len() < 1 + 32 + 64 + 1 {
+    if !topo_verus_proofs::event_modules::signed::is_well_formed_signed_prefix(blob) {
         return None;
     }
-    Some(&blob[33..blob.len() - 64])
+    let (start, end) =
+        topo_verus_proofs::event_modules::signed::signed_body_range(blob.len());
+    Some(&blob[start..end])
 }
 
 pub fn outer_signer_event_id(blob: &[u8]) -> Option<[u8; 32]> {
-    if blob.first().copied() != Some(EVENT_TYPE_SIGNED) || blob.len() < 1 + 32 + 64 + 1 {
+    if !topo_verus_proofs::event_modules::signed::is_well_formed_signed_prefix(blob) {
         return None;
     }
     let mut out = [0u8; 32];
-    out.copy_from_slice(&blob[1..33]);
+    out.copy_from_slice(
+        &blob[topo_verus_proofs::event_modules::signed::SIGNER_ID_OFFSET
+            ..topo_verus_proofs::event_modules::signed::SIGNER_ID_END],
+    );
     Some(out)
 }
 
@@ -103,12 +108,13 @@ pub fn encode_signed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ));
     }
 
-    let mut out = Vec::with_capacity(1 + 32 + signed.payload.len() + 64);
-    out.push(EVENT_TYPE_SIGNED);
-    out.extend_from_slice(&signed.signer_event_id);
-    out.extend_from_slice(&signed.payload);
-    out.extend_from_slice(&signed.signature);
-    Ok(out)
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_signed_envelope(
+            &signed.signer_event_id,
+            &signed.payload,
+            &signed.signature,
+        ),
+    )
 }
 
 use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult};

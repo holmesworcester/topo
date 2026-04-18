@@ -44,8 +44,20 @@ impl super::Describe for InviteAcceptedEvent {
 /// [41..73] invite_event_id (32 bytes)
 /// [73..105] workspace_id (32 bytes)
 pub fn parse_invite_accepted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, tenant_event_id, invite_event_id, workspace_id)) =
+        topo_verus_proofs::event_modules::layout::ts_id3::parse_ts_id3(
+            EVENT_TYPE_INVITE_ACCEPTED,
+            blob,
+        )
+    {
+        return Ok(ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: ts,
+            tenant_event_id,
+            invite_event_id,
+            workspace_id,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_INVITE_ACCEPTED, INVITE_ACCEPTED_FIELDS, blob)?;
-
     Ok(ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         tenant_event_id: values[1].as_event_id().unwrap(),
@@ -59,19 +71,13 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         ParsedEvent::InviteAccepted(a) => a,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(ia.created_at_ms),
-        FieldValue::EventId(ia.tenant_event_id),
-        FieldValue::EventId(ia.invite_event_id),
-        FieldValue::EventId(ia.workspace_id),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id3::encode_ts_id3(
         EVENT_TYPE_INVITE_ACCEPTED,
-        INVITE_ACCEPTED_FIELDS,
-        &values,
-    )?)
+        ia.created_at_ms,
+        &ia.tenant_event_id,
+        &ia.invite_event_id,
+        &ia.workspace_id,
+    ))
 }
 
 // === Projector (event-module locality) ===

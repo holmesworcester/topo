@@ -2,22 +2,32 @@
 //!
 //! This seam consumes normalized query/runtime facts, builds a
 //! `DecisionContext`, and emits a bounded auth plan.
+//!
+//! Every `pub fn` below is executable Rust consumed by
+//! `src/runtime/transport/session_auth.rs`. Postconditions (`ensures`) are
+//! SMT-checked against the function body by `cargo-verus verify`.
 
 use vstd::prelude::*;
 
 verus! {
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestedSessionAuthPlan {
     PeerShared,
     InviteBootstrap,
 }
 
+/// Primitive core of the bootstrap-fallback-invite raw rows — carries only
+/// dedup counts and the boolean workspace flag. The runtime aggregates its
+/// `Vec<Candidate>` into this core before calling the verified planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapFallbackInviteRawRows {
-    pub candidate_row_count: nat,
-    pub distinct_candidate_count: nat,
+    pub candidate_row_count: u32,
+    pub distinct_candidate_count: u32,
     pub unique_distinct_candidate_workspace_already_local_before_candidate: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapFallbackInviteDecisionContext {
     MissingCandidate,
     UniqueCandidate {
@@ -26,6 +36,7 @@ pub enum BootstrapFallbackInviteDecisionContext {
     AmbiguousCandidate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapFallbackInvitePlan {
     RejectMissingCandidate,
     UseInvite,
@@ -33,12 +44,14 @@ pub enum BootstrapFallbackInvitePlan {
     RejectAlreadyLocalWorkspaceCandidate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundSessionAuthRawRows {
     pub bootstrap_auth_still_valid: bool,
     pub bound_daemon_matches_remote: bool,
     pub remote_session_peer_authorized: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundSessionAuthDecisionContext {
     pub requested_plan: RequestedSessionAuthPlan,
     pub bootstrap_auth_still_valid: bool,
@@ -47,20 +60,33 @@ pub struct OutboundSessionAuthDecisionContext {
     pub remote_session_peer_authorized: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundSessionAuthDecision {
     KeepRequested,
     UpgradeToPeerSharedAfterRouteAdmission,
     UpgradeToPeerSharedAfterBootstrapLapse,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedSessionAuthPlan {
     PeerShared,
     InviteBootstrap,
 }
 
-pub open spec fn normalize_bootstrap_fallback_invite_decision_context(
+pub fn normalize_bootstrap_fallback_invite_decision_context(
     raw_rows: BootstrapFallbackInviteRawRows,
-) -> BootstrapFallbackInviteDecisionContext {
+) -> (context: BootstrapFallbackInviteDecisionContext)
+    ensures
+        raw_rows.distinct_candidate_count == 0
+            ==> context == BootstrapFallbackInviteDecisionContext::MissingCandidate,
+        raw_rows.distinct_candidate_count == 1
+            ==> context == (BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+                workspace_already_local_before_candidate:
+                    raw_rows.unique_distinct_candidate_workspace_already_local_before_candidate,
+            }),
+        raw_rows.distinct_candidate_count > 1
+            ==> context == BootstrapFallbackInviteDecisionContext::AmbiguousCandidate,
+{
     if raw_rows.distinct_candidate_count == 0 {
         BootstrapFallbackInviteDecisionContext::MissingCandidate
     } else if raw_rows.distinct_candidate_count == 1 {
@@ -73,9 +99,27 @@ pub open spec fn normalize_bootstrap_fallback_invite_decision_context(
     }
 }
 
-pub open spec fn decide_bootstrap_fallback_invite_plan(
-    context: BootstrapFallbackInviteDecisionContext,
-) -> BootstrapFallbackInvitePlan {
+pub fn decide_bootstrap_fallback_invite_plan(
+    context: &BootstrapFallbackInviteDecisionContext,
+) -> (plan: BootstrapFallbackInvitePlan)
+    ensures
+        *context == BootstrapFallbackInviteDecisionContext::MissingCandidate
+            ==> plan == BootstrapFallbackInvitePlan::RejectMissingCandidate,
+        *context == BootstrapFallbackInviteDecisionContext::AmbiguousCandidate
+            ==> plan == BootstrapFallbackInvitePlan::RejectAmbiguousCandidate,
+        (match context {
+            BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+                workspace_already_local_before_candidate,
+            } => *workspace_already_local_before_candidate,
+            _ => false,
+        }) ==> plan == BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate,
+        (match context {
+            BootstrapFallbackInviteDecisionContext::UniqueCandidate {
+                workspace_already_local_before_candidate,
+            } => !*workspace_already_local_before_candidate,
+            _ => false,
+        }) ==> plan == BootstrapFallbackInvitePlan::UseInvite,
+{
     match context {
         BootstrapFallbackInviteDecisionContext::MissingCandidate => {
             BootstrapFallbackInvitePlan::RejectMissingCandidate
@@ -83,7 +127,7 @@ pub open spec fn decide_bootstrap_fallback_invite_plan(
         BootstrapFallbackInviteDecisionContext::UniqueCandidate {
             workspace_already_local_before_candidate,
         } => {
-            if workspace_already_local_before_candidate {
+            if *workspace_already_local_before_candidate {
                 BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
             } else {
                 BootstrapFallbackInvitePlan::UseInvite
@@ -95,11 +139,18 @@ pub open spec fn decide_bootstrap_fallback_invite_plan(
     }
 }
 
-pub open spec fn normalize_outbound_session_auth_decision_context(
+pub fn normalize_outbound_session_auth_decision_context(
     raw_rows: OutboundSessionAuthRawRows,
     requested_plan: RequestedSessionAuthPlan,
     daemon_connection_admits_route: bool,
-) -> OutboundSessionAuthDecisionContext {
+) -> (context: OutboundSessionAuthDecisionContext)
+    ensures
+        context.requested_plan == requested_plan,
+        context.bootstrap_auth_still_valid == raw_rows.bootstrap_auth_still_valid,
+        context.daemon_connection_admits_route == daemon_connection_admits_route,
+        context.bound_daemon_matches_remote == raw_rows.bound_daemon_matches_remote,
+        context.remote_session_peer_authorized == raw_rows.remote_session_peer_authorized,
+{
     OutboundSessionAuthDecisionContext {
         requested_plan,
         bootstrap_auth_still_valid: raw_rows.bootstrap_auth_still_valid,
@@ -109,9 +160,39 @@ pub open spec fn normalize_outbound_session_auth_decision_context(
     }
 }
 
-pub open spec fn decide_outbound_session_auth_decision(
-    context: OutboundSessionAuthDecisionContext,
-) -> OutboundSessionAuthDecision {
+pub fn decide_outbound_session_auth_decision(
+    context: &OutboundSessionAuthDecisionContext,
+) -> (decision: OutboundSessionAuthDecision)
+    ensures
+        // PeerShared requests are always kept as-is.
+        context.requested_plan == RequestedSessionAuthPlan::PeerShared
+            ==> decision == OutboundSessionAuthDecision::KeepRequested,
+        // InviteBootstrap with active bootstrap and authorized steady-state peer
+        // with an admitted route upgrades to PeerShared immediately.
+        (context.requested_plan == RequestedSessionAuthPlan::InviteBootstrap
+            && context.bootstrap_auth_still_valid
+            && context.remote_session_peer_authorized
+            && (context.bound_daemon_matches_remote || context.daemon_connection_admits_route))
+            ==> decision == OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission,
+        // InviteBootstrap with active bootstrap but no admitted route keeps the request.
+        (context.requested_plan == RequestedSessionAuthPlan::InviteBootstrap
+            && context.bootstrap_auth_still_valid
+            && !(context.remote_session_peer_authorized
+                && (context.bound_daemon_matches_remote || context.daemon_connection_admits_route)))
+            ==> decision == OutboundSessionAuthDecision::KeepRequested,
+        // InviteBootstrap with lapsed bootstrap, matching daemon binding, and
+        // authorized peer upgrades after the bootstrap lapse.
+        (context.requested_plan == RequestedSessionAuthPlan::InviteBootstrap
+            && !context.bootstrap_auth_still_valid
+            && context.bound_daemon_matches_remote
+            && context.remote_session_peer_authorized)
+            ==> decision == OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse,
+        // InviteBootstrap with lapsed bootstrap and missing binding-or-auth keeps request.
+        (context.requested_plan == RequestedSessionAuthPlan::InviteBootstrap
+            && !context.bootstrap_auth_still_valid
+            && !(context.bound_daemon_matches_remote && context.remote_session_peer_authorized))
+            ==> decision == OutboundSessionAuthDecision::KeepRequested,
+{
     match context.requested_plan {
         RequestedSessionAuthPlan::PeerShared => OutboundSessionAuthDecision::KeepRequested,
         RequestedSessionAuthPlan::InviteBootstrap => {
@@ -133,10 +214,22 @@ pub open spec fn decide_outbound_session_auth_decision(
     }
 }
 
-pub open spec fn plan_for_outbound_session_auth_decision(
+pub fn plan_for_outbound_session_auth_decision(
     requested_plan: RequestedSessionAuthPlan,
     decision: OutboundSessionAuthDecision,
-) -> ResolvedSessionAuthPlan {
+) -> (resolved: ResolvedSessionAuthPlan)
+    ensures
+        (decision == OutboundSessionAuthDecision::KeepRequested
+            && requested_plan == RequestedSessionAuthPlan::PeerShared)
+            ==> resolved == ResolvedSessionAuthPlan::PeerShared,
+        (decision == OutboundSessionAuthDecision::KeepRequested
+            && requested_plan == RequestedSessionAuthPlan::InviteBootstrap)
+            ==> resolved == ResolvedSessionAuthPlan::InviteBootstrap,
+        decision == OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
+            ==> resolved == ResolvedSessionAuthPlan::PeerShared,
+        decision == OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse
+            ==> resolved == ResolvedSessionAuthPlan::PeerShared,
+{
     match decision {
         OutboundSessionAuthDecision::KeepRequested => match requested_plan {
             RequestedSessionAuthPlan::PeerShared => ResolvedSessionAuthPlan::PeerShared,
@@ -147,280 +240,6 @@ pub open spec fn plan_for_outbound_session_auth_decision(
             ResolvedSessionAuthPlan::PeerShared
         }
     }
-}
-
-proof fn outbound_bootstrap_fallback_rejects_same_workspace_candidate()
-    ensures
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: 1,
-                distinct_candidate_count: 1,
-                unique_distinct_candidate_workspace_already_local_before_candidate: true,
-            })
-        ) == BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate,
-{
-}
-
-proof fn outbound_bootstrap_fallback_duplicate_rows_preserve_same_workspace_rejection(
-    candidate_row_count: nat,
-)
-    requires
-        candidate_row_count > 1,
-    ensures
-        normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-            candidate_row_count,
-            distinct_candidate_count: 1,
-            unique_distinct_candidate_workspace_already_local_before_candidate: true,
-        }) == (BootstrapFallbackInviteDecisionContext::UniqueCandidate {
-            workspace_already_local_before_candidate: true,
-        }),
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count,
-                distinct_candidate_count: 1,
-                unique_distinct_candidate_workspace_already_local_before_candidate: true,
-            })
-        ) == BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate,
-{
-}
-
-proof fn outbound_bootstrap_fallback_duplicate_row_count_is_noninterfering(
-    row_count_a: nat,
-    row_count_b: nat,
-    distinct_candidate_count: nat,
-    workspace_already_local_before_candidate: bool,
-)
-    ensures
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: row_count_a,
-                distinct_candidate_count,
-                unique_distinct_candidate_workspace_already_local_before_candidate:
-                    workspace_already_local_before_candidate,
-            })
-        ) == decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: row_count_b,
-                distinct_candidate_count,
-                unique_distinct_candidate_workspace_already_local_before_candidate:
-                    workspace_already_local_before_candidate,
-            })
-        ),
-{
-}
-
-proof fn outbound_bootstrap_fallback_accepts_only_unique_nonlocal_candidate()
-    ensures
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: 1,
-                distinct_candidate_count: 1,
-                unique_distinct_candidate_workspace_already_local_before_candidate: false,
-            })
-        ) == BootstrapFallbackInvitePlan::UseInvite,
-{
-}
-
-proof fn outbound_bootstrap_fallback_rejects_ambiguous_candidates(candidate_count: nat)
-    requires candidate_count > 1
-    ensures
-        decide_bootstrap_fallback_invite_plan(
-            normalize_bootstrap_fallback_invite_decision_context(BootstrapFallbackInviteRawRows {
-                candidate_row_count: candidate_count,
-                distinct_candidate_count: candidate_count,
-                unique_distinct_candidate_workspace_already_local_before_candidate: false,
-            })
-        ) == BootstrapFallbackInvitePlan::RejectAmbiguousCandidate,
-{
-}
-
-proof fn outbound_normalization_preserves_query_facts()
-    ensures
-        normalize_outbound_session_auth_decision_context(
-            OutboundSessionAuthRawRows {
-                bootstrap_auth_still_valid: true,
-                bound_daemon_matches_remote: false,
-                remote_session_peer_authorized: true,
-            },
-            RequestedSessionAuthPlan::InviteBootstrap,
-            false,
-        ) == (OutboundSessionAuthDecisionContext {
-            requested_plan: RequestedSessionAuthPlan::InviteBootstrap,
-            bootstrap_auth_still_valid: true,
-            daemon_connection_admits_route: false,
-            bound_daemon_matches_remote: false,
-            remote_session_peer_authorized: true,
-        }),
-{
-}
-
-proof fn outbound_peer_shared_request_is_preserved(
-    bootstrap_auth_still_valid: bool,
-    daemon_connection_admits_route: bool,
-    bound_daemon_matches_remote: bool,
-    remote_session_peer_authorized: bool,
-)
-    ensures
-        plan_for_outbound_session_auth_decision(
-            RequestedSessionAuthPlan::PeerShared,
-            decide_outbound_session_auth_decision(
-                normalize_outbound_session_auth_decision_context(
-                    OutboundSessionAuthRawRows {
-                        bootstrap_auth_still_valid,
-                        bound_daemon_matches_remote,
-                        remote_session_peer_authorized,
-                    },
-                    RequestedSessionAuthPlan::PeerShared,
-                    daemon_connection_admits_route,
-                ),
-            ),
-        ) == ResolvedSessionAuthPlan::PeerShared,
-{
-}
-
-proof fn outbound_bootstrap_upgrades_bound_known_daemon_while_active_when_authorized()
-    ensures
-        decide_outbound_session_auth_decision(
-            normalize_outbound_session_auth_decision_context(
-                OutboundSessionAuthRawRows {
-                    bootstrap_auth_still_valid: true,
-                    bound_daemon_matches_remote: true,
-                    remote_session_peer_authorized: true,
-                },
-                RequestedSessionAuthPlan::InviteBootstrap,
-                false,
-            ),
-        ) == OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission,
-        plan_for_outbound_session_auth_decision(
-            RequestedSessionAuthPlan::InviteBootstrap,
-            decide_outbound_session_auth_decision(
-                normalize_outbound_session_auth_decision_context(
-                    OutboundSessionAuthRawRows {
-                        bootstrap_auth_still_valid: true,
-                        bound_daemon_matches_remote: true,
-                        remote_session_peer_authorized: true,
-                    },
-                    RequestedSessionAuthPlan::InviteBootstrap,
-                    false,
-                ),
-            ),
-        ) == ResolvedSessionAuthPlan::PeerShared,
-{
-}
-
-proof fn outbound_bootstrap_keeps_bound_known_daemon_while_active_without_peer_route()
-    ensures
-        decide_outbound_session_auth_decision(
-            normalize_outbound_session_auth_decision_context(
-                OutboundSessionAuthRawRows {
-                    bootstrap_auth_still_valid: true,
-                    bound_daemon_matches_remote: true,
-                    remote_session_peer_authorized: false,
-                },
-                RequestedSessionAuthPlan::InviteBootstrap,
-                false,
-            ),
-        ) == OutboundSessionAuthDecision::KeepRequested,
-        plan_for_outbound_session_auth_decision(
-            RequestedSessionAuthPlan::InviteBootstrap,
-            decide_outbound_session_auth_decision(
-                normalize_outbound_session_auth_decision_context(
-                    OutboundSessionAuthRawRows {
-                        bootstrap_auth_still_valid: true,
-                        bound_daemon_matches_remote: true,
-                        remote_session_peer_authorized: false,
-                    },
-                    RequestedSessionAuthPlan::InviteBootstrap,
-                    false,
-                ),
-            ),
-        ) == ResolvedSessionAuthPlan::InviteBootstrap,
-{
-}
-
-proof fn outbound_bootstrap_upgrades_after_admitted_route()
-    ensures
-        decide_outbound_session_auth_decision(
-            normalize_outbound_session_auth_decision_context(
-                OutboundSessionAuthRawRows {
-                    bootstrap_auth_still_valid: true,
-                    bound_daemon_matches_remote: false,
-                    remote_session_peer_authorized: true,
-                },
-                RequestedSessionAuthPlan::InviteBootstrap,
-                true,
-            ),
-        ) == OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission,
-        plan_for_outbound_session_auth_decision(
-            RequestedSessionAuthPlan::InviteBootstrap,
-            decide_outbound_session_auth_decision(
-                normalize_outbound_session_auth_decision_context(
-                    OutboundSessionAuthRawRows {
-                        bootstrap_auth_still_valid: true,
-                        bound_daemon_matches_remote: false,
-                        remote_session_peer_authorized: true,
-                    },
-                    RequestedSessionAuthPlan::InviteBootstrap,
-                    true,
-                ),
-            ),
-        ) == ResolvedSessionAuthPlan::PeerShared,
-{
-}
-
-proof fn outbound_bootstrap_upgrades_only_after_bootstrap_lapses_when_binding_and_auth_hold()
-    ensures
-        decide_outbound_session_auth_decision(
-            normalize_outbound_session_auth_decision_context(
-                OutboundSessionAuthRawRows {
-                    bootstrap_auth_still_valid: false,
-                    bound_daemon_matches_remote: true,
-                    remote_session_peer_authorized: true,
-                },
-                RequestedSessionAuthPlan::InviteBootstrap,
-                false,
-            ),
-        ) == OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse,
-        plan_for_outbound_session_auth_decision(
-            RequestedSessionAuthPlan::InviteBootstrap,
-            decide_outbound_session_auth_decision(
-                normalize_outbound_session_auth_decision_context(
-                    OutboundSessionAuthRawRows {
-                        bootstrap_auth_still_valid: false,
-                        bound_daemon_matches_remote: true,
-                        remote_session_peer_authorized: true,
-                    },
-                    RequestedSessionAuthPlan::InviteBootstrap,
-                    false,
-                ),
-            ),
-        ) == ResolvedSessionAuthPlan::PeerShared,
-        decide_outbound_session_auth_decision(
-            normalize_outbound_session_auth_decision_context(
-                OutboundSessionAuthRawRows {
-                    bootstrap_auth_still_valid: false,
-                    bound_daemon_matches_remote: false,
-                    remote_session_peer_authorized: true,
-                },
-                RequestedSessionAuthPlan::InviteBootstrap,
-                false,
-            ),
-        ) == OutboundSessionAuthDecision::KeepRequested,
-        plan_for_outbound_session_auth_decision(
-            RequestedSessionAuthPlan::InviteBootstrap,
-            decide_outbound_session_auth_decision(
-                normalize_outbound_session_auth_decision_context(
-                    OutboundSessionAuthRawRows {
-                        bootstrap_auth_still_valid: false,
-                        bound_daemon_matches_remote: false,
-                        remote_session_peer_authorized: true,
-                    },
-                    RequestedSessionAuthPlan::InviteBootstrap,
-                    false,
-                ),
-            ),
-        ) == ResolvedSessionAuthPlan::InviteBootstrap,
-{
 }
 
 } // verus!

@@ -81,6 +81,19 @@ pub fn deterministic_key_request_created_at_ms(
 }
 
 pub fn parse_key_request(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, id1, id2, id3, id4, id5, id6)) =
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id6(EVENT_TYPE_KEY_REQUEST, blob)
+    {
+        return Ok(ParsedEvent::KeyRequest(KeyRequestEvent {
+            created_at_ms: ts,
+            blocked_event_id: id1,
+            key_event_id: id2,
+            frontier_hash: id3,
+            delivery_target_id: id4,
+            recipient_event_id: id5,
+            unwrap_key_event_id: id6,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_KEY_REQUEST, KEY_REQUEST_FIELDS, blob)?;
     Ok(ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
@@ -98,22 +111,16 @@ pub fn encode_key_request(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::KeyRequest(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(kr.created_at_ms),
-        FieldValue::EventId(kr.blocked_event_id),
-        FieldValue::EventId(kr.key_event_id),
-        FieldValue::EventId(kr.frontier_hash),
-        FieldValue::EventId(kr.delivery_target_id),
-        FieldValue::EventId(kr.recipient_event_id),
-        FieldValue::EventId(kr.unwrap_key_event_id),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::event_modules::layout::shapes::encode_ts_id6(
         EVENT_TYPE_KEY_REQUEST,
-        KEY_REQUEST_FIELDS,
-        &values,
-    )?)
+        kr.created_at_ms,
+        &kr.blocked_event_id,
+        &kr.key_event_id,
+        &kr.frontier_hash,
+        &kr.delivery_target_id,
+        &kr.recipient_event_id,
+        &kr.unwrap_key_event_id,
+    ))
 }
 
 use crate::crypto::event_id_to_base64;

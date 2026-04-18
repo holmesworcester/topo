@@ -32,8 +32,16 @@ impl super::Describe for InviteSecretEvent {
 }
 
 pub fn parse_invite_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, invite_event_id, private_key_bytes)) =
+        topo_verus_proofs::event_modules::layout::ts_id2::parse_ts_id2(EVENT_TYPE_INVITE_SECRET, blob)
+    {
+        return Ok(ParsedEvent::InviteSecret(InviteSecretEvent {
+            created_at_ms: ts,
+            invite_event_id,
+            private_key_bytes,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_INVITE_SECRET, INVITE_SECRET_FIELDS, blob)?;
-
     Ok(ParsedEvent::InviteSecret(InviteSecretEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         invite_event_id: values[1].as_event_id().unwrap(),
@@ -46,18 +54,12 @@ pub fn encode_invite_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         ParsedEvent::InviteSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.invite_event_id),
-        FieldValue::EventId(e.private_key_bytes),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
         EVENT_TYPE_INVITE_SECRET,
-        INVITE_SECRET_FIELDS,
-        &values,
-    )?)
+        e.created_at_ms,
+        &e.invite_event_id,
+        &e.private_key_bytes,
+    ))
 }
 
 pub fn deterministic_invite_secret_created_at_ms(

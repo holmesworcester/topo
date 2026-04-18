@@ -142,6 +142,30 @@ pub(crate) fn record_block_rows(
             missing.len() as i64
         ],
     )?;
+
+    // Immediately re-query both counters and assert the cascade invariant holds.
+    // If someone reintroduces the INSERT-OR-IGNORE drift (see bug_hunt #3), this
+    // fires at the moment of divergence, not downstream when projection gives a
+    // wrong answer.
+    let deps_remaining: i64 = conn.query_row(
+        "SELECT deps_remaining FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+        |row| row.get(0),
+    )?;
+    let edge_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+        |row| row.get(0),
+    )?;
+    if !topo_verus_proofs::state::projection::apply::cascade_invariant::cascade_counter_consistent(
+        deps_remaining as u32,
+        edge_count as u32,
+    ) {
+        panic!(
+            "cascade invariant violation: blocked_events.deps_remaining = {deps_remaining} but blocked_event_deps row count = {edge_count} for (peer={recorded_by}, event={event_id_b64}). See bug_hunt #3.",
+        );
+    }
+
     let _ = EventTimeline::new(conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
     Ok(())
 }
@@ -221,6 +245,18 @@ fn load_context_load_disposition_raw_rows(
 fn normalize_context_load_disposition(
     raw_rows: ContextLoadDispositionRawRows,
 ) -> ContextLoadDispositionDecisionContext {
+    // Tag-level shape preservation is verified by verus-proofs; the runtime
+    // wrapper carries over the rich payloads (missing Vec, reason String,
+    // message_event_id String).
+    use topo_verus_proofs::state::projection::stages::{
+        normalize_context_load_disposition_core, ContextLoadDispositionRawRowsCore,
+    };
+    let _core = normalize_context_load_disposition_core(match &raw_rows {
+        ContextLoadDispositionRawRows::Ready => ContextLoadDispositionRawRowsCore::Ready,
+        ContextLoadDispositionRawRows::Block { .. } => ContextLoadDispositionRawRowsCore::Block,
+        ContextLoadDispositionRawRows::Reject { .. } => ContextLoadDispositionRawRowsCore::Reject,
+        ContextLoadDispositionRawRows::Purge { .. } => ContextLoadDispositionRawRowsCore::Purge,
+    });
     match raw_rows {
         ContextLoadDispositionRawRows::Ready => ContextLoadDispositionDecisionContext::Ready,
         ContextLoadDispositionRawRows::Block { missing } => {
@@ -238,42 +274,77 @@ fn normalize_context_load_disposition(
 fn decide_context_load_disposition(
     context: &ContextLoadDispositionDecisionContext,
 ) -> ContextLoadDispositionPlan {
-    match context {
-        ContextLoadDispositionDecisionContext::Ready => ContextLoadDispositionPlan::Continue,
-        ContextLoadDispositionDecisionContext::Block { missing } => {
-            ContextLoadDispositionPlan::RecordBlockAndReturn {
-                missing: missing.clone(),
-            }
-        }
-        ContextLoadDispositionDecisionContext::Reject { reason } => {
-            ContextLoadDispositionPlan::Reject {
-                reason: reason.clone(),
-            }
-        }
-        ContextLoadDispositionDecisionContext::Purge { message_event_id } => {
-            ContextLoadDispositionPlan::EmitHardPurgeAndReturn {
-                message_event_id: message_event_id.clone(),
-            }
-        }
+    // The tag-level dispatch is verified in verus-proofs; runtime rehydrates
+    // the concrete payloads on each output branch.
+    use topo_verus_proofs::state::projection::stages::{
+        decide_context_load_disposition_core, ContextLoadDispositionDecisionContextCore,
+        ContextLoadDispositionPlanCore,
+    };
+    let core_plan = decide_context_load_disposition_core(match context {
+        ContextLoadDispositionDecisionContext::Ready => ContextLoadDispositionDecisionContextCore::Ready,
+        ContextLoadDispositionDecisionContext::Block { .. } => ContextLoadDispositionDecisionContextCore::Block,
+        ContextLoadDispositionDecisionContext::Reject { .. } => ContextLoadDispositionDecisionContextCore::Reject,
+        ContextLoadDispositionDecisionContext::Purge { .. } => ContextLoadDispositionDecisionContextCore::Purge,
+    });
+    match (core_plan, context) {
+        (ContextLoadDispositionPlanCore::Continue, _) => ContextLoadDispositionPlan::Continue,
+        (
+            ContextLoadDispositionPlanCore::RecordBlockAndReturn,
+            ContextLoadDispositionDecisionContext::Block { missing },
+        ) => ContextLoadDispositionPlan::RecordBlockAndReturn {
+            missing: missing.clone(),
+        },
+        (
+            ContextLoadDispositionPlanCore::Reject,
+            ContextLoadDispositionDecisionContext::Reject { reason },
+        ) => ContextLoadDispositionPlan::Reject {
+            reason: reason.clone(),
+        },
+        (
+            ContextLoadDispositionPlanCore::EmitHardPurgeAndReturn,
+            ContextLoadDispositionDecisionContext::Purge { message_event_id },
+        ) => ContextLoadDispositionPlan::EmitHardPurgeAndReturn {
+            message_event_id: message_event_id.clone(),
+        },
+        _ => unreachable!("verified core dispatch is tag-preserving"),
     }
 }
 
 fn decide_projection_decision_effect_plan(
     context: &ProjectionDecisionEffectDecisionContext,
 ) -> ProjectionDecisionEffectPlan {
-    match context {
+    use topo_verus_proofs::state::projection::stages::{
+        decide_projection_decision_effect_plan_core, ProjectionDecisionEffectDecisionContextCore,
+        ProjectionDecisionEffectPlanCore,
+    };
+    let core_plan = decide_projection_decision_effect_plan_core(match context {
         ProjectionDecisionEffectDecisionContext::Valid => {
+            ProjectionDecisionEffectDecisionContextCore::Valid
+        }
+        ProjectionDecisionEffectDecisionContext::Block { .. } => {
+            ProjectionDecisionEffectDecisionContextCore::Block
+        }
+        ProjectionDecisionEffectDecisionContext::Reject => {
+            ProjectionDecisionEffectDecisionContextCore::Reject
+        }
+        ProjectionDecisionEffectDecisionContext::AlreadyProcessed => {
+            ProjectionDecisionEffectDecisionContextCore::AlreadyProcessed
+        }
+    });
+    match (core_plan, context) {
+        (ProjectionDecisionEffectPlanCore::ApplyWriteOpsAndEmitCommands, _) => {
             ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands
         }
-        ProjectionDecisionEffectDecisionContext::Block { missing } => {
-            ProjectionDecisionEffectPlan::EmitCommandsOnly {
-                missing: missing.clone(),
-            }
-        }
-        ProjectionDecisionEffectDecisionContext::Reject
-        | ProjectionDecisionEffectDecisionContext::AlreadyProcessed => {
+        (
+            ProjectionDecisionEffectPlanCore::EmitCommandsOnly,
+            ProjectionDecisionEffectDecisionContext::Block { missing },
+        ) => ProjectionDecisionEffectPlan::EmitCommandsOnly {
+            missing: missing.clone(),
+        },
+        (ProjectionDecisionEffectPlanCore::NoEffects, _) => {
             ProjectionDecisionEffectPlan::NoEffects
         }
+        _ => unreachable!("verified core dispatch is tag-preserving"),
     }
 }
 
@@ -653,6 +724,29 @@ fn apply_projection_frame<B: ProjectionBackend>(
     // Dispatch to pure projector
     let result = dispatch_pure_projector(recorded_by, event_id_b64, parsed, &ctx);
 
+    // Assert ProjectorResult well-formedness: Block/Reject/AlreadyProcessed must
+    // not carry write_ops. A malformed result is a projector bug — panic at the
+    // dispatch boundary so the offending projector is identifiable in logs.
+    {
+        use topo_verus_proofs::state::projection::apply::projector_result_discipline::{
+            projector_result_well_formed, ProjectionDecisionKind,
+        };
+        let kind = match &result.decision {
+            ProjectionDecision::Valid => ProjectionDecisionKind::Valid,
+            ProjectionDecision::BlockOnMissingDeps { .. } => ProjectionDecisionKind::Block,
+            ProjectionDecision::Reject { .. } => ProjectionDecisionKind::Reject,
+            ProjectionDecision::AlreadyProcessed => ProjectionDecisionKind::AlreadyProcessed,
+        };
+        if !projector_result_well_formed(kind, result.write_ops.len() as u32) {
+            panic!(
+                "projector returned {:?} with {} write_ops; only Valid may carry writes (event {})",
+                kind,
+                result.write_ops.len(),
+                event_id_b64,
+            );
+        }
+    }
+
     // Explicit per-decision side-effect policy:
     // - Valid: apply write_ops and emitted commands.
     // - Block: apply emitted commands only (for block-side effects).
@@ -662,6 +756,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
     );
     match decide_projection_decision_effect_plan(&projection_decision_effect_context) {
         ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands => {
+            super::write_exec::assert_writes_tenant_isolated(recorded_by, &result.write_ops);
             backend.execute_write_ops(&result.write_ops)?;
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }

@@ -1,6 +1,80 @@
 use super::super::projector::{EmitCommand, SqlVal, WriteOp};
 use crate::crypto::event_id_from_base64;
 use rusqlite::Connection;
+use topo_verus_proofs::state::projection::apply::tenant_isolation::{
+    check_writes_tenant_isolated, WriteOpTenantView,
+};
+use topo_verus_proofs::state::projection::apply::writeop_idempotency::{is_idempotent_writeop, WriteOpKind};
+
+/// Trusted extractor: exhaustive match over runtime `WriteOp` variants into the
+/// verus-proofs `WriteOpKind` tag. If a new `WriteOp` variant is ever added, this
+/// match goes non-exhaustive at compile time, forcing a new branch and a matching
+/// `WriteOpKind` variant in verus-proofs, which in turn forces `is_idempotent_writeop`
+/// to explicitly prove (or reject) the new kind.
+fn writeop_kind(op: &WriteOp) -> WriteOpKind {
+    match op {
+        WriteOp::InsertOrIgnore { .. } => WriteOpKind::InsertOrIgnore,
+        WriteOp::Delete { .. } => WriteOpKind::Delete,
+    }
+}
+
+/// Trusted extractor: build a `WriteOpTenantView` from a `WriteOp` given the executing
+/// tenant. Looks for a column (or where-clause key) named `recorded_by`; if present,
+/// compares its value to `executing_tenant`. If absent, the view's `has_recorded_by`
+/// is `false` and the verified check allows the write through — those writes target
+/// tables that do not participate in the tenant-scope dimension (schema metadata, etc).
+fn writeop_tenant_view(op: &WriteOp, executing_tenant: &str) -> WriteOpTenantView {
+    match op {
+        WriteOp::InsertOrIgnore {
+            columns, values, ..
+        } => {
+            for (idx, col) in columns.iter().enumerate() {
+                if *col == "recorded_by" {
+                    let matches = matches!(values.get(idx), Some(SqlVal::Text(s)) if s == executing_tenant);
+                    return WriteOpTenantView {
+                        has_recorded_by: true,
+                        recorded_by_matches_executing: matches,
+                    };
+                }
+            }
+            WriteOpTenantView {
+                has_recorded_by: false,
+                recorded_by_matches_executing: false,
+            }
+        }
+        WriteOp::Delete { where_clause, .. } => {
+            for (col, val) in where_clause {
+                if *col == "recorded_by" {
+                    let matches = matches!(val, SqlVal::Text(s) if s == executing_tenant);
+                    return WriteOpTenantView {
+                        has_recorded_by: true,
+                        recorded_by_matches_executing: matches,
+                    };
+                }
+            }
+            WriteOpTenantView {
+                has_recorded_by: false,
+                recorded_by_matches_executing: false,
+            }
+        }
+    }
+}
+
+/// Enforce tenant isolation on a batch of WriteOps before execution.
+/// Panics if the Verus-verified `check_writes_tenant_isolated` rejects the batch —
+/// a rejection means a projector emitted cross-tenant writes, which is a hard bug
+/// and must not be silently recovered from.
+pub(crate) fn assert_writes_tenant_isolated(executing_tenant: &str, ops: &[WriteOp]) {
+    let views: Vec<WriteOpTenantView> = ops
+        .iter()
+        .map(|op| writeop_tenant_view(op, executing_tenant))
+        .collect();
+    if !check_writes_tenant_isolated(&views) {
+        panic!(
+            "tenant isolation violation: projector running as {executing_tenant} emitted WriteOp(s) with recorded_by != {executing_tenant}",
+        );
+    }
+}
 
 /// Execute a list of WriteOps against the database.
 ///
@@ -11,6 +85,10 @@ pub(crate) fn execute_write_ops(
     ops: &[WriteOp],
 ) -> Result<(), Box<dyn std::error::Error>> {
     for op in ops {
+        debug_assert!(
+            is_idempotent_writeop(writeop_kind(op)),
+            "WriteOp variant is not idempotent; all WriteOps must be replay-safe",
+        );
         match op {
             WriteOp::InsertOrIgnore {
                 table,

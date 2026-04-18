@@ -34,8 +34,16 @@ impl super::Describe for PeerSecretEvent {
 pub const PEER_SECRET_WIRE_SIZE: usize = wire_size_for_fields(PEER_SECRET_FIELDS);
 
 pub fn parse_peer_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, signer_event_id, private_key_bytes)) =
+        topo_verus_proofs::event_modules::layout::ts_id2::parse_ts_id2(EVENT_TYPE_PEER_SECRET, blob)
+    {
+        return Ok(ParsedEvent::PeerSecret(PeerSecretEvent {
+            created_at_ms: ts,
+            signer_event_id,
+            private_key_bytes,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_PEER_SECRET, PEER_SECRET_FIELDS, blob)?;
-
     Ok(ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         signer_event_id: values[1].as_event_id().unwrap(),
@@ -48,18 +56,12 @@ pub fn encode_peer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::PeerSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.signer_event_id),
-        FieldValue::EventId(e.private_key_bytes),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
         EVENT_TYPE_PEER_SECRET,
-        PEER_SECRET_FIELDS,
-        &values,
-    )?)
+        e.created_at_ms,
+        &e.signer_event_id,
+        &e.private_key_bytes,
+    ))
 }
 
 // === Projector (event-module locality) ===

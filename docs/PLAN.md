@@ -153,13 +153,15 @@ Required shape per seam:
 5. `decide_*`: pure planner from `DecisionContext -> Plan`.
 6. executor: runtime code that performs only the effects named by `Plan`.
 
-Proof organization:
+Proof organization (see `docs/DESIGN.md §"Verus Proof Model"` for the canonical spec):
 
-1. Verus files live in a mirrored tree under `verus-proofs/src/`, matching production ownership (`runtime/...`, `state/...`, `pipeline/...`).
-2. Proof modules model the `RawRows`, `DecisionContext`, normalizer, planner, and plan invariants for the owning runtime seam.
-3. Production Rust modules should expose small pure normalizer/planner functions when possible, but they should not absorb large inline proof blocks.
-4. Inline Verus proof code is allowed only for small local facts where colocating the proof is clearer than creating a mirrored module.
-5. The working seam inventory is `docs/planning/FORMAL_SEAM_COVERAGE.md`; update it when a proof-bearing seam is added, moved, or renamed.
+1. `topo-verus-proofs` is a **path-dep of `topo`**, not a parallel mirror. Normalizers and planners are written as executable `pub fn` inside `verus!` blocks with `requires`/`ensures` clauses. The runtime imports them via `pub use topo_verus_proofs::...` and calls them directly.
+2. `cargo-verus verify` SMT-checks each `ensures` against the actual function body. A body change that violates the postcondition fails the merge gate.
+3. Where runtime types carry `String`/`Option<RuntimeEnum>`/`Vec<RuntimeStruct>` payloads that cannot cross the crate boundary, use the **verified core + runtime adapter** pattern: Verus fn takes/returns a primitives-only `*Core` shape; the runtime has a thin unverified adapter that projects → calls verified fn → rehydrates payload.
+4. The Verus tree under `verus-proofs/src/` mirrors production ownership (`runtime/...`, `state/...`, `pipeline/...`) so proofs can be reviewed with the code they verify.
+5. Abstract `spec fn` mirrors of runtime functions are **deprecated** — they pass SMT but say nothing about the runtime body. Any remaining `spec fn`s must either (a) be intermediate predicates cited by an `ensures` on a grounded exec fn, or (b) carry a `_spec` suffix + comment explaining why they have no single-function runtime counterpart (typically protocol frame shapes or emergent cross-function invariants).
+6. The **tamper test** (`scripts/verus_tamper_test.sh`) runs in the primary merge gate and asserts that flipping an ensures-protected function body causes `cargo-verus verify` to fail with "postcondition not satisfied". This guards against Verus upgrades silently breaking the SMT-on-real-bodies guarantee.
+7. The working seam inventory is `docs/planning/FORMAL_SEAM_COVERAGE.md`; update it when a proof-bearing seam is added, moved, or renamed.
 
 Required proof/test split:
 

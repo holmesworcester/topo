@@ -83,19 +83,15 @@ pub fn encode_file_slice(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     if fs.ciphertext.len() != FILE_SLICE_CIPHERTEXT_BYTES {
         return Err(EventError::ContentTooLong(fs.ciphertext.len()));
     }
-
-    let values = vec![
-        FieldValue::Timestamp(fs.created_at_ms),
-        FieldValue::EventId(fs.file_id),
-        FieldValue::U32(fs.slice_number),
-        FieldValue::FixedBytes(fs.ciphertext.clone()),
-    ];
-
-    Ok(encode_fields(
-        EVENT_TYPE_FILE_SLICE,
-        FILE_SLICE_FIELDS,
-        &values,
-    )?)
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u32_slice(
+            EVENT_TYPE_FILE_SLICE,
+            fs.created_at_ms,
+            &fs.file_id,
+            fs.slice_number,
+            &fs.ciphertext,
+        ),
+    )
 }
 
 pub static FILE_SLICE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

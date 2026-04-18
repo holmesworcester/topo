@@ -44,6 +44,24 @@ impl super::Describe for KeyRotationEvent {
 }
 
 pub fn parse_key_rotation(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, key_event_id, frontier_count, fr1, fr2, fr3, fr4, fh, rb)) =
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id6(
+            EVENT_TYPE_KEY_ROTATION,
+            blob,
+        )
+    {
+        return Ok(ParsedEvent::KeyRotation(KeyRotationEvent {
+            created_at_ms: ts,
+            key_event_id,
+            frontier_count,
+            frontier_ref_1: fr1,
+            frontier_ref_2: fr2,
+            frontier_ref_3: fr3,
+            frontier_ref_4: fr4,
+            frontier_hash: fh,
+            rotated_by: rb,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_KEY_ROTATION, KEY_ROTATION_FIELDS, blob)?;
     Ok(ParsedEvent::KeyRotation(KeyRotationEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
@@ -59,26 +77,24 @@ pub fn parse_key_rotation(blob: &[u8]) -> Result<ParsedEvent, EventError> {
 }
 
 pub fn encode_key_rotation(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
-    let rotation = match event {
+    let r = match event {
         ParsedEvent::KeyRotation(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
-    let values = vec![
-        FieldValue::Timestamp(rotation.created_at_ms),
-        FieldValue::EventId(rotation.key_event_id),
-        FieldValue::U8(rotation.frontier_count),
-        FieldValue::EventId(rotation.frontier_ref_1),
-        FieldValue::EventId(rotation.frontier_ref_2),
-        FieldValue::EventId(rotation.frontier_ref_3),
-        FieldValue::EventId(rotation.frontier_ref_4),
-        FieldValue::EventId(rotation.frontier_hash),
-        FieldValue::EventId(rotation.rotated_by),
-    ];
-    Ok(encode_fields(
-        EVENT_TYPE_KEY_ROTATION,
-        KEY_ROTATION_FIELDS,
-        &values,
-    )?)
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u8_id6(
+            EVENT_TYPE_KEY_ROTATION,
+            r.created_at_ms,
+            &r.key_event_id,
+            r.frontier_count,
+            &r.frontier_ref_1,
+            &r.frontier_ref_2,
+            &r.frontier_ref_3,
+            &r.frontier_ref_4,
+            &r.frontier_hash,
+            &r.rotated_by,
+        ),
+    )
 }
 
 use crate::crypto::event_id_to_base64;

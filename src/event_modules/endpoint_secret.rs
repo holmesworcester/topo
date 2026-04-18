@@ -32,8 +32,20 @@ pub fn endpoint_id_from_private_key_bytes(private_key_bytes: &[u8; 32]) -> Strin
 }
 
 pub fn parse_endpoint_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    // Verus-verified ts_id codec (see verus-proofs/src/state/event_codec_ts_id.rs).
+    if let Some((created_at_ms, private_key_bytes)) =
+        topo_verus_proofs::event_modules::layout::ts_id::parse_ts_id(
+            EVENT_TYPE_ENDPOINT_SECRET,
+            blob,
+        )
+    {
+        return Ok(ParsedEvent::EndpointSecret(EndpointSecretEvent {
+            created_at_ms,
+            private_key_bytes,
+        }));
+    }
+    // Fall back to the generic decoder for canonical error variants.
     let values = decode_fields(EVENT_TYPE_ENDPOINT_SECRET, ENDPOINT_SECRET_FIELDS, blob)?;
-
     Ok(ParsedEvent::EndpointSecret(EndpointSecretEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         private_key_bytes: values[1].as_event_id().unwrap(),
@@ -45,17 +57,11 @@ pub fn encode_endpoint_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         ParsedEvent::EndpointSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(e.created_at_ms),
-        FieldValue::EventId(e.private_key_bytes),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
         EVENT_TYPE_ENDPOINT_SECRET,
-        ENDPOINT_SECRET_FIELDS,
-        &values,
-    )?)
+        e.created_at_ms,
+        &e.private_key_bytes,
+    ))
 }
 
 pub fn deterministic_endpoint_secret_created_at_ms(private_key_bytes: &[u8; 32]) -> u64 {

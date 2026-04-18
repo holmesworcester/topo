@@ -19,8 +19,22 @@ impl super::super::Describe for MessageEvent {
 }
 
 pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((ts, workspace_id, author_id, content_slot)) =
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id2_fb1024(
+            EVENT_TYPE_MESSAGE,
+            blob,
+        )
+    {
+        let content = crate::event_modules::layout::common::read_text_slot(&content_slot)
+            .map_err(EventError::TextSlot)?;
+        return Ok(ParsedEvent::Message(MessageEvent {
+            created_at_ms: ts,
+            workspace_id,
+            author_id,
+            content,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_MESSAGE, MESSAGE_FIELDS, blob)?;
-
     Ok(ParsedEvent::Message(MessageEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         workspace_id: values[1].as_event_id().unwrap(),
@@ -34,15 +48,18 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::Message(m) => m,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(msg.created_at_ms),
-        FieldValue::EventId(msg.workspace_id),
-        FieldValue::EventId(msg.author_id),
-        FieldValue::Text(msg.content.clone()),
-    ];
-
-    Ok(encode_fields(EVENT_TYPE_MESSAGE, MESSAGE_FIELDS, &values)?)
+    let mut content_slot: [u8; MESSAGE_CONTENT_BYTES] = [0u8; MESSAGE_CONTENT_BYTES];
+    crate::event_modules::layout::common::write_text_slot(&msg.content, &mut content_slot)
+        .map_err(EventError::TextSlot)?;
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id2_fb1024(
+            EVENT_TYPE_MESSAGE,
+            msg.created_at_ms,
+            &msg.workspace_id,
+            &msg.author_id,
+            &content_slot,
+        ),
+    )
 }
 
 pub static MESSAGE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

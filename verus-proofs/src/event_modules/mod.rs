@@ -1,3 +1,6 @@
-pub mod content_commands;
+pub mod encrypted;
+pub mod layout;
+pub mod registry;
+pub mod roundtrip;
+pub mod signed;
 pub mod workspace;
-pub mod workspace_commands;

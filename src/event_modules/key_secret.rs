@@ -32,8 +32,15 @@ impl super::Describe for KeySecretEvent {
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  key_bytes (32 bytes)
 pub fn parse_key_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if let Some((created_at_ms, key_bytes)) =
+        topo_verus_proofs::event_modules::layout::ts_id::parse_ts_id(EVENT_TYPE_KEY_SECRET, blob)
+    {
+        return Ok(ParsedEvent::KeySecret(KeySecretEvent {
+            created_at_ms,
+            key_bytes,
+        }));
+    }
     let values = decode_fields(EVENT_TYPE_KEY_SECRET, KEY_SECRET_FIELDS, blob)?;
-
     Ok(ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         key_bytes: values[1].as_event_id().unwrap(),
@@ -45,17 +52,11 @@ pub fn encode_key_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::KeySecret(s) => s,
         _ => return Err(EventError::WrongVariant),
     };
-
-    let values = vec![
-        FieldValue::Timestamp(sk.created_at_ms),
-        FieldValue::EventId(sk.key_bytes),
-    ];
-
-    Ok(encode_fields(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
         EVENT_TYPE_KEY_SECRET,
-        KEY_SECRET_FIELDS,
-        &values,
-    )?)
+        sk.created_at_ms,
+        &sk.key_bytes,
+    ))
 }
 
 /// Deterministic timestamp derivation for key materialized Secret events.
