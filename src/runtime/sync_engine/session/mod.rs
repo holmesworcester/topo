@@ -1,11 +1,14 @@
 //! Sync session logic: initiator and responder range sessions.
 
 pub mod admission;
+pub mod data_plane;
 pub mod depsync;
 pub mod initiator;
+pub mod live_suppression;
 pub mod logging;
 pub mod range_session;
 pub mod receive;
+pub mod receive_task;
 pub mod responder;
 pub mod windowing;
 

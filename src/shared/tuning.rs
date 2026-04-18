@@ -121,12 +121,73 @@ pub fn live_suppression_batch_settle_ms() -> u64 {
     5
 }
 
+pub fn live_suppression_prefetch_ids() -> usize {
+    if let Some(v) = read_usize_env("TOPO_LIVE_SUPPRESSION_PREFETCH_IDS") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        8
+    } else {
+        32
+    }
+}
+
 pub fn session_ingest_cap() -> usize {
     if low_mem_mode() {
         8
     } else {
         5000
     }
+}
+
+pub fn direct_ingest_pending_bytes_cap() -> usize {
+    if let Some(v) = read_usize_env("TOPO_DIRECT_INGEST_PENDING_BYTES_CAP") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        8 * 1024 * 1024
+    } else {
+        32 * 1024 * 1024
+    }
+}
+
+pub fn direct_ingest_large_blob_threshold_bytes() -> usize {
+    if let Some(v) = read_usize_env("TOPO_DIRECT_INGEST_LARGE_BLOB_THRESHOLD_BYTES") {
+        return v.max(1);
+    }
+    64 * 1024
+}
+
+pub fn direct_ingest_large_blob_pending_charge_bytes() -> usize {
+    if let Some(v) = read_usize_env("TOPO_DIRECT_INGEST_LARGE_BLOB_PENDING_CHARGE_BYTES") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        1024 * 1024
+    } else {
+        4 * 1024 * 1024
+    }
+}
+
+pub fn direct_receive_batch_item_cap() -> usize {
+    if let Some(v) = read_usize_env("TOPO_DIRECT_RECEIVE_BATCH_ITEM_CAP") {
+        return v.max(1);
+    }
+    8192
+}
+
+pub fn direct_receive_large_blob_batch_max_bytes() -> usize {
+    if let Some(v) = read_usize_env("TOPO_DIRECT_RECEIVE_LARGE_BLOB_BATCH_MAX_BYTES") {
+        return v.max(1);
+    }
+    256 * 1024
+}
+
+pub fn direct_receive_small_blob_batch_max_bytes() -> usize {
+    if let Some(v) = read_usize_env("TOPO_DIRECT_RECEIVE_SMALL_BLOB_BATCH_MAX_BYTES") {
+        return v.max(1);
+    }
+    1024 * 1024
 }
 
 // -- Transport --

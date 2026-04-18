@@ -1,4 +1,8 @@
-//! Formal verification of durable range-session index and send-order policy selection.
+//! Formal verification of the durable range-session send-planning seam.
+//!
+//! Live suppression and receive-task mechanics now live in dedicated runtime
+//! modules; this mirror continues to cover the durable index/query-to-plan
+//! normalization that remains in `range_session.rs`.
 
 use vstd::prelude::*;
 
