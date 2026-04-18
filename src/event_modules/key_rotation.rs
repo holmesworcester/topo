@@ -45,7 +45,7 @@ impl super::Describe for KeyRotationEvent {
 
 pub fn parse_key_rotation(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, key_event_id, frontier_count, fr1, fr2, fr3, fr4, fh, rb)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id_u8_id6(
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id6(
             EVENT_TYPE_KEY_ROTATION,
             blob,
         )
@@ -82,7 +82,7 @@ pub fn encode_key_rotation(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_u8_id6(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u8_id6(
             EVENT_TYPE_KEY_ROTATION,
             r.created_at_ms,
             &r.key_event_id,

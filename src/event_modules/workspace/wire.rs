@@ -41,7 +41,7 @@ pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     // Verified byte-level parser for [type][u64 ts][id:32][fb:64]; UTF-8 validation
     // of the 64-byte text slot is layered on top via read_text_slot.
     if let Some((ts, public_key, name_slot)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id_fb64(EVENT_TYPE_WORKSPACE, blob)
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_fb64(EVENT_TYPE_WORKSPACE, blob)
     {
         let name = crate::event_modules::layout::common::read_text_slot(&name_slot)
             .map_err(EventError::TextSlot)?;
@@ -71,7 +71,7 @@ pub fn encode_workspace(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     crate::event_modules::layout::common::write_text_slot(&ws.name, &mut name_slot)
         .map_err(EventError::TextSlot)?;
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_fb64(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_fb64(
             EVENT_TYPE_WORKSPACE,
             ws.created_at_ms,
             &ws.public_key,

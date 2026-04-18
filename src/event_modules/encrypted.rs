@@ -22,17 +22,17 @@ use encrypted_offsets as off;
 pub const NO_OWNER_EVENT_ID: [u8; 32] = [0u8; 32];
 
 pub fn outer_inner_type_code(blob: &[u8]) -> Option<u8> {
-    if !topo_verus_proofs::state::encrypted_event_structure::is_well_formed_encrypted_header(blob) {
+    if !topo_verus_proofs::event_modules::encrypted::is_well_formed_encrypted_header(blob) {
         return None;
     }
     blob.get(off::INNER_TYPE_CODE).copied()
 }
 
 pub fn outer_owner_event_id(blob: &[u8]) -> Option<[u8; 32]> {
-    if !topo_verus_proofs::state::encrypted_event_structure::is_well_formed_encrypted_header(blob) {
+    if !topo_verus_proofs::event_modules::encrypted::is_well_formed_encrypted_header(blob) {
         return None;
     }
-    let (start, end) = topo_verus_proofs::state::encrypted_event_structure::owner_event_id_range();
+    let (start, end) = topo_verus_proofs::event_modules::encrypted::owner_event_id_range();
     let owner = blob.get(start..end)?;
     let mut out = [0u8; 32];
     out.copy_from_slice(owner);
@@ -161,7 +161,7 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     }
 
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_encrypted_envelope(
+        topo_verus_proofs::event_modules::layout::shapes::encode_encrypted_envelope(
             enc.created_at_ms,
             &enc.key_event_id,
             &enc.owner_event_id,

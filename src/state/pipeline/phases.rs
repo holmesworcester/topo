@@ -101,7 +101,7 @@ fn decide_persist_event_plan(context: &PersistEventDecisionContext) -> PersistEv
     // priority lane) is verified in verus-proofs; the runtime rehydrates the
     // concrete `workspace_binding: Option<String>` into `WorkspaceBinding(String)`
     // when the verified core selects that branch.
-    use topo_verus_proofs::pipeline::persist_phase::{
+    use topo_verus_proofs::state::pipeline::phases::{
         decide_persist_event_plan_core, PersistEventDecisionContextCore, ShareScopeCore,
         WorkspaceTargetCore,
     };

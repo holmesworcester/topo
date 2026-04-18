@@ -110,7 +110,7 @@ pub fn frontier_refs_from_slots(
 
 pub fn parse_removal(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, removed_member_ref, parent_count, p1, p2, p3, p4, fh, rb)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id_u8_id6(EVENT_TYPE_REMOVAL, blob)
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id6(EVENT_TYPE_REMOVAL, blob)
     {
         return Ok(ParsedEvent::Removal(RemovalEvent {
             created_at_ms: ts,
@@ -144,7 +144,7 @@ pub fn encode_removal(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_u8_id6(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u8_id6(
             EVENT_TYPE_REMOVAL,
             r.created_at_ms,
             &r.removed_member_ref,

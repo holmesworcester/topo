@@ -21,7 +21,7 @@
 
 use rusqlite::Connection;
 use std::marker::PhantomData;
-use topo_verus_proofs::state::txn_state_machine::{
+use topo_verus_proofs::state::db::txn_guard::{
     begin_transition_valid, commit_transition_valid, drop_is_noop, drop_should_rollback,
     rollback_transition_valid, DbTxnState,
 };

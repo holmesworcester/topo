@@ -33,7 +33,7 @@ impl super::Describe for InviteSecretEvent {
 
 pub fn parse_invite_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, invite_event_id, private_key_bytes)) =
-        topo_verus_proofs::state::event_codec_ts_id2::parse_ts_id2(EVENT_TYPE_INVITE_SECRET, blob)
+        topo_verus_proofs::event_modules::layout::ts_id2::parse_ts_id2(EVENT_TYPE_INVITE_SECRET, blob)
     {
         return Ok(ParsedEvent::InviteSecret(InviteSecretEvent {
             created_at_ms: ts,
@@ -54,7 +54,7 @@ pub fn encode_invite_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         ParsedEvent::InviteSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_ts_id2::encode_ts_id2(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
         EVENT_TYPE_INVITE_SECRET,
         e.created_at_ms,
         &e.invite_event_id,

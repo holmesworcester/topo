@@ -79,7 +79,7 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_u8_id9(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u8_id9(
             EVENT_TYPE_KEY_SHARED,
             e.created_at_ms,
             &e.key_event_id,

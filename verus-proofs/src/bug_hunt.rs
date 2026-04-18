@@ -10,7 +10,7 @@
 //! the relevant seam) and remove it here. A shrinking `bug_hunt.rs` is progress.
 
 use vstd::prelude::*;
-use crate::decision::*;
+use crate::state::projection::decision::*;
 
 verus! {
 

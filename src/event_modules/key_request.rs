@@ -82,7 +82,7 @@ pub fn deterministic_key_request_created_at_ms(
 
 pub fn parse_key_request(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, id1, id2, id3, id4, id5, id6)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id6(EVENT_TYPE_KEY_REQUEST, blob)
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id6(EVENT_TYPE_KEY_REQUEST, blob)
     {
         return Ok(ParsedEvent::KeyRequest(KeyRequestEvent {
             created_at_ms: ts,
@@ -111,7 +111,7 @@ pub fn encode_key_request(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::KeyRequest(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_shapes::encode_ts_id6(
+    Ok(topo_verus_proofs::event_modules::layout::shapes::encode_ts_id6(
         EVENT_TYPE_KEY_REQUEST,
         kr.created_at_ms,
         &kr.blocked_event_id,

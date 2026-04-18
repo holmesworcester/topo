@@ -39,7 +39,7 @@ impl super::super::Describe for ReactionEvent {
 
 pub fn parse_reaction(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, target_event_id, author_id, emoji_slot)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id2_fb64(
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id2_fb64(
             EVENT_TYPE_REACTION,
             blob,
         )
@@ -71,7 +71,7 @@ pub fn encode_reaction(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     crate::event_modules::layout::common::write_text_slot(&rxn.emoji, &mut emoji_slot)
         .map_err(EventError::TextSlot)?;
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id2_fb64(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id2_fb64(
             EVENT_TYPE_REACTION,
             rxn.created_at_ms,
             &rxn.target_event_id,

@@ -503,13 +503,13 @@ pub fn encode_event(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         match parse_event(&blob) {
             Ok(parsed) => {
                 let type_code_ok =
-                    topo_verus_proofs::state::command_roundtrip::event_type_code_preserved(
+                    topo_verus_proofs::event_modules::roundtrip::event_type_code_preserved(
                         type_code,
                         parsed.event_type_code(),
                     );
                 let full_equality_ok = parsed == *event;
                 assert!(
-                    topo_verus_proofs::state::command_roundtrip::encoder_roundtrip_ok(
+                    topo_verus_proofs::event_modules::roundtrip::encoder_roundtrip_ok(
                         type_code_ok,
                         full_equality_ok,
                     ),
@@ -613,7 +613,7 @@ mod tests {
         }
     }
 
-    use topo_verus_proofs::state::projector_registry::{
+    use topo_verus_proofs::event_modules::registry::{
         formal_family_of, EventTypeCode, FormalProjectorFamily,
     };
 

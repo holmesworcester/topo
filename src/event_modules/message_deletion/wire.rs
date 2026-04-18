@@ -30,7 +30,7 @@ pub const MESSAGE_DELETION_WIRE_SIZE: usize = wire_size_for_fields(MESSAGE_DELET
 /// [9..41]  target_event_id (32 bytes)
 pub fn parse_message_deletion(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((created_at_ms, target_event_id)) =
-        topo_verus_proofs::state::event_codec_ts_id::parse_ts_id(
+        topo_verus_proofs::event_modules::layout::ts_id::parse_ts_id(
             EVENT_TYPE_MESSAGE_DELETION,
             blob,
         )
@@ -52,7 +52,7 @@ pub fn encode_message_deletion(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
         ParsedEvent::MessageDeletion(d) => d,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_ts_id::encode_ts_id(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
         EVENT_TYPE_MESSAGE_DELETION,
         del.created_at_ms,
         &del.target_event_id,

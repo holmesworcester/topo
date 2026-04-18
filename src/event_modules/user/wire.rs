@@ -34,7 +34,7 @@ impl super::super::Describe for UserEvent {
 
 pub fn parse_user(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, public_key, name_slot)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id_fb64(EVENT_TYPE_USER, blob)
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_fb64(EVENT_TYPE_USER, blob)
     {
         let username = crate::event_modules::layout::common::read_text_slot(&name_slot)
             .map_err(EventError::TextSlot)?;
@@ -61,7 +61,7 @@ pub fn encode_user(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     crate::event_modules::layout::common::write_text_slot(&e.username, &mut name_slot)
         .map_err(EventError::TextSlot)?;
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_fb64(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_fb64(
             EVENT_TYPE_USER,
             e.created_at_ms,
             &e.public_key,

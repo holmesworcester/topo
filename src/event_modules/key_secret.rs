@@ -33,7 +33,7 @@ impl super::Describe for KeySecretEvent {
 /// [9..41]  key_bytes (32 bytes)
 pub fn parse_key_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((created_at_ms, key_bytes)) =
-        topo_verus_proofs::state::event_codec_ts_id::parse_ts_id(EVENT_TYPE_KEY_SECRET, blob)
+        topo_verus_proofs::event_modules::layout::ts_id::parse_ts_id(EVENT_TYPE_KEY_SECRET, blob)
     {
         return Ok(ParsedEvent::KeySecret(KeySecretEvent {
             created_at_ms,
@@ -52,7 +52,7 @@ pub fn encode_key_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::KeySecret(s) => s,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_ts_id::encode_ts_id(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
         EVENT_TYPE_KEY_SECRET,
         sk.created_at_ms,
         &sk.key_bytes,

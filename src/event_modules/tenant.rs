@@ -35,7 +35,7 @@ pub fn parse_tenant(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     // Verus-verified parser for the (type_byte + u64 + [u8;32]) shape; returns
     // Some iff the blob length and type byte match. See
     // verus-proofs/src/state/event_codec_ts_id.rs.
-    match topo_verus_proofs::state::event_codec_ts_id::parse_ts_id(EVENT_TYPE_TENANT, blob) {
+    match topo_verus_proofs::event_modules::layout::ts_id::parse_ts_id(EVENT_TYPE_TENANT, blob) {
         Some((created_at_ms, public_key)) => Ok(ParsedEvent::Tenant(TenantEvent {
             created_at_ms,
             public_key,
@@ -58,7 +58,7 @@ pub fn encode_tenant(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
     // Verus-verified encoder; output is SMT-proven to round-trip through `parse_ts_id`.
-    Ok(topo_verus_proofs::state::event_codec_ts_id::encode_ts_id(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
         EVENT_TYPE_TENANT,
         e.created_at_ms,
         &e.public_key,

@@ -6,7 +6,7 @@
 //! `cargo-verus verify`.
 
 use vstd::prelude::*;
-use crate::decision::*;
+use crate::state::projection::decision::*;
 
 verus! {
 

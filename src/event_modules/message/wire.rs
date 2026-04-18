@@ -20,7 +20,7 @@ impl super::super::Describe for MessageEvent {
 
 pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, workspace_id, author_id, content_slot)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id2_fb1024(
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id2_fb1024(
             EVENT_TYPE_MESSAGE,
             blob,
         )
@@ -52,7 +52,7 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     crate::event_modules::layout::common::write_text_slot(&msg.content, &mut content_slot)
         .map_err(EventError::TextSlot)?;
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id2_fb1024(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id2_fb1024(
             EVENT_TYPE_MESSAGE,
             msg.created_at_ms,
             &msg.workspace_id,

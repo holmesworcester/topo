@@ -89,7 +89,7 @@ pub fn encode_bench_dep(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         slot_bytes[start..start + 32].copy_from_slice(id);
     }
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_fb320_fb16(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_fb320_fb16(
             EVENT_TYPE_BENCH_DEP,
             b.created_at_ms,
             &slot_bytes,

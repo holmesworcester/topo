@@ -84,7 +84,7 @@ pub fn encode_file_slice(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         return Err(EventError::ContentTooLong(fs.ciphertext.len()));
     }
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_u32_slice(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u32_slice(
             EVENT_TYPE_FILE_SLICE,
             fs.created_at_ms,
             &fs.file_id,

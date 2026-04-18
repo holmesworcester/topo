@@ -29,7 +29,7 @@ impl super::super::Describe for AdminEvent {
 
 pub fn parse_admin(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, public_key, user_event_id)) =
-        topo_verus_proofs::state::event_codec_ts_id2::parse_ts_id2(EVENT_TYPE_ADMIN, blob)
+        topo_verus_proofs::event_modules::layout::ts_id2::parse_ts_id2(EVENT_TYPE_ADMIN, blob)
     {
         return Ok(ParsedEvent::Admin(AdminEvent {
             created_at_ms: ts,
@@ -50,7 +50,7 @@ pub fn encode_admin(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::Admin(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_ts_id2::encode_ts_id2(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
         EVENT_TYPE_ADMIN,
         e.created_at_ms,
         &e.public_key,

@@ -151,7 +151,7 @@ pub(crate) fn record_block_rows(
         rusqlite::params![recorded_by, event_id_b64],
         |row| row.get(0),
     )?;
-    if !topo_verus_proofs::state::cascade_invariant::cascade_counter_consistent(
+    if !topo_verus_proofs::state::projection::apply::cascade_invariant::cascade_counter_consistent(
         deps_remaining as u32,
         edge_count as u32,
     ) {
@@ -722,7 +722,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
     // not carry write_ops. A malformed result is a projector bug — panic at the
     // dispatch boundary so the offending projector is identifiable in logs.
     {
-        use topo_verus_proofs::state::projector_result_discipline::{
+        use topo_verus_proofs::state::projection::apply::projector_result_discipline::{
             projector_result_well_formed, ProjectionDecisionKind,
         };
         let kind = match &result.decision {

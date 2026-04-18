@@ -1,10 +1,10 @@
 use super::super::contract::{EmitCommand, SqlVal, WriteOp};
 use crate::crypto::event_id_from_base64;
 use rusqlite::Connection;
-use topo_verus_proofs::state::tenant_isolation::{
+use topo_verus_proofs::state::projection::apply::tenant_isolation::{
     check_writes_tenant_isolated, WriteOpTenantView,
 };
-use topo_verus_proofs::state::writeop_idempotency::{is_idempotent_writeop, WriteOpKind};
+use topo_verus_proofs::state::projection::apply::writeop_idempotency::{is_idempotent_writeop, WriteOpKind};
 
 /// Trusted extractor: exhaustive match over runtime `WriteOp` variants into the
 /// verus-proofs `WriteOpKind` tag. If a new `WriteOp` variant is ever added, this

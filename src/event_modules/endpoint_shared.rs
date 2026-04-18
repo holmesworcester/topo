@@ -80,7 +80,7 @@ pub fn deterministic_endpoint_shared_event_id(private_key_bytes: &[u8; 32]) -> [
 
 pub fn parse_endpoint_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, public_key, signature)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id_fb64(
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_fb64(
             EVENT_TYPE_ENDPOINT_SHARED,
             blob,
         )
@@ -111,7 +111,7 @@ pub fn encode_endpoint_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         _ => return Err(EventError::WrongVariant),
     };
     return Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id_fb64(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_fb64(
             EVENT_TYPE_ENDPOINT_SHARED,
             e.created_at_ms,
             &e.public_key,

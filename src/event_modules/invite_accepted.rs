@@ -45,7 +45,7 @@ impl super::Describe for InviteAcceptedEvent {
 /// [73..105] workspace_id (32 bytes)
 pub fn parse_invite_accepted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, tenant_event_id, invite_event_id, workspace_id)) =
-        topo_verus_proofs::state::event_codec_ts_id3::parse_ts_id3(
+        topo_verus_proofs::event_modules::layout::ts_id3::parse_ts_id3(
             EVENT_TYPE_INVITE_ACCEPTED,
             blob,
         )
@@ -71,7 +71,7 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         ParsedEvent::InviteAccepted(a) => a,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_ts_id3::encode_ts_id3(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id3::encode_ts_id3(
         EVENT_TYPE_INVITE_ACCEPTED,
         ia.created_at_ms,
         &ia.tenant_event_id,

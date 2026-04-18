@@ -16,7 +16,7 @@
 //! preserving a single source of truth about which types are signers.
 
 use vstd::prelude::*;
-use super::projector_registry::EventTypeCode;
+use crate::event_modules::registry::EventTypeCode;
 
 verus! {
 

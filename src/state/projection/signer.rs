@@ -97,7 +97,8 @@ fn signer_identity_from_parsed(
     // let an attacker substitute content for a key. See
     // verus-proofs/src/state/signer_chain.rs::is_valid_signer_type.
     let type_code = parsed.event_type_code();
-    use topo_verus_proofs::state::{projector_registry, signer_chain};
+    use topo_verus_proofs::event_modules::registry as projector_registry;
+    use topo_verus_proofs::state::projection::signer as signer_chain;
     if let Some(code_enum) = runtime_type_code_to_enum(type_code) {
         if !signer_chain::is_valid_signer_type(code_enum) {
             return Err(format!(
@@ -151,9 +152,9 @@ fn signer_identity_from_parsed(
 /// Mirrors the extractor in event_modules/mod.rs::tests::type_code_to_enum.
 fn runtime_type_code_to_enum(
     type_code: u8,
-) -> Option<topo_verus_proofs::state::projector_registry::EventTypeCode> {
+) -> Option<topo_verus_proofs::event_modules::registry::EventTypeCode> {
     use crate::event_modules::*;
-    use topo_verus_proofs::state::projector_registry::EventTypeCode;
+    use topo_verus_proofs::event_modules::registry::EventTypeCode;
     match type_code {
         EVENT_TYPE_MESSAGE => Some(EventTypeCode::Message),
         EVENT_TYPE_REACTION => Some(EventTypeCode::Reaction),

@@ -413,7 +413,7 @@ pub fn make_wire_ingest_item(
     // is effectively a no-op (both sides are the same local hash); in debug builds
     // it catches tampering with `hash_event` and surfaces a clear error.
     debug_assert!(
-        topo_verus_proofs::state::event_id_integrity::event_id_matches_blob_hash(
+        topo_verus_proofs::state::pipeline::event_id_integrity::event_id_matches_blob_hash(
             &event_id,
             &crate::crypto::hash_event(&blob),
         ),

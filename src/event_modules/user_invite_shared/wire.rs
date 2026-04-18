@@ -37,7 +37,7 @@ impl super::super::Describe for UserInviteEvent {
 
 pub fn parse_user_invite(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, public_key, workspace_id, authority_event_id)) =
-        topo_verus_proofs::state::event_codec_ts_id3::parse_ts_id3(EVENT_TYPE_USER_INVITE, blob)
+        topo_verus_proofs::event_modules::layout::ts_id3::parse_ts_id3(EVENT_TYPE_USER_INVITE, blob)
     {
         return Ok(ParsedEvent::UserInvite(UserInviteEvent {
             created_at_ms: ts,
@@ -60,7 +60,7 @@ pub fn encode_user_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::UserInvite(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_ts_id3::encode_ts_id3(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id3::encode_ts_id3(
         EVENT_TYPE_USER_INVITE,
         e.created_at_ms,
         &e.public_key,

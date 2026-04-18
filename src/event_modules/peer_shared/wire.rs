@@ -38,7 +38,7 @@ impl super::super::Describe for PeerSharedEvent {
 
 pub fn parse_peer_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, public_key, user_event_id, endpoint_shared_event_id, name_slot)) =
-        topo_verus_proofs::state::event_codec_shapes::parse_ts_id3_fb64(
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id3_fb64(
             EVENT_TYPE_PEER_SHARED,
             blob,
         )
@@ -72,7 +72,7 @@ pub fn encode_peer_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     crate::event_modules::layout::common::write_text_slot(&e.device_name, &mut name_slot)
         .map_err(EventError::TextSlot)?;
     Ok(
-        topo_verus_proofs::state::event_codec_shapes::encode_ts_id3_fb64(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id3_fb64(
             EVENT_TYPE_PEER_SHARED,
             e.created_at_ms,
             &e.public_key,

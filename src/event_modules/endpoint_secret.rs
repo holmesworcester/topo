@@ -34,7 +34,7 @@ pub fn endpoint_id_from_private_key_bytes(private_key_bytes: &[u8; 32]) -> Strin
 pub fn parse_endpoint_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     // Verus-verified ts_id codec (see verus-proofs/src/state/event_codec_ts_id.rs).
     if let Some((created_at_ms, private_key_bytes)) =
-        topo_verus_proofs::state::event_codec_ts_id::parse_ts_id(
+        topo_verus_proofs::event_modules::layout::ts_id::parse_ts_id(
             EVENT_TYPE_ENDPOINT_SECRET,
             blob,
         )
@@ -57,7 +57,7 @@ pub fn encode_endpoint_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         ParsedEvent::EndpointSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_ts_id::encode_ts_id(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
         EVENT_TYPE_ENDPOINT_SECRET,
         e.created_at_ms,
         &e.private_key_bytes,

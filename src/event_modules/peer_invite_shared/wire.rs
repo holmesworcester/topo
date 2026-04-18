@@ -34,7 +34,7 @@ impl super::super::Describe for DeviceInviteEvent {
 /// [41..73]   authority_event_id (32 bytes)
 pub fn parse_device_invite(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, public_key, authority_event_id)) =
-        topo_verus_proofs::state::event_codec_ts_id2::parse_ts_id2(EVENT_TYPE_DEVICE_INVITE, blob)
+        topo_verus_proofs::event_modules::layout::ts_id2::parse_ts_id2(EVENT_TYPE_DEVICE_INVITE, blob)
     {
         return Ok(ParsedEvent::DeviceInvite(DeviceInviteEvent {
             created_at_ms: ts,
@@ -55,7 +55,7 @@ pub fn encode_device_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         ParsedEvent::DeviceInvite(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::state::event_codec_ts_id2::encode_ts_id2(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
         EVENT_TYPE_DEVICE_INVITE,
         e.created_at_ms,
         &e.public_key,
