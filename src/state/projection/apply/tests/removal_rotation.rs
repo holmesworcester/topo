@@ -155,7 +155,7 @@ fn test_key_rotation_blocks_on_missing_frontier_then_projects_and_rejects_bad_ha
     let blocked_eid = insert_event_raw(&conn, recorded_by, &blocked_blob);
     let result = project_one(&conn, recorded_by, &blocked_eid).unwrap();
     match result {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert!(
                 missing.contains(&frontier_eid),
                 "expected missing frontier dep, got {missing:?}"
@@ -312,7 +312,7 @@ fn test_key_rotation_multi_parent_frontier_blocks_until_all_frontier_deps_arrive
     let rotation_eid = insert_event_raw(&conn, recorded_by, &rotation_blob);
 
     match project_one(&conn, recorded_by, &rotation_eid).unwrap() {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert!(
                 missing.contains(&left_eid),
                 "missing frontier should include left parent"
@@ -333,7 +333,7 @@ fn test_key_rotation_multi_parent_frontier_blocks_until_all_frontier_deps_arrive
     );
 
     match project_one(&conn, recorded_by, &rotation_eid).unwrap() {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert!(
                 !missing.contains(&left_eid),
                 "projected frontier dep should no longer be missing"

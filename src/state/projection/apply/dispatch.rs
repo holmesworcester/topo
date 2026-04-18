@@ -1,4 +1,4 @@
-use super::super::contract::{ProjectorDecisionContext, ProjectorResult};
+use super::super::projector::{ProjectorDecisionContext, ProjectorResult};
 use crate::event_modules::{registry, ParsedEvent};
 
 /// Dispatch to the appropriate pure projector via registry lookup.

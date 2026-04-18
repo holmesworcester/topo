@@ -88,7 +88,7 @@ pub fn deterministic_endpoint_secret_event_id(private_key_bytes: &[u8; 32]) -> [
     crate::crypto::hash_event(&blob)
 }
 
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::{Connection, OptionalExtension};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

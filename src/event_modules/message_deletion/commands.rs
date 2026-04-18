@@ -1,5 +1,5 @@
 use crate::crypto::EventId;
-use crate::projection::create::create_encrypted_event_synchronous;
+use crate::projection::create::create_encrypted_event;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
@@ -24,7 +24,7 @@ pub fn create(
     });
     let key_event_id =
         super::super::workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
-    let eid = create_encrypted_event_synchronous(
+    let eid = create_encrypted_event(
         db,
         recorded_by,
         &key_event_id,
@@ -75,8 +75,7 @@ mod tests {
     fn delete_message_returns_target_hex_for_created_message() {
         let conn = open_in_memory().expect("open in-memory db");
         create_tables(&conn).expect("create tables");
-        crate::transport::materialize_daemon_identity(&conn)
-            .expect("materialize daemon identity");
+        crate::transport::materialize_daemon_identity(&conn).expect("materialize daemon identity");
 
         let workspace =
             create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create ws");

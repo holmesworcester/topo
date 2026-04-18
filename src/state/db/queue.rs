@@ -130,7 +130,7 @@ pub fn backoff_ms(attempts: i64) -> i64 {
 
 /// Recover expired leases on a given table by clearing lease_until.
 ///
-/// Currently used by `ProjectQueue::recover_expired` to re-expose rows
+/// Currently used by `ProjectionQueue::recover_expired` to re-expose rows
 /// that were claimed but never acknowledged (for example after a crash).
 /// Returns the number of rows recovered.
 pub fn recover_expired_leases(

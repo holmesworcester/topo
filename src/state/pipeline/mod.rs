@@ -1,3 +1,8 @@
+//! Event ingest pipeline. Batches incoming blobs, runs the persist phase in a single
+//! SQLite transaction ([`phases`]), then drives post-commit effects ([`effects`]) and
+//! [`drain`]s the projection queue. The separation keeps WAL-write work tight so the
+//! sync engine's long-running reader connection does not contend with projection writes.
+
 mod drain;
 mod effects;
 mod phases;
@@ -11,6 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
+use crate::crypto::EventId;
 use crate::db::open_connection;
 use crate::db::store::{
     lookup_workspace_id, SQL_INSERT_EVENT, SQL_INSERT_RECORDED_EVENT,
@@ -25,6 +31,11 @@ use self::effects::{
 use self::phases::{run_persist_phase, PersistPhaseOutput};
 
 pub use self::drain::drain_project_queue;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImmediateIngestResult {
+    pub persisted_event_ids: Vec<EventId>,
+}
 
 fn ingest_is_bulk(item: &IngestItem) -> bool {
     events::outer_semantic_type_code(&item.1) == Some(events::EVENT_TYPE_FILE_SLICE)
@@ -316,10 +327,15 @@ pub fn batch_writer(
     }
 }
 
-pub fn ingest_now(db_path: &str, batch: Vec<IngestItem>) -> Result<usize, String> {
+pub fn ingest_now_result(
+    db_path: &str,
+    batch: Vec<IngestItem>,
+) -> Result<ImmediateIngestResult, String> {
     let mut batch = batch;
     if batch.is_empty() {
-        return Ok(0);
+        return Ok(ImmediateIngestResult {
+            persisted_event_ids: Vec::new(),
+        });
     }
 
 
@@ -380,13 +396,19 @@ pub fn ingest_now(db_path: &str, batch: Vec<IngestItem>) -> Result<usize, String
         &mut enqueue_stmt,
     );
     let effects_executor = SqlitePostCommitEffectsExecutor::new(&db);
-    let persisted_count = persist_output.persisted_event_ids.len();
+    let persisted_event_ids = persist_output.persisted_event_ids.clone();
     commit_and_run_post_commit_effects(&db, &persist_output, &effects_executor, drain_batch_size())
         .map_err(|e| {
             let _ = db.execute("ROLLBACK", []);
             format!("commit immediate ingest batch: {e}")
         })?;
-    Ok(persisted_count)
+    Ok(ImmediateIngestResult {
+        persisted_event_ids,
+    })
+}
+
+pub fn ingest_now(db_path: &str, batch: Vec<IngestItem>) -> Result<usize, String> {
+    ingest_now_result(db_path, batch).map(|result| result.persisted_event_ids.len())
 }
 
 pub fn ingest_one(db_path: &str, item: IngestItem) -> Result<(), String> {

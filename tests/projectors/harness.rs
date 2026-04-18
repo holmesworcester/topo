@@ -7,15 +7,15 @@
 pub mod fixtures {
     use topo::event_modules::{
         AdminEvent, DeviceInviteEvent, FileEvent, FileSliceEvent, InviteAcceptedEvent,
-        KeyRequestEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
-        UserInviteEvent, WorkspaceEvent,
+        KeyRequestEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent,
+        ReactionEvent, UserInviteEvent, WorkspaceEvent,
     };
-    use topo::projection::contract::{
+    use topo::projection::projector::{
         BootstrapDecisionContext, CurrentSignerInfo, EmitCommand, FileDescriptorInfo,
         ProjectorDecisionContext, ProjectorResult, WriteOp,
     };
     use topo::projection::decision::ProjectionDecision;
-    use topo::projection::queries::{
+    use topo::projection::decision_context::{
         ContextLoadResult, DepLoadResult, ProjectionFrameContext, ProjectionQueries,
     };
 
@@ -260,7 +260,7 @@ pub mod fixtures {
 
     pub fn assert_block(result: &ProjectorResult) {
         assert!(
-            matches!(result.decision, ProjectionDecision::Block { .. }),
+            matches!(result.decision, ProjectionDecision::BlockOnMissingDeps { .. }),
             "expected Block, got {:?}",
             result.decision
         );

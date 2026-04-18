@@ -160,7 +160,7 @@ pub fn encode_removal(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 }
 
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {

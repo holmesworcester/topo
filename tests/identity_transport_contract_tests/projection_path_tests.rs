@@ -4,7 +4,7 @@
 use topo::contracts::transport_identity_contract::TransportIdentitySpec;
 use topo::event_modules::peer_secret::PeerSecretEvent;
 use topo::event_modules::ParsedEvent;
-use topo::projection::contract::EmitCommand;
+use topo::projection::projector::EmitCommand;
 
 fn project(recorded_by: &str, event: &ParsedEvent) -> Vec<EmitCommand> {
     let result = topo::event_modules::peer_secret::project_pure(

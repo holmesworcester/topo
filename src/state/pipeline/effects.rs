@@ -1,4 +1,4 @@
-use crate::db::project_queue::ProjectQueue;
+use crate::db::projection_queue::ProjectionQueue;
 use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
 use super::drain::drain_project_queue_on_connection;
@@ -28,7 +28,7 @@ impl<'a> SqlitePostCommitEffectsExecutor<'a> {
 
 impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
     fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize) {
-        let pq = ProjectQueue::new(self.db);
+        let pq = ProjectionQueue::new(self.db);
 
         // First drain the origin tenants so removals in this batch are
         // projected before we fan out to siblings.

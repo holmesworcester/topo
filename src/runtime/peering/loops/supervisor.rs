@@ -13,12 +13,11 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::project_queue::ProjectQueue;
+use crate::db::projection_queue::ProjectionQueue;
 use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::repeated_warning::should_emit_globally;
-use crate::sync::session::receive_log::recover_receive_logs;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{
@@ -65,23 +64,12 @@ pub(super) fn run_startup_preflight(
     let db = open_connection(db_path)?;
     create_tables(&db)?;
 
-    let recovered_receive_logs = recover_receive_logs(db_path).unwrap_or_else(|e| {
-        tracing::warn!("receive log recovery failed: {}", e);
-        0
-    });
-    if recovered_receive_logs > 0 {
-        info!(
-            "Recovered {} event(s) from receive logs",
-            recovered_receive_logs
-        );
-    }
-
     let purged = purge_expired_endpoints(&db, current_timestamp_ms()).unwrap_or(0);
     if purged > 0 {
         info!("Purged {} expired endpoint observations", purged);
     }
 
-    let project_queue = ProjectQueue::new(&db);
+    let project_queue = ProjectionQueue::new(&db);
     let recovered = project_queue.recover_expired().unwrap_or(0);
     if recovered > 0 {
         info!("Recovered {} expired project_queue leases", recovered);

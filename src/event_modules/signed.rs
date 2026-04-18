@@ -117,7 +117,7 @@ pub fn encode_signed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     )
 }
 
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult};
 
 pub fn project_pure(
     _recorded_by: &str,

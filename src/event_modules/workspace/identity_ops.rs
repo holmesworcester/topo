@@ -15,7 +15,7 @@ use crate::event_modules::removal::{
 };
 use crate::event_modules::*;
 use crate::projection::create::{
-    create_event_synchronous, create_signed_event_synchronous, event_id_or_blocked,
+    create_event, create_signed_event, event_id_or_blocked,
     store_signed_event_then_project,
 };
 use crate::projection::encrypted::wrap_key_for_recipient;
@@ -79,7 +79,7 @@ pub(crate) fn ensure_local_tenant_event_at(
             created_at_ms,
             public_key: peer_key.verifying_key().to_bytes(),
         });
-        event_id_or_blocked(create_event_synchronous(conn, recorded_by, &tenant_evt))?
+        event_id_or_blocked(create_event(conn, recorded_by, &tenant_evt))?
     };
 
     Ok(tenant_event_id)
@@ -92,7 +92,7 @@ fn create_deterministic_key_secret_event(
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let expected = crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
     let sk_evt = crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes);
-    let created = create_event_synchronous(conn, recorded_by, &sk_evt)?;
+    let created = create_event(conn, recorded_by, &sk_evt)?;
     if created != expected {
         return Err("key_secret event_id mismatch for deterministic key material".into());
     }
@@ -349,7 +349,7 @@ fn ensure_rotation_for_key_frontier_at(
         rotated_by: authoring.signer_event_id,
     });
 
-    Ok(create_signed_event_synchronous(
+    Ok(create_signed_event(
         conn,
         recorded_by,
         &authoring.signer_event_id,
@@ -459,7 +459,7 @@ fn emit_key_shared_for_invite_target(
         unwrap_key_event_id: *unwrap_key_event_id,
         wrapped_key: wrapped,
     });
-    let created = event_id_or_blocked(create_signed_event_synchronous(
+    let created = event_id_or_blocked(create_signed_event(
         conn,
         recorded_by,
         sender_peer_shared_event_id,
@@ -779,7 +779,7 @@ pub(crate) fn store_invite_secret(
         *invite_event_id,
         private_key,
     );
-    let created = event_id_or_blocked(create_event_synchronous(conn, recorded_by, &evt))?;
+    let created = event_id_or_blocked(create_event(conn, recorded_by, &evt))?;
     if created != expected {
         return Err("invite_secret event_id mismatch for deterministic key material".into());
     }
@@ -829,7 +829,7 @@ fn create_invite_event_with_optional_bootstrap_context(
             },
         )?)
     } else {
-        Ok(create_signed_event_synchronous(
+        Ok(create_signed_event(
             conn,
             recorded_by,
             signer_event_id,

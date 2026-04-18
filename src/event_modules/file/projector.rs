@@ -1,7 +1,7 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::define_query_context_loader;
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::decision_context::define_query_context_loader;
 
 define_query_context_loader!(build_projector_context, File, load_file_context, "file");
 

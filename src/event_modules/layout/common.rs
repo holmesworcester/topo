@@ -56,11 +56,11 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     use super::super::key_shared::KEY_SHARED_WIRE_SIZE;
     use super::super::message::wire::MESSAGE_WIRE_SIZE;
     use super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
-    use super::super::peer_invite_shared::DEVICE_INVITE_WIRE_SIZE;
+    use super::super::device_invite::DEVICE_INVITE_WIRE_SIZE;
     use super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
     use super::super::reaction::REACTION_WIRE_SIZE;
     use super::super::user::USER_WIRE_SIZE;
-    use super::super::user_invite_shared::USER_INVITE_WIRE_SIZE;
+    use super::super::user_invite::USER_INVITE_WIRE_SIZE;
     use super::super::workspace::WORKSPACE_WIRE_SIZE;
 
     match inner_type_code {
@@ -241,12 +241,12 @@ mod tests {
         use super::super::super::key_shared::KEY_SHARED_WIRE_SIZE;
         use super::super::super::message::MESSAGE_WIRE_SIZE;
         use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
-        use super::super::super::peer_invite_shared::DEVICE_INVITE_WIRE_SIZE;
+        use super::super::super::device_invite::DEVICE_INVITE_WIRE_SIZE;
         use super::super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
         use super::super::super::tenant::TENANT_WIRE_SIZE;
         use super::super::super::user::USER_WIRE_SIZE;
-        use super::super::super::user_invite_shared::USER_INVITE_WIRE_SIZE;
+        use super::super::super::user_invite::USER_INVITE_WIRE_SIZE;
         use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
 
         assert_eq!(MESSAGE_WIRE_SIZE, 1097);

@@ -5,7 +5,7 @@ pub mod depsync;
 pub mod initiator;
 pub mod logging;
 pub mod range_session;
-pub mod receive_log;
+pub mod receive;
 pub mod responder;
 pub mod windowing;
 

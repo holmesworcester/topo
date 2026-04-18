@@ -15,17 +15,14 @@ use crate::runtime::sync_engine::session::depsync::{
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
-    open_live_suppression_session, send_selected_events, spawn_receive_log_task,
+    open_live_suppression_session, order_phase2_then_phase1_shared_event_ids_for_send_for_peer,
+    send_selected_events, spawn_receive_task,
 };
-use crate::sync::session::receive_log::{
-    acquire_peer_session_ingest_guard, enqueue_receive_log_ingest_waiter_with_priority_segment,
-    enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment,
-    note_hot_receive_finished, note_hot_receive_started, wait_for_receive_log_ingests,
-};
+use crate::sync::session::receive::{acquire_peer_session_ingest_guard, wait_for_ingest_waiters};
 use crate::sync::session::windowing::{
     decode_sync_window_kind, encode_initial_neg_open, is_low_mem_allowed_window,
-    is_priority_ingest_window, mark_outbound_window_completed,
-    restrict_outbound_windows_to_last_week, select_outbound_window, SyncWindowKind,
+    mark_outbound_window_completed, restrict_outbound_windows_to_last_week, select_outbound_window,
+    SyncWindowKind,
 };
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -265,8 +262,15 @@ where
     let mut phase2_have_ids = Vec::<Id>::new();
     let mut phase2_need_ids = Vec::<Id>::new();
     let phase2_used = !candidate_universe.is_empty();
+    let mut phase2_storage_items = Vec::<String>::new();
     if phase2_used {
         let phase2_storage = build_candidate_storage(&store, &candidate_universe)?;
+        if crate::runtime::sync_engine::session::range_session::trace_dep_send_ids_enabled() {
+            phase2_storage_items =
+                crate::runtime::sync_engine::session::range_session::trace_negentropy_storage_items(
+                    &phase2_storage,
+                )?;
+        }
         let mut phase2 = Negentropy::borrowed(&phase2_storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
         control
             .send(&Frame::NegMsg {
@@ -337,18 +341,49 @@ where
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &observed_need_ids, &mut pending_round_replies);
 
-    let mut send_event_ids = phase1_diff
+    let mut phase1_send_event_ids = phase1_diff
         .have_root_ids
         .iter()
         .map(neg_id_to_event_id)
         .collect::<Vec<_>>();
-    send_event_ids.extend(phase2_have_ids.iter().map(neg_id_to_event_id));
-    sort_dedup_event_ids(&mut send_event_ids);
-
-    let hot_receive = is_priority_ingest_window(range.kind);
-    if hot_receive {
-        note_hot_receive_started(db_path);
+    sort_dedup_event_ids(&mut phase1_send_event_ids);
+    let mut phase2_send_event_ids = phase2_have_ids
+        .iter()
+        .map(neg_id_to_event_id)
+        .collect::<Vec<_>>();
+    sort_dedup_event_ids(&mut phase2_send_event_ids);
+    let mut phase2_need_event_ids = phase2_need_ids
+        .iter()
+        .map(neg_id_to_event_id)
+        .collect::<Vec<_>>();
+    sort_dedup_event_ids(&mut phase2_need_event_ids);
+    let ordered_send_event_ids = order_phase2_then_phase1_shared_event_ids_for_send_for_peer(
+        &db,
+        recorded_by,
+        &ws_id,
+        range,
+        &phase2_send_event_ids,
+        &phase1_send_event_ids,
+    )?;
+    if crate::runtime::sync_engine::session::range_session::trace_dep_send_ids_enabled() {
+        debug!(
+            target: "topo::sync_operation",
+            session_id,
+            peer = %peer_id,
+            range = ?range.kind,
+            phase1_candidate_root_ids = ?crate::runtime::sync_engine::session::range_session::trace_event_id_list(&phase1_candidate_root_ids),
+            local_dep_candidates = ?crate::runtime::sync_engine::session::range_session::trace_event_id_list(&local_dep_candidates),
+            candidate_universe = ?crate::runtime::sync_engine::session::range_session::trace_event_id_list(&candidate_universe),
+            phase2_storage_items = ?phase2_storage_items,
+            phase2_have_ids = ?crate::runtime::sync_engine::session::range_session::trace_event_id_list(&phase2_send_event_ids),
+            phase2_need_ids = ?crate::runtime::sync_engine::session::range_session::trace_event_id_list(&phase2_need_event_ids),
+            phase2_send_ids = ?crate::runtime::sync_engine::session::range_session::trace_event_id_list(&phase2_send_event_ids),
+            phase1_send_ids = ?crate::runtime::sync_engine::session::range_session::trace_event_id_list(&phase1_send_event_ids),
+            ordered_send_ids = ?crate::runtime::sync_engine::session::range_session::trace_event_id_list(&ordered_send_event_ids),
+            "initiator dep-send trace"
+        );
     }
+
     let settle_between_batches = live_peer_ids.len() > 1;
     let (mut live_suppression, receive_live_suppression) = if let Some((session, receive_state)) =
         open_live_suppression_session(
@@ -364,7 +399,7 @@ where
     } else {
         (None, None)
     };
-    let receive_task = spawn_receive_log_task(
+    let receive_task = spawn_receive_task(
         data_recv,
         db_path.to_string(),
         recorded_by.to_string(),
@@ -377,12 +412,9 @@ where
         receive_live_suppression,
     );
     let (events_sent, bytes_sent) = send_selected_events(
-        &db,
         &store,
         &mut data_send,
-        &send_event_ids,
-        recorded_by,
-        &ws_id,
+        &ordered_send_event_ids,
         range,
         live_suppression.as_mut(),
     )
@@ -390,43 +422,11 @@ where
     drop(data_send);
 
     let received = match receive_task.await {
-        Ok(result) => result.map_err(|e| format!("receive log task: {e}"))?,
-        Err(e) => {
-            if hot_receive {
-                note_hot_receive_finished(db_path);
-            }
-            return Err(format!("receive log task join: {e}").into());
-        }
+        Ok(result) => result.map_err(|e| format!("receive task: {e}"))?,
+        Err(e) => return Err(format!("receive task join: {e}").into()),
     };
-    let mut ingest_waiters = received.ingest_waiters;
-    if let Some(path) = received.path {
-        let waiter = if let Some(pending_overlay) = received.pending_overlay {
-            enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment(
-                db_path,
-                path,
-                hot_receive,
-                received.final_priority_segment_ordinal,
-                pending_overlay,
-            )
-        } else {
-            enqueue_receive_log_ingest_waiter_with_priority_segment(
-                db_path,
-                path,
-                hot_receive,
-                received.final_priority_segment_ordinal,
-            )
-        }
-        .map_err(|e| format!("enqueue receive log ingest: {e}"))?;
-        ingest_waiters.push(waiter);
-    }
-    if let Err(e) = wait_for_receive_log_ingests(ingest_waiters).await {
-        if hot_receive {
-            note_hot_receive_finished(db_path);
-        }
-        return Err(format!("receive log ingest wait: {e}").into());
-    }
-    if hot_receive {
-        note_hot_receive_finished(db_path);
+    if let Err(e) = wait_for_ingest_waiters(received.ingest_waiters).await {
+        return Err(format!("direct ingest wait: {e}").into());
     }
     debug!(
         target: "topo::sync_operation",

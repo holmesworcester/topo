@@ -3,10 +3,32 @@ mod perf_network_shaper;
 
 use cli_harness::*;
 use perf_network_shaper::{NetworkProfile, UdpTrafficShaper};
+use serde_json::Value;
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+fn rpc_data(response: &Value) -> &Value {
+    assert!(
+        response["ok"].as_bool().unwrap_or(false),
+        "rpc response should be ok=true, got: {response}"
+    );
+    &response["data"]
+}
+
+fn event_list_items(data: &Value) -> &[Value] {
+    data["events"].as_array().map(Vec::as_slice).unwrap_or(&[])
+}
+
+fn encrypted_inner_type_event_ids(events: &[Value], inner_type: &str) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| event["event_type"].as_str() == Some("encrypted"))
+        .filter(|event| event["decrypted_inner"]["inner_type"].as_str() == Some(inner_type))
+        .filter_map(|event| event["id"].as_str().map(str::to_string))
+        .collect()
+}
 
 #[test]
 fn test_cli_incomplete_download_visible_before_completion() {
@@ -309,7 +331,7 @@ fn test_cli_live_message_during_large_file_sync() {
 }
 
 #[test]
-fn test_cli_topo_view_progress_advances_across_manual_refreshes() {
+fn test_cli_file_slice_projection_is_staggered_during_download() {
     hold_network_test_lock_for_binary();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir
@@ -324,7 +346,7 @@ fn test_cli_topo_view_progress_advances_across_manual_refreshes() {
         .to_str()
         .unwrap()
         .to_string();
-    let file_name = "manual-refresh-progress.bin";
+    let file_name = "projection-timeline-progress.bin";
     let source_path = tmpdir.path().join(file_name);
     let mut source_file = std::fs::File::create(&source_path).unwrap();
     let mut chunk = vec![0u8; 1024 * 1024];
@@ -353,9 +375,9 @@ fn test_cli_topo_view_progress_advances_across_manual_refreshes() {
         alice_real_addr,
         bob_bind_addr,
         NetworkProfile {
-            slug: "manual-refresh-progress",
-            title: "Manual Refresh Progress",
-            note: "Shaped link for manual topo view refresh progress assertions",
+            slug: "projection-timeline-progress",
+            title: "Projection Timeline Progress",
+            note: "Shaped link for projected_at stagger assertions during file sync",
             bandwidth_mbps_per_direction: 4.0,
             rtt_ms: 80,
             jitter_ms: 0,
@@ -412,7 +434,7 @@ fn test_cli_topo_view_progress_advances_across_manual_refreshes() {
             "--db",
             &alice_db,
             "send-file",
-            "manual refresh progress",
+            "projection timeline progress",
             "--file",
             source_path.to_str().unwrap(),
         ])
@@ -424,45 +446,66 @@ fn test_cli_topo_view_progress_advances_across_manual_refreshes() {
         String::from_utf8_lossy(&send_out.stderr)
     );
 
-    fn extract_incomplete_percent(snapshot: &str, file_name: &str) -> Option<u8> {
-        let line = snapshot
-            .lines()
-            .find(|line| line.contains("\u{23f3}") && line.contains(file_name))?;
-        let digits_rev: String = line
-            .split('%')
-            .next()?
-            .chars()
-            .rev()
-            .skip_while(|ch| !ch.is_ascii_digit())
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect();
-        let digits: String = digits_rev.chars().rev().collect();
-        digits.parse::<u8>().ok()
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut observed_progress = std::collections::BTreeSet::new();
-    let mut completed_snapshot = None;
-    while Instant::now() < deadline {
-        let view_snapshot = get_view_raw(&bob_db);
-        if let Some(percent) = extract_incomplete_percent(&view_snapshot, file_name) {
-            observed_progress.insert(percent);
-        }
-        if view_snapshot.contains(&format!("\u{2714}  {file_name}")) {
-            completed_snapshot = Some(view_snapshot);
-        }
-        if completed_snapshot.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    let completed_snapshot =
-        completed_snapshot.expect("topo view never showed the attachment as complete");
+    let expected_slice_count = (std::fs::metadata(&source_path).unwrap().len() as usize)
+        .div_ceil(topo::event_modules::file_slice::FILE_SLICE_DATA_BYTES);
+    let bob_events = assert_value_eventually(
+        Duration::from_secs(120),
+        Duration::from_millis(200),
+        "bob projects all file_slice events for the transferred file",
+        || rpc_method_json(&bob_db, r#"{"type":"EventList"}"#),
+        |response| {
+            let events = event_list_items(rpc_data(response));
+            encrypted_inner_type_event_ids(events, "file_slice").len() >= expected_slice_count
+        },
+    );
+    let file_slice_event_ids =
+        encrypted_inner_type_event_ids(event_list_items(rpc_data(&bob_events)), "file_slice");
     assert!(
-        observed_progress.len() >= 2,
-        "manual topo view refreshes should observe more than one incomplete percentage before completion, saw {:?}\nfinal snapshot:\n{}",
-        observed_progress,
-        completed_snapshot
+        file_slice_event_ids.len() >= expected_slice_count,
+        "expected at least {} projected file_slice events on Bob, got {}",
+        expected_slice_count,
+        file_slice_event_ids.len()
+    );
+
+    let projected_at_ms: Vec<i64> = file_slice_event_ids
+        .iter()
+        .map(|event_id| {
+            let response = rpc_method_json(
+                &bob_db,
+                &format!(r#"{{"type":"EventTimeline","event_id":"{}"}}"#, event_id),
+            );
+            rpc_data(&response)["projected_at_ms"]
+                .as_i64()
+                .unwrap_or_else(|| {
+                    panic!("missing projected_at_ms for file_slice event {event_id}")
+                })
+        })
+        .collect();
+    let min_projected_at = *projected_at_ms
+        .iter()
+        .min()
+        .expect("file_slice projected_at values should exist");
+    let max_projected_at = *projected_at_ms
+        .iter()
+        .max()
+        .expect("file_slice projected_at values should exist");
+    let distinct_projected_at = projected_at_ms
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    assert!(
+        distinct_projected_at >= 4,
+        "download projection should advance across multiple file_slice timeline entries, saw {} distinct projected_at values across {} slices: {:?}",
+        distinct_projected_at,
+        file_slice_event_ids.len(),
+        projected_at_ms
+    );
+    assert!(
+        max_projected_at - min_projected_at >= 1_000,
+        "file_slice projection should be staggered over at least 1s, saw span={}ms across {} slices",
+        max_projected_at - min_projected_at,
+        file_slice_event_ids.len()
     );
 }

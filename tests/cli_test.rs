@@ -2660,8 +2660,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     let phone_base_eid = send_message(&phone.db, phone_base);
     assert_event_visible_on_all(&[&phone.db], &phone_base_eid, timeout_ms);
 
-    let laptop =
-        start_linked_discovery_cli_peer(&tmpdir, "laptop.db", &link_a, "alice", "laptop");
+    let laptop = start_linked_discovery_cli_peer(&tmpdir, "laptop.db", &link_a, "alice", "laptop");
     let laptop_tenant = laptop.tenant_label();
     assert_identity_eventually_materialized(&laptop.db, timeout_ms);
     assert_event_visible_on_all(&[&laptop.db], &phone_base_eid, timeout_ms);
@@ -2670,8 +2669,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     assert_event_visible_on_all(&[&phone.db, &laptop.db], &laptop_eid, timeout_ms);
 
     let link_b = create_device_link(&laptop.db, &daemon_listen_addr(&laptop.db));
-    let tablet =
-        start_linked_discovery_cli_peer(&tmpdir, "tablet.db", &link_b, "alice", "tablet");
+    let tablet = start_linked_discovery_cli_peer(&tmpdir, "tablet.db", &link_b, "alice", "tablet");
     let tablet_tenant = tablet.tenant_label();
     assert_identity_eventually_materialized(&tablet.db, timeout_ms);
     assert_event_visible_on_all(&[&tablet.db], &phone_base_eid, timeout_ms);

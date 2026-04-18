@@ -100,7 +100,7 @@ pub fn encode_bench_dep(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 // === Projector (event-module locality) ===
 
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult};
 
 /// Pure projector: BenchDep — no projection table, valid_events tracks completion.
 pub fn project_pure(

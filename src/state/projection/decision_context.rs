@@ -6,7 +6,7 @@ use crate::event_modules::{
     UserInviteEvent, WorkspaceEvent, EVENT_TYPE_ADMIN, EVENT_TYPE_DEVICE_INVITE,
     EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
 };
-use crate::projection::contract::{
+use crate::projection::projector::{
     BootstrapDecisionContext, CurrentSignerInfo, DeletionIntentInfo, FileDescriptorInfo,
     ProjectorDecisionContext, UnwrappedSecretMaterial,
 };
@@ -1115,12 +1115,12 @@ pub trait ProjectionQueries {
 macro_rules! define_query_context_loader {
     ($fn_name:ident, $variant:ident, $query_method:ident, $label:literal) => {
         pub fn $fn_name(
-            queries: &dyn $crate::projection::queries::ProjectionQueries,
-            frame: &$crate::projection::queries::ProjectionFrameContext,
+            queries: &dyn $crate::projection::decision_context::ProjectionQueries,
+            frame: &$crate::projection::decision_context::ProjectionFrameContext,
             recorded_by: &str,
             event_id_b64: &str,
             parsed: &$crate::event_modules::ParsedEvent,
-        ) -> Result<$crate::projection::queries::ContextLoadResult, Box<dyn std::error::Error>> {
+        ) -> Result<$crate::projection::decision_context::ContextLoadResult, Box<dyn std::error::Error>> {
             let event = match parsed {
                 $crate::event_modules::ParsedEvent::$variant(event) => event,
                 _ => {
@@ -1130,7 +1130,7 @@ macro_rules! define_query_context_loader {
                 }
             };
 
-            Ok($crate::projection::queries::ContextLoadResult::ready(
+            Ok($crate::projection::decision_context::ContextLoadResult::ready(
                 queries.$query_method(frame, recorded_by, event_id_b64, event)?,
             ))
         }

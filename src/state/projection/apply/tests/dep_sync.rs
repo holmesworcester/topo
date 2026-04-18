@@ -421,6 +421,117 @@ fn today_bench_dep_range_storage_dedupes_shared_long_tail_across_many_hot_roots(
 }
 
 #[test]
+fn blocked_shared_root_persists_missing_dep_edges_for_dep_sync() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+    let recorded_by = "tenant-blocked-dep-sync";
+
+    let _ = make_identity_chain(&conn, recorded_by);
+    let workspace_id =
+        crate::db::store::lookup_workspace_id(&conn, recorded_by).expect("workspace binding");
+    let now_ms = crate::db::queue::current_timestamp_ms();
+    let missing_dep = [0x77; 32];
+
+    let blob = events::encode_event(&ParsedEvent::BenchDep(BenchDepEvent {
+        created_at_ms: now_ms.max(0) as u64,
+        dep_ids: vec![missing_dep],
+        payload: [0x44; 16],
+    }))
+    .unwrap();
+    let blocked_root = insert_event_raw(&conn, recorded_by, &blob);
+
+    match project_one(&conn, recorded_by, &blocked_root).unwrap() {
+        ProjectionDecision::Block { missing } => assert_eq!(missing, vec![missing_dep]),
+        other => panic!("expected blocked projection, got {:?}", other),
+    }
+    reindex_shared_event_at(&conn, &workspace_id, blocked_root, now_ms);
+
+    let blocked_workspace_id: String = conn
+        .query_row(
+            "SELECT workspace_id
+             FROM blocked_events
+             WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, event_id_to_base64(&blocked_root)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocked_workspace_id, workspace_id);
+
+    assert_eq!(
+        list_shared_event_deps(&conn, &workspace_id, &blocked_root).unwrap(),
+        vec![missing_dep],
+        "blocked shared roots should retain their missing dep edges for phase2 dep sync"
+    );
+
+    let storage = build_range_dep_storage(
+        &conn,
+        "/tmp/blocked-shared-root-dep-sync.db",
+        &workspace_id,
+        SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(now_ms - DAY_MS),
+            ts_max_exclusive_ms: Some(now_ms + DAY_MS),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        storage.dep_candidate_ids_for_roots(&[blocked_root]),
+        vec![missing_dep],
+        "phase2 should surface missing deps for blocked shared roots already present in shared_event_index"
+    );
+}
+
+#[test]
+fn blocked_shared_root_uses_indexed_workspace_when_invite_binding_is_missing() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+    let recorded_by = "tenant-blocked-indexed-workspace";
+
+    let _ = make_identity_chain(&conn, recorded_by);
+    let workspace_id =
+        crate::db::store::lookup_workspace_id(&conn, recorded_by).expect("workspace binding");
+    let now_ms = crate::db::queue::current_timestamp_ms();
+    let missing_dep = [0x88; 32];
+
+    let blob = events::encode_event(&ParsedEvent::BenchDep(BenchDepEvent {
+        created_at_ms: now_ms.max(0) as u64,
+        dep_ids: vec![missing_dep],
+        payload: [0x55; 16],
+    }))
+    .unwrap();
+    let blocked_root = insert_event_raw(&conn, recorded_by, &blob);
+    reindex_shared_event_at(&conn, &workspace_id, blocked_root, now_ms);
+    conn.execute(
+        "DELETE FROM invites_accepted WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .unwrap();
+
+    match project_one(&conn, recorded_by, &blocked_root).unwrap() {
+        ProjectionDecision::Block { missing } => assert_eq!(missing, vec![missing_dep]),
+        other => panic!("expected blocked projection, got {:?}", other),
+    }
+
+    let blocked_workspace_id: String = conn
+        .query_row(
+            "SELECT workspace_id
+             FROM blocked_events
+             WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, event_id_to_base64(&blocked_root)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocked_workspace_id, workspace_id);
+
+    assert_eq!(
+        list_shared_event_deps(&conn, &workspace_id, &blocked_root).unwrap(),
+        vec![missing_dep],
+        "blocked shared roots should resolve workspace from shared_event_index when invites_accepted is not ready"
+    );
+}
+
+#[test]
 fn old_range_storage_disables_dep_expansion() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();

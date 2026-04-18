@@ -1,3 +1,8 @@
+//! Event type registry, wire-format parsing, and the `ParsedEvent` enum that flows through
+//! the projection pipeline. One submodule per event type; shared helpers live in
+//! [`layout`] and [`registry`]. `registry()` builds the static table consulted by the
+//! pipeline to parse, encrypt-wrap, and project each type.
+
 pub mod admin;
 pub mod bench_dep;
 pub mod encrypted;
@@ -14,7 +19,7 @@ pub mod key_shared;
 pub mod layout;
 pub mod message;
 pub mod message_deletion;
-pub mod peer_invite_shared;
+pub mod device_invite;
 pub mod peer_secret;
 pub mod peer_shared;
 pub mod reaction;
@@ -23,7 +28,7 @@ pub mod removal;
 pub mod signed;
 pub mod tenant;
 pub mod user;
-pub mod user_invite_shared;
+pub mod user_invite;
 pub mod workspace;
 
 use rusqlite::Connection;
@@ -68,7 +73,7 @@ pub use key_secret::KeySecretEvent;
 pub use key_shared::KeySharedEvent;
 pub use message::MessageEvent;
 pub use message_deletion::MessageDeletionEvent;
-pub use peer_invite_shared::DeviceInviteEvent;
+pub use device_invite::DeviceInviteEvent;
 pub use peer_secret::PeerSecretEvent;
 pub use peer_shared::PeerSharedEvent;
 pub use reaction::ReactionEvent;
@@ -77,7 +82,7 @@ pub use removal::RemovalEvent;
 pub use signed::SignedEvent;
 pub use tenant::TenantEvent;
 pub use user::UserEvent;
-pub use user_invite_shared::UserInviteEvent;
+pub use user_invite::UserInviteEvent;
 pub use workspace::WorkspaceEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
@@ -122,8 +127,8 @@ pub fn outer_semantic_type_code(blob: &[u8]) -> Option<u8> {
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     workspace::ensure_schema(conn)?;
     invite_accepted::ensure_schema(conn)?;
-    user_invite_shared::ensure_schema(conn)?;
-    peer_invite_shared::ensure_schema(conn)?;
+    user_invite::ensure_schema(conn)?;
+    device_invite::ensure_schema(conn)?;
     user::ensure_schema(conn)?;
     peer_shared::ensure_schema(conn)?;
     admin::ensure_schema(conn)?;
@@ -455,8 +460,8 @@ pub fn registry() -> &'static EventRegistry {
             &removal::REMOVAL_META,
             &key_rotation::KEY_ROTATION_META,
             &key_request::KEY_REQUEST_META,
-            &user_invite_shared::USER_INVITE_META,
-            &peer_invite_shared::DEVICE_INVITE_META,
+            &user_invite::USER_INVITE_META,
+            &device_invite::DEVICE_INVITE_META,
             &user::USER_META,
             &peer_shared::PEER_SHARED_META,
             &admin::ADMIN_META,

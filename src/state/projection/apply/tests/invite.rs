@@ -35,7 +35,7 @@ fn test_raw_unprojected_invite_blob_does_not_materialize_trust() {
     // Simulate raw ingress that writes directly to events/recorded_events but never
     // runs projection. Presence in storage alone must not create any trust rows.
     let fake_workspace_id: [u8; 32] = [0xAA; 32];
-    let mut fake_blob = vec![10u8]; // user_invite_shared type code
+    let mut fake_blob = vec![10u8]; // user_invite type code
     fake_blob.extend_from_slice(&[0u8; 40]); // created_at_ms(8) + public_key(32)
     fake_blob.extend_from_slice(&fake_workspace_id); // workspace_id bytes
     fake_blob.extend_from_slice(&[0u8; 97]); // rest of the fixed-size blob
@@ -45,7 +45,7 @@ fn test_raw_unprojected_invite_blob_does_not_materialize_trust() {
 
     conn.execute(
         "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, 'user_invite_shared', ?2, 'shared', 0, 0)",
+         VALUES (?1, 'user_invite', ?2, 'shared', 0, 0)",
         rusqlite::params![&fake_b64, &fake_blob],
     )
     .unwrap();

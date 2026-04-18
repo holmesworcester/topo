@@ -1,4 +1,4 @@
-use super::super::contract::{EmitCommand, SqlVal, WriteOp};
+use super::super::projector::{EmitCommand, SqlVal, WriteOp};
 use crate::crypto::event_id_from_base64;
 use rusqlite::Connection;
 use topo_verus_proofs::state::projection::apply::tenant_isolation::{
@@ -213,7 +213,7 @@ pub(crate) fn execute_emit_commands(
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
             EmitCommand::EmitDeterministicBlob { blob } => {
-                let _ = crate::projection::emit::emit_deterministic_blob(conn, recorded_by, blob)?;
+                let _ = crate::projection::create::emit_deterministic_blob(conn, recorded_by, blob)?;
             }
         }
     }

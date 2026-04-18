@@ -12,7 +12,7 @@ use crate::event_modules::removal::{
 use crate::event_modules::workspace::load_local_authoring_context;
 use crate::event_modules::ParsedEvent;
 use crate::projection::create::{
-    create_encrypted_event_synchronous, create_event_synchronous, create_signed_event_synchronous,
+    create_encrypted_event, create_event, create_signed_event,
 };
 pub(crate) use crate::runtime::key_repair::{
     current_local_logical_frontier, has_key_rotation_for_frontier, key_shared_target,
@@ -34,7 +34,7 @@ pub fn seed_deterministic_key_secret(
     crate::db::schema::create_tables(&conn)?;
     let event = deterministic_key_secret_event(key_bytes);
     let expected = deterministic_key_secret_event_id(&key_bytes);
-    let created = create_event_synchronous(&conn, recorded_by, &event)?;
+    let created = create_event(&conn, recorded_by, &event)?;
     if created != expected {
         return Err("deterministic key_secret event_id mismatch".into());
     }
@@ -58,7 +58,7 @@ pub fn create_encrypted_message_with_key(
         author_id: authoring.author_id,
         content: content.to_string(),
     });
-    Ok(create_encrypted_event_synchronous(
+    Ok(create_encrypted_event(
         &conn,
         recorded_by,
         key_event_id,
@@ -96,7 +96,7 @@ pub fn create_removal(
         frontier_hash: frontier_hash_from_refs(parent_refs),
         removed_by: authoring.signer_event_id,
     });
-    Ok(create_signed_event_synchronous(
+    Ok(create_signed_event(
         &conn,
         recorded_by,
         &authoring.signer_event_id,
@@ -134,7 +134,7 @@ pub fn create_key_rotation(
         frontier_hash: frontier_hash_from_refs(frontier_refs),
         rotated_by: authoring.signer_event_id,
     });
-    Ok(create_signed_event_synchronous(
+    Ok(create_signed_event(
         &conn,
         recorded_by,
         &authoring.signer_event_id,
@@ -165,7 +165,7 @@ fn ensure_key_rotation_exists(
         frontier_hash: frontier.frontier_hash,
         rotated_by: authoring.signer_event_id,
     });
-    let _ = create_signed_event_synchronous(
+    let _ = create_signed_event(
         conn,
         recorded_by,
         &authoring.signer_event_id,

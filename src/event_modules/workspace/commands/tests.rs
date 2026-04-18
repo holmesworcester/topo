@@ -3,7 +3,7 @@ use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_in_memory, schema::create_tables};
 use crate::event_modules::workspace::command_plans;
 use crate::event_modules::{parse_event, ParsedEvent, RemovalEvent};
-use crate::projection::create::create_signed_event_synchronous;
+use crate::projection::create::create_signed_event;
 use ed25519_dalek::SigningKey;
 
 fn peer_id_for_signing_key(key: &SigningKey) -> String {
@@ -62,7 +62,7 @@ fn create_local_removal(
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&slots),
         removed_by: *signer_event_id,
     });
-    create_signed_event_synchronous(conn, recorded_by, signer_event_id, &removal, signing_key)
+    create_signed_event(conn, recorded_by, signer_event_id, &removal, signing_key)
         .expect("create signed removal")
 }
 

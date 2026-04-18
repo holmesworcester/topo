@@ -20,7 +20,7 @@ mod tests {
     use topo::event_modules::peer_secret::{project_pure as project_peer_secret, PeerSecretEvent};
     use topo::event_modules::tenant::{project_pure as project_tenant, TenantEvent};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::{EmitCommand, SqlVal, WriteOp};
+    use topo::projection::projector::{EmitCommand, SqlVal, WriteOp};
     use topo::shared::contracts::transport_identity_contract::TransportIdentitySpec;
 
     const EVENT_ID: &str = "root_identity_event";
@@ -34,7 +34,7 @@ mod tests {
     }
 
     fn insert_op<'a>(
-        result: &'a topo::projection::contract::ProjectorResult,
+        result: &'a topo::projection::projector::ProjectorResult,
         table: &str,
     ) -> &'a WriteOp {
         result

@@ -1,3 +1,7 @@
+//! `peer_shared` event (type 16): publicly-visible binding of a user to a transport
+//! endpoint. Conceptually today's "account_shared"; the wire `type_name` is preserved for
+//! durable on-the-wire compatibility. See the canonical-naming note in DESIGN.md.
+
 pub mod projector;
 pub mod queries;
 pub mod wire;

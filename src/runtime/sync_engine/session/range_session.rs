@@ -1,25 +1,20 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use negentropy::{Id, NegentropyStorageVector};
-use rusqlite::{Connection, OptionalExtension};
+use negentropy::{Id, NegentropyStorageBase, NegentropyStorageVector};
+use rusqlite::Connection;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tracing::debug;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::negentropy_cache::{sum_day_epochs, sum_week_epochs};
+use crate::db::queue::current_timestamp_ms;
 use crate::db::store::Store;
 use crate::protocol::{neg_id_to_event_id, Frame, MSG_TYPE_EVENT};
 use crate::sync::session::logging::SyncRunRxCapture;
-use crate::sync::session::receive_log::{
-    enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment,
-    load_pending_receive_overlay_entries, next_pending_receive_overlay_session_id,
-    open_pending_receive_overlay_session, record_pending_receive_overlay_entries,
-    PendingReceiveOverlayEntry, PendingReceiveOverlayGuard, PendingReceiveOverlaySession,
-    ReceiveLogIngestWaiter, ReceiveLogWriter,
-};
+use crate::sync::session::receive::{enqueue_direct_ingest_waiter, IngestWaiter};
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 
 use topo_verus_proofs::runtime::sync_engine::session::range_session::{
@@ -41,169 +36,133 @@ use crate::tuning::{
 const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
 const LIVE_SUPPRESSION_PREFETCH_IDS: usize = 32;
 const LOW_MEM_LIVE_SUPPRESSION_PREFETCH_IDS: usize = 8;
-const LASTDAY_RECEIVE_LOG_ROLLOVER_BYTES: u64 = 512 * 1024;
+const DIRECT_RECEIVE_BATCH_ITEM_CAP: usize = 8192;
+const DIRECT_RECEIVE_LARGE_BLOB_THRESHOLD_BYTES: usize = 64 * 1024;
+const DIRECT_RECEIVE_LARGE_BLOB_BATCH_MAX_BYTES: usize = 256 * 1024;
+const DIRECT_RECEIVE_SMALL_BLOB_BATCH_MAX_BYTES: usize = 1024 * 1024;
+fn sync_order_profile_enabled() -> bool {
+    std::env::var_os("TOPO_SYNC_ORDER_PROFILE").is_some()
+}
+
+pub(crate) fn trace_dep_send_ids_enabled() -> bool {
+    std::env::var_os("TOPO_TRACE_DEP_SEND_IDS").is_some()
+}
+
+pub(crate) fn trace_event_id_list(ids: &[EventId]) -> Vec<String> {
+    ids.iter()
+        .map(|event_id| crate::crypto::event_id_to_base64(event_id))
+        .collect()
+}
+
+pub(crate) fn trace_negentropy_storage_items(
+    storage: &NegentropyStorageVector,
+) -> Result<Vec<String>, negentropy::Error> {
+    let size = storage.size()?;
+    let mut items = Vec::with_capacity(size);
+    storage.iterate(0, size, &mut |item, _| {
+        items.push(format!(
+            "{}:{}",
+            item.timestamp,
+            crate::crypto::event_id_to_base64(&item.id.to_bytes())
+        ));
+        Ok(true)
+    })?;
+    Ok(items)
+}
 
 pub struct RangeReceiveResult {
     pub events_received: u64,
     pub bytes_received: u64,
-    pub path: Option<PathBuf>,
-    pub pending_overlay: Option<PendingReceiveOverlaySession>,
-    pub final_priority_segment_ordinal: Option<u64>,
-    pub ingest_waiters: Vec<ReceiveLogIngestWaiter>,
+    pub ingest_waiters: Vec<IngestWaiter>,
 }
 
-struct ReceiveLogSegmentBuffer {
+struct DirectReceiveBatchBuffer {
     db_path: String,
     recorded_by: String,
-    workspace_id: String,
-    range: SyncWindow,
-    session_id: u64,
     source_tag: String,
-    priority_ingest: bool,
-    current_segment_ordinal: u64,
-    writer: Option<ReceiveLogWriter>,
-    pending_overlay: Option<PendingReceiveOverlayGuard>,
-    pending_overlay_entries: Vec<PendingReceiveOverlayEntry>,
-    ingest_waiters: Vec<ReceiveLogIngestWaiter>,
+    live_suppression_publish: Option<(LiveSuppressionCohortKey, u64)>,
+    batch: Vec<crate::contracts::event_pipeline_contract::IngestItem>,
+    batch_bytes: usize,
+    batch_has_large_blob: bool,
+    ingest_waiters: Vec<IngestWaiter>,
 }
 
-impl ReceiveLogSegmentBuffer {
+impl DirectReceiveBatchBuffer {
     fn open(
         db_path: String,
         recorded_by: String,
-        workspace_id: String,
-        range: SyncWindow,
-        session_id: u64,
         source_tag: String,
-    ) -> Result<Self, String> {
-        let priority_ingest = matches!(range.kind, SyncWindowKind::LastDay);
-        let mut this = Self {
+        live_suppression_publish: Option<(LiveSuppressionCohortKey, u64)>,
+    ) -> Self {
+        Self {
             db_path,
             recorded_by,
-            workspace_id,
-            range,
-            session_id,
             source_tag,
-            priority_ingest,
-            current_segment_ordinal: 0,
-            writer: None,
-            pending_overlay: None,
-            pending_overlay_entries: Vec::new(),
+            live_suppression_publish,
+            batch: Vec::with_capacity(DIRECT_RECEIVE_BATCH_ITEM_CAP),
+            batch_bytes: 0,
+            batch_has_large_blob: false,
             ingest_waiters: Vec::new(),
-        };
-        this.open_segment()?;
-        Ok(this)
+        }
     }
 
-    fn open_segment(&mut self) -> Result<(), String> {
-        self.writer = Some(ReceiveLogWriter::open(
-            &self.db_path,
-            &self.recorded_by,
-            self.session_id,
-            &self.source_tag,
-        )?);
-        self.pending_overlay = Some(open_pending_receive_overlay_session(
-            &self.db_path,
-            &self.workspace_id,
-            self.range.kind,
-            next_pending_receive_overlay_session_id(),
+    fn append_blob(&mut self, event_id: &EventId, blob: &[u8], created_at_ms: Option<i64>) {
+        self.batch_bytes = self.batch_bytes.saturating_add(blob.len());
+        self.batch_has_large_blob |= blob.len() >= DIRECT_RECEIVE_LARGE_BLOB_THRESHOLD_BYTES;
+        self.batch.push((
+            *event_id,
+            blob.to_vec(),
+            self.recorded_by.clone(),
+            self.source_tag.clone(),
+            current_timestamp_ms(),
+            0,
         ));
-        Ok(())
-    }
-
-    fn append_blob(
-        &mut self,
-        event_id: &EventId,
-        blob: &[u8],
-        overlay_entry: Option<PendingReceiveOverlayEntry>,
-    ) -> Result<(), String> {
-        if let Some(entry) = overlay_entry {
-            self.pending_overlay_entries.push(entry);
+        if let (Some((key, session_id)), Some(created_at_ms)) =
+            (&self.live_suppression_publish, created_at_ms)
+        {
+            publish_live_suppression_event(key, *session_id, *event_id, created_at_ms);
         }
-        self.writer
-            .as_mut()
-            .expect("receive log segment should be open")
-            .append_blob(event_id, blob)?;
-        if self.should_roll() {
-            self.seal_current_segment_for_background_ingest()?;
-            self.open_segment()?;
-        }
-        Ok(())
     }
 
-    fn should_roll(&self) -> bool {
-        self.range.kind == SyncWindowKind::LastDay
-            && self
-                .writer
-                .as_ref()
-                .map(|writer| writer.bytes_written() >= LASTDAY_RECEIVE_LOG_ROLLOVER_BYTES)
-                .unwrap_or(false)
+    fn should_flush(&self) -> bool {
+        self.batch.len() >= DIRECT_RECEIVE_BATCH_ITEM_CAP
+            || self.batch_bytes >= self.batch_max_bytes()
     }
 
-    fn seal_current_segment_for_background_ingest(&mut self) -> Result<(), String> {
-        let writer = self
-            .writer
-            .take()
-            .expect("receive log segment writer should be present");
-        let pending_overlay = self
-            .pending_overlay
-            .take()
-            .expect("receive log overlay should be present");
-        let path = writer.finish()?;
-        if let Some(path) = path {
-            record_pending_receive_overlay_entries(
-                pending_overlay.session(),
-                std::mem::take(&mut self.pending_overlay_entries),
-            );
-            let waiter =
-                enqueue_receive_log_ingest_with_pending_overlay_waiter_with_priority_segment(
-                    &self.db_path,
-                    path,
-                    self.priority_ingest,
-                    self.priority_ingest.then_some(self.current_segment_ordinal),
-                    pending_overlay.into_session(),
-                )?;
-            self.ingest_waiters.push(waiter);
-        }
-        self.current_segment_ordinal = self.current_segment_ordinal.saturating_add(1);
-        Ok(())
-    }
-
-    fn finish(
-        mut self,
-    ) -> Result<
-        (
-            Option<PathBuf>,
-            Option<PendingReceiveOverlaySession>,
-            Option<u64>,
-            Vec<ReceiveLogIngestWaiter>,
-        ),
-        String,
-    > {
-        let writer = self
-            .writer
-            .take()
-            .expect("receive log segment writer should be present");
-        let pending_overlay = self
-            .pending_overlay
-            .take()
-            .expect("receive log overlay should be present");
-        let path = writer.finish()?;
-        let pending_overlay = if path.is_some() {
-            record_pending_receive_overlay_entries(
-                pending_overlay.session(),
-                std::mem::take(&mut self.pending_overlay_entries),
-            );
-            Some(pending_overlay.into_session())
+    fn batch_max_bytes(&self) -> usize {
+        if self.batch_has_large_blob {
+            DIRECT_RECEIVE_LARGE_BLOB_BATCH_MAX_BYTES
         } else {
-            None
-        };
-        Ok((
-            path,
-            pending_overlay,
-            self.priority_ingest.then_some(self.current_segment_ordinal),
-            self.ingest_waiters,
-        ))
+            DIRECT_RECEIVE_SMALL_BLOB_BATCH_MAX_BYTES
+        }
+    }
+
+    async fn flush(&mut self) -> Result<(), String> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut self.batch);
+        self.batch_bytes = 0;
+        self.batch_has_large_blob = false;
+        let direct_waiter = enqueue_direct_ingest_waiter(&self.db_path, batch)
+            .await
+            .map_err(|e| format!("enqueue direct ingest batch: {e}"))?;
+        let (completion_tx, completion_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = match direct_waiter.await {
+                Ok(Ok(result)) => Ok(result.persisted_event_ids.len()),
+                Ok(Err(e)) => Err(format!("direct ingest batch: {e}")),
+                Err(e) => Err(format!("direct ingest waiter dropped: {e}")),
+            };
+            let _ = completion_tx.send(result);
+        });
+        self.ingest_waiters.push(completion_rx);
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<Vec<IngestWaiter>, String> {
+        self.flush().await?;
+        Ok(self.ingest_waiters)
     }
 }
 
@@ -445,118 +404,13 @@ fn load_cached_shared_event_index_slice(
     Ok(storage)
 }
 
-fn pending_entries_in_range(
-    db_path: &str,
-    workspace_id: &str,
-    range: SyncWindow,
-) -> Vec<PendingReceiveOverlayEntry> {
-    load_pending_receive_overlay_entries(db_path, workspace_id, range.kind)
-        .into_iter()
-        .filter(|pending| sync_window_contains_ts(range, pending.created_at_ms))
-        .collect()
-}
-
-fn sync_window_contains_ts(range: SyncWindow, created_at_ms: i64) -> bool {
-    if range
-        .ts_min()
-        .map(|ts_min| created_at_ms < ts_min)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    if range
-        .ts_max_exclusive()
-        .map(|ts_max| created_at_ms >= ts_max)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    true
-}
-
-fn load_shared_sync_entries_with_pending(
-    conn: &Connection,
-    db_path: &str,
-    workspace_id: &str,
-    range: SyncWindow,
-) -> Result<Vec<(i64, EventId)>, String> {
-    let mut entries = load_shared_sync_entries(conn, workspace_id, range)?;
-    let mut seen = entries
-        .iter()
-        .map(|(_, event_id)| *event_id)
-        .collect::<HashSet<_>>();
-
-    for pending in load_pending_receive_overlay_entries(db_path, workspace_id, range.kind) {
-        if sync_window_contains_ts(range, pending.created_at_ms) && seen.insert(pending.event_id) {
-            entries.push((pending.created_at_ms, pending.event_id));
-        }
-    }
-
-    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    Ok(entries)
-}
-
-fn load_workspace_index_membership_with_pending(
-    conn: &Connection,
-    db_path: &str,
-    workspace_id: &str,
-    range: SyncWindow,
-    ids: &[EventId],
-) -> Result<HashSet<EventId>, String> {
-    let mut known = load_workspace_index_membership(conn, workspace_id, range, ids)?;
-    if ids.is_empty() {
-        return Ok(known);
-    }
-
-    let requested = ids.iter().copied().collect::<HashSet<_>>();
-    for pending in pending_entries_in_range(db_path, workspace_id, range) {
-        if requested.contains(&pending.event_id) {
-            known.insert(pending.event_id);
-        }
-    }
-    Ok(known)
-}
-
 pub fn load_shared_event_index_slice(
     conn: &Connection,
     db_path: &str,
     workspace_id: &str,
     range: SyncWindow,
 ) -> Result<Arc<NegentropyStorageVector>, String> {
-    let pending = pending_entries_in_range(db_path, workspace_id, range);
-    let base = load_cached_shared_event_index_slice(conn, db_path, workspace_id, range)?;
-    if pending.is_empty() {
-        return Ok(base);
-    }
-
-    let pending_ids = pending
-        .iter()
-        .map(|entry| entry.event_id)
-        .collect::<Vec<_>>();
-    let existing_ids = load_workspace_index_membership(conn, workspace_id, range, &pending_ids)?;
-    let mut seen_pending = HashSet::new();
-
-    let mut storage = base.as_ref().clone();
-    storage
-        .unseal()
-        .map_err(|e| format!("unseal negentropy vector storage: {e}"))?;
-    for pending_entry in pending {
-        if existing_ids.contains(&pending_entry.event_id)
-            || !seen_pending.insert(pending_entry.event_id)
-        {
-            continue;
-        }
-        storage
-            .insert(
-                pending_entry.created_at_ms.max(0) as u64,
-                Id::from_byte_array(pending_entry.event_id),
-            )
-            .map_err(|e| format!("insert pending negentropy vector item: {e}"))?;
-    }
-    storage
-        .seal()
-        .map_err(|e| format!("reseal negentropy vector storage: {e}"))?;
-    Ok(Arc::new(storage))
+    load_cached_shared_event_index_slice(conn, db_path, workspace_id, range)
 }
 
 pub fn load_shared_send_batch(
@@ -584,19 +438,14 @@ pub fn load_shared_send_batch(
 
 pub fn list_missing_shared_event_ids_for_range(
     source_conn: &Connection,
-    source_db_path: &str,
+    _source_db_path: &str,
     source_workspace_id: &str,
     dest_conn: &Connection,
-    dest_db_path: &str,
+    _dest_db_path: &str,
     dest_workspace_id: &str,
     range: SyncWindow,
 ) -> Result<Vec<EventId>, String> {
-    let source_entries = load_shared_sync_entries_with_pending(
-        source_conn,
-        source_db_path,
-        source_workspace_id,
-        range,
-    )?;
+    let source_entries = load_shared_sync_entries(source_conn, source_workspace_id, range)?;
     if source_entries.is_empty() {
         return Ok(Vec::new());
     }
@@ -605,13 +454,8 @@ pub fn list_missing_shared_event_ids_for_range(
         .iter()
         .map(|(_, event_id)| *event_id)
         .collect::<Vec<_>>();
-    let known_dest = load_workspace_index_membership_with_pending(
-        dest_conn,
-        dest_db_path,
-        dest_workspace_id,
-        range,
-        &source_ids,
-    )?;
+    let known_dest =
+        load_workspace_index_membership(dest_conn, dest_workspace_id, range, &source_ids)?;
 
     Ok(source_entries
         .into_iter()
@@ -702,14 +546,23 @@ fn eligible_shared_send_root_ids(
     workspace_id: &str,
     _range: SyncWindow,
     requested_ids: &[EventId],
+    require_workspace_index_membership: bool,
 ) -> Result<(Vec<EventId>, HashMap<EventId, i64>), String> {
+    let profile_enabled = sync_order_profile_enabled();
+    let started_at = profile_enabled.then(Instant::now);
     let created_at_by_id = store
         .get_shared_created_at_batch(requested_ids)
         .map_err(|e| format!("load selected created_at batch: {e}"))?;
-    let workspace_members =
+    let created_at_loaded_at = profile_enabled.then(Instant::now);
+    let workspace_members = if require_workspace_index_membership {
         load_workspace_index_membership_any_range(conn, workspace_id, requested_ids)
-            .map_err(|e| format!("load workspace index membership for selected sends: {e}"))?;
+            .map_err(|e| format!("load workspace index membership for selected sends: {e}"))?
+    } else {
+        HashSet::new()
+    };
+    let workspace_members_loaded_at = profile_enabled.then(Instant::now);
     let mut eligible = Vec::with_capacity(requested_ids.len());
+    let mut transport_blocked = 0usize;
     for event_id in requested_ids {
         let transport_shareable = match recorded_by {
             Some(recorded_by) => {
@@ -718,87 +571,63 @@ fn eligible_shared_send_root_ids(
             }
             None => true,
         };
+        let present_in_workspace_index = if require_workspace_index_membership {
+            workspace_members.contains(event_id)
+        } else {
+            true
+        };
         let plan = decide_shared_send_eligibility_plan(&normalize_shared_send_eligibility_context(
             SharedSendEligibilityRawRows {
                 requested_by_reconciliation: true,
-                present_in_workspace_index: workspace_members.contains(event_id),
+                present_in_workspace_index,
                 shared_blob_available: created_at_by_id.contains_key(event_id),
                 transport_shareable,
             },
         ));
         if matches!(plan, SharedSendEligibilityPlan::SendRoot) {
             eligible.push(*event_id);
+        } else if !transport_shareable {
+            transport_blocked = transport_blocked.saturating_add(1);
         }
+    }
+    if let (Some(started_at), Some(created_at_loaded_at), Some(workspace_members_loaded_at)) = (
+        started_at,
+        created_at_loaded_at,
+        workspace_members_loaded_at,
+    ) {
+        eprintln!(
+            "[sync-order] eligible workspace={} requested={} eligible={} created_at_rows={} workspace_rows={} transport_blocked={} created_at_ms={} membership_ms={} shareable_scan_ms={} total_ms={}",
+            workspace_id,
+            requested_ids.len(),
+            eligible.len(),
+            created_at_by_id.len(),
+            if require_workspace_index_membership {
+                workspace_members.len()
+            } else {
+                requested_ids.len()
+            },
+            transport_blocked,
+            created_at_loaded_at.duration_since(started_at).as_millis(),
+            workspace_members_loaded_at
+                .duration_since(created_at_loaded_at)
+                .as_millis(),
+            Instant::now()
+                .duration_since(workspace_members_loaded_at)
+                .as_millis(),
+            Instant::now().duration_since(started_at).as_millis(),
+        );
     }
 
     Ok((eligible, created_at_by_id))
 }
 
-fn live_suppression_order_rank(seed: &str, event_id: &EventId) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(seed.as_bytes());
-    hasher.update(event_id);
-    *hasher.finalize().as_bytes()
-}
-
 fn prioritize_send_order_with_created_at(
-    range: SyncWindow,
     ids: &[EventId],
-    live_suppression_seed: Option<&str>,
     created_at_by_id: &HashMap<EventId, i64>,
+    scatter_seed: Option<&str>,
 ) -> Vec<EventId> {
-    if let Some(seed) = live_suppression_seed {
-        let mut ranked = ids
-            .iter()
-            .map(|event_id| (*event_id, live_suppression_order_rank(seed, event_id)))
-            .collect::<Vec<_>>();
-        ranked.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-        return ranked.into_iter().map(|(event_id, _)| event_id).collect();
-    }
-
-    let order_policy = decide_shared_send_order_policy(range.kind);
-    if matches!(order_policy, SharedSendOrderPolicy::PreserveInput) {
-        return ids.to_vec();
-    }
-
-    let mut ordered = ids.to_vec();
-    ordered.sort_by(|left, right| {
-        let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
-        let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
-        match order_policy {
-            SharedSendOrderPolicy::NewestFirst => {
-                right_ts.cmp(&left_ts).then_with(|| right.cmp(left))
-            }
-            SharedSendOrderPolicy::PreserveInput => left.cmp(right),
-        }
-    });
-    ordered
-}
-
-#[cfg(test)]
-fn prioritize_send_order(
-    store: &Store<'_>,
-    range: SyncWindow,
-    ids: &[EventId],
-    live_suppression_seed: Option<&str>,
-) -> Result<Vec<EventId>, String> {
-    if let Some(seed) = live_suppression_seed {
-        let mut ranked = ids
-            .iter()
-            .map(|event_id| (*event_id, live_suppression_order_rank(seed, event_id)))
-            .collect::<Vec<_>>();
-        ranked.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-        return Ok(ranked.into_iter().map(|(event_id, _)| event_id).collect());
-    }
-
-    let order_policy = decide_shared_send_order_policy(range.kind);
-    if matches!(order_policy, SharedSendOrderPolicy::PreserveInput) {
-        return Ok(ids.to_vec());
-    }
-
-    let created_at_by_id = store
-        .get_shared_created_at_batch(ids)
-        .map_err(|e| format!("load shared created_at batch: {e}"))?;
+    let profile_enabled = sync_order_profile_enabled();
+    let started_at = profile_enabled.then(Instant::now);
     let mut ordered: Vec<EventId> = ids
         .iter()
         .filter(|event_id| created_at_by_id.contains_key(*event_id))
@@ -807,14 +636,63 @@ fn prioritize_send_order(
     ordered.sort_by(|left, right| {
         let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
         let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
-        match order_policy {
-            SharedSendOrderPolicy::NewestFirst => {
-                right_ts.cmp(&left_ts).then_with(|| right.cmp(left))
-            }
-            SharedSendOrderPolicy::PreserveInput => left.cmp(right),
-        }
+        left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
     });
-    Ok(ordered)
+    let ordered_head_len = live_suppression_prefetch_ids().min(ordered.len());
+    if live_suppression_mode() {
+        if let Some(seed) = scatter_seed {
+            deterministic_scatter_send_order(&mut ordered, seed, ordered_head_len);
+        }
+    }
+    if let Some(started_at) = started_at {
+        let mut unique_timestamps = HashSet::with_capacity(ordered.len());
+        for event_id in &ordered {
+            if let Some(created_at_ms) = created_at_by_id.get(event_id) {
+                unique_timestamps.insert(*created_at_ms);
+            }
+        }
+        eprintln!(
+            "[sync-order] sort ordered={} ordered_head={} unique_timestamps={} duplicate_timestamps={} scatter_enabled={} sort_ms={}",
+            ordered.len(),
+            ordered_head_len,
+            unique_timestamps.len(),
+            ordered.len().saturating_sub(unique_timestamps.len()),
+            scatter_seed.is_some() && live_suppression_mode(),
+            Instant::now().duration_since(started_at).as_millis(),
+        );
+    }
+    ordered
+}
+
+fn deterministic_scatter_send_order(ordered: &mut [EventId], seed: &str, ordered_head_len: usize) {
+    let scatter_start = ordered_head_len.min(ordered.len());
+    ordered[scatter_start..].sort_by(|left, right| {
+        deterministic_scatter_key(seed, left).cmp(&deterministic_scatter_key(seed, right))
+    });
+}
+
+fn deterministic_scatter_key(seed: &str, event_id: &EventId) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(seed.len() as u64).to_le_bytes());
+    hasher.update(seed.as_bytes());
+    hasher.update(event_id);
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+fn prioritize_send_order(
+    store: &Store<'_>,
+    ids: &[EventId],
+    scatter_seed: Option<&str>,
+) -> Result<Vec<EventId>, String> {
+    let created_at_by_id = store
+        .get_shared_created_at_batch(ids)
+        .map_err(|e| format!("load shared created_at batch: {e}"))?;
+    Ok(prioritize_send_order_with_created_at(
+        ids,
+        &created_at_by_id,
+        scatter_seed,
+    ))
 }
 
 fn live_suppression_registry(
@@ -1082,7 +960,20 @@ fn refill_live_send_queue(
         if refill_ids.is_empty() {
             break;
         }
-        for (event_id, blob) in load_shared_send_batch(store, &refill_ids)? {
+        let loaded = load_shared_send_batch(store, &refill_ids)?;
+        if trace_dep_send_ids_enabled() {
+            let loaded_ids = loaded
+                .iter()
+                .map(|(event_id, _)| *event_id)
+                .collect::<Vec<_>>();
+            debug!(
+                target: "topo::sync_operation",
+                refill_requested_ids = ?trace_event_id_list(&refill_ids),
+                refill_loaded_ids = ?trace_event_id_list(&loaded_ids),
+                "live send queue refill"
+            );
+        }
+        for (event_id, blob) in loaded {
             if !suppressed_ids.contains(&event_id) {
                 send_queue.push_back((event_id, blob));
             }
@@ -1091,125 +982,14 @@ fn refill_live_send_queue(
     Ok(())
 }
 
-fn load_selected_direct_deps(
-    conn: &Connection,
-    workspace_id: &str,
-    event_id: &EventId,
-    selected_ids: &HashSet<EventId>,
-    created_at_by_id: &HashMap<EventId, i64>,
-    dep_cache: &mut HashMap<EventId, Vec<EventId>>,
-) -> Result<Vec<EventId>, String> {
-    if let Some(dep_ids) = dep_cache.get(event_id) {
-        return Ok(dep_ids.clone());
-    }
-
-    let mut dep_ids = crate::db::dep_index::list_shared_event_deps(conn, workspace_id, event_id)
-        .map_err(|e| format!("load shared event deps: {e}"))?
-        .into_iter()
-        .filter(|dep_id| selected_ids.contains(dep_id))
-        .collect::<Vec<_>>();
-    if let Some(descriptor_dep_id) =
-        load_selected_file_descriptor_dep(conn, event_id, selected_ids)?
-    {
-        dep_ids.push(descriptor_dep_id);
-    }
-    dep_ids.sort_by(|left, right| {
-        let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
-        let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
-        left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
-    });
-    dep_ids.dedup();
-    dep_cache.insert(*event_id, dep_ids.clone());
-    Ok(dep_ids)
-}
-
-fn load_selected_file_descriptor_dep(
-    conn: &Connection,
-    event_id: &EventId,
-    selected_ids: &HashSet<EventId>,
-) -> Result<Option<EventId>, String> {
-    let descriptor_event_id_b64: Option<String> = conn
-        .query_row(
-            "SELECT descriptor_event_id
-             FROM file_slices
-             WHERE event_id = ?1
-               AND descriptor_event_id != ''
-             ORDER BY recorded_by ASC
-             LIMIT 1",
-            rusqlite::params![event_id_to_base64(event_id)],
-            |row| crate::db::sql_types::get_text(row, 0),
-        )
-        .optional()
-        .map_err(|e| format!("load file_slice descriptor dependency: {e}"))?;
-    Ok(descriptor_event_id_b64
-        .and_then(|event_id_b64| crate::crypto::event_id_from_base64(&event_id_b64))
-        .filter(|descriptor_event_id| selected_ids.contains(descriptor_event_id)))
-}
-
-fn visit_selected_send_order(
-    conn: &Connection,
-    workspace_id: &str,
-    event_id: EventId,
-    selected_ids: &HashSet<EventId>,
-    created_at_by_id: &HashMap<EventId, i64>,
-    dep_cache: &mut HashMap<EventId, Vec<EventId>>,
-    emitted: &mut HashSet<EventId>,
-    visiting: &mut HashSet<EventId>,
-    ordered: &mut Vec<EventId>,
-) -> Result<(), String> {
-    if emitted.contains(&event_id) {
-        return Ok(());
-    }
-    if !visiting.insert(event_id) {
-        return Ok(());
-    }
-
-    for dep_id in load_selected_direct_deps(
-        conn,
-        workspace_id,
-        &event_id,
-        selected_ids,
-        created_at_by_id,
-        dep_cache,
-    )? {
-        let dep_plan = decide_selected_dep_order_plan(&normalize_selected_dep_order_context(
-            SelectedDepOrderRawRows {
-                dep_is_selected: selected_ids.contains(&dep_id),
-                dep_already_emitted: emitted.contains(&dep_id),
-                dep_currently_visiting: visiting.contains(&dep_id),
-            },
-        ));
-        match dep_plan {
-            SelectedDepOrderPlan::EmitDepBeforeRoot => {
-                visit_selected_send_order(
-                    conn,
-                    workspace_id,
-                    dep_id,
-                    selected_ids,
-                    created_at_by_id,
-                    dep_cache,
-                    emitted,
-                    visiting,
-                    ordered,
-                )?;
-            }
-            SelectedDepOrderPlan::SkipDepEdge => continue,
-        }
-    }
-
-    visiting.remove(&event_id);
-    emitted.insert(event_id);
-    ordered.push(event_id);
-    Ok(())
-}
-
 fn order_requested_ids_for_send(
     conn: &Connection,
     store: &Store<'_>,
     workspace_id: &str,
-    range: SyncWindow,
+    _range: SyncWindow,
     requested_ids: &[EventId],
     live_suppression_seed: Option<&str>,
+    require_workspace_index_membership: bool,
 ) -> Result<Vec<EventId>, String> {
     if requested_ids.is_empty() {
         return Ok(Vec::new());
@@ -1220,36 +1000,66 @@ fn order_requested_ids_for_send(
         store,
         live_suppression_seed,
         workspace_id,
-        range,
+        _range,
         requested_ids,
+        require_workspace_index_membership,
     )?;
-    let ordered_roots = prioritize_send_order_with_created_at(
-        range,
+    Ok(prioritize_send_order_with_created_at(
         &eligible_roots,
-        live_suppression_seed,
         &created_at_by_id,
-    );
-    let selected_ids: HashSet<EventId> = eligible_roots.iter().copied().collect();
+        live_suppression_seed,
+    ))
+}
 
-    let mut ordered = Vec::new();
-    let mut emitted = HashSet::new();
-    let mut visiting = HashSet::new();
-    let mut dep_cache = HashMap::new();
-
-    for event_id in ordered_roots {
-        visit_selected_send_order(
-            conn,
+fn order_phase2_then_phase1_requested_ids_for_send(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    range: SyncWindow,
+    phase2_requested_ids: &[EventId],
+    phase1_requested_ids: &[EventId],
+    live_suppression_seed: Option<&str>,
+) -> Result<Vec<EventId>, String> {
+    let profile_enabled = sync_order_profile_enabled();
+    let started_at = profile_enabled.then(Instant::now);
+    let mut ordered = order_requested_ids_for_send(
+        conn,
+        store,
+        workspace_id,
+        range,
+        phase2_requested_ids,
+        live_suppression_seed,
+        false,
+    )?;
+    let phase2_ordered_at = profile_enabled.then(Instant::now);
+    let phase2_seen = ordered.iter().copied().collect::<HashSet<_>>();
+    let phase1_unique = phase1_requested_ids
+        .iter()
+        .copied()
+        .filter(|event_id| !phase2_seen.contains(event_id))
+        .collect::<Vec<_>>();
+    ordered.extend(order_requested_ids_for_send(
+        conn,
+        store,
+        workspace_id,
+        range,
+        &phase1_unique,
+        live_suppression_seed,
+        true,
+    )?);
+    if let (Some(started_at), Some(phase2_ordered_at)) = (started_at, phase2_ordered_at) {
+        eprintln!(
+            "[sync-order] phase-buckets workspace={} phase2_requested={} phase2_ordered={} phase1_requested={} phase1_unique={} final_ordered={} phase2_ms={} total_ms={}",
             workspace_id,
-            event_id,
-            &selected_ids,
-            &created_at_by_id,
-            &mut dep_cache,
-            &mut emitted,
-            &mut visiting,
-            &mut ordered,
-        )?;
+            phase2_requested_ids.len(),
+            phase2_seen.len(),
+            phase1_requested_ids.len(),
+            phase1_unique.len(),
+            ordered.len(),
+            phase2_ordered_at.duration_since(started_at).as_millis(),
+            Instant::now().duration_since(started_at).as_millis(),
+        );
     }
-
     Ok(ordered)
 }
 
@@ -1260,7 +1070,7 @@ pub fn order_requested_shared_event_ids_for_send(
     requested_ids: &[EventId],
 ) -> Result<Vec<EventId>, String> {
     let store = Store::new(conn);
-    order_requested_ids_for_send(conn, &store, workspace_id, range, requested_ids, None)
+    order_requested_ids_for_send(conn, &store, workspace_id, range, requested_ids, None, true)
 }
 
 pub fn order_requested_shared_event_ids_for_send_for_peer(
@@ -1278,16 +1088,34 @@ pub fn order_requested_shared_event_ids_for_send_for_peer(
         range,
         requested_ids,
         Some(recorded_by),
+        true,
+    )
+}
+
+pub fn order_phase2_then_phase1_shared_event_ids_for_send_for_peer(
+    conn: &Connection,
+    recorded_by: &str,
+    workspace_id: &str,
+    range: SyncWindow,
+    phase2_requested_ids: &[EventId],
+    phase1_requested_ids: &[EventId],
+) -> Result<Vec<EventId>, String> {
+    let store = Store::new(conn);
+    order_phase2_then_phase1_requested_ids_for_send(
+        conn,
+        &store,
+        workspace_id,
+        range,
+        phase2_requested_ids,
+        phase1_requested_ids,
+        Some(recorded_by),
     )
 }
 
 async fn send_have_events_live<S>(
-    conn: &Connection,
     store: &Store<'_>,
     data_send: &mut S,
-    have_ids: &[Id],
-    recorded_by: &str,
-    workspace_id: &str,
+    ordered_ids: &[EventId],
     range: SyncWindow,
     live_suppression: &mut LiveSuppressionSession,
 ) -> Result<(u64, u64), String>
@@ -1298,19 +1126,10 @@ where
     let suppression_batch_size = live_suppression_send_batch_size();
     let mut events_sent = 0u64;
     let mut bytes_sent = 0u64;
-    let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
-    let ordered_ids = order_requested_ids_for_send(
-        conn,
-        store,
-        workspace_id,
-        range,
-        &event_ids,
-        Some(recorded_by),
-    )?;
     debug!(
         target: "topo::sync_operation",
         range = ?range.kind,
-        requested_count = have_ids.len(),
+        requested_count = ordered_ids.len(),
         ordered_count = ordered_ids.len(),
         suppression_cap = cap,
         suppression_batch_size,
@@ -1486,12 +1305,9 @@ where
 }
 
 pub async fn send_selected_events<S>(
-    conn: &Connection,
     store: &Store<'_>,
     data_send: &mut S,
-    event_ids: &[EventId],
-    _recorded_by: &str,
-    workspace_id: &str,
+    ordered_event_ids: &[EventId],
     range: SyncWindow,
     live_suppression: Option<&mut LiveSuppressionSession>,
 ) -> Result<(u64, u64), String>
@@ -1499,32 +1315,16 @@ where
     S: StreamSend,
 {
     if let Some(live_suppression) = live_suppression {
-        let have_ids = event_ids
-            .iter()
-            .copied()
-            .map(Id::from_byte_array)
-            .collect::<Vec<_>>();
-        return send_have_events_live(
-            conn,
-            store,
-            data_send,
-            &have_ids,
-            _recorded_by,
-            workspace_id,
-            range,
-            live_suppression,
-        )
-        .await;
+        return send_have_events_live(store, data_send, ordered_event_ids, range, live_suppression)
+            .await;
     }
 
-    if event_ids.is_empty() {
+    if ordered_event_ids.is_empty() {
         return Ok((0, 0));
     }
 
     let mut events_sent = 0u64;
     let mut bytes_sent = 0u64;
-    let ordered_event_ids =
-        order_requested_ids_for_send(conn, store, workspace_id, range, event_ids, None)?;
     for chunk in ordered_event_ids.chunks(64) {
         let ordered = load_shared_send_batch(store, chunk)?;
         let mut payload = Vec::new();
@@ -1565,13 +1365,19 @@ where
     S: StreamSend,
 {
     let event_ids = have_ids.iter().map(neg_id_to_event_id).collect::<Vec<_>>();
-    send_selected_events(
+    let ordered_event_ids = order_requested_ids_for_send(
         conn,
         store,
-        data_send,
-        &event_ids,
-        recorded_by,
         workspace_id,
+        range,
+        &event_ids,
+        Some(recorded_by),
+        true,
+    )?;
+    send_selected_events(
+        store,
+        data_send,
+        &ordered_event_ids,
         range,
         live_suppression,
     )
@@ -1606,21 +1412,6 @@ fn event_created_at_ms(blob: &[u8]) -> Option<i64> {
         .and_then(|created_at_ms| i64::try_from(created_at_ms).ok())
 }
 
-fn pending_receive_overlay_entry_for_created_at(
-    range: SyncWindow,
-    created_at_ms: i64,
-    event_id: EventId,
-) -> Option<PendingReceiveOverlayEntry> {
-    if sync_window_contains_ts(range, created_at_ms) {
-        Some(PendingReceiveOverlayEntry {
-            created_at_ms,
-            event_id,
-        })
-    } else {
-        None
-    }
-}
-
 fn append_event_frame_bytes(payload: &mut Vec<u8>, blob: &[u8]) -> Result<(), String> {
     let blob_len = u32::try_from(blob.len())
         .map_err(|_| format!("range event too large: {} bytes", blob.len()))?;
@@ -1630,12 +1421,12 @@ fn append_event_frame_bytes(payload: &mut Vec<u8>, blob: &[u8]) -> Result<(), St
     Ok(())
 }
 
-pub fn spawn_receive_log_task<R>(
+pub fn spawn_receive_task<R>(
     data_recv: R,
     db_path: String,
     recorded_by: String,
-    workspace_id: String,
-    range: SyncWindow,
+    _workspace_id: String,
+    _range: SyncWindow,
     session_id: u64,
     source_tag: String,
     idle_timeout: Duration,
@@ -1647,14 +1438,15 @@ where
 {
     tokio::spawn(async move {
         let mut data_recv = data_recv;
-        let mut receive_log = ReceiveLogSegmentBuffer::open(
+        let live_suppression_publish = live_suppression
+            .as_ref()
+            .map(|state| (state.key.clone(), state.session_id));
+        let mut receive_buffer = DirectReceiveBatchBuffer::open(
             db_path.clone(),
             recorded_by.clone(),
-            workspace_id.clone(),
-            range,
-            session_id,
             source_tag.clone(),
-        )?;
+            live_suppression_publish,
+        );
         let mut events_received = 0u64;
         let mut bytes_received = 0u64;
         let mut live_suppression = live_suppression;
@@ -1675,26 +1467,9 @@ where
                         if let Some(capture) = &rx_capture {
                             capture.record_event_id_b64(event_id_to_base64(&event_id));
                         }
-                        if let (Some(state), Some(created_at_ms)) =
-                            (&live_suppression, created_at_ms)
-                        {
-                            publish_live_suppression_event(
-                                &state.key,
-                                state.session_id,
-                                event_id,
-                                created_at_ms,
-                            );
-                        }
-                        if let Some(entry) = created_at_ms.and_then(|created_at_ms| {
-                            pending_receive_overlay_entry_for_created_at(
-                                range,
-                                created_at_ms,
-                                event_id,
-                            )
-                        }) {
-                            receive_log.append_blob(&event_id, &blob, Some(entry))?;
-                        } else {
-                            receive_log.append_blob(&event_id, &blob, None)?;
+                        receive_buffer.append_blob(&event_id, &blob, created_at_ms);
+                        if receive_buffer.should_flush() {
+                            receive_buffer.flush().await?;
                         }
                         bytes_received += blob.len() as u64;
                         events_received += 1;
@@ -1736,16 +1511,9 @@ where
                             if let Some(capture) = &rx_capture {
                                 capture.record_event_id_b64(event_id_to_base64(&event_id));
                             }
-                            if let Some(entry) = created_at_ms.and_then(|created_at_ms| {
-                                pending_receive_overlay_entry_for_created_at(
-                                    range,
-                                    created_at_ms,
-                                    event_id,
-                                )
-                            }) {
-                                receive_log.append_blob(&event_id, &blob, Some(entry))?;
-                            } else {
-                                receive_log.append_blob(&event_id, &blob, None)?;
+                            receive_buffer.append_blob(&event_id, &blob, created_at_ms);
+                            if receive_buffer.should_flush() {
+                                receive_buffer.flush().await?;
                             }
                             bytes_received += blob.len() as u64;
                             events_received += 1;
@@ -1761,14 +1529,10 @@ where
             }
         }
 
-        let (path, pending_overlay, final_priority_segment_ordinal, ingest_waiters) =
-            receive_log.finish()?;
+        let ingest_waiters = receive_buffer.finish().await?;
         Ok(RangeReceiveResult {
             events_received,
             bytes_received,
-            path,
-            pending_overlay,
-            final_priority_segment_ordinal,
             ingest_waiters,
         })
     })
@@ -1792,7 +1556,10 @@ mod tests {
         ParsedEvent, PeerSharedEvent,
     };
     use crate::state::pipeline::ingest_now;
+    use crate::sync::session::depsync::{build_candidate_storage, build_range_dep_storage};
+    use crate::sync::session::NEGENTROPY_FRAME_SIZE_LIMIT;
     use async_trait::async_trait;
+    use negentropy::{Id, Negentropy};
 
     struct EnvGuard {
         prev_live_suppression: Option<String>,
@@ -2090,16 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn prioritize_send_order_matches_lane_policy() {
-        assert_eq!(
-            decide_shared_send_order_policy(SyncWindowKind::LastDay),
-            SharedSendOrderPolicy::NewestFirst
-        );
-        assert_eq!(
-            decide_shared_send_order_policy(SyncWindowKind::Old),
-            SharedSendOrderPolicy::PreserveInput
-        );
-
+    fn prioritize_send_order_uses_oldest_first_timestamps() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
@@ -2141,19 +1899,117 @@ mod tests {
         .unwrap();
 
         let store = Store::new(&conn);
-        let hot_order = prioritize_send_order(
+        let ordered = prioritize_send_order(&store, &[first_id, second_id], None).unwrap();
+
+        assert_eq!(ordered, vec![first_id, second_id]);
+    }
+
+    #[test]
+    fn order_requested_ids_for_send_scatter_is_deterministic_after_ordered_head() {
+        let _env = EnvGuard::enable_live_suppression();
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "workspace-scatter";
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: Some(10_000),
+        };
+        let total = live_suppression_prefetch_ids().max(1) + 16;
+        let mut expected_oldest_first = Vec::with_capacity(total);
+        for idx in 0..total {
+            let event = ParsedEvent::Message(MessageEvent {
+                created_at_ms: (idx + 1) as u64,
+                workspace_id: [0x41; 32],
+                author_id: [0x42; 32],
+                content: format!("scatter-{idx}"),
+            });
+            let blob = encode_event(&event).unwrap();
+            let event_id = hash_event(&blob);
+            let created_at_ms = (idx + 1) as i64;
+            insert_event(
+                &conn,
+                &event_id,
+                "message",
+                &blob,
+                ShareScope::Shared,
+                created_at_ms,
+                created_at_ms,
+            )
+            .unwrap();
+            insert_shared_event_index_entry_if_shared(
+                &conn,
+                ShareScope::Shared,
+                created_at_ms,
+                &event_id,
+                workspace_id,
+                &blob,
+            )
+            .unwrap();
+            expected_oldest_first.push(event_id);
+        }
+        let requested_ids = expected_oldest_first
+            .iter()
+            .copied()
+            .rev()
+            .collect::<Vec<_>>();
+        let store = Store::new(&conn);
+
+        let ordered_a = order_requested_ids_for_send(
+            &conn,
             &store,
-            SyncWindow {
-                kind: SyncWindowKind::LastDay,
-                ts_min_inclusive_ms: Some(0),
-                ts_max_exclusive_ms: None,
-            },
-            &[first_id, second_id],
-            None,
+            workspace_id,
+            range,
+            &requested_ids,
+            Some("tenant-a"),
+            true,
+        )
+        .unwrap();
+        let ordered_a_again = order_requested_ids_for_send(
+            &conn,
+            &store,
+            workspace_id,
+            range,
+            &requested_ids,
+            Some("tenant-a"),
+            true,
+        )
+        .unwrap();
+        let ordered_b = order_requested_ids_for_send(
+            &conn,
+            &store,
+            workspace_id,
+            range,
+            &requested_ids,
+            Some("tenant-b"),
+            true,
         )
         .unwrap();
 
-        assert_eq!(hot_order, vec![second_id, first_id]);
+        let ordered_head_len = live_suppression_prefetch_ids().min(expected_oldest_first.len());
+        assert_eq!(ordered_a, ordered_a_again);
+        assert_eq!(
+            &ordered_a[..ordered_head_len],
+            &expected_oldest_first[..ordered_head_len]
+        );
+        assert_eq!(
+            &ordered_b[..ordered_head_len],
+            &expected_oldest_first[..ordered_head_len]
+        );
+
+        let mut ordered_a_tail = ordered_a[ordered_head_len..].to_vec();
+        let mut ordered_b_tail = ordered_b[ordered_head_len..].to_vec();
+        let mut expected_tail = expected_oldest_first[ordered_head_len..].to_vec();
+        ordered_a_tail.sort_unstable();
+        ordered_b_tail.sort_unstable();
+        expected_tail.sort_unstable();
+        assert_eq!(ordered_a_tail, expected_tail);
+        assert_eq!(ordered_b_tail, expected_tail);
+        assert_ne!(
+            ordered_a[ordered_head_len..],
+            expected_oldest_first[ordered_head_len..]
+        );
+        assert_ne!(ordered_a[ordered_head_len..], ordered_b[ordered_head_len..]);
     }
 
     #[test]
@@ -2206,6 +2062,7 @@ mod tests {
             },
             &[event_id],
             None,
+            true,
         )
         .unwrap();
 
@@ -2235,12 +2092,26 @@ mod tests {
             ts_min_inclusive_ms: None,
             ts_max_exclusive_ms: None,
         };
-        let wrong_workspace_order =
-            order_requested_ids_for_send(&conn, &store, "workspace-a", range, &[event_id], None)
-                .unwrap();
-        let matching_workspace_order =
-            order_requested_ids_for_send(&conn, &store, "workspace-b", range, &[event_id], None)
-                .unwrap();
+        let wrong_workspace_order = order_requested_ids_for_send(
+            &conn,
+            &store,
+            "workspace-a",
+            range,
+            &[event_id],
+            None,
+            true,
+        )
+        .unwrap();
+        let matching_workspace_order = order_requested_ids_for_send(
+            &conn,
+            &store,
+            "workspace-b",
+            range,
+            &[event_id],
+            None,
+            true,
+        )
+        .unwrap();
 
         assert!(wrong_workspace_order.is_empty());
         assert_eq!(matching_workspace_order, vec![event_id]);
@@ -2317,6 +2188,7 @@ mod tests {
             range,
             &[file_slice_event_id, file_event_id],
             None,
+            true,
         )
         .unwrap();
 
@@ -2324,120 +2196,490 @@ mod tests {
     }
 
     #[test]
-    fn selected_dep_order_plan_emits_only_selected_unvisited_deps() {
-        assert_eq!(
-            decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
-                dep_is_selected: true,
-                dep_already_emitted: false,
-                dep_currently_visiting: false,
-            }),
-            SelectedDepOrderPlan::EmitDepBeforeRoot
-        );
-        assert_eq!(
-            decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
-                dep_is_selected: false,
-                dep_already_emitted: false,
-                dep_currently_visiting: false,
-            }),
-            SelectedDepOrderPlan::SkipDepEdge
-        );
-        assert_eq!(
-            decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
-                dep_is_selected: true,
-                dep_already_emitted: true,
-                dep_currently_visiting: false,
-            }),
-            SelectedDepOrderPlan::SkipDepEdge
-        );
-        assert_eq!(
-            decide_selected_dep_order_plan(&SelectedDepOrderDecisionContext {
-                dep_is_selected: true,
-                dep_already_emitted: false,
-                dep_currently_visiting: true,
-            }),
-            SelectedDepOrderPlan::SkipDepEdge
-        );
-    }
-
-    #[test]
-    fn selected_dep_order_plan_matches_all_boolean_cases() {
-        for dep_is_selected in [false, true] {
-            for dep_already_emitted in [false, true] {
-                for dep_currently_visiting in [false, true] {
-                    let context = SelectedDepOrderDecisionContext {
-                        dep_is_selected,
-                        dep_already_emitted,
-                        dep_currently_visiting,
-                    };
-                    let expected =
-                        if dep_is_selected && !dep_already_emitted && !dep_currently_visiting {
-                            SelectedDepOrderPlan::EmitDepBeforeRoot
-                        } else {
-                            SelectedDepOrderPlan::SkipDepEdge
-                        };
-                    assert_eq!(decide_selected_dep_order_plan(&context), expected);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn selected_dep_order_normalizer_preserves_raw_rows_for_planner() {
-        let raw = SelectedDepOrderRawRows {
-            dep_is_selected: true,
-            dep_already_emitted: false,
-            dep_currently_visiting: false,
-        };
-        let context = normalize_selected_dep_order_context(raw);
-        assert_eq!(
-            context,
-            SelectedDepOrderDecisionContext {
-                dep_is_selected: true,
-                dep_already_emitted: false,
-                dep_currently_visiting: false,
-            }
-        );
-        assert_eq!(
-            decide_selected_dep_order_plan(&context),
-            SelectedDepOrderPlan::EmitDepBeforeRoot
-        );
-    }
-
-    #[test]
-    fn live_suppression_send_order_uses_peer_seed_to_scatter_roots() {
+    fn order_requested_ids_for_send_keeps_file_descriptor_before_slice_with_live_suppression() {
+        let _env = EnvGuard::enable_live_suppression();
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
+        let workspace_id = "workspace-files-live";
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: Some(10_000),
+        };
+
+        let file_blob = b"shared file descriptor live";
+        let file_event_id = hash_event(file_blob);
+        insert_event(
+            &conn,
+            &file_event_id,
+            "file",
+            file_blob,
+            ShareScope::Shared,
+            100,
+            100,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![workspace_id, 100i64, file_event_id.as_slice()],
+        )
+        .unwrap();
+
+        let file_slice_blob = b"shared file slice live";
+        let file_slice_event_id = hash_event(file_slice_blob);
+        insert_event(
+            &conn,
+            &file_slice_event_id,
+            "file_slice",
+            file_slice_blob,
+            ShareScope::Shared,
+            200,
+            200,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![workspace_id, 200i64, file_slice_event_id.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "tenant-a",
+                "file-id-b64",
+                0i64,
+                event_id_to_base64(&file_slice_event_id),
+                200i64,
+                event_id_to_base64(&file_event_id),
+            ],
+        )
+        .unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = order_requested_ids_for_send(
+            &conn,
+            &store,
+            workspace_id,
+            range,
+            &[file_slice_event_id, file_event_id],
+            Some("tenant-a"),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![file_event_id, file_slice_event_id]);
+    }
+
+    #[test]
+    fn order_phase2_then_phase1_allows_unindexed_endpoint_shared_dep() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "workspace-endpoint-dep";
         let store = Store::new(&conn);
         let range = SyncWindow {
             kind: SyncWindowKind::LastDay,
             ts_min_inclusive_ms: Some(0),
             ts_max_exclusive_ms: None,
         };
-        let ids = (0u8..16)
-            .map(|idx| {
-                let mut event_id = [0u8; 32];
-                event_id[31] = idx;
-                event_id
-            })
-            .collect::<Vec<_>>();
 
-        let tenant_a_order = prioritize_send_order(&store, range, &ids, Some("tenant-a")).unwrap();
-        let tenant_b_order = prioritize_send_order(&store, range, &ids, Some("tenant-b")).unwrap();
-        let mut expected_a = ids
-            .iter()
-            .map(|event_id| (*event_id, live_suppression_order_rank("tenant-a", event_id)))
-            .collect::<Vec<_>>();
-        expected_a.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-        let expected_a = expected_a
-            .into_iter()
-            .map(|(event_id, _)| event_id)
-            .collect::<Vec<_>>();
+        let endpoint_event = endpoint_shared::deterministic_endpoint_shared_event([0x55; 32]);
+        let endpoint_blob = encode_event(&endpoint_event).unwrap();
+        let endpoint_event_id = hash_event(&endpoint_blob);
+        insert_event(
+            &conn,
+            &endpoint_event_id,
+            "endpoint_shared",
+            &endpoint_blob,
+            ShareScope::Shared,
+            100,
+            100,
+        )
+        .unwrap();
 
-        assert_eq!(tenant_a_order, expected_a);
-        assert_ne!(
-            tenant_a_order, tenant_b_order,
-            "different local peers should not all send replicated roots in the same order"
+        let peer_shared_event = ParsedEvent::PeerShared(PeerSharedEvent {
+            created_at_ms: 200,
+            public_key: [0x66; 32],
+            user_event_id: [0x77; 32],
+            endpoint_shared_event_id: endpoint_event_id,
+            device_name: "device".to_string(),
+        });
+        let peer_shared_blob = encode_event(&peer_shared_event).unwrap();
+        let peer_shared_event_id = hash_event(&peer_shared_blob);
+        insert_event(
+            &conn,
+            &peer_shared_event_id,
+            "peer_shared",
+            &peer_shared_blob,
+            ShareScope::Shared,
+            200,
+            200,
+        )
+        .unwrap();
+        insert_shared_event_index_entry_if_shared(
+            &conn,
+            ShareScope::Shared,
+            200,
+            &peer_shared_event_id,
+            workspace_id,
+            &peer_shared_blob,
+        )
+        .unwrap();
+
+        let ordered = order_phase2_then_phase1_requested_ids_for_send(
+            &conn,
+            &store,
+            workspace_id,
+            range,
+            &[endpoint_event_id],
+            &[peer_shared_event_id],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![endpoint_event_id, peer_shared_event_id]);
+    }
+
+    #[test]
+    fn order_phase2_then_phase1_keeps_phase2_first_and_sorts_each_bucket_by_timestamp() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "workspace-phase-buckets";
+        let store = Store::new(&conn);
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: None,
+        };
+        let phase1_old = insert_shared_bench_dep(&conn, workspace_id, 100, vec![], 1);
+        let phase1_new = insert_shared_bench_dep(&conn, workspace_id, 300, vec![], 2);
+        let phase2_newer_than_phase1_old =
+            insert_shared_bench_dep(&conn, workspace_id, 200, vec![], 3);
+        let phase2_old = insert_shared_bench_dep(&conn, workspace_id, 50, vec![], 4);
+
+        let ordered = order_phase2_then_phase1_requested_ids_for_send(
+            &conn,
+            &store,
+            workspace_id,
+            range,
+            &[phase2_newer_than_phase1_old, phase2_old],
+            &[phase1_new, phase1_old],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ordered,
+            vec![
+                phase2_old,
+                phase2_newer_than_phase1_old,
+                phase1_old,
+                phase1_new
+            ]
         );
+    }
+
+    #[test]
+    fn phase2_reconciliation_detects_unindexed_future_timestamp_dep() {
+        let hub = open_in_memory().unwrap();
+        let source = open_in_memory().unwrap();
+        create_tables(&hub).unwrap();
+        create_tables(&source).unwrap();
+
+        let workspace_id = "workspace-future-phase2";
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: Some(current_timestamp_ms() + 1_000),
+        };
+
+        let endpoint_event = endpoint_shared::deterministic_endpoint_shared_event([0x77; 32]);
+        let endpoint_blob = encode_event(&endpoint_event).unwrap();
+        let endpoint_event_id = hash_event(&endpoint_blob);
+        let endpoint_created_at = match &endpoint_event {
+            ParsedEvent::EndpointShared(event) => event.created_at_ms as i64,
+            _ => unreachable!("endpoint_shared fixture should be endpoint_shared"),
+        };
+        insert_event(
+            &hub,
+            &endpoint_event_id,
+            "endpoint_shared",
+            &endpoint_blob,
+            ShareScope::Shared,
+            endpoint_created_at,
+            endpoint_created_at,
+        )
+        .unwrap();
+
+        let root_created_at = current_timestamp_ms();
+        let root_event_id = insert_shared_bench_dep(
+            &hub,
+            workspace_id,
+            root_created_at,
+            vec![endpoint_event_id],
+            0x41,
+        );
+        replace_shared_event_deps(&hub, workspace_id, &root_event_id, &[endpoint_event_id])
+            .unwrap();
+
+        insert_event(
+            &source,
+            &root_event_id,
+            "bench_dep_perf_testing",
+            &hub.query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![crate::crypto::event_id_to_base64(&root_event_id)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap(),
+            ShareScope::Shared,
+            root_created_at,
+            root_created_at,
+        )
+        .unwrap();
+        insert_shared_event_index_entry_if_shared(
+            &source,
+            ShareScope::Shared,
+            root_created_at,
+            &root_event_id,
+            workspace_id,
+            &hub.query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![crate::crypto::event_id_to_base64(&root_event_id)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        replace_shared_event_deps(&source, workspace_id, &root_event_id, &[endpoint_event_id])
+            .unwrap();
+
+        let hub_storage =
+            build_range_dep_storage(&hub, "/tmp/future-phase2-hub.db", workspace_id, range)
+                .unwrap();
+        let source_storage =
+            build_range_dep_storage(&source, "/tmp/future-phase2-source.db", workspace_id, range)
+                .unwrap();
+
+        let hub_candidates = hub_storage.dep_candidate_ids_for_roots(&[root_event_id]);
+        let source_candidates = source_storage.dep_candidate_ids_for_roots(&[root_event_id]);
+
+        assert_eq!(hub_candidates, vec![endpoint_event_id]);
+        assert_eq!(source_candidates, vec![endpoint_event_id]);
+
+        let hub_candidate_storage =
+            build_candidate_storage(&Store::new(&hub), &hub_candidates).unwrap();
+        let source_candidate_storage =
+            build_candidate_storage(&Store::new(&source), &source_candidates).unwrap();
+
+        let mut hub_phase2 =
+            Negentropy::borrowed(&hub_candidate_storage, NEGENTROPY_FRAME_SIZE_LIMIT).unwrap();
+        let mut source_phase2 =
+            Negentropy::borrowed(&source_candidate_storage, NEGENTROPY_FRAME_SIZE_LIMIT).unwrap();
+
+        let mut hub_have_ids = Vec::<Id>::new();
+        let mut hub_need_ids = Vec::<Id>::new();
+        let mut source_have_ids = Vec::<Id>::new();
+        let mut source_need_ids = Vec::<Id>::new();
+
+        let mut query = hub_phase2.initiate().unwrap();
+        loop {
+            let response = source_phase2
+                .reconcile_with_diff(&query, &mut source_have_ids, &mut source_need_ids)
+                .unwrap();
+            match hub_phase2
+                .reconcile_with_ids(&response, &mut hub_have_ids, &mut hub_need_ids)
+                .unwrap()
+            {
+                Some(next_query) => query = next_query,
+                None => break,
+            }
+        }
+
+        let hub_have = hub_have_ids
+            .into_iter()
+            .map(|id| id.to_bytes())
+            .collect::<Vec<_>>();
+        let source_need = source_need_ids
+            .into_iter()
+            .map(|id| id.to_bytes())
+            .collect::<Vec<_>>();
+
+        assert_eq!(hub_have, vec![endpoint_event_id]);
+        assert_eq!(source_need, vec![endpoint_event_id]);
+    }
+
+    #[test]
+    fn dep_storage_cache_invalidates_when_shared_dep_edges_change() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let workspace_id = "workspace-dep-cache-invalidation";
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: Some(10_000),
+        };
+        let db_path = "/tmp/dep-cache-invalidation.db";
+
+        let root_event_id = insert_shared_bench_dep(&conn, workspace_id, 100, vec![], 0x51);
+        let dep_event_id = [0x61; 32];
+
+        let initial_storage = build_range_dep_storage(&conn, db_path, workspace_id, range).unwrap();
+        assert!(initial_storage
+            .dep_candidate_ids_for_roots(&[root_event_id])
+            .is_empty());
+
+        replace_shared_event_deps(&conn, workspace_id, &root_event_id, &[dep_event_id]).unwrap();
+
+        let updated_storage = build_range_dep_storage(&conn, db_path, workspace_id, range).unwrap();
+        assert_eq!(
+            updated_storage.dep_candidate_ids_for_roots(&[root_event_id]),
+            vec![dep_event_id]
+        );
+    }
+
+    #[test]
+    fn phase2_reconciliation_detects_missing_future_dep_when_other_dep_is_already_present() {
+        let hub = open_in_memory().unwrap();
+        let source = open_in_memory().unwrap();
+        create_tables(&hub).unwrap();
+        create_tables(&source).unwrap();
+
+        let workspace_id = "workspace-future-phase2-mixed";
+        let now_ms = current_timestamp_ms();
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(now_ms - 60_000),
+            ts_max_exclusive_ms: Some(now_ms + 1_000),
+        };
+
+        let shared_old_dep =
+            insert_shared_bench_dep(&hub, workspace_id, now_ms - 30_000, vec![], 0x11);
+        let shared_old_dep_blob: Vec<u8> = hub
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![crate::crypto::event_id_to_base64(&shared_old_dep)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        insert_event(
+            &source,
+            &shared_old_dep,
+            "bench_dep_perf_testing",
+            &shared_old_dep_blob,
+            ShareScope::Shared,
+            now_ms - 30_000,
+            now_ms - 30_000,
+        )
+        .unwrap();
+
+        let future_dep_event = endpoint_shared::deterministic_endpoint_shared_event([0x88; 32]);
+        let future_dep_blob = encode_event(&future_dep_event).unwrap();
+        let future_dep_id = hash_event(&future_dep_blob);
+        let future_dep_created_at = match &future_dep_event {
+            ParsedEvent::EndpointShared(event) => event.created_at_ms as i64,
+            _ => unreachable!("endpoint_shared fixture should be endpoint_shared"),
+        };
+        insert_event(
+            &hub,
+            &future_dep_id,
+            "endpoint_shared",
+            &future_dep_blob,
+            ShareScope::Shared,
+            future_dep_created_at,
+            future_dep_created_at,
+        )
+        .unwrap();
+
+        let root_a = insert_shared_bench_dep(
+            &hub,
+            workspace_id,
+            now_ms - 3_000,
+            vec![shared_old_dep],
+            0x21,
+        );
+        let root_b =
+            insert_shared_bench_dep(&hub, workspace_id, now_ms - 2_000, vec![root_a], 0x22);
+        let root_c = insert_shared_bench_dep(
+            &hub,
+            workspace_id,
+            now_ms - 1_000,
+            vec![root_a, root_b, future_dep_id],
+            0x23,
+        );
+        replace_shared_event_deps(&hub, workspace_id, &root_a, &[shared_old_dep]).unwrap();
+        replace_shared_event_deps(&hub, workspace_id, &root_b, &[root_a]).unwrap();
+        replace_shared_event_deps(
+            &hub,
+            workspace_id,
+            &root_c,
+            &[root_a, root_b, future_dep_id],
+        )
+        .unwrap();
+
+        let hub_storage =
+            build_range_dep_storage(&hub, "/tmp/future-phase2-mixed-hub.db", workspace_id, range)
+                .unwrap();
+        let source_storage = build_range_dep_storage(
+            &source,
+            "/tmp/future-phase2-mixed-source.db",
+            workspace_id,
+            range,
+        )
+        .unwrap();
+
+        let hub_candidates = hub_storage.dep_candidate_ids_for_roots(&[root_a, root_b, root_c]);
+        let source_candidates = source_storage.dep_candidate_ids_for_roots(&[]);
+
+        assert_eq!(hub_candidates.len(), 2);
+        assert!(hub_candidates.contains(&shared_old_dep));
+        assert!(hub_candidates.contains(&future_dep_id));
+        assert!(source_candidates.is_empty());
+
+        let hub_candidate_storage =
+            build_candidate_storage(&Store::new(&hub), &hub_candidates).unwrap();
+        let source_candidate_storage =
+            build_candidate_storage(&Store::new(&source), &hub_candidates).unwrap();
+
+        let mut hub_phase2 =
+            Negentropy::borrowed(&hub_candidate_storage, NEGENTROPY_FRAME_SIZE_LIMIT).unwrap();
+        let mut source_phase2 =
+            Negentropy::borrowed(&source_candidate_storage, NEGENTROPY_FRAME_SIZE_LIMIT).unwrap();
+
+        let mut hub_have_ids = Vec::<Id>::new();
+        let mut hub_need_ids = Vec::<Id>::new();
+        let mut source_have_ids = Vec::<Id>::new();
+        let mut source_need_ids = Vec::<Id>::new();
+
+        let mut query = hub_phase2.initiate().unwrap();
+        loop {
+            let response = source_phase2
+                .reconcile_with_diff(&query, &mut source_have_ids, &mut source_need_ids)
+                .unwrap();
+            match hub_phase2
+                .reconcile_with_ids(&response, &mut hub_have_ids, &mut hub_need_ids)
+                .unwrap()
+            {
+                Some(next_query) => query = next_query,
+                None => break,
+            }
+        }
+
+        let hub_have = hub_have_ids
+            .into_iter()
+            .map(|id| id.to_bytes())
+            .collect::<Vec<_>>();
+        let source_need = source_need_ids
+            .into_iter()
+            .map(|id| id.to_bytes())
+            .collect::<Vec<_>>();
+
+        assert_eq!(hub_have, vec![future_dep_id]);
+        assert_eq!(source_need, vec![future_dep_id]);
     }
 
     #[test]
@@ -2482,85 +2724,11 @@ mod tests {
             },
             &selected_ids,
             None,
+            true,
         )
         .unwrap();
 
         assert_eq!(ordered, vec![leaf]);
-    }
-
-    #[test]
-    fn load_shared_sync_entries_includes_pending_receive_overlay() {
-        let conn = open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-        let tmpdir = tempfile::tempdir().unwrap();
-        let db_path = tmpdir.path().join("node.db");
-        let db_path = db_path.to_str().unwrap();
-        let workspace_id = "workspace-pending-receive";
-        let range = SyncWindow {
-            kind: SyncWindowKind::LastDay,
-            ts_min_inclusive_ms: Some(10),
-            ts_max_exclusive_ms: Some(100),
-        };
-        let durable_id = insert_shared_bench_dep(&conn, workspace_id, 20, vec![], 1);
-        let pending_id = [0x33; 32];
-        let out_of_range_pending_id = [0x44; 32];
-
-        let overlay = crate::sync::session::receive_log::open_pending_receive_overlay_session(
-            db_path,
-            workspace_id,
-            range.kind,
-            77,
-        );
-        crate::sync::session::receive_log::record_pending_receive_overlay_entry(
-            overlay.session(),
-            30,
-            pending_id,
-        );
-        crate::sync::session::receive_log::record_pending_receive_overlay_entry(
-            overlay.session(),
-            30,
-            durable_id,
-        );
-        crate::sync::session::receive_log::record_pending_receive_overlay_entry(
-            overlay.session(),
-            5,
-            out_of_range_pending_id,
-        );
-
-        let entries =
-            load_shared_sync_entries_with_pending(&conn, db_path, workspace_id, range).unwrap();
-        let selected_ids = entries
-            .into_iter()
-            .map(|(_, event_id)| event_id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(selected_ids, vec![durable_id, pending_id]);
-        let broader_range = SyncWindow {
-            kind: SyncWindowKind::LastWeek,
-            ts_min_inclusive_ms: Some(0),
-            ts_max_exclusive_ms: Some(100),
-        };
-        let entries =
-            load_shared_sync_entries_with_pending(&conn, db_path, workspace_id, broader_range)
-                .unwrap();
-        let selected_ids = entries
-            .into_iter()
-            .map(|(_, event_id)| event_id)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            selected_ids,
-            vec![out_of_range_pending_id, durable_id, pending_id],
-            "pending receives from a narrower active window must suppress/overlay broader follow-up windows"
-        );
-        drop(overlay);
-
-        let entries =
-            load_shared_sync_entries_with_pending(&conn, db_path, workspace_id, range).unwrap();
-        let selected_ids = entries
-            .into_iter()
-            .map(|(_, event_id)| event_id)
-            .collect::<Vec<_>>();
-        assert_eq!(selected_ids, vec![durable_id]);
     }
 
     #[test]
@@ -2589,52 +2757,6 @@ mod tests {
 
         assert!(!Arc::ptr_eq(&first, &third));
         assert_eq!(third.size().unwrap(), 2);
-    }
-
-    #[test]
-    fn load_shared_event_index_slice_applies_pending_overlay_without_replacing_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("node.db");
-        let conn = open_connection(&db_path).unwrap();
-        create_tables(&conn).unwrap();
-        let db_path = db_path.to_str().unwrap();
-        let workspace_id = "workspace-overlay-cache";
-        let range = SyncWindow {
-            kind: SyncWindowKind::LastDay,
-            ts_min_inclusive_ms: Some(10),
-            ts_max_exclusive_ms: Some(100),
-        };
-        let durable_id = insert_shared_bench_dep(&conn, workspace_id, 20, vec![], 1);
-        let pending_id = [0x55; 32];
-
-        let cached = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
-        assert_eq!(cached.size().unwrap(), 1);
-
-        let overlay = crate::sync::session::receive_log::open_pending_receive_overlay_session(
-            db_path,
-            workspace_id,
-            range.kind,
-            88,
-        );
-        crate::sync::session::receive_log::record_pending_receive_overlay_entry(
-            overlay.session(),
-            30,
-            pending_id,
-        );
-        crate::sync::session::receive_log::record_pending_receive_overlay_entry(
-            overlay.session(),
-            30,
-            durable_id,
-        );
-
-        let overlaid = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
-        assert!(!Arc::ptr_eq(&cached, &overlaid));
-        assert_eq!(overlaid.size().unwrap(), 2);
-
-        drop(overlay);
-        let reloaded = load_shared_event_index_slice(&conn, db_path, workspace_id, range).unwrap();
-        assert!(Arc::ptr_eq(&cached, &reloaded));
-        assert_eq!(reloaded.size().unwrap(), 1);
     }
 
     #[test]
@@ -2692,6 +2814,7 @@ mod tests {
             },
             &selected_ids,
             None,
+            true,
         )
         .unwrap();
 
@@ -2744,6 +2867,7 @@ mod tests {
             },
             &selected_ids,
             None,
+            true,
         )
         .unwrap();
         assert_eq!(ordered_ids.len(), all_ids.len());
@@ -3048,6 +3172,7 @@ mod tests {
             range,
             &[first_id, second_id, third_id],
             Some("tenant-a"),
+            true,
         )
         .unwrap()
         .into_iter()
@@ -3092,6 +3217,20 @@ mod tests {
         let conn = open_connection(&db_path).unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = crate::crypto::event_id_to_base64(&[0x71; 32]);
+        conn.execute(
+            "INSERT OR IGNORE INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "tenant-a",
+                "ia-tenant-a",
+                "tenant-event-a",
+                "invite-event-a",
+                &workspace_id,
+                0_i64
+            ],
+        )
+        .unwrap();
         let range = SyncWindow {
             kind: SyncWindowKind::LastDay,
             ts_min_inclusive_ms: Some(0),
@@ -3126,7 +3265,7 @@ mod tests {
         let blob = encode_event(&event).unwrap();
         let event_id = hash_event(&blob);
         let remote_suppressed = [0x99; 32];
-        let receive_task = spawn_receive_log_task(
+        let receive_task = spawn_receive_task(
             MockDataRecv::with_frames(vec![
                 Ok(Frame::Event { blob: blob.clone() }),
                 Ok(Frame::SuppressIds {
@@ -3149,24 +3288,19 @@ mod tests {
         let result = receive_task.await.unwrap().unwrap();
         assert_eq!(result.events_received, 1);
         assert_eq!(result.bytes_received, blob.len() as u64);
-        assert!(result.path.is_some());
-        assert!(result.pending_overlay.is_some());
-        assert_eq!(
-            load_shared_sync_entries_with_pending(
-                &conn,
-                db_path.to_str().unwrap(),
-                &workspace_id,
-                range
-            )
-            .unwrap(),
-            vec![(40, event_id)]
-        );
         assert_eq!(
             sibling_session
                 .outbound_suppression_rx
                 .try_recv()
-                .expect("sibling suppression delivery"),
+                .expect("sibling suppression delivery before ingest wait"),
             event_id
+        );
+        crate::sync::session::receive::wait_for_ingest_waiters(result.ingest_waiters)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_shared_sync_entries(&conn, &workspace_id, range).unwrap(),
+            vec![(40, event_id)]
         );
         assert_eq!(
             primary_session
@@ -3178,9 +3312,6 @@ mod tests {
         assert!(
             primary_session.remote_done_rx.try_recv().is_ok(),
             "receive task should notify remote done once the peer finishes"
-        );
-        crate::sync::session::receive_log::clear_pending_receive_overlay_session(
-            result.pending_overlay.as_ref().unwrap(),
         );
     }
 }

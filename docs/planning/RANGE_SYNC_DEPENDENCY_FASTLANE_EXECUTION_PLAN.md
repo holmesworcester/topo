@@ -153,7 +153,7 @@ Still open:
 Core validation used on this branch:
 
 1. `cargo test -q range_scheduler_round_robins_windows --lib`
-2. `cargo test -q receive_log_ --lib`
+2. `cargo test -q receive_ --lib`
 3. `cargo test -q --test sync_contract_tests`
 4. `cargo test -q --test download_timeline_test`
 5. `cargo test --test sync_graph_test`

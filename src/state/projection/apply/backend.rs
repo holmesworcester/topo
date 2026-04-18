@@ -3,8 +3,8 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::ParsedEvent;
-use crate::projection::contract::{EmitCommand, WriteOp};
-use crate::projection::queries::ProjectionQueries;
+use crate::projection::projector::{EmitCommand, WriteOp};
+use crate::projection::decision_context::ProjectionQueries;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use rusqlite::{Connection, OptionalExtension};
 
@@ -113,23 +113,93 @@ fn collect_associated_key_shared_dep_ids(
     Ok(dep_ids)
 }
 
+fn resolve_shared_event_workspace_id(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id: &EventId,
+) -> ProjectionApplyResult<Option<String>> {
+    let indexed_workspace_id = conn
+        .query_row(
+            "SELECT workspace_id
+             FROM shared_event_index
+             WHERE id = ?1
+               AND workspace_id != ''
+             ORDER BY workspace_id
+             LIMIT 1",
+            rusqlite::params![event_id.as_slice()],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()?;
+    if indexed_workspace_id.is_some() {
+        return Ok(indexed_workspace_id);
+    }
+    Ok(lookup_workspace_id(conn, recorded_by))
+}
+
+fn resolve_blocked_event_workspace_id(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> ProjectionApplyResult<Option<String>> {
+    let is_shared: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM events
+                 WHERE event_id = ?1
+                   AND share_scope = 'shared'
+             )",
+            rusqlite::params![event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !is_shared {
+        return Ok(None);
+    }
+    let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) else {
+        return Ok(None);
+    };
+    resolve_shared_event_workspace_id(conn, recorded_by, &event_id)
+}
+
+fn load_blocked_event_workspace_id(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> ProjectionApplyResult<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT workspace_id
+             FROM blocked_events
+             WHERE peer_id = ?1
+               AND event_id = ?2
+               AND workspace_id IS NOT NULL
+               AND workspace_id != ''",
+            rusqlite::params![recorded_by, event_id_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()?)
+}
+
 fn persist_shared_dep_edges(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
     sub_event: &ParsedEvent,
 ) -> ProjectionApplyResult<()> {
-    let Some(workspace_id) = lookup_workspace_id(conn, recorded_by) else {
+    let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) else {
         return Ok(());
     };
-    let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) else {
+    let Some(workspace_id) = resolve_shared_event_workspace_id(conn, recorded_by, &event_id)?
+    else {
         return Ok(());
     };
     let outer_blob: Option<Vec<u8>> = conn
         .query_row(
             "SELECT blob
-             FROM events
-             WHERE event_id = ?1
+            FROM events
+            WHERE event_id = ?1
                AND share_scope = 'shared'",
             rusqlite::params![event_id_b64],
             |row| crate::db::sql_types::get_blob(row, 0),
@@ -153,6 +223,41 @@ fn persist_shared_dep_edges(
             .map(|(_, dep_id)| dep_id),
     );
     let dep_ids = filter_syncable_shared_dep_ids(conn, dep_ids)?;
+    crate::db::dep_index::replace_shared_event_deps(conn, &workspace_id, &event_id, &dep_ids)?;
+    Ok(())
+}
+
+fn persist_blocked_shared_dep_edges(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    missing: &[EventId],
+) -> ProjectionApplyResult<()> {
+    let Some(event_id) = crate::crypto::event_id_from_base64(event_id_b64) else {
+        return Ok(());
+    };
+    let Some(workspace_id) = load_blocked_event_workspace_id(conn, recorded_by, event_id_b64)?
+    else {
+        return Ok(());
+    };
+    let is_shared: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM events
+                 WHERE event_id = ?1
+                   AND share_scope = 'shared'
+             )",
+            rusqlite::params![event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !is_shared {
+        return Ok(());
+    }
+
+    let dep_ids = dedupe_dep_ids(missing.to_vec());
     crate::db::dep_index::replace_shared_event_deps(conn, &workspace_id, &event_id, &dep_ids)?;
     Ok(())
 }
@@ -285,7 +390,15 @@ impl ProjectionBackend for Connection {
         event_id_b64: &str,
         missing: &[EventId],
     ) -> ProjectionApplyResult<()> {
-        super::stages::record_block_rows(self, recorded_by, event_id_b64, missing)?;
+        let workspace_id = resolve_blocked_event_workspace_id(self, recorded_by, event_id_b64)?;
+        super::stages::record_block_rows(
+            self,
+            recorded_by,
+            event_id_b64,
+            missing,
+            workspace_id.as_deref(),
+        )?;
+        persist_blocked_shared_dep_edges(self, recorded_by, event_id_b64, missing)?;
         Ok(())
     }
 
@@ -402,9 +515,9 @@ mod tests {
         encode_event, EncryptedEvent, ParsedEvent, TenantEvent, EVENT_TYPE_FILE_SLICE,
     };
     use crate::projection::apply::stages::apply_projection_with_backend;
-    use crate::projection::contract::{EmitCommand, ProjectorDecisionContext, WriteOp};
+    use crate::projection::projector::{EmitCommand, ProjectorDecisionContext, WriteOp};
     use crate::projection::decision::ProjectionDecision;
-    use crate::projection::queries::{DepLoadResult, ProjectionQueryResult};
+    use crate::projection::decision_context::{DepLoadResult, ProjectionQueryResult};
 
     use super::*;
     use crate::projection::apply::project_one::project_one_step_with_backend;
@@ -568,131 +681,131 @@ mod tests {
 
         fn load_workspace_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _workspace: &crate::event_modules::WorkspaceEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_admin_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _admin: &crate::event_modules::AdminEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_peer_shared_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _peer_shared: &crate::event_modules::PeerSharedEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_user_invite_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _user_invite: &crate::event_modules::UserInviteEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_device_invite_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _device_invite: &crate::event_modules::DeviceInviteEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_message_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _message: &crate::event_modules::MessageEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_message_deletion_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _message_deletion: &crate::event_modules::MessageDeletionEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_reaction_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _reaction: &crate::event_modules::ReactionEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_file_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _file: &crate::event_modules::FileEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_file_slice_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _file_slice: &crate::event_modules::FileSliceEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_invite_accepted_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _invite_accepted: &crate::event_modules::InviteAcceptedEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_key_request_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _key_request: &crate::event_modules::KeyRequestEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
 
         fn load_key_shared_context(
             &self,
-            _frame: &crate::projection::queries::ProjectionFrameContext,
+            _frame: &crate::projection::decision_context::ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _key_shared: &crate::event_modules::KeySharedEvent,
-        ) -> crate::projection::queries::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
             Ok(ProjectorDecisionContext::default())
         }
     }
@@ -710,13 +823,13 @@ mod tests {
             .unwrap();
         let ctx = (meta.context_loader)(
             &conn,
-            &crate::projection::queries::ProjectionFrameContext::default(),
+            &crate::projection::decision_context::ProjectionFrameContext::default(),
             "peer-a",
             "event-a",
             &parsed,
         )
         .unwrap();
-        let crate::projection::queries::ContextLoadResult::Ready(ctx) = ctx else {
+        let crate::projection::decision_context::ContextLoadResult::Ready(ctx) = ctx else {
             panic!("expected ready context");
         };
         assert!(ctx.accepted_workspace_id.is_none());
@@ -812,7 +925,7 @@ mod tests {
 
         assert_eq!(
             decision,
-            ProjectionDecision::Block {
+            ProjectionDecision::BlockOnMissingDeps {
                 missing: vec![key_event_id]
             }
         );

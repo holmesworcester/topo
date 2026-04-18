@@ -11,7 +11,7 @@ use crate::event_modules::file_slice::{
     BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES, MAX_FILE_BYTES,
 };
 use crate::projection::create::{
-    create_encrypted_event_synchronous, create_encrypted_event_synchronous_with_owner,
+    create_encrypted_event, create_encrypted_event_with_owner,
 };
 use crate::service::open_db_for_peer;
 use crate::state::db::queue::current_timestamp_ms_u64;
@@ -75,6 +75,16 @@ fn resolve_generate_history_span_ms(history_span: Option<&str>) -> u64 {
         .and_then(parse_history_span_ms)
         .or_else(generate_message_spread_ms)
         .unwrap_or(DEFAULT_GENERATE_HISTORY_SPAN_MS)
+}
+
+fn next_monotonic_timestamp_ms(next_timestamp_ms: &mut u64) -> u64 {
+    let now_ms = current_timestamp_ms_u64();
+    if now_ms > *next_timestamp_ms {
+        *next_timestamp_ms = now_ms;
+    }
+    let assigned = *next_timestamp_ms;
+    *next_timestamp_ms = next_timestamp_ms.saturating_add(1);
+    assigned
 }
 
 pub(crate) fn generate_messages_for_recorded_by_between(
@@ -235,7 +245,7 @@ pub fn create(
         content: cmd.content,
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
-    let eid = create_encrypted_event_synchronous(
+    let eid = create_encrypted_event(
         db,
         recorded_by,
         &key_event_id,
@@ -297,7 +307,7 @@ pub fn create_deletion(
         target_event_id: cmd.target_event_id,
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
-    let eid = create_encrypted_event_synchronous(
+    let eid = create_encrypted_event(
         db,
         recorded_by,
         &key_event_id,
@@ -467,12 +477,13 @@ pub fn generate_files_for_peer(
     for i in 0..files {
         let file_start = Instant::now();
         begin_immediate_with_retry(&db)?;
+        let mut next_created_at_ms = current_timestamp_ms_u64();
         let message_event_id = create(
             &db,
             &recorded_by,
             &ctx.signer_event_id,
             &ctx.signing_key,
-            current_timestamp_ms_u64(),
+            next_monotonic_timestamp_ms(&mut next_created_at_ms),
             CreateMessageCmd {
                 workspace_id: ctx.workspace_id,
                 author_id: ctx.author_id,
@@ -495,13 +506,13 @@ pub fn generate_files_for_peer(
                 "blob_bytes overflow".into()
             })?;
 
-        create_encrypted_event_synchronous_with_owner(
+        create_encrypted_event_with_owner(
             &db,
             &recorded_by,
             &key_event_id,
             Some(&message_event_id),
             &ParsedEvent::File(FileEvent {
-                created_at_ms: current_timestamp_ms_u64(),
+                created_at_ms: next_monotonic_timestamp_ms(&mut next_created_at_ms),
                 message_id: message_event_id,
                 file_id,
                 blob_bytes,
@@ -519,13 +530,13 @@ pub fn generate_files_for_peer(
         })?;
 
         for slice_number in 0..slices_per_file {
-            create_encrypted_event_synchronous_with_owner(
+            create_encrypted_event_with_owner(
                 &db,
                 &recorded_by,
                 &key_event_id,
                 Some(&message_event_id),
                 &ParsedEvent::FileSlice(FileSliceEvent {
-                    created_at_ms: current_timestamp_ms_u64(),
+                    created_at_ms: next_monotonic_timestamp_ms(&mut next_created_at_ms),
                     file_id,
                     slice_number: slice_number as u32,
                     ciphertext: ciphertext.clone(),
@@ -713,12 +724,13 @@ fn send_file_for_peer_inner(
     let message_event_id = crate::state::db::queue::with_immediate_tx_result(
         &db,
         || -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+            let mut next_created_at_ms = current_timestamp_ms_u64();
             let message_event_id = create(
                 &db,
                 &recorded_by,
                 &ctx.signer_event_id,
                 &ctx.signing_key,
-                current_timestamp_ms_u64(),
+                next_monotonic_timestamp_ms(&mut next_created_at_ms),
                 CreateMessageCmd {
                     workspace_id: ctx.workspace_id,
                     author_id: ctx.author_id,
@@ -729,13 +741,13 @@ fn send_file_for_peer_inner(
             let key_event_id =
                 workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
 
-            create_encrypted_event_synchronous_with_owner(
+            create_encrypted_event_with_owner(
                 &db,
                 &recorded_by,
                 &key_event_id,
                 Some(&message_event_id),
                 &ParsedEvent::File(FileEvent {
-                    created_at_ms: current_timestamp_ms_u64(),
+                    created_at_ms: next_monotonic_timestamp_ms(&mut next_created_at_ms),
                     message_id: message_event_id,
                     file_id,
                     blob_bytes: file_size,
@@ -783,13 +795,13 @@ fn send_file_for_peer_inner(
                     )?;
                 remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
 
-                create_encrypted_event_synchronous_with_owner(
+                create_encrypted_event_with_owner(
                     &db,
                     &recorded_by,
                     &key_event_id,
                     Some(&message_event_id),
                     &ParsedEvent::FileSlice(FileSliceEvent {
-                        created_at_ms: current_timestamp_ms_u64(),
+                        created_at_ms: next_monotonic_timestamp_ms(&mut next_created_at_ms),
                         file_id,
                         slice_number: slice_number as u32,
                         ciphertext,
@@ -813,13 +825,13 @@ fn send_file_for_peer_inner(
                 )?;
                 let ciphertext =
                     vec![(bad_idx as u8).wrapping_add(0xA5); FILE_SLICE_CIPHERTEXT_BYTES];
-                create_encrypted_event_synchronous_with_owner(
+                create_encrypted_event_with_owner(
                     &db,
                     &recorded_by,
                     &key_event_id,
                     Some(&message_event_id),
                     &ParsedEvent::FileSlice(FileSliceEvent {
-                        created_at_ms: current_timestamp_ms_u64(),
+                        created_at_ms: next_monotonic_timestamp_ms(&mut next_created_at_ms),
                         file_id,
                         slice_number,
                         ciphertext,
@@ -892,6 +904,8 @@ mod tests {
         let source_path = tmp.path().join("payload.bin");
         std::fs::write(&source_path, vec![0x5Au8; FILE_SLICE_DATA_BYTES * 2]).unwrap();
 
+        crate::transport::materialize_daemon_identity_from_db(db_path)
+            .expect("materialize daemon identity");
         let created = create_workspace_for_db(db_path, "ws", "alice", "laptop").unwrap();
         let err = send_file_for_peer_inner(
             db_path,
@@ -921,5 +935,19 @@ mod tests {
         assert_eq!(messages, 0, "message row must roll back");
         assert_eq!(files, 0, "file descriptor must roll back");
         assert_eq!(file_slices, 0, "file slices must roll back");
+    }
+
+    #[test]
+    fn next_monotonic_timestamp_ms_advances_across_ties_and_saturates() {
+        let mut next_timestamp_ms = u64::MAX - 2;
+
+        let first = next_monotonic_timestamp_ms(&mut next_timestamp_ms);
+        let second = next_monotonic_timestamp_ms(&mut next_timestamp_ms);
+        let third = next_monotonic_timestamp_ms(&mut next_timestamp_ms);
+
+        assert_eq!(first, u64::MAX - 2);
+        assert_eq!(second, u64::MAX - 1);
+        assert_eq!(third, u64::MAX);
+        assert_eq!(next_timestamp_ms, u64::MAX);
     }
 }

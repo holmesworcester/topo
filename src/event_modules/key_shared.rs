@@ -98,10 +98,10 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 }
 
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{
+use crate::projection::projector::{
     EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
 };
-use crate::projection::queries::{ProjectionFrameContext, ProjectionQueries};
+use crate::projection::decision_context::{ProjectionFrameContext, ProjectionQueries};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -133,13 +133,13 @@ pub fn build_projector_context(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-) -> Result<crate::projection::queries::ContextLoadResult, Box<dyn std::error::Error>> {
+) -> Result<crate::projection::decision_context::ContextLoadResult, Box<dyn std::error::Error>> {
     let ss = match parsed {
         ParsedEvent::KeyShared(ss) => ss,
         _ => return Err("key_shared context loader called for non-key_shared event".into()),
     };
 
-    Ok(crate::projection::queries::ContextLoadResult::ready(
+    Ok(crate::projection::decision_context::ContextLoadResult::ready(
         queries.load_key_shared_context(frame, recorded_by, event_id_b64, ss)?,
     ))
 }

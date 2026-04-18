@@ -11,7 +11,7 @@ fn test_endpoint_secret_projects_under_endpoint_scope() {
     let event = crate::event_modules::endpoint_secret::deterministic_endpoint_secret_event(
         private_key_bytes,
     );
-    let event_id = create_event_synchronous(&conn, &endpoint_id, &event).unwrap();
+    let event_id = create_event(&conn, &endpoint_id, &event).unwrap();
 
     let stored: (String, String) = conn
         .query_row(
@@ -72,7 +72,7 @@ fn test_endpoint_shared_projects_under_endpoint_scope() {
     let event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
         private_key_bytes,
     );
-    let event_id = create_event_synchronous(&conn, &endpoint_id, &event).unwrap();
+    let event_id = create_event(&conn, &endpoint_id, &event).unwrap();
 
     let stored: (String, String) = conn
         .query_row(
@@ -192,7 +192,7 @@ fn test_peer_shared_blocks_when_endpoint_shared_missing() {
     let peer_shared_eid = insert_event_raw(&conn, recorded_by, &peer_shared_blob);
 
     match project_one(&conn, recorded_by, &peer_shared_eid).unwrap() {
-        ProjectionDecision::Block { missing } => {
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
             assert!(
                 missing.contains(&endpoint_eid),
                 "missing deps should include endpoint_shared"
@@ -236,7 +236,7 @@ fn test_peer_shared_unblocks_after_endpoint_shared_projects() {
 
     assert!(matches!(
         project_one(&conn, recorded_by, &peer_shared_eid).unwrap(),
-        ProjectionDecision::Block { .. }
+        ProjectionDecision::BlockOnMissingDeps { .. }
     ));
 
     insert_event_raw(&conn, &endpoint_id, &endpoint_blob);
@@ -438,7 +438,7 @@ fn setup_workspace_anchor(conn: &Connection, recorded_by: &str) -> (EventId, Sig
         invite_event_id: workspace_eid,
         workspace_id: workspace_eid,
     });
-    create_event_synchronous(conn, recorded_by, &invite_accepted).unwrap();
+    create_event(conn, recorded_by, &invite_accepted).unwrap();
     assert!(
         matches!(
             project_one(conn, recorded_by, &workspace_eid).unwrap(),
@@ -464,7 +464,7 @@ fn create_bootstrap_user_invite(
         workspace_id: workspace_eid,
         authority_event_id: workspace_eid,
     });
-    let invite_eid = create_signed_event_synchronous(
+    let invite_eid = create_signed_event(
         conn,
         recorded_by,
         &workspace_eid,
@@ -488,7 +488,7 @@ fn project_valid_user_from_invite(
         public_key: user_key.verifying_key().to_bytes(),
         username: username.to_string(),
     });
-    let user_eid = create_signed_event_synchronous(
+    let user_eid = create_signed_event(
         conn,
         recorded_by,
         &invite_event_id,
@@ -512,7 +512,7 @@ fn project_valid_bootstrap_device_invite(
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: user_event_id,
     });
-    let device_invite_eid = create_signed_event_synchronous(
+    let device_invite_eid = create_signed_event(
         conn,
         recorded_by,
         &user_event_id,
@@ -536,7 +536,7 @@ fn project_valid_admin_for_user(
         public_key: user_public_key,
         user_event_id,
     });
-    create_signed_event_synchronous(
+    create_signed_event(
         conn,
         recorded_by,
         &workspace_eid,
@@ -564,7 +564,7 @@ fn project_valid_peer_shared_for_user(
         endpoint_shared_event_id,
         device_name: device_name.to_string(),
     });
-    let peer_shared_eid = create_signed_event_synchronous(
+    let peer_shared_eid = create_signed_event(
         conn,
         recorded_by,
         &device_invite_eid,
@@ -648,7 +648,7 @@ fn test_peer_shared_rejects_wrong_signer_family_at_projection() {
         public_key: user_key.verifying_key().to_bytes(),
         user_event_id: user_eid,
     });
-    let admin_eid = create_signed_event_synchronous(
+    let admin_eid = create_signed_event(
         &conn,
         recorded_by,
         &workspace_eid,
@@ -1323,7 +1323,7 @@ fn test_device_invite_rejects_peer_signed_authority_mismatch_at_projection() {
 
 #[test]
 fn test_emit_cross_tenant_records_and_projects() {
-    use crate::projection::emit::emit_deterministic_event;
+    use crate::projection::create::emit_deterministic_event;
 
     let conn = setup();
     let tenant_a = "tenant_a";
@@ -1396,7 +1396,7 @@ fn test_emit_cross_tenant_records_and_projects() {
 
 #[test]
 fn test_emit_local_share_scope_no_shared_event_index() {
-    use crate::projection::emit::emit_deterministic_event;
+    use crate::projection::create::emit_deterministic_event;
 
     let conn = setup();
     let recorded_by = "peer1";

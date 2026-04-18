@@ -1,3 +1,9 @@
+//! `message` event (type 1): a chat message authored by a user. Hosts the user-facing send
+//! and delete commands ([`commands`]) plus the message-view query ([`queries`]) that joins
+//! each message with its reactions and file attachments into a single API-ready item
+//! (deletions are handled separately via hard-purge). This is the canonical reference
+//! module for adding a new event type — see DESIGN.md §"Adding Event-Layer Functionality".
+
 pub mod commands;
 pub mod layout;
 pub mod projector;

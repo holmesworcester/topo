@@ -1,7 +1,7 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::decision_context::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
@@ -100,9 +100,9 @@ mod projector_tests {
     use crate::event_modules::EVENT_TYPE_DEVICE_INVITE;
     use crate::event_modules::{encode_event, DeviceInviteEvent};
     use crate::event_modules::{ParsedEvent, PeerSharedEvent, WorkspaceEvent};
-    use crate::projection::contract::CurrentSignerInfo;
-    use crate::projection::queries::ContextLoadResult;
-    use crate::projection::queries::ProjectionFrameContext;
+    use crate::projection::projector::CurrentSignerInfo;
+    use crate::projection::decision_context::ContextLoadResult;
+    use crate::projection::decision_context::ProjectionFrameContext;
 
     fn peer_shared_event() -> ParsedEvent {
         ParsedEvent::PeerShared(PeerSharedEvent {

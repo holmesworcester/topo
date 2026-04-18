@@ -234,7 +234,7 @@ The attraction is real: connection sharing becomes simpler, and there is less ex
 
 ### Sync And Convergence
 
-Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. The active control path is dep-aware: for one selected range of root events from `shared_event_index`, each side reuses an immutable in-memory snapshot keyed by `(db_path, workspace_id, window_kind, bounds, epoch)`. Each root-partitioned slice carries one combined homomorphic fingerprint over the root ids in that slice plus the recursive dependency contribution induced by those roots. Phase 1 exchanges `NegOpen` / `NegMsg` over those combined fingerprints and exacts only root ids for small mismatched slices. Each side then expands dependency candidates from the local-only and dep-probe roots discovered in Phase 1, exchanges those candidate ids, and runs a second stock Negentropy round over that candidate-dependency universe to confirm which deps are actually missing before either side streams event blobs. The receiver hashes each blob, appends the event id and blob to a durable `ReceiveLog` segment, and stamps `first_received_at` / `first_stored_at` in that segment as each blob lands. Cold ranges still ingest after the session-finalized log closes; hot `LastDay` receives instead roll sealed `ReceiveLog` segments every `512 KiB` so canonical ingest can begin before the network session ends.
+Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. The active control path is dep-aware: for one selected range of durable root events from `shared_event_index`, each side reuses an immutable in-memory snapshot keyed by `(db_path, workspace_id, window_kind, bounds, epoch)`. Each root-partitioned slice carries one combined homomorphic fingerprint over the root ids in that slice plus the recursive dependency contribution induced by those roots. Phase 1 exchanges `NegOpen` / `NegMsg` over those combined fingerprints and exacts only root ids for small mismatched slices. Each side then expands dependency candidates from the local-only and dep-probe roots discovered in Phase 1, exchanges those candidate ids, and runs a second stock Negentropy round over that candidate-dependency universe to confirm which deps are actually missing before either side streams event blobs. The receiver hashes each blob once, publishes live suppression immediately when enabled, and enqueues bounded in-memory direct-ingest batches. The direct-ingest worker writes canonical rows straight into SQLite, stamps `first_received_at` / `first_stored_at` during persist, and lets WAL backpressure slow the network path when ingest falls behind. This is an explicit UX tradeoff: writing raw blobs straight to disk or into a large pre-ingest memory buffer can improve pure download-time / time-to-durable metrics because the network path finishes earlier, but direct on-the-fly ingest gives earlier canonical visibility, earlier projection, and better in-progress file/download UX.
 
 Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses a dep-aware Phase 1 over one selected root range at a time and a stock Negentropy Phase 2 only over candidate dependency ids. The current scheduler intentionally stays simple and runs a per-peer cadence through:
 
@@ -243,11 +243,11 @@ Negentropy remains the set-reconciliation engine because it is agnostic to event
 3. `last twelve weeks`
 4. `old`
 
-When multiple peers are connected, each peer runs that same cadence independently. The scheduler no longer divides historical ranges by peer rank, ownership, or hash partition. Duplicate reduction is handled by live suppression: as a receiver hashes incoming events, it publishes those event ids to other same-workspace sessions; senders then skip ids that the receiver says it already has or is already receiving.
+When multiple peers are connected, each peer runs that same cadence independently. The scheduler no longer divides historical ranges by peer rank, ownership, or hash partition. Duplicate reduction is handled by live suppression: as a receiver hashes incoming events, it publishes those event ids to other same-workspace sessions; senders then skip ids that the receiver says it already has or is already receiving. To avoid every identical source colliding on the same bulk prefix, senders keep a small timestamp-ordered head for early metadata and deterministically scatter the remaining tail by seeded event-id hash.
 
-This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, no peer partition, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, later rounds with the remaining peers reconcile the same ranges again and fill holes. While a hot `LastDay` receive is active for a DB, ordinary background receive-log ingest stays paused so download/store remains the priority path, but sealed hot `LastDay` segments are allowed through immediately. The ingest worker prefers the earliest sealed segment from that session first so descriptor-bearing metadata projects before later slice-heavy segments, and the next sync session with that same peer does not begin until the prior session's receive-log ingests have drained.
+This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, no peer partition, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, later rounds with the remaining peers reconcile the same ranges again and fill holes. The next sync session with that same peer does not begin until the prior session's direct-ingest batches have drained, so a peer-specific negentropy round is fully ingested before the next one starts.
 
-Sync is range-owned with a receive-log durable handoff. Live suppression may advertise a freshly hashed id before canonical ingest because suppression is only an efficiency hint. Bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
+Sync is range-owned with direct canonical ingest. Live suppression may advertise a freshly hashed id before canonical ingest because suppression is only an efficiency hint. Bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, a file-backed receive log, or a shared ingest channel to keep the wire busy.
 
 For same-workspace sibling tenants sharing one DB, there is one extra local step after canonical persistence: shared events created locally or ingested from the network are fanned out to sibling tenant scopes with the same `workspace_id`, then projected through those tenants' normal queue/drain path. This is not a transport shortcut and it does not bypass projectors; it is local fanout of already-canonical shared blobs so one shared DB converges the same way multiple separate daemons would.
 
@@ -283,7 +283,14 @@ For reactive data flows, the daemon provides a local subscription engine. Fronte
 
 ## Adding Event-Layer Functionality
 
-This is the concrete workflow for adding a user-facing feature as event-layer functionality, using a new multi-valued message attachment type (`message_unfurl`) as the example. The same flow applies to `message_reply` (or any other "many per message" relation): one canonical event per attachment item, all keyed by `message_id`.
+This section is the fastest path from "I have a feature idea" to working code. It walks through adding a new event type end-to-end, using a new multi-valued message attachment type (`message_unfurl`) as the worked example. The same flow applies to `message_reply` or any other "many per message" relation: one canonical event per item, all keyed by `message_id`.
+
+Prerequisites — concepts you should skim before starting:
+
+- [§1.2 Event format](#12-event-format) — fixed-length wire layout via declarative field specs
+- [§4.1 Single projector entrypoint](#41-single-projector-entrypoint) and [§4.2 Pure functional projector contract](#42-pure-functional-projector-contract) — how events become rows
+- [§5 Dependency Blocking and Unblocking](#5-dependency-blocking-and-unblocking) — why deps are declared in meta, not enforced by the projector
+- **Project-to-own-table rule** (in Motivation): a projector only writes its own table; cross-event effects flow through emitted events.
 
 ### Example Feature: Multi-Valued `message_unfurl`
 
@@ -295,50 +302,62 @@ Do not mutate the `message` row in place to add unfurls.
 
 ### 1. Create The Event Module
 
-Add a new module directory:
+Add a new module directory mirroring existing modules like [`reaction/`](/home/holmes/poc-7/src/event_modules/reaction/):
 
 ```text
 src/event_modules/message_unfurl/
-  mod.rs
-  wire.rs
-  projector.rs
-  queries.rs
+  mod.rs        // ensure_schema, re-exports
+  wire.rs       // FieldSpec layout, parse/encode, EventTypeMeta static
+  projector.rs  // pure projector + context loader
+  queries.rs    // read helpers
+  commands.rs   // (optional) user-facing send/emit
 ```
 
-Model and wire format in [wire.rs](/home/holmes/poc-7/src/event_modules/file/wire.rs)-style:
+Wire layout uses declarative `FieldSpec` — no hand-written offsets. Signed events do NOT carry signature bytes in the inner struct; the `Signed` wrapper (type 35) holds `signer_event_id` and the 64-byte signature. In `wire.rs`:
 
 ```rust
+pub const MESSAGE_UNFURL_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("message_id"),
+    FieldSpec::Text("url", 512),
+    FieldSpec::Text("title", 256),
+    FieldSpec::Text("image_url", 512),
+];
+pub const MESSAGE_UNFURL_WIRE_SIZE: usize = wire_size_for_fields(MESSAGE_UNFURL_FIELDS);
+
 pub struct MessageUnfurlEvent {
     pub created_at_ms: u64,
-    pub message_id: [u8; 32],   // dep: message
-    pub url: String,            // fixed-size text slot
-    pub title: String,          // fixed-size text slot
-    pub image_url: String,      // fixed-size text slot, "" when absent
-    pub signed_by: [u8; 32],    // dep: signer
-    pub signer_type: u8,
-    pub signature: [u8; 64],
+    pub message_id: [u8; 32],
+    pub url: String,
+    pub title: String,
+    pub image_url: String,
 }
 
-pub static MESSAGE_UNFURL_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_MESSAGE_UNFURL,
-    type_name: "message_unfurl",
-    projection_table: "message_unfurls",
-    share_scope: ShareScope::Shared,
-    dep_fields: &["message_id", "signed_by"],
-    dep_field_type_codes: &[&[1], &[]], // message, signer-resolved
-    signer_required: true,
-    signature_byte_len: 64,
-    encryptable: true,
-    parse: parse_message_unfurl,
-    encode: encode_message_unfurl,
-    projector: super::projector::project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
-};
+pub static MESSAGE_UNFURL_META: EventTypeMeta =
+    crate::event_modules::registry::event_type_meta! {
+        type_code: EVENT_TYPE_MESSAGE_UNFURL,
+        type_name: "message_unfurl",
+        projection_table: "message_unfurls",
+        share_scope: ShareScope::Shared,
+        dep_fields: &["message_id"],
+        dep_field_type_codes: &[&[EVENT_TYPE_MESSAGE]],
+        signer_required: true,
+        signature_byte_len: 0,   // 0 for inner events; Signed wrapper holds the sig
+        encryptable: true,
+        parse: parse_message_unfurl,
+        encode: encode_message_unfurl,
+        projector: super::projector::project_pure,
+        context_loader: crate::event_modules::registry::load_empty_context,
+    };
 ```
+
+Notes:
+- `signer_required: true` means the event must arrive wrapped in `Signed`; signer identity is the signer chain resolved from the wrapper's `signer_event_id`, so it does not appear in `dep_fields`.
+- Use `load_empty_context` when the projector needs no extra row context; otherwise write a `build_projector_context` that calls a typed loader on `ProjectionQueries` (see [reaction/projector.rs](/home/holmes/poc-7/src/event_modules/reaction/projector.rs)).
 
 ### 2. Add Projection Table + Projector
 
-In `message_unfurl/mod.rs`, define schema with tenant scope and message fanout index:
+In `message_unfurl/mod.rs`, define schema with tenant scope (`recorded_by` in PK) and a message fanout index:
 
 ```sql
 CREATE TABLE IF NOT EXISTS message_unfurls (
@@ -349,77 +368,78 @@ CREATE TABLE IF NOT EXISTS message_unfurls (
   title TEXT NOT NULL,
   image_url TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  signer_event_id TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (recorded_by, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_msg_unfurls_message
   ON message_unfurls(recorded_by, message_id);
 ```
 
-In `message_unfurl/projector.rs`, emit `InsertOrIgnore` into `message_unfurls`.  
-This is what makes "many unfurls per message" natural: multiple events with same `message_id`, different `event_id`.
+In `message_unfurl/projector.rs`, return `ProjectorResult::valid(ops)` with a single `WriteOp::InsertOrIgnore` into `message_unfurls`. This is what makes "many unfurls per message" natural: multiple events with the same `message_id` and different `event_id`. The projector must be pure — no direct SQL, no reads outside the supplied `ProjectorDecisionContext`.
 
 ### 3. Register The Type In Core Event Registry
 
-Update [mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs):
+Update [src/event_modules/mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs):
 
-1. `pub mod message_unfurl;`
-2. `pub use message_unfurl::MessageUnfurlEvent;`
-3. Allocate a new `EVENT_TYPE_MESSAGE_UNFURL` code.
-4. Add `message_unfurl::ensure_schema(conn)?` to `ensure_schema`.
-5. Add `ParsedEvent::MessageUnfurl(...)`.
-6. Add entries in `dep_field_values`, `event_type_code`, and `signer_fields`.
-7. Add `&message_unfurl::MESSAGE_UNFURL_META` to `registry()`.
+1. `pub mod message_unfurl;` and `pub use message_unfurl::MessageUnfurlEvent;`
+2. Allocate a new `EVENT_TYPE_MESSAGE_UNFURL: u8 = N;` constant (pick the next free code).
+3. Call `message_unfurl::ensure_schema(conn)?` from `ensure_schema`.
+4. Add a `ParsedEvent::MessageUnfurl(MessageUnfurlEvent)` variant.
+5. Add match arms in `ParsedEvent::created_at_ms`, `dep_field_values`, `event_type_code`, and `human_fields`.
+6. Add `&message_unfurl::MESSAGE_UNFURL_META` to the `registry()` slice.
 
-If encryptable, also add wire size mapping in [common.rs](/home/holmes/poc-7/src/event_modules/layout/common.rs) `encrypted_inner_wire_size(...)`.
+Additional wiring required by the registry-coverage tests — these are not optional:
+
+- `formal_projector_family()` in the `mod.rs` test block — every registered code must be assigned to a Verus-covered family, or `test_registry_formal_projector_coverage` fails.
+- The `test_registry_encryptable_coverage` and `test_registry_transport_privacy_coverage` expectations in `mod.rs` — update the expected code lists to include the new type.
+
+Conditional on the event's shape:
+
+- [layout/common.rs](/home/holmes/poc-7/src/event_modules/layout/common.rs) `encrypted_inner_wire_size(...)` — add a size mapping if `encryptable: true`.
+- `EventTypeMeta::transport_privacy()` in [registry.rs](/home/holmes/poc-7/src/event_modules/registry.rs) — extend the match if this event must ride encrypted on the wire (e.g., user content).
 
 ### 4. Add Queries And Include In Message View
 
-Create `message_unfurl::queries::list_for_message(...)` (same pattern as [queries.rs](/home/holmes/poc-7/src/event_modules/file/queries.rs)).
+Create `message_unfurl::queries::list_for_message(...)` (same pattern as [file/queries.rs](/home/holmes/poc-7/src/event_modules/file/queries.rs)).
 
-Then update [queries.rs](/home/holmes/poc-7/src/event_modules/message/queries.rs):
+Then update [message/queries.rs](/home/holmes/poc-7/src/event_modules/message/queries.rs):
 
 1. import `message_unfurl`,
 2. fetch unfurls alongside reactions/attachments,
-3. add `unfurls: Vec<UnfurlSummary>` to [mod.rs](/home/holmes/poc-7/src/event_modules/message/mod.rs) `MessageItem`, where each `UnfurlSummary` carries `url`, `title`, and `image_url`.
+3. add `unfurls: Vec<UnfurlSummary>` to `MessageItem` in [message/mod.rs](/home/holmes/poc-7/src/event_modules/message/mod.rs), where each `UnfurlSummary` carries `url`, `title`, and `image_url`.
 
 This is the only place the "messages API shape" changes; canonical history remains event-sourced.
 
 ### 5. Add Command Path
 
-Add a command entrypoint where user-facing sends are already implemented:
+Add a command entrypoint where user-facing sends are already implemented — either in [message/commands.rs](/home/holmes/poc-7/src/event_modules/message/commands.rs) or a focused `message_unfurl/commands.rs`.
 
-1. either in [commands.rs](/home/holmes/poc-7/src/event_modules/message/commands.rs),
-2. or a focused `message_unfurl/commands.rs`.
-
-Use `create_signed_event_synchronous(...)` to emit one `message_unfurl` event per unfurl.  
-If the message does not exist yet, the unfurl event blocks and later unblocks via normal cascade.
+Use `create_signed_event(...)` from [src/state/projection/create.rs](/home/holmes/poc-7/src/state/projection/create.rs) to emit one `message_unfurl` event per unfurl; for content that must be encrypted on the wire, use `create_encrypted_event(...)` — when passed signer info, it produces `Signed(Encrypted(inner))` (outer Signed wrapping the Encrypted envelope). If the message does not exist yet, the unfurl event blocks on `message_id` and later unblocks via the normal Kahn cascade ([§5.2](#52-counter-based-kahn-cascade-unblock)). The staged variants (`create_signed_event_staged`, `create_encrypted_event_staged`) return `Ok` rather than `Err` on missing deps — use them when the caller tolerates deferred projection.
 
 ### 6. Wire RPC/CLI To The New Command
 
 If this feature is externally callable:
 
-1. add RPC method variant in [protocol.rs](/home/holmes/poc-7/src/runtime/control/rpc/protocol.rs),
-2. add catalog entry in [catalog.rs](/home/holmes/poc-7/src/runtime/control/rpc/catalog.rs),
-3. add dispatch handler in [server.rs](/home/holmes/poc-7/src/runtime/control/rpc/server.rs),
-4. add CLI handler in [main.rs](/home/holmes/poc-7/src/runtime/control/main.rs) using `rpc_require_daemon()`.
+1. add an `RpcMethod` variant in [protocol.rs](/home/holmes/poc-7/src/runtime/control/rpc/protocol.rs),
+2. add a `MethodInfo` catalog entry in [catalog.rs](/home/holmes/poc-7/src/runtime/control/rpc/catalog.rs),
+3. add a dispatch handler in [server.rs](/home/holmes/poc-7/src/runtime/control/rpc/server.rs),
+4. add a CLI handler in [main.rs](/home/holmes/poc-7/src/runtime/control/main.rs) calling through `rpc_require_daemon(...)`.
 
 The CLI must always go through RPC — never open the database directly for workspace queries. No event logic belongs in RPC/service routing; those layers orchestrate only.
 
 ### 7. Tests You Add In The Same Change
 
-1. Roundtrip/meta tests in [mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs) (parse/encode, dep fields, signer fields, registry lookup).
-2. Projector tests in `tests/projectors/` for valid insert + dep/signer blocking behavior.
-3. Pipeline integration tests in `src/state/projection/apply/tests/` for unblock/cascade behavior.
+1. Roundtrip/meta tests in [src/event_modules/mod.rs](/home/holmes/poc-7/src/event_modules/mod.rs) (parse/encode, dep fields, registry lookup, encryptable/transport-privacy/formal-family coverage).
+2. Pure-projector tests in [tests/projectors/](/home/holmes/poc-7/tests/projectors/) — valid-input projection and rejects over the pure contract (no pipeline).
+3. Pipeline integration tests in [src/state/projection/apply/tests/](/home/holmes/poc-7/src/state/projection/apply/tests/) — dep/signer blocking, unblock cascade, and encrypt/decrypt flow against a real DB.
 4. Scenario/API test proving messages can return multiple unfurls for one message.
 
 ### `message_reply` Variant
 
 If you implement reply references instead of unfurls, use the same flow with:
 
-1. `message_reply` event fields: `message_id`, `target_message_id`, signer fields,
-2. deps: `["message_id", "target_message_id", "signed_by"]`,
-3. projection table keyed by `(recorded_by, event_id)` with index on `(recorded_by, message_id)`.
+1. `message_reply` inner fields: `message_id`, `target_message_id` (both `EventId`), plus any reply metadata,
+2. `dep_fields: &["message_id", "target_message_id"]` (signer is still resolved via the Signed wrapper, not declared here),
+3. projection table keyed by `(recorded_by, event_id)` with an index on `(recorded_by, message_id)`.
 
 You still get "multiple replies attached to one message" by emitting multiple `message_reply` events with the same `message_id`.
 
@@ -520,7 +540,7 @@ Current shape:
    - negentropy reconcile for one explicit range,
    - bulk event transfer for that same range,
 2. bulk range transfer does not use `ResponseCredit`, durable `wanted`, or a per-event request scheduler,
-3. the receiver writes bulk data to a `ReceiveLog`; cold ranges finalize one log and ingest it through the normal background path, while hot `LastDay` receives roll sealed `512 KiB` segments and enqueue those segments for priority ingest during the session,
+3. the receiver hashes bulk data once, publishes suppression when enabled, and pushes bounded direct-ingest batches straight into canonical SQLite ingest with WAL backpressure,
 4. auth and removal-frontier state are prioritized ahead of hot-range transfer so newly visible messages unblock without a separate dependency fast path.
 
 ---
@@ -844,31 +864,40 @@ Discovery-only invite acceptance may still persist an empty `bootstrap_addr` mar
 
 This PoC does not implement `PeerRemoved`, `UserRemoved`, or a `ban` command. Safe user/device removal requires coordinated group key agreement plus key rotation so future ciphertext is no longer available to the removed member. When removal is added back, it must revoke any admitted `(tenant_id, remote_peer_id)` routes on live daemon connections and close the daemon connection entirely if no tenant scopes remain; we must not rely on ingest rejection alone. We intentionally defer that work here and keep transport trust/session logic limited to invite/bootstrap trust and steady-state `PeerShared` trust.
 
-### Receive logs and range ingest
+### Direct ingest and range receive
 
-The active network ingest model has one durable receive boundary: range sessions
-write blobs to `ReceiveLog` files, then background replay moves those records
-through canonical ingest and projection. The durable handoff stays file-backed,
-but a hot `LastDay` receive is no longer forced to wait for one end-of-session
-log close before any ingest work starts.
+The active network ingest model now has one canonical receive boundary: range
+sessions hash blobs once, optionally publish live suppression immediately, and
+hand bounded batches straight to the direct-ingest worker. That worker writes
+canonical rows into SQLite and lets WAL backpressure slow the network path if
+ingest falls behind.
+
+This choice favors time-to-viewable / time-to-projected state over raw
+download completion. A design that first spills received blobs to a file or a
+large memory buffer before ingest can finish network receive sooner, but it
+pushes visibility later, weakens in-progress download progress, and reintroduces
+extra file/buffer lifecycle machinery that the direct-ingest path avoids.
 
 Range receive path:
-1. hash each incoming blob once before durable append to compute its event id,
+1. hash each incoming blob once to compute its event id,
 2. publish that event id to the live-suppression cohort when live suppression is enabled,
-3. append the event id and blob to the active `ReceiveLog` segment,
-4. stamp first-store timing as the append succeeds,
-5. record an in-memory pending-receive overlay entry for active range reconciliation,
-6. for hot `LastDay` receives, seal and enqueue the segment every `512 KiB`; colder ranges still wait for close or idle timeout,
-7. let priority hot segments replay immediately while non-priority background logs wait behind active hot receives,
-8. order hot-segment replay by earliest segment ordinal first so early metadata reaches canonical state before later file slices,
-9. require the next session with that same peer to wait until the prior session's receive-log ingests finish,
-10. recover leftover logs on startup and delete them after successful replay.
+3. enqueue the blob into a bounded direct-ingest batch,
+4. stamp first-store timing when the batch reaches canonical ingest,
+5. require the next session with that same peer to wait until the prior session's direct-ingest batches finish.
 
-This keeps the bulk hot path free of per-event SQLite work while still using
-the same canonical/projector pipeline after the durable handoff point. The
-tradeoff is explicit: live UX for hot `LastDay` transfers improves because
-sealed segments ingest mid-session, while durability and crash recovery still
-come from the same receive-log files.
+This keeps the protocol shape simple: no file-backed receive log, no startup
+recovery pass, and no separate in-memory overlay that pretends roots exist
+before they are durably indexed.
+
+Observed follow-up: an April 2026 experiment that changed selected-send order
+to oldest-first timestamp order (including `phase2` before `phase1`) preserved
+or slightly improved `all durable` time on the `500k` tiered catchup bench, but
+regressed `all projected` materially on the same surface. The `Old` window did
+not start doing dependency sync in that experiment; `SyncWindowKind::Old`
+continued to skip dep-search and phase-2 dependency reconciliation entirely.
+That regression is therefore pinned as future investigation into how root send
+order reshapes downstream ingest/projection work, not as evidence that full
+range sync should be running dep closure work.
 
 ### Session-auth credential storage
 
@@ -909,7 +938,7 @@ The production peering runtime follows a single conceptual loop:
 6. **Logical session auth and runners**: tenant work reuses the live daemon connection and opens logical range sessions. Steady-state sessions begin with `OpenSessionRoute`; bootstrap or new-workspace sessions use `OpenSessionAuthInvite`, then run through `SyncConnectionHandler`.
 
 Known drawback: because there is no pre-handshake secret gate today, anyone who learns the daemon's `iroh` address or relay-reachable endpoint can touch the unauthenticated `iroh/topo` surface. They still cannot authenticate into a workspace without a valid route or invite proof, but they can force the first-session timeout path and probe for bugs in `iroh` itself or in our own session/bootstrap parsing and admission logic. This is an intentional simplicity tradeoff in the current design, not a claim that the exposed pre-proof surface is zero.
-7. **Ingest boundary**: range sessions write `ReceiveLog` files, and replayed logs converge through the canonical/projector path.
+7. **Ingest boundary**: range sessions feed direct-ingest batches, and those canonical rows converge through the normal projector path.
 8. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
 
 ### Module ownership
@@ -1309,15 +1338,13 @@ Peer runtime worker shape:
    - choose one explicit range,
    - reconcile that range with negentropy on the control stream,
    - exchange missing blobs on the data stream as event frames,
-   - hash received blobs once, publish live suppression when enabled, and append blobs plus event ids to a `ReceiveLog`,
-   - for hot `LastDay` receives, roll sealed `512 KiB` receive-log segments and enqueue them for priority ingest during the session,
-   - hold the same-peer session gate until those receive-log ingests complete.
+   - hash received blobs once, publish live suppression when enabled, and enqueue bounded direct-ingest batches,
+   - hold the same-peer session gate until those direct-ingest batches complete.
 2. project worker/drain:
    - claim `project_queue`,
    - run `project_one` in autocommit,
    - dequeue successes in batches and retry failures with backoff.
 3. cleanup worker:
-   - recover leftover receive logs,
    - reclaim expired leases,
    - purge stale operational rows and expired endpoint observations.
 
@@ -1331,16 +1358,15 @@ Bulk transfer is range-owned.
    - `last twelve weeks`
    - `old`
 2. the initiator opens a `Range` session and sends the concrete window bounds in the initial `NegOpen`,
-3. both sides reuse a cached dep-aware snapshot for that root range and overlay pending receive-log roots for local suppression,
+3. both sides reuse a cached dep-aware snapshot for that durable root range,
 4. Phase 1 compares one combined fingerprint per root slice and exacts only root ids for small mismatched slices,
 5. both sides expand dependency candidates from the Phase 1 local-only and dep-probe roots, exchange those candidate ids, and run a stock Negentropy Phase 2 over the shared candidate-dependency universe,
 6. after Phase 2 confirms which deps are truly missing, both sides stream all missing blobs for that range as raw event frames on the data stream in dependency-safe order,
 7. with live suppression enabled, the sender also accepts batched `SuppressIds` frames from the receiver and stops sending ids that are already received or pending elsewhere,
-8. the receiver hashes each blob once before append, records the event id plus blob in the active `ReceiveLog` segment, stamps `first_received_at` and `first_stored_at`, and advertises the id to sibling same-workspace sessions,
+8. the receiver hashes each blob once before enqueue, advertises the id to sibling same-workspace sessions, and hands bounded batches straight to canonical ingest,
 9. senders finish a live-suppression data stream with `RangeDataDone`; receivers continue to finalize on close or idle timeout for compatibility,
-10. on close or idle timeout, the current log is finalized with `flush + sync_all`; hot `LastDay` receives also seal intermediate `512 KiB` segments mid-session and queue each finished segment for canonical ingest,
-11. while a hot `LastDay` receive is active for a DB, non-priority receive-log replay stays paused so download/store remains the priority path, but those sealed hot segments are allowed through immediately,
-12. hot-segment replay prefers the earliest segment ordinal from a session first, and the next session with that same peer waits until the prior session's receive-log ingests complete.
+10. on close or idle timeout, the receiver just flushes any remaining in-memory direct-ingest batch and waits for canonical ingest completion,
+11. the next session with that same peer waits until the prior session's direct-ingest batches complete.
 
 Dependency repair is now range-owned inside the active round rather than delegated to a separate bucket system:
 
@@ -1353,18 +1379,15 @@ Dependency repair is now range-owned inside the active round rather than delegat
 1. `project_queue` is transient and purged on terminal decision for the `(peer_id, event_id)` projection target.
 2. enqueue uses dedupe guards and skips terminal or already-blocked states.
 3. duplicate enqueue races are safe via `INSERT OR IGNORE` plus terminal fast-drop checks.
-4. `ReceiveLog` replay parses valid records to EOF and ignores a truncated tail.
-5. leftover receive logs are ingested on startup; interrupted bulk ranges are not discarded.
-6. live suppression and pending-receive overlay state are bounded in-memory state keyed by DB/workspace/session identity.
+4. live suppression state is bounded in-memory state keyed by DB/workspace/session identity.
 
 ## 7.5 Atomicity boundaries
 
 Must be atomic:
 
-1. append one event id plus blob to the `ReceiveLog`,
-2. canonical event insert + recorded insert + `project_queue` enqueue,
-3. projection state transition + project dequeue,
-4. unblock update + project requeue.
+1. canonical event insert + recorded insert + `project_queue` enqueue,
+2. projection state transition + project dequeue,
+3. unblock update + project requeue.
 
 Can be eventual:
 
@@ -1414,9 +1437,8 @@ live connections to the same peer.
 The active branch chooses simpler boundaries over a global per-event planner:
 
 1. **Range-owned bulk transfer.** One range session owns one explicit range and
-   one receive-log stream; cold ranges usually produce one finalized log, while
-   hot `LastDay` receives may roll multiple sealed `512 KiB` segments that are
-   ingested before session end.
+   one direct-ingest stream backed by a bounded in-memory queue and SQLite WAL
+   backpressure.
 2. **Prioritized range repair.** Blockers are recorded locally and repaired by
    later range windows; there is no separate dependency session.
 3. **Daemon-connection-scoped ownership.** Sessions belong to one authenticated
@@ -1432,8 +1454,11 @@ The active branch chooses simpler boundaries over a global per-event planner:
    scheduler.
 6. **Suppression-based multi-source coordination.** When live suppression is
    enabled, received event ids are advertised to same-workspace sessions and
-   senders skip suppressed ids. Suppression is an efficiency hint; later range
-   rounds recover any falsely suppressed or dropped ids.
+   senders skip suppressed ids. Senders preserve a small timestamp-ordered head
+   and deterministically scatter the remaining tail by seeded event-id hash so
+   parallel sources diverge on bulk transfer without delaying early metadata.
+   Suppression is an efficiency hint; later range rounds recover any falsely
+   suppressed or dropped ids.
 7. **Prefer cached immutable window snapshots over per-session rebuilds.** The
    active implementation reuses one in-memory dep-aware snapshot per
    `(db_path, workspace_id, window_kind, bounds, epoch)` and only rebuilds that
@@ -1445,7 +1470,7 @@ The active branch chooses simpler boundaries over a global per-event planner:
 
 Baseline implementation:
 1. `shared_event_index` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
-2. `RangeSession` reuses a cached dep-aware snapshot for one explicit fixed UTC root range. That snapshot stores the ordered root ids in the range and the cached recursive dependency closure for each durable root in the range. Pending receive-log roots are overlaid per session for suppression, and the `Old` window intentionally disables dependency expansion.
+2. `RangeSession` reuses a cached dep-aware snapshot for one explicit fixed UTC root range. That snapshot stores the ordered durable root ids in the range and the cached recursive dependency closure for each durable root in the range, and the `Old` window intentionally disables dependency expansion.
 3. Control-plane reconciliation uses `NegOpen` and `NegMsg`; the first `NegOpen` may carry a `P7SW` window envelope selecting one of:
    - `LastDay`
    - `LastWeek`
@@ -1454,7 +1479,7 @@ Baseline implementation:
 4. Phase 1 compares one combined homomorphic fingerprint per root slice. Exact slices exchange only root ids plus the combined fingerprint, so Phase 1 does not inline exact dep ids.
 5. After Phase 1, both sides expand dependency candidates from the local-only and dep-probe roots, exchange those dep candidate ids explicitly, and run a stock Negentropy Phase 2 over that candidate universe to confirm which deps are actually missing.
 6. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
-7. Range data transfer streams event blobs after reconciliation for that range; live suppression mode also sends `SuppressIds` and `RangeDataDone` frames on the data stream.
+7. Range data transfer streams event blobs after reconciliation for that range; live suppression mode also sends `SuppressIds` and `RangeDataDone` frames on the data stream, and sender order keeps a small timestamp-ordered head before deterministically scattering the remaining tail by seeded event-id hash.
 8. Multi-source coordination does not replace negentropy; live suppression only reduces duplicate sends after range-local membership has been discovered by the dep-aware Phase 1 and confirmed by the Phase 2 candidate-dep round.
 9. The current range path uses the cached dep-aware snapshot for Phase 1 and a vector-backed stock Negentropy storage only for the Phase 2 candidate-dependency round. The old manual dep-bucket path has been removed.
 

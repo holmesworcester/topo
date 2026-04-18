@@ -45,8 +45,8 @@ flowchart TD
     LIFE --> FACT["session factory"]
     FACT --> RANGE["Range session"]
 
-    RANGE --> LOG["ReceiveLog append"]
-    LOG --> INGEST["ingest_event_log"]
+    RANGE --> LOG["bounded direct-ingest queue"]
+    LOG --> INGEST["ingest_now_result"]
 
     INGEST --> STORE["persist + project_queue enqueue"]
     STORE --> QDB[("project_queue")]
@@ -67,8 +67,8 @@ flowchart TD
     WIN --> NEG["NegOpen / NegMsg"]
     NEG --> SEND["send missing Event blobs"]
     NEG --> RECV["receive missing Event blobs"]
-    RECV --> LOG["ReceiveLog append"]
-    LOG --> INGEST["ingest_event_log"]
+    RECV --> LOG["bounded direct-ingest queue"]
+    LOG --> INGEST["ingest_now_result"]
     INGEST --> PROJ["project_one + cascade"]
     BLOCKED["blocked_event_deps"] --> WIN
 ```
@@ -153,7 +153,7 @@ flowchart TD
 
     subgraph PIPE["Event Pipeline"]
       LOCAL --> LOCAL_PROJ["local create + project_one"]
-      RANGE_LOG["ReceiveLog"] --> LOG_INGEST["ingest_event_log"]
+      RANGE_LOG["bounded direct-ingest queue"] --> LOG_INGEST["ingest_now_result"]
       DEP_INGEST["ingest_now"] --> P1["Persist + enqueue"]
       LOG_INGEST --> P1
       P1 --> PROJ_Q["project_queue"]
@@ -348,7 +348,7 @@ flowchart LR
 
 ## Current Data-Flow Facts
 
-1. bulk sync is range-owned and writes to `ReceiveLog`, not a shared ingest channel.
+1. bulk sync is range-owned and writes to a bounded direct-ingest queue, not a file-backed receive log or shared ingest channel.
 2. dependency repair is a separate session class and ingests replies immediately with `ingest_now`.
 3. the active bulk path does not use durable `wanted`, request-credit, or `ResponseCredit`.
 4. RPC command/query dispatch still routes to owner modules; `service.rs` remains an infra helper layer.

@@ -117,6 +117,7 @@ mod tests {
         assert!(tables.contains(&"events".to_string()));
         assert!(tables.contains(&"recorded_event_owners".to_string()));
         assert!(tables.contains(&"shared_event_index".to_string()));
+        assert!(tables.contains(&"negentropy_dep_epoch".to_string()));
         assert!(tables.contains(&"negentropy_day_epoch".to_string()));
         assert!(tables.contains(&"negentropy_week_epoch".to_string()));
         assert!(tables.contains(&"project_queue".to_string()));
