@@ -1,4 +1,4 @@
-//! Formal verification of range-session index and send-order policy selection — verified core.
+//! Range-session index and send-order policy selection — verified core.
 //!
 //! Each `pub fn` below is executable Rust consumed by
 //! `src/runtime/sync_engine/session/range_session.rs`. Postconditions (`ensures`) are
@@ -6,23 +6,12 @@
 //!
 //! The runtime defines its own `SyncWindowKind` enum (in `session::windowing`) that this
 //! crate cannot import without a dependency cycle. The verified order-policy planner here
-//! takes a boolean `is_last_day` flag instead; the runtime wraps it with a thin matches!()
-//! adapter. The SharedSyncEntry abstract spec models an in-process cache snapshot that is
-//! not yet directly consumed from the runtime; it remains declarative.
+//! takes a boolean `is_last_day` flag instead; the runtime wraps it with a `matches!()`
+//! adapter.
 
 use vstd::prelude::*;
 
 verus! {
-
-// ---------------------------------------------------------------------------
-// Abstract window-kind model (declarative; used by spec-only obligations).
-
-pub enum SyncWindowKind {
-    Old,
-    LastDay,
-    LastWeek,
-    LastTwelveWeeks,
-}
 
 // ---------------------------------------------------------------------------
 // Shared send-order policy — verified exec fn over a boolean flag.
@@ -174,149 +163,6 @@ pub fn decide_selected_dep_order_plan(
     } else {
         SelectedDepOrderPlan::SkipDepEdge
     }
-}
-
-// ---------------------------------------------------------------------------
-// SharedSyncEntry cache-reuse decision — spec-only design contract.
-//
-// This planner is not directly invoked from the runtime today but records the
-// SMT-checked intent that a cached negentropy snapshot is reused iff the cache
-// epoch and bounds both match the requested window. It is kept as a spec fn so
-// its obligations compose with spec-only proof tests below.
-
-pub struct SharedSyncEntryRawRows {
-    pub window_kind: SyncWindowKind,
-    pub root_entry_count: nat,
-    pub cache_epoch_matches: bool,
-    pub cache_bounds_match: bool,
-}
-
-pub struct SharedSyncEntryDecisionContext {
-    pub window_kind: SyncWindowKind,
-    pub root_entry_count: nat,
-    pub cache_epoch_matches: bool,
-    pub cache_bounds_match: bool,
-}
-
-pub struct SharedSyncEntryPlan {
-    pub dep_search_enabled: bool,
-    pub candidate_root_count: nat,
-    pub reuse_cached_snapshot: bool,
-}
-
-pub open spec fn should_search_deps(kind: SyncWindowKind) -> bool {
-    match kind {
-        SyncWindowKind::LastDay | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
-            true
-        }
-        SyncWindowKind::Old => false,
-    }
-}
-
-pub open spec fn normalize_shared_sync_entry_context(
-    raw_rows: SharedSyncEntryRawRows,
-) -> SharedSyncEntryDecisionContext {
-    SharedSyncEntryDecisionContext {
-        window_kind: raw_rows.window_kind,
-        root_entry_count: raw_rows.root_entry_count,
-        cache_epoch_matches: raw_rows.cache_epoch_matches,
-        cache_bounds_match: raw_rows.cache_bounds_match,
-    }
-}
-
-pub open spec fn decide_shared_sync_entry_plan(
-    context: &SharedSyncEntryDecisionContext,
-) -> SharedSyncEntryPlan {
-    SharedSyncEntryPlan {
-        dep_search_enabled: should_search_deps(context.window_kind),
-        candidate_root_count: context.root_entry_count,
-        reuse_cached_snapshot: context.cache_epoch_matches && context.cache_bounds_match,
-    }
-}
-
-proof fn shared_sync_entry_normalizer_preserves_query_facts(
-    root_count: nat,
-    cache_epoch_matches: bool,
-    cache_bounds_match: bool,
-)
-    ensures
-        normalize_shared_sync_entry_context(SharedSyncEntryRawRows {
-            window_kind: SyncWindowKind::LastDay,
-            root_entry_count: root_count,
-            cache_epoch_matches,
-            cache_bounds_match,
-        }) == (SharedSyncEntryDecisionContext {
-            window_kind: SyncWindowKind::LastDay,
-            root_entry_count: root_count,
-            cache_epoch_matches,
-            cache_bounds_match,
-        }),
-{
-}
-
-proof fn old_window_disables_dep_search(root_count: nat)
-    ensures
-        decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-            window_kind: SyncWindowKind::Old,
-            root_entry_count: root_count,
-            cache_epoch_matches: false,
-            cache_bounds_match: false,
-        }) == (SharedSyncEntryPlan {
-            dep_search_enabled: false,
-            candidate_root_count: root_count,
-            reuse_cached_snapshot: false,
-        }),
-{
-}
-
-proof fn hot_windows_enable_dep_search(root_count: nat)
-    ensures
-        decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-            window_kind: SyncWindowKind::LastDay,
-            root_entry_count: root_count,
-            cache_epoch_matches: false,
-            cache_bounds_match: false,
-        }) == (SharedSyncEntryPlan {
-            dep_search_enabled: true,
-            candidate_root_count: root_count,
-            reuse_cached_snapshot: false,
-        }),
-        decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-            window_kind: SyncWindowKind::LastWeek,
-            root_entry_count: root_count,
-            cache_epoch_matches: false,
-            cache_bounds_match: false,
-        }).dep_search_enabled,
-        decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-            window_kind: SyncWindowKind::LastTwelveWeeks,
-            root_entry_count: root_count,
-            cache_epoch_matches: false,
-            cache_bounds_match: false,
-        }).dep_search_enabled,
-{
-}
-
-proof fn cache_reuse_requires_epoch_and_bounds_match(root_count: nat, kind: SyncWindowKind)
-    ensures
-        decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-            window_kind: kind,
-            root_entry_count: root_count,
-            cache_epoch_matches: true,
-            cache_bounds_match: true,
-        }).reuse_cached_snapshot,
-        !decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-            window_kind: kind,
-            root_entry_count: root_count,
-            cache_epoch_matches: false,
-            cache_bounds_match: true,
-        }).reuse_cached_snapshot,
-        !decide_shared_sync_entry_plan(&SharedSyncEntryDecisionContext {
-            window_kind: kind,
-            root_entry_count: root_count,
-            cache_epoch_matches: true,
-            cache_bounds_match: false,
-        }).reuse_cached_snapshot,
-{
 }
 
 } // verus!

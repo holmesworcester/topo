@@ -87,7 +87,10 @@ PeerPrivkey == "peer_secret"
 InvitePrivkey == "invite_secret"
 
 \* Content
-Channel == "channel"
+\* (The "Channel" event type previously defined here was removed from the
+\* runtime; see src/event_modules/mod.rs for the current registered set.
+\* Any TLA model extension that wants to reintroduce a Channel concept must
+\* re-ground it against runtime before merging.)
 Message == "message"
 MessageReaction == "message_reaction"
 MessageDeletion == "message_deletion"
@@ -121,7 +124,7 @@ FullEventTypes == {
     Admin,
     PeerPrivkey,
     InvitePrivkey,
-    Channel, Message, MessageReaction, MessageDeletion,
+    Message, MessageReaction, MessageDeletion,
     MessageAttachment, FileSlice,
     Secret, SecretShared, Encrypted
 }
@@ -162,7 +165,7 @@ IdentityEvents == {
     InvitePrivkey
 } \cup AllWorkspaceEvents
 
-ContentEvents == {Channel, Message, MessageReaction, MessageDeletion, MessageAttachment, FileSlice}
+ContentEvents == {Message, MessageReaction, MessageDeletion, MessageAttachment, FileSlice}
 EncryptionEvents == {Secret, SecretShared, Encrypted}
 
 \* Connection state values (per-peer state machine for invite-based bootstrap).

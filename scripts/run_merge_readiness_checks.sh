@@ -59,6 +59,7 @@ mode="${1:-targeted}"
 run_primary_formal_gate() {
     run_expect_tests cargo test -q --manifest-path "$MANIFEST" --lib boundary_tests:: -- --nocapture
     run_expect_tests cargo test -q --manifest-path "$MANIFEST" --lib registry_formal_projector_coverage -- --nocapture
+    run python3 "$ROOT/scripts/check_no_fake_proofs.py"
     run env TOPO_REQUIRE_VERUS=1 "$ROOT/scripts/run_verus_proofs.sh"
     run env TOPO_REQUIRE_VERUS=1 "$ROOT/scripts/verus_tamper_test.sh"
 }

@@ -1,12 +1,21 @@
-//! Formal verification of ProjectionDecision semantics.
+//! Projection-decision enum, shared between bug_hunt (spec world) and the
+//! apply-stage codecs (exec world).
+//!
+//! The grounded effect-policy invariant (Valid → writes, Block/Reject/
+//! AlreadyProcessed → no writes) lives in
+//! `state/projection/apply/projector_result_discipline.rs` as an `ensures` on
+//! the exec fn `projector_result_well_formed`, which the runtime asserts after
+//! every `dispatch_pure_projector` call. This file intentionally defines only
+//! the enum types; the abstract effect-policy predicates that used to live here
+//! were redundant with that grounded check and have been removed.
 
 use vstd::prelude::*;
 
 verus! {
 
-/// Model of ProjectionDecision — the four terminal states an event can reach.
-/// We use simple int tags for missing deps count rather than Seq to avoid
-/// derive issues with Verus ghost types.
+/// Spec-world ProjectionDecision (uses `nat` for missing_count). Used by
+/// `bug_hunt.rs` to model the abstract cascade / block behavior. The runtime
+/// does not call this directly.
 pub enum ProjectionDecision {
     Valid,
     Block { missing_count: nat },
@@ -14,115 +23,16 @@ pub enum ProjectionDecision {
     AlreadyProcessed,
 }
 
-/// Exec-friendly counterpart of ProjectionDecision using u32 for the missing
-/// dependency count. Used by executable abstract models in context_loading.rs
-/// and project_one.rs where SMT-checked postconditions must apply to function
-/// bodies the compiler actually runs.
+/// Exec-friendly counterpart using `u32`. Used by
+/// `state/projection/apply/context_loading.rs` and
+/// `state/projection/apply/project_one.rs` as the return type of verified
+/// exec fns that the runtime calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionDecisionCore {
     Valid,
     Block { missing_count: u32 },
     Reject,
     AlreadyProcessed,
-}
-
-/// A decision is "permanently terminal" — the event will not be re-processed.
-pub open spec fn is_permanently_terminal(d: &ProjectionDecision) -> bool {
-    match d {
-        ProjectionDecision::Valid => true,
-        ProjectionDecision::Reject => true,
-        ProjectionDecision::AlreadyProcessed => true,
-        ProjectionDecision::Block { .. } => false,
-    }
-}
-
-/// A decision requires write_ops execution.
-pub open spec fn requires_write_ops(d: &ProjectionDecision) -> bool {
-    match d {
-        ProjectionDecision::Valid => true,
-        _ => false,
-    }
-}
-
-/// A decision allows emit_commands execution.
-pub open spec fn allows_emit_commands(d: &ProjectionDecision) -> bool {
-    match d {
-        ProjectionDecision::Valid => true,
-        ProjectionDecision::Block { .. } => true,
-        _ => false,
-    }
-}
-
-/// A decision forbids all side effects.
-pub open spec fn forbids_all_effects(d: &ProjectionDecision) -> bool {
-    match d {
-        ProjectionDecision::Reject => true,
-        ProjectionDecision::AlreadyProcessed => true,
-        _ => false,
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Proofs
-// ═══════════════════════════════════════════════════════════════════
-
-/// Proof: every decision falls into exactly one effect-policy bucket.
-proof fn proof_decision_categories_are_exhaustive_and_exclusive(d: &ProjectionDecision)
-    ensures
-        (requires_write_ops(d) && allows_emit_commands(d) && !forbids_all_effects(d))
-        || (!requires_write_ops(d) && allows_emit_commands(d) && !forbids_all_effects(d))
-        || (!requires_write_ops(d) && !allows_emit_commands(d) && forbids_all_effects(d)),
-{
-}
-
-/// Proof: Valid is the only decision that triggers write_ops.
-proof fn proof_only_valid_triggers_writes(d: &ProjectionDecision)
-    ensures requires_write_ops(d) <==> matches!(*d, ProjectionDecision::Valid),
-{
-}
-
-/// Proof: Reject and AlreadyProcessed forbid all effects.
-proof fn proof_reject_and_already_processed_are_inert(d: &ProjectionDecision)
-    ensures forbids_all_effects(d) <==> (
-        matches!(*d, ProjectionDecision::Reject)
-        || matches!(*d, ProjectionDecision::AlreadyProcessed)
-    ),
-{
-}
-
-/// Proof: Block decisions must carry missing dependency information.
-proof fn proof_block_has_missing_deps(missing_count: nat)
-    requires missing_count > 0
-    ensures
-        ({
-            let d = ProjectionDecision::Block { missing_count };
-            !is_permanently_terminal(&d) && allows_emit_commands(&d) && !requires_write_ops(&d)
-        }),
-{
-}
-
-/// Proof: write_ops implies emit_commands are also allowed.
-proof fn proof_writes_imply_commands(d: &ProjectionDecision)
-    ensures requires_write_ops(d) ==> allows_emit_commands(d),
-{
-}
-
-/// Proof: forbids_all_effects implies permanently terminal.
-proof fn proof_inert_implies_terminal(d: &ProjectionDecision)
-    ensures forbids_all_effects(d) ==> is_permanently_terminal(d),
-{
-}
-
-/// Proof: the effect policy partitions exactly cover all decisions.
-proof fn proof_effect_policy_is_a_partition(d: &ProjectionDecision)
-    ensures
-        ({
-            let w = requires_write_ops(d);
-            let c = allows_emit_commands(d);
-            let f = forbids_all_effects(d);
-            (w && c && !f) || (!w && c && !f) || (!w && !c && f)
-        }),
-{
 }
 
 } // verus!
