@@ -141,6 +141,19 @@ fn derive_wrap_key(local_private: &SigningKey, remote_public: &VerifyingKey) -> 
     *hasher.finalize().as_bytes()
 }
 
+/// Derive a symmetric bundle-encryption key from the same DH input as
+/// key-wrap, but with distinct domain separation for large payloads.
+fn derive_bundle_key(local_private: &SigningKey, remote_public: &VerifyingKey) -> [u8; 32] {
+    let local_scalar = local_private.to_scalar();
+    let remote_point = remote_public.to_montgomery();
+    let shared_point = &remote_point * &local_scalar;
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"poc7-key-bundle-v1");
+    hasher.update(shared_point.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 /// Wrap a 32-byte secret key for a recipient identified by their Ed25519 public key.
 ///
 /// Simplified wrap for POC: XOR plaintext key with a derived wrap key.
@@ -173,6 +186,29 @@ pub fn unwrap_key_from_sender(
         plaintext[i] = wrapped_key[i] ^ wrap_key[i];
     }
     plaintext
+}
+
+/// Encrypt an arbitrary bundle for a recipient using the same Ed25519->X25519
+/// DH path as key-wrap, then AES-256-GCM for the payload.
+pub fn encrypt_bundle_for_recipient(
+    sender_private: &SigningKey,
+    recipient_public: &VerifyingKey,
+    plaintext: &[u8],
+) -> Result<([u8; 12], Vec<u8>, [u8; 16]), Box<dyn std::error::Error>> {
+    let bundle_key = derive_bundle_key(sender_private, recipient_public);
+    encrypt_event_blob(&bundle_key, plaintext)
+}
+
+/// Decrypt a bundle encrypted with `encrypt_bundle_for_recipient`.
+pub fn decrypt_bundle_from_sender(
+    recipient_private: &SigningKey,
+    sender_public: &VerifyingKey,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+    auth_tag: &[u8; 16],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let bundle_key = derive_bundle_key(recipient_private, sender_public);
+    decrypt_event_blob(&bundle_key, nonce, ciphertext, auth_tag)
 }
 
 #[cfg(test)]
@@ -265,5 +301,27 @@ mod tests {
         let unwrapped =
             unwrap_key_from_sender(&recipient_key, &sender_key.verifying_key(), &wrapped);
         assert_eq!(unwrapped, plaintext_key);
+    }
+
+    #[test]
+    fn test_bundle_encrypt_decrypt_roundtrip() {
+        let mut rng = rand::thread_rng();
+        let sender_key = SigningKey::generate(&mut rng);
+        let recipient_key = SigningKey::generate(&mut rng);
+        let plaintext = vec![0x5A; 2048];
+
+        let (nonce, ciphertext, auth_tag) =
+            encrypt_bundle_for_recipient(&sender_key, &recipient_key.verifying_key(), &plaintext)
+                .expect("encrypt bundle");
+        let decrypted = decrypt_bundle_from_sender(
+            &recipient_key,
+            &sender_key.verifying_key(),
+            &nonce,
+            &ciphertext,
+            &auth_tag,
+        )
+        .expect("decrypt bundle");
+
+        assert_eq!(decrypted, plaintext);
     }
 }

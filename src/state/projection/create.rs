@@ -800,6 +800,7 @@ mod tests {
             public_key: invite_key.verifying_key().to_bytes(),
             workspace_id: net_eid,
             authority_event_id: net_eid,
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         let uib_eid =
             create_signed_event(conn, recorded_by, &net_eid, &uib, &workspace_key)
@@ -819,6 +820,7 @@ mod tests {
             created_at_ms: now_ms(),
             public_key: device_invite_key.verifying_key().to_bytes(),
             authority_event_id: ub_eid,
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         let dif_eid =
             create_signed_event(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();

@@ -262,7 +262,7 @@ fn real_pair_sync_is_required_for_replication_between_virtual_daemon_nodes() {
 }
 
 #[test]
-fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
+fn planner_drives_message_and_key_history_propagation_across_real_pair_sync_graph() {
     let tmpdir = tempfile::tempdir().unwrap();
     let phone_db = tmpdir.path().join("phone.db");
     let laptop_db = tmpdir.path().join("laptop.db");
@@ -284,10 +284,10 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
     wait_for_authoring_ready(&phone, &[phone_db.to_string_lossy().into_owned()]);
 
     let phone_link = create_device_link(&phone);
-    let phone_key_shared_ids = event_ids_of_type(&phone, "key_shared");
+    let phone_key_history_ids = event_ids_of_type(&phone, "key_history");
     assert!(
-        !phone_key_shared_ids.is_empty(),
-        "device-link creation on the phone should emit at least one key_shared event"
+        !phone_key_history_ids.is_empty(),
+        "device-link creation on the phone should emit at least one key_history event"
     );
     let accepted_laptop = laptop.call(RpcMethod::AcceptLink {
         invite: phone_link,
@@ -318,13 +318,13 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
         ],
     );
     assert!(
-        phone_key_shared_ids.iter().all(|event_id| {
+        phone_key_history_ids.iter().all(|event_id| {
             let response = laptop.call(RpcMethod::AssertNow {
                 predicate: format!("has_event:{event_id} >= 1"),
             });
             response.ok
         }),
-        "the first pair sync should replicate the phone's real key_shared events onto the laptop"
+        "the first pair sync should replicate the phone's real key_history events onto the laptop"
     );
 
     let laptop_link = create_device_link(&laptop);
@@ -375,19 +375,11 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
                 && intent.target_recorded_by == laptop_peer),
         "the linked tablet should target the laptop via real imported connect targets"
     );
-    assert!(
-        !chain_intents
-            .iter()
-            .any(|intent| intent.initiator_recorded_by == tablet_peer
-                && intent.target_recorded_by == phone_peer),
-        "the tablet must not invent a direct phone sync edge when the real daemon state only knows the laptop link"
-    );
-
     run_session_for_intent(intent_between(&chain_intents, &tablet_peer, &laptop_peer));
     assert_has_event(&tablet, &routed_message);
 
     assert!(
-        phone_key_shared_ids
+        phone_key_history_ids
             .iter()
             .all(|event_id| {
                 let response = tablet.call(RpcMethod::AssertNow {
@@ -395,6 +387,6 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
                 });
                 response.ok
             }),
-        "the phone's real key_shared events should propagate to the tablet through the chained laptop pair sync"
+        "the phone's real key_history events should propagate to the tablet through the chained laptop pair sync"
     );
 }

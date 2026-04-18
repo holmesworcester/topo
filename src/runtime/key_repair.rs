@@ -241,6 +241,52 @@ pub(crate) fn current_local_logical_frontier(
     })
 }
 
+fn rotation_frontier_by_key_event_id(
+    conn: &Connection,
+    recorded_by: &str,
+    key_event_id: &EventId,
+) -> KeyRepairResult<Option<RotationFrontier>> {
+    let key_event_id_b64 = event_id_to_base64(key_event_id);
+    let row: Option<(i64, String, String, String, String, String)> = conn
+        .query_row(
+            "SELECT frontier_count, frontier_ref_1, frontier_ref_2, frontier_ref_3, frontier_ref_4, frontier_hash
+             FROM key_rotations
+             WHERE recorded_by = ?1
+               AND event_id = ?2
+             LIMIT 1",
+            rusqlite::params![recorded_by, &key_event_id_b64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                    crate::db::sql_types::get_text(row, 2)?,
+                    crate::db::sql_types::get_text(row, 3)?,
+                    crate::db::sql_types::get_text(row, 4)?,
+                    crate::db::sql_types::get_text(row, 5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((frontier_count, ref1, ref2, ref3, ref4, frontier_hash_b64)) = row else {
+        return Ok(None);
+    };
+    let frontier_refs = frontier_refs_from_slots(
+        frontier_count as u8,
+        &[
+            decode_frontier_slot(&ref1)?,
+            decode_frontier_slot(&ref2)?,
+            decode_frontier_slot(&ref3)?,
+            decode_frontier_slot(&ref4)?,
+        ],
+    )?;
+    let frontier_hash =
+        event_id_from_base64(&frontier_hash_b64).ok_or("invalid key_rotation.frontier_hash")?;
+    Ok(Some(RotationFrontier {
+        frontier_hash,
+        frontier_refs,
+    }))
+}
+
 pub(crate) fn has_key_rotation_for_frontier(
     conn: &Connection,
     recorded_by: &str,
@@ -327,6 +373,9 @@ fn accumulate_response_stats(
 fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> KeyRepairResult<usize> {
     let conn = open_connection(db_path)?;
     crate::db::schema::create_tables(&conn)?;
+    if !accepted_invite_history_ready(&conn, recorded_by)? {
+        return Ok(0);
+    }
     let blocked = blocked_encrypted_events(&conn, recorded_by)?;
     if blocked.is_empty() {
         return Ok(0);
@@ -337,12 +386,15 @@ fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> KeyRepairResu
     let mut emitted = 0usize;
 
     for (blocked_event_id, key_event_id, created_at_ms) in blocked {
-        let Some(rotation) = local_rotation_frontier(&conn, recorded_by, &key_event_id)? else {
+        if has_local_key_material(&conn, recorded_by, &key_event_id)? {
+            continue;
+        }
+        let Some(frontier) = rotation_frontier_by_key_event_id(&conn, recorded_by, &key_event_id)? else {
             continue;
         };
         let target_id = delivery_target_id(
             &key_event_id,
-            &rotation.frontier_hash,
+            &frontier.frontier_hash,
             &recipient_event_id,
             &unwrap_key_event_id,
         );
@@ -350,7 +402,7 @@ fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> KeyRepairResu
             created_at_ms,
             blocked_event_id,
             key_event_id,
-            frontier_hash: rotation.frontier_hash,
+            frontier_hash: frontier.frontier_hash,
             delivery_target_id: target_id,
             recipient_event_id,
             unwrap_key_event_id,
@@ -387,7 +439,6 @@ fn emit_key_shared_responses_for_peer(
     crate::db::schema::create_tables(&conn)?;
     let authoring = load_local_authoring_context(&conn, recorded_by)?;
     let known_responses = known_key_shared_summaries(&conn, recorded_by)?;
-    let repaired_key_ids = repaired_key_ids_for_local_recipient(&conn, recorded_by)?;
     let mut best_rank_by_target = BTreeMap::<RepairTarget, ([u8; 32], EventId, EventId)>::new();
     for response in known_responses {
         let rank = response_rank(response.target, response.signer_event_id);
@@ -408,9 +459,6 @@ fn emit_key_shared_responses_for_peer(
             continue;
         }
         if !is_authorized_repair_target(&conn, recorded_by, &request.target)? {
-            continue;
-        }
-        if repaired_key_ids.contains(&request.target.key_event_id) {
             continue;
         }
 
@@ -525,30 +573,77 @@ fn local_repair_recipient_material(
     conn: &Connection,
     recorded_by: &str,
 ) -> KeyRepairResult<(EventId, EventId)> {
-    let invite_event_id_b64: String = conn.query_row(
-        "SELECT invite_event_id
-         FROM invites_accepted
-         WHERE recorded_by = ?1
-         ORDER BY created_at ASC, event_id ASC
-         LIMIT 1",
-        rusqlite::params![recorded_by],
-        |row| crate::db::sql_types::get_text(row, 0),
-    )?;
-    let invite_secret_event_id_b64: String = conn.query_row(
+    let (recipient_event_id, _) =
+        crate::event_modules::peer_shared::load_local_peer_signer_required(conn, recorded_by)?;
+    let recipient_event_id_b64 = event_id_to_base64(&recipient_event_id);
+    let peer_secret_event_id_b64: String = conn.query_row(
         "SELECT event_id
-         FROM invite_secrets
+         FROM peer_secrets
          WHERE recorded_by = ?1
-           AND invite_event_id = ?2
-         ORDER BY created_at ASC, event_id ASC
+           AND signer_event_id = ?2
+         ORDER BY created_at DESC, event_id DESC
          LIMIT 1",
-        rusqlite::params![recorded_by, &invite_event_id_b64],
+        rusqlite::params![recorded_by, &recipient_event_id_b64],
         |row| crate::db::sql_types::get_text(row, 0),
     )?;
-    let recipient_event_id =
-        event_id_from_base64(&invite_event_id_b64).ok_or("invalid invite_event_id base64")?;
-    let unwrap_key_event_id = event_id_from_base64(&invite_secret_event_id_b64)
-        .ok_or("invalid invite_secret.event_id base64")?;
+    let unwrap_key_event_id = event_id_from_base64(&peer_secret_event_id_b64)
+        .ok_or("invalid peer_secret.event_id base64")?;
     Ok((recipient_event_id, unwrap_key_event_id))
+}
+
+fn accepted_invite_history_ready(conn: &Connection, recorded_by: &str) -> KeyRepairResult<bool> {
+    let accepted: Option<(String, String)> = conn
+        .query_row(
+            "SELECT invite_event_id, workspace_id
+             FROM invites_accepted
+             WHERE recorded_by = ?1
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((invite_event_id_b64, workspace_id_b64)) = accepted else {
+        return Ok(true);
+    };
+    if invite_event_id_b64 == workspace_id_b64 {
+        return Ok(true);
+    }
+    let invite_row: Option<String> = conn
+        .query_row(
+            "SELECT key_history_event_id FROM user_invites WHERE recorded_by = ?1 AND event_id = ?2
+             UNION ALL
+             SELECT key_history_event_id FROM device_invites WHERE recorded_by = ?1 AND event_id = ?2
+             LIMIT 1",
+            rusqlite::params![recorded_by, &invite_event_id_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()?;
+    let Some(key_history_event_id_b64) = invite_row else {
+        return Ok(false);
+    };
+    if key_history_event_id_b64.is_empty() {
+        return Ok(true);
+    }
+    let Some(key_history_event_id) = event_id_from_base64(&key_history_event_id_b64) else {
+        return Ok(false);
+    };
+    if key_history_event_id == [0u8; 32] {
+        return Ok(true);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM key_histories
+             WHERE recorded_by = ?1 AND event_id = ?2
+         )",
+        rusqlite::params![recorded_by, &key_history_event_id_b64],
+        |row| row.get(0),
+    )?)
 }
 
 fn known_key_requests(conn: &Connection, recorded_by: &str) -> KeyRepairResult<Vec<RequestRow>> {
@@ -732,9 +827,10 @@ fn request_recipient_verifying_key(
     )?;
     let parsed = parse_semantic_event(&blob)?;
     let public_key = match parsed {
+        ParsedEvent::PeerShared(evt) => evt.public_key,
         ParsedEvent::UserInvite(evt) => evt.public_key,
         ParsedEvent::DeviceInvite(evt) => evt.public_key,
-        _ => return Err("recipient_event_id is not an invite event".into()),
+        _ => return Err("recipient_event_id is not a supported repair identity".into()),
     };
     Ok(VerifyingKey::from_bytes(&public_key)?)
 }
@@ -754,12 +850,7 @@ fn local_rotation_frontier(
     recorded_by: &str,
     key_event_id: &EventId,
 ) -> KeyRepairResult<Option<RotationFrontier>> {
-    let frontier = current_local_logical_frontier(conn, recorded_by)?;
-    if has_key_rotation_for_frontier(conn, recorded_by, key_event_id, &frontier)? {
-        Ok(Some(frontier))
-    } else {
-        Ok(None)
-    }
+    rotation_frontier_by_key_event_id(conn, recorded_by, key_event_id)
 }
 
 fn is_authorized_repair_target(
@@ -773,12 +864,12 @@ fn is_authorized_repair_target(
     if rotation.frontier_hash != target.frontier_hash {
         return Ok(false);
     }
-    let Some(removed) =
-        removed_member_refs_for_frontier(conn, recorded_by, &rotation.frontier_refs)?
-    else {
-        return Ok(false);
-    };
-    Ok(!removed.contains(&target.recipient_event_id))
+    Ok(!repair_target_is_removed(
+        conn,
+        recorded_by,
+        &rotation.frontier_refs,
+        &target.recipient_event_id,
+    )?)
 }
 
 fn removed_member_refs_for_frontier(
@@ -804,6 +895,50 @@ fn removed_member_refs_for_frontier(
     }
 
     Ok(Some(removed))
+}
+
+fn repair_target_is_removed(
+    conn: &Connection,
+    recorded_by: &str,
+    frontier_refs: &[EventId],
+    recipient_event_id: &EventId,
+) -> KeyRepairResult<bool> {
+    let Some(removed) = removed_member_refs_for_frontier(conn, recorded_by, frontier_refs)? else {
+        return Ok(false);
+    };
+    if removed.contains(recipient_event_id) {
+        return Ok(true);
+    }
+    let recipient_event_id_b64 = event_id_to_base64(recipient_event_id);
+    let user_event_id_b64: Option<String> = conn
+        .query_row(
+            "SELECT user_event_id
+             FROM peers_shared
+             WHERE recorded_by = ?1 AND event_id = ?2
+             LIMIT 1",
+            rusqlite::params![recorded_by, &recipient_event_id_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()?;
+    let Some(user_event_id_b64) = user_event_id_b64 else {
+        return Ok(false);
+    };
+    if user_event_id_b64.is_empty() {
+        return Ok(false);
+    }
+    let Some(user_event_id) = event_id_from_base64(&user_event_id_b64) else {
+        return Ok(false);
+    };
+    let Some(removal_refs) = crate::event_modules::workspace::identity_ops::peer_shared_removal_refs(
+        conn,
+        recipient_event_id,
+        Some(user_event_id),
+    )? else {
+        return Ok(true);
+    };
+    Ok(removal_refs
+        .iter()
+        .any(|removed_ref| removed.contains(removed_ref)))
 }
 
 fn removal_row(

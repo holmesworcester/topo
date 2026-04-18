@@ -236,7 +236,9 @@ mod tests {
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
         use super::super::super::invite_secret::INVITE_SECRET_WIRE_SIZE;
+        use super::super::super::key_history::KEY_HISTORY_WIRE_SIZE;
         use super::super::super::key_request::KEY_REQUEST_WIRE_SIZE;
+        use super::super::super::key_rotation::KEY_ROTATION_WIRE_SIZE;
         use super::super::super::key_secret::KEY_SECRET_WIRE_SIZE;
         use super::super::super::key_shared::KEY_SHARED_WIRE_SIZE;
         use super::super::super::message::MESSAGE_WIRE_SIZE;
@@ -260,10 +262,12 @@ mod tests {
         assert_eq!(KEY_SECRET_WIRE_SIZE, 41);
         assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 41);
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 105);
-        assert_eq!(USER_INVITE_WIRE_SIZE, 105);
-        assert_eq!(DEVICE_INVITE_WIRE_SIZE, 73);
+        assert_eq!(USER_INVITE_WIRE_SIZE, 137);
+        assert_eq!(DEVICE_INVITE_WIRE_SIZE, 105);
         assert_eq!(ADMIN_WIRE_SIZE, 73);
         assert_eq!(TENANT_WIRE_SIZE, 41);
+        assert_eq!(KEY_ROTATION_WIRE_SIZE, 524490);
+        assert_eq!(KEY_HISTORY_WIRE_SIZE, 524357);
         assert_eq!(KEY_SHARED_WIRE_SIZE, 330);
         assert_eq!(INVITE_SECRET_WIRE_SIZE, 73);
         assert_eq!(KEY_REQUEST_WIRE_SIZE, 201);

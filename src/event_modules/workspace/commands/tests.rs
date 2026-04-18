@@ -602,9 +602,45 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
             |row| row.get(0),
         )
         .expect("query blocked events");
+    let blocked_details: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.blob, be.event_id
+                 FROM blocked_events be
+                 JOIN events e ON e.event_id = be.event_id
+                 WHERE be.peer_id = ?1
+                 ORDER BY be.event_id ASC",
+            )
+            .expect("prepare blocked detail query");
+        stmt.query_map(rusqlite::params![&phone_peer_id], |row| {
+            let blob = crate::db::sql_types::get_blob(row, 0)?;
+            let event_id = crate::db::sql_types::get_text(row, 1)?;
+            let event_name = |parsed: &crate::event_modules::ParsedEvent| {
+                crate::event_modules::registry()
+                    .lookup(parsed.event_type_code())
+                    .map(|meta| meta.type_name.to_string())
+                    .unwrap_or_else(|| format!("type-{}", parsed.event_type_code()))
+            };
+            let event_type = match crate::event_modules::parse_event(&blob) {
+                Ok(crate::event_modules::ParsedEvent::Signed(signed)) => {
+                    match crate::event_modules::parse_event(&signed.payload) {
+                        Ok(inner) => format!("signed({})", event_name(&inner)),
+                        Err(_) => "signed(parse-error)".to_string(),
+                    }
+                }
+                Ok(parsed) => event_name(&parsed),
+                Err(_) => "parse-error".to_string(),
+            };
+            Ok((event_type, event_id))
+        })
+        .expect("query blocked detail rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect blocked detail rows")
+    };
     assert_eq!(
         blocked_count, 0,
-        "device link should not leave blocked local events"
+        "device link should not leave blocked local events: {:?}",
+        blocked_details
     );
 }
 

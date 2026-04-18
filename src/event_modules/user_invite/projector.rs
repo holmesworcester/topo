@@ -53,18 +53,23 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
-    let (public_key, created_at_ms) = match parsed {
-        ParsedEvent::UserInvite(ui) => (&ui.public_key, ui.created_at_ms as i64),
+    let (public_key, created_at_ms, key_history_event_id) = match parsed {
+        ParsedEvent::UserInvite(ui) => (
+            &ui.public_key,
+            ui.created_at_ms as i64,
+            event_id_to_base64(&ui.key_history_event_id),
+        ),
         _ => return ProjectorResult::reject("not a user_invite event".to_string()),
     };
 
     let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "user_invites",
-        columns: vec!["recorded_by", "event_id", "public_key"],
+        columns: vec!["recorded_by", "event_id", "public_key", "key_history_event_id"],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Blob(public_key.to_vec()),
+            SqlVal::Text(key_history_event_id),
         ],
     }];
 
@@ -117,6 +122,7 @@ mod user_invite_projector_tests {
             public_key: [9u8; 32],
             workspace_id: [2u8; 32],
             authority_event_id: [2u8; 32],
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         })
     }
 
@@ -126,6 +132,7 @@ mod user_invite_projector_tests {
             public_key: [9u8; 32],
             workspace_id: [2u8; 32],
             authority_event_id: [4u8; 32],
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         })
     }
 
@@ -188,6 +195,7 @@ mod user_invite_projector_tests {
             public_key: [9u8; 32],
             workspace_id: [2u8; 32],
             authority_event_id: [2u8; 32],
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         let conn = open_in_memory().expect("open db");
         create_tables(&conn).expect("create tables");
@@ -219,6 +227,7 @@ mod user_invite_projector_tests {
             public_key: [9u8; 32],
             workspace_id: [2u8; 32],
             authority_event_id: [6u8; 32],
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         let conn = open_in_memory().expect("open db");
         create_tables(&conn).expect("create tables");

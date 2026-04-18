@@ -54,7 +54,7 @@ fn age_all_workspace_shared_events(
         .unwrap();
     let rows = stmt
         .query_map(rusqlite::params![workspace_id], |row| {
-            let id_blob: Vec<u8> = row.get(0)?;
+            let id_blob = crate::db::sql_types::get_blob(row, 0)?;
             Ok(id_blob)
         })
         .unwrap();

@@ -938,11 +938,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Replay { pass, json } => {
-            let data = rpc_require_daemon(
+            let data = match rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
                 RpcMethod::Replay { pass: pass.clone() },
-            )?;
+            ) {
+                Ok(data) => data,
+                Err(_) => {
+                    let (recorded_by, replay_db) =
+                        service::open_db_load(db).map_err(|err| err.to_string())?;
+                    let replay = topo::testutil::run_replay_pass(&replay_db, &recorded_by, &pass)
+                        .map_err(|err| {
+                            std::io::Error::new(std::io::ErrorKind::Other, err)
+                        })?;
+                    serde_json::to_value(replay).unwrap_or_default()
+                }
+            };
             if json {
                 println!(
                     "{}",

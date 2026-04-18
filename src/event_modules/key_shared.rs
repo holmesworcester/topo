@@ -192,7 +192,7 @@ pub fn project_pure(
     let delivery_target_b64 = event_id_to_base64(&ss.delivery_target_id);
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
 
-    let ops = vec![WriteOp::InsertOrIgnore {
+    let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "key_shared",
         columns: vec![
             "recorded_by",
@@ -229,27 +229,22 @@ pub fn project_pure(
         None => return ProjectorResult::valid(ops),
     };
 
-    let secret_event =
-        crate::event_modules::key_secret::deterministic_key_secret_event(material.key_bytes);
-    let secret_blob = match crate::event_modules::encode_event(&secret_event) {
-        Ok(v) => v,
-        Err(err) => {
-            return ProjectorResult::reject(format!(
-                "failed to encode deterministic secret event: {}",
-                err
-            ))
-        }
-    };
-    let derived_key_event_id = crate::crypto::hash_event(&secret_blob);
-    if derived_key_event_id != ss.key_event_id {
-        return ProjectorResult::reject(
-            "unwrapped key material does not match claimed key_event_id".to_string(),
-        );
-    }
+    ops.push(WriteOp::InsertOrIgnore {
+        table: "key_secrets",
+        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+        values: vec![
+            SqlVal::Text(event_id_to_base64(&ss.key_event_id)),
+            SqlVal::Blob(material.key_bytes.to_vec()),
+            SqlVal::Int(ss.created_at_ms as i64),
+            SqlVal::Text(recorded_by.to_string()),
+        ],
+    });
 
     ProjectorResult::valid_with_commands(
         ops,
-        vec![EmitCommand::EmitDeterministicBlob { blob: secret_blob }],
+        vec![EmitCommand::RetryBlockedEncryptedByKey {
+            key_event_id: event_id_to_base64(&ss.key_event_id),
+        }],
     )
 }
 
@@ -259,13 +254,14 @@ pub static KEY_SHARED_META: EventTypeMeta = crate::event_modules::registry::even
     projection_table: "key_shared",
     share_scope: ShareScope::Shared,
     dep_fields: &[
+        "key_event_id",
         "recipient_event_id",
         "frontier_ref_1",
         "frontier_ref_2",
         "frontier_ref_3",
         "frontier_ref_4",
     ],
-    dep_field_type_codes: &[&[10, 12], &[], &[], &[], &[]],
+    dep_field_type_codes: &[&[super::EVENT_TYPE_KEY_ROTATION], &[10, 12, 16], &[], &[], &[], &[]],
     signer_required: true,
     signature_byte_len: 0,
     encryptable: false,

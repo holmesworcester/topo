@@ -1341,7 +1341,7 @@ fn dispatch(
         RpcMethod::Replay { pass } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
-                    match crate::testutil::run_replay_pass(&db, &recorded_by, &pass) {
+                    match crate::testutil::run_replay_pass_on_snapshot(&db, &recorded_by, &pass) {
                         Ok(result) => RpcResponse::success(result),
                         Err(e) => RpcResponse::error(e),
                     }

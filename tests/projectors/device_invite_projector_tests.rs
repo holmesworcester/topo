@@ -18,6 +18,7 @@ mod tests {
             created_at_ms: 9000,
             public_key,
             authority_event_id: [3u8; 32],
+            key_history_event_id: topo::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         })
     }
 

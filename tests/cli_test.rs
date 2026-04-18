@@ -2400,10 +2400,10 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     // Alice creates invite (via daemon RPC)
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
 
-    // Alice should have emitted content key wrapping during invite creation
+    // Alice should have emitted historical key bootstrap material during invite creation.
     assert!(
-        count_rows(&alice_db, "key_shared") >= 1,
-        "inviter should emit at least one key_shared key-wrap during invite creation"
+        count_rows(&alice_db, "key_histories") >= 1,
+        "inviter should emit at least one key_history bootstrap event during invite creation"
     );
 
     // Bob accepts invite: installs deterministic cert, creates identity chain
@@ -2422,14 +2422,16 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
         timeout_ms,
     );
 
-    // After sync, Bob should have Alice's key_shared event (content key ciphertext).
-    // Note: deferred content key unwrapping (key_shared → key_secrets) is a
-    // follow-up feature for the projection-first flow. The old inline bootstrap
-    // sync performed this unwrap immediately, but the daemon-driven cascade
-    // doesn't yet trigger it automatically.
+    // After sync, Bob should have Alice's bootstrap history and the shared
+    // key_rotation needed by the bootstrap message. Invite bootstrap now relies
+    // on key_history plus normal key rotation sync, not proactive key_shared.
     assert!(
-        count_rows(&bob_db, "key_shared") >= 1,
-        "invitee should have inviter's key_shared event after sync"
+        count_rows(&bob_db, "key_histories") >= 1,
+        "invitee should have inviter's key_history event after sync"
+    );
+    assert!(
+        count_rows(&bob_db, "key_rotations") >= 1,
+        "invitee should have inviter's key_rotation event after sync"
     );
 
     let bob_eid = send_message(&bob_db, "bootstrap trust from invite data");

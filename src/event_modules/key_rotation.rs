@@ -7,9 +7,11 @@ use super::removal::{
 };
 use super::{EventError, ParsedEvent, EVENT_TYPE_KEY_ROTATION};
 
+pub const KEY_ROTATION_CAP: usize = 8192;
+pub const KEY_ROTATION_SLOT_BYTES: usize = KEY_ROTATION_CAP * 32;
+
 pub const KEY_ROTATION_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
-    FieldSpec::EventId("key_event_id"),
     FieldSpec::U8("frontier_count"),
     FieldSpec::EventId("frontier_ref_1"),
     FieldSpec::EventId("frontier_ref_2"),
@@ -17,6 +19,8 @@ pub const KEY_ROTATION_FIELDS: &[FieldSpec] = &[
     FieldSpec::EventId("frontier_ref_4"),
     FieldSpec::EventId("frontier_hash"),
     FieldSpec::EventId("rotated_by"),
+    FieldSpec::FixedBytes("recipient_slots", KEY_ROTATION_SLOT_BYTES),
+    FieldSpec::FixedBytes("wrapped_keys", KEY_ROTATION_SLOT_BYTES),
 ];
 
 pub const KEY_ROTATION_WIRE_SIZE: usize = wire_size_for_fields(KEY_ROTATION_FIELDS);
@@ -24,7 +28,6 @@ pub const KEY_ROTATION_WIRE_SIZE: usize = wire_size_for_fields(KEY_ROTATION_FIEL
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRotationEvent {
     pub created_at_ms: u64,
-    pub key_event_id: [u8; 32],
     pub frontier_count: u8,
     pub frontier_ref_1: [u8; 32],
     pub frontier_ref_2: [u8; 32],
@@ -32,73 +35,114 @@ pub struct KeyRotationEvent {
     pub frontier_ref_4: [u8; 32],
     pub frontier_hash: [u8; 32],
     pub rotated_by: [u8; 32],
+    pub recipient_slots: Vec<[u8; 32]>,
+    pub wrapped_keys: Vec<[u8; 32]>,
 }
 
 impl super::Describe for KeyRotationEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("key_event_id", super::short_id_b64(&self.key_event_id)),
             ("frontier_hash", super::short_id_b64(&self.frontier_hash)),
+            ("slot_cap", KEY_ROTATION_CAP.to_string()),
         ]
     }
 }
 
-pub fn parse_key_rotation(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if let Some((ts, key_event_id, frontier_count, fr1, fr2, fr3, fr4, fh, rb)) =
-        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id6(
-            EVENT_TYPE_KEY_ROTATION,
-            blob,
-        )
-    {
-        return Ok(ParsedEvent::KeyRotation(KeyRotationEvent {
-            created_at_ms: ts,
-            key_event_id,
-            frontier_count,
-            frontier_ref_1: fr1,
-            frontier_ref_2: fr2,
-            frontier_ref_3: fr3,
-            frontier_ref_4: fr4,
-            frontier_hash: fh,
-            rotated_by: rb,
+fn split_slots(bytes: &[u8], what: &str) -> Result<Vec<[u8; 32]>, EventError> {
+    if bytes.len() != KEY_ROTATION_SLOT_BYTES {
+        return Err(EventError::InvalidMetadata(match what {
+            "recipient_slots" => "recipient_slots size does not match key rotation cap",
+            _ => "wrapped_keys size does not match key rotation cap",
         }));
     }
+    let mut out = Vec::with_capacity(KEY_ROTATION_CAP);
+    for chunk in bytes.chunks_exact(32) {
+        let mut slot = [0u8; 32];
+        slot.copy_from_slice(chunk);
+        out.push(slot);
+    }
+    Ok(out)
+}
+
+fn flatten_slots(slots: &[[u8; 32]], what: &'static str) -> Result<Vec<u8>, EventError> {
+    if slots.len() != KEY_ROTATION_CAP {
+        return Err(EventError::InvalidMetadata(match what {
+            "recipient_slots" => "recipient_slots len does not match key rotation cap",
+            _ => "wrapped_keys len does not match key rotation cap",
+        }));
+    }
+    let mut out = Vec::with_capacity(KEY_ROTATION_SLOT_BYTES);
+    for slot in slots {
+        out.extend_from_slice(slot);
+    }
+    Ok(out)
+}
+
+pub fn parse_key_rotation(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let values = decode_fields(EVENT_TYPE_KEY_ROTATION, KEY_ROTATION_FIELDS, blob)?;
+    let recipient_slots = split_slots(
+        values[8]
+            .clone()
+            .into_fixed_bytes()
+            .ok_or(EventError::WrongVariant)?
+            .as_slice(),
+        "recipient_slots",
+    )?;
+    let wrapped_keys = split_slots(
+        values[9]
+            .clone()
+            .into_fixed_bytes()
+            .ok_or(EventError::WrongVariant)?
+            .as_slice(),
+        "wrapped_keys",
+    )?;
     Ok(ParsedEvent::KeyRotation(KeyRotationEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
-        key_event_id: values[1].as_event_id().unwrap(),
-        frontier_count: values[2].as_u8().unwrap(),
-        frontier_ref_1: values[3].as_event_id().unwrap(),
-        frontier_ref_2: values[4].as_event_id().unwrap(),
-        frontier_ref_3: values[5].as_event_id().unwrap(),
-        frontier_ref_4: values[6].as_event_id().unwrap(),
-        frontier_hash: values[7].as_event_id().unwrap(),
-        rotated_by: values[8].as_event_id().unwrap(),
+        frontier_count: values[1].as_u8().unwrap(),
+        frontier_ref_1: values[2].as_event_id().unwrap(),
+        frontier_ref_2: values[3].as_event_id().unwrap(),
+        frontier_ref_3: values[4].as_event_id().unwrap(),
+        frontier_ref_4: values[5].as_event_id().unwrap(),
+        frontier_hash: values[6].as_event_id().unwrap(),
+        rotated_by: values[7].as_event_id().unwrap(),
+        recipient_slots,
+        wrapped_keys,
     }))
 }
 
 pub fn encode_key_rotation(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
-    let r = match event {
+    let rotation = match event {
         ParsedEvent::KeyRotation(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(
-        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u8_id6(
-            EVENT_TYPE_KEY_ROTATION,
-            r.created_at_ms,
-            &r.key_event_id,
-            r.frontier_count,
-            &r.frontier_ref_1,
-            &r.frontier_ref_2,
-            &r.frontier_ref_3,
-            &r.frontier_ref_4,
-            &r.frontier_hash,
-            &r.rotated_by,
-        ),
-    )
+    let recipient_slots = flatten_slots(&rotation.recipient_slots, "recipient_slots")?;
+    let wrapped_keys = flatten_slots(&rotation.wrapped_keys, "wrapped_keys")?;
+    let values = vec![
+        FieldValue::Timestamp(rotation.created_at_ms),
+        FieldValue::U8(rotation.frontier_count),
+        FieldValue::EventId(rotation.frontier_ref_1),
+        FieldValue::EventId(rotation.frontier_ref_2),
+        FieldValue::EventId(rotation.frontier_ref_3),
+        FieldValue::EventId(rotation.frontier_ref_4),
+        FieldValue::EventId(rotation.frontier_hash),
+        FieldValue::EventId(rotation.rotated_by),
+        FieldValue::FixedBytes(recipient_slots),
+        FieldValue::FixedBytes(wrapped_keys),
+    ];
+    Ok(encode_fields(
+        EVENT_TYPE_KEY_ROTATION,
+        KEY_ROTATION_FIELDS,
+        &values,
+    )?)
 }
 
 use crate::crypto::event_id_to_base64;
-use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::decision_context::{
+    ContextLoadResult, ProjectionFrameContext, ProjectionQueries,
+};
+use crate::projection::projector::{
+    EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
+};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -122,6 +166,25 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+pub fn build_projector_context(
+    queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    let rotation = match parsed {
+        ParsedEvent::KeyRotation(rotation) => rotation,
+        _ => return Err("key_rotation context loader called for non-key_rotation event".into()),
+    };
+    Ok(ContextLoadResult::ready(queries.load_key_rotation_context(
+        frame,
+        recorded_by,
+        event_id_b64,
+        rotation,
+    )?))
+}
+
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -132,6 +195,12 @@ pub fn project_pure(
         ParsedEvent::KeyRotation(event) => event,
         _ => return ProjectorResult::reject("not a key_rotation event".to_string()),
     };
+    if rotation.recipient_slots.len() != KEY_ROTATION_CAP {
+        return ProjectorResult::reject("recipient_slots len does not match key rotation cap".to_string());
+    }
+    if rotation.wrapped_keys.len() != KEY_ROTATION_CAP {
+        return ProjectorResult::reject("wrapped_keys len does not match key rotation cap".to_string());
+    }
     let Some(current_signer) = ctx.current_signer.as_ref() else {
         return ProjectorResult::reject("key_rotation missing current signer envelope".to_string());
     };
@@ -158,7 +227,7 @@ pub fn project_pure(
         return ProjectorResult::reject("frontier_hash does not match frontier refs".to_string());
     }
 
-    ProjectorResult::valid(vec![WriteOp::InsertOrIgnore {
+    let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "key_rotations",
         columns: vec![
             "recorded_by",
@@ -175,7 +244,7 @@ pub fn project_pure(
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Text(event_id_to_base64(&rotation.key_event_id)),
+            SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Text(event_id_to_base64(&rotation.frontier_hash)),
             SqlVal::Int(rotation.frontier_count as i64),
             SqlVal::Text(event_id_to_base64(&rotation.frontier_ref_1)),
@@ -184,7 +253,28 @@ pub fn project_pure(
             SqlVal::Text(event_id_to_base64(&rotation.frontier_ref_4)),
             SqlVal::Text(current_signer.event_id.clone()),
         ],
-    }])
+    }];
+
+    if let Some(material) = &ctx.unwrapped_secret_material {
+        ops.push(WriteOp::InsertOrIgnore {
+            table: "key_secrets",
+            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+            values: vec![
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Blob(material.key_bytes.to_vec()),
+                SqlVal::Int(rotation.created_at_ms as i64),
+                SqlVal::Text(recorded_by.to_string()),
+            ],
+        });
+        return ProjectorResult::valid_with_commands(
+            ops,
+            vec![EmitCommand::RetryBlockedEncryptedByKey {
+                key_event_id: event_id_b64.to_string(),
+            }],
+        );
+    }
+
+    ProjectorResult::valid(ops)
 }
 
 pub static KEY_ROTATION_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
@@ -205,7 +295,7 @@ pub static KEY_ROTATION_META: EventTypeMeta = crate::event_modules::registry::ev
     parse: parse_key_rotation,
     encode: encode_key_rotation,
     projector: project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: build_projector_context,
 };
 
 #[cfg(test)]
@@ -213,12 +303,19 @@ mod tests {
     use super::*;
     use crate::event_modules::{encode_event, parse_event};
 
+    fn empty_slots() -> Vec<[u8; 32]> {
+        vec![[0u8; 32]; KEY_ROTATION_CAP]
+    }
+
     #[test]
     fn test_key_rotation_roundtrip() {
         let frontier_refs = vec![[0x11; 32]];
+        let mut recipient_slots = empty_slots();
+        let mut wrapped_keys = empty_slots();
+        recipient_slots[0] = [0x44; 32];
+        wrapped_keys[0] = [0x55; 32];
         let event = ParsedEvent::KeyRotation(KeyRotationEvent {
             created_at_ms: 10_000,
-            key_event_id: [0x22; 32],
             frontier_count: frontier_refs.len() as u8,
             frontier_ref_1: frontier_refs[0],
             frontier_ref_2: [0u8; 32],
@@ -226,6 +323,8 @@ mod tests {
             frontier_ref_4: [0u8; 32],
             frontier_hash: frontier_hash_from_refs(&frontier_refs),
             rotated_by: [0x33; 32],
+            recipient_slots,
+            wrapped_keys,
         });
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), KEY_ROTATION_WIRE_SIZE);

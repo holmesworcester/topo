@@ -51,6 +51,15 @@ pub enum EmitCommand {
     /// Emit a canonical deterministic event blob through the normal event
     /// pipeline (events + recorded_events + project_one).
     EmitDeterministicBlob { blob: Vec<u8> },
+    /// Index a shared endpoint identity into the workspace event set once a
+    /// peer_shared event proves which workspace it belongs to.
+    IndexEndpointSharedForWorkspace {
+        workspace_id: String,
+        endpoint_shared_event_id: String,
+    },
+    /// Retry blocked encrypted events that reference this logical key id after
+    /// local key material becomes available.
+    RetryBlockedEncryptedByKey { key_event_id: String },
 }
 
 /// The pure projector contract: everything a projector returns.
@@ -213,8 +222,10 @@ pub struct ProjectorDecisionContext {
     /// projector dispatch, the root message graph to purge.
     pub purge_message_event_id: Option<String>,
 
-    /// For KeyShared: DH-unwrapped key material, if available.
+    /// For KeyRotation/KeyShared: DH-unwrapped key material, if available.
     pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,
+    /// For KeyHistory: invite-DH-unwrapped historical key material.
+    pub unwrapped_key_history_material: Vec<HistoricalKeyMaterial>,
 
     /// For FileSlice: descriptor info for the file_id.
     /// Empty vec means no descriptor exists yet (dep-block on file_id).
@@ -272,6 +283,13 @@ pub struct ProjectorDecisionContext {
 /// Unwrapped symmetric key material derived from KeyShared.
 #[derive(Debug, Clone)]
 pub struct UnwrappedSecretMaterial {
+    pub key_bytes: [u8; 32],
+}
+
+/// Unwrapped historical key material derived from KeyHistory.
+#[derive(Debug, Clone)]
+pub struct HistoricalKeyMaterial {
+    pub key_event_id: [u8; 32],
     pub key_bytes: [u8; 32],
 }
 

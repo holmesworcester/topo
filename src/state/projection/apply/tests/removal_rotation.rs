@@ -1,5 +1,5 @@
 use super::*;
-use crate::event_modules::key_rotation::KeyRotationEvent;
+use crate::event_modules::key_rotation::{KeyRotationEvent, KEY_ROTATION_CAP};
 use crate::event_modules::removal::{frontier_hash_from_refs, RemovalEvent};
 
 fn make_signed_removal(
@@ -36,7 +36,6 @@ fn make_signed_removal(
 fn make_signed_key_rotation(
     signing_key: &SigningKey,
     signer_eid: &EventId,
-    key_event_id: [u8; 32],
     frontier: &[[u8; 32]],
     frontier_hash_override: Option<[u8; 32]>,
 ) -> (ParsedEvent, Vec<u8>) {
@@ -50,7 +49,6 @@ fn make_signed_key_rotation(
     }
     let event = ParsedEvent::KeyRotation(KeyRotationEvent {
         created_at_ms: now_ms(),
-        key_event_id,
         frontier_count: frontier.len() as u8,
         frontier_ref_1: slots[0],
         frontier_ref_2: slots[1],
@@ -58,6 +56,8 @@ fn make_signed_key_rotation(
         frontier_ref_4: slots[3],
         frontier_hash: frontier_hash_override.unwrap_or_else(|| frontier_hash_from_refs(frontier)),
         rotated_by: *signer_eid,
+        recipient_slots: vec![[0u8; 32]; KEY_ROTATION_CAP],
+        wrapped_keys: vec![[0u8; 32]; KEY_ROTATION_CAP],
     });
     let blob = sign_blob(signing_key, signer_eid, &event);
     let parsed = events::parse_event(&blob).unwrap();
@@ -110,7 +110,7 @@ fn test_key_rotation_projects_root_frontier_and_rejects_bad_hash() {
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
 
     let (_valid_rotation, valid_blob) =
-        make_signed_key_rotation(&signing_key, &signer_eid, [0x66; 32], &[], None);
+        make_signed_key_rotation(&signing_key, &signer_eid, &[], None);
     let valid_eid = insert_event_raw(&conn, recorded_by, &valid_blob);
     let result = project_one(&conn, recorded_by, &valid_eid).unwrap();
     assert_eq!(result, ProjectionDecision::Valid);
@@ -126,7 +126,7 @@ fn test_key_rotation_projects_root_frontier_and_rejects_bad_hash() {
     assert!(projected, "root-frontier rotation should project");
 
     let (_bad_rotation, bad_blob) =
-        make_signed_key_rotation(&signing_key, &signer_eid, [0x67; 32], &[], Some([0xAB; 32]));
+        make_signed_key_rotation(&signing_key, &signer_eid, &[], Some([0xAB; 32]));
     let bad_eid = insert_event_raw(&conn, recorded_by, &bad_blob);
     let result = project_one(&conn, recorded_by, &bad_eid).unwrap();
     match result {
@@ -151,7 +151,7 @@ fn test_key_rotation_blocks_on_missing_frontier_then_projects_and_rejects_bad_ha
         make_signed_removal(&signing_key, &signer_eid, [0x88; 32], &[], None);
     let frontier_eid = canonical_test_event_id(&conn, recorded_by, &frontier_blob);
     let (_blocked_rotation, blocked_blob) =
-        make_signed_key_rotation(&signing_key, &signer_eid, [0x77; 32], &[frontier_eid], None);
+        make_signed_key_rotation(&signing_key, &signer_eid, &[frontier_eid], None);
     let blocked_eid = insert_event_raw(&conn, recorded_by, &blocked_blob);
     let result = project_one(&conn, recorded_by, &blocked_eid).unwrap();
     match result {
@@ -185,7 +185,6 @@ fn test_key_rotation_blocks_on_missing_frontier_then_projects_and_rejects_bad_ha
     let (_bad_rotation, bad_blob) = make_signed_key_rotation(
         &signing_key,
         &signer_eid,
-        [0x77; 32],
         &[frontier_eid],
         Some([0xAB; 32]),
     );
@@ -305,7 +304,6 @@ fn test_key_rotation_multi_parent_frontier_blocks_until_all_frontier_deps_arrive
     let (_rotation, rotation_blob) = make_signed_key_rotation(
         &signing_key,
         &signer_eid,
-        [0xA3; 32],
         &canonical_frontier,
         None,
     );
@@ -417,7 +415,6 @@ fn test_key_rotation_rejects_unsorted_multi_parent_frontier_even_when_hash_match
     let (_rotation, unsorted_rotation_blob) = make_signed_key_rotation(
         &signing_key,
         &signer_eid,
-        [0xB3; 32],
         &unsorted_frontier,
         Some(frontier_hash_from_refs(&sorted_frontier)),
     );

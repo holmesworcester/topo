@@ -969,6 +969,187 @@ fn refill_live_send_queue(
     Ok(())
 }
 
+fn extend_created_at_by_shared_ids(
+    store: &Store<'_>,
+    event_ids: &[EventId],
+    created_at_by_id: &mut HashMap<EventId, i64>,
+) -> Result<(), String> {
+    let missing = event_ids
+        .iter()
+        .copied()
+        .filter(|event_id| !created_at_by_id.contains_key(event_id))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let loaded = store
+        .get_shared_created_at_batch(&missing)
+        .map_err(|e| format!("load shared created_at batch for dep closure: {e}"))?;
+    created_at_by_id.extend(loaded);
+    Ok(())
+}
+
+fn shared_event_sendable_for_selected_dep(
+    conn: &Connection,
+    store: &Store<'_>,
+    recorded_by: Option<&str>,
+    event_id: &EventId,
+    created_at_by_id: &mut HashMap<EventId, i64>,
+) -> Result<bool, String> {
+    extend_created_at_by_shared_ids(store, &[*event_id], created_at_by_id)?;
+    if !created_at_by_id.contains_key(event_id) {
+        return Ok(false);
+    }
+    let transport_shareable = match recorded_by {
+        Some(recorded_by) => crate::runtime::key_repair::shared_sendable_event_id(
+            conn, recorded_by, event_id,
+        )
+        .map_err(|e| format!("evaluate shared sendability for dep event: {e}"))?,
+        None => true,
+    };
+    Ok(transport_shareable)
+}
+
+fn load_selected_direct_deps(
+    conn: &Connection,
+    store: &Store<'_>,
+    recorded_by: Option<&str>,
+    workspace_id: &str,
+    event_id: &EventId,
+    created_at_by_id: &mut HashMap<EventId, i64>,
+    dep_cache: &mut HashMap<EventId, Vec<EventId>>,
+) -> Result<Vec<EventId>, String> {
+    if let Some(dep_ids) = dep_cache.get(event_id) {
+        return Ok(dep_ids.clone());
+    }
+
+    let mut dep_ids = crate::db::dep_index::list_shared_event_deps(conn, workspace_id, event_id)
+        .map_err(|e| format!("load shared event deps: {e}"))?
+        .into_iter()
+        .filter(|dep_id| {
+            shared_event_sendable_for_selected_dep(
+                conn,
+                store,
+                recorded_by,
+                dep_id,
+                created_at_by_id,
+            )
+            .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if let Some(descriptor_dep_id) = load_selected_file_descriptor_dep(
+        conn,
+        store,
+        recorded_by,
+        event_id,
+        created_at_by_id,
+    )? {
+        dep_ids.push(descriptor_dep_id);
+    }
+    dep_ids.sort_by(|left, right| {
+        let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
+        let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
+        left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
+    });
+    dep_ids.dedup();
+    dep_cache.insert(*event_id, dep_ids.clone());
+    Ok(dep_ids)
+}
+
+fn load_selected_file_descriptor_dep(
+    conn: &Connection,
+    store: &Store<'_>,
+    recorded_by: Option<&str>,
+    event_id: &EventId,
+    created_at_by_id: &mut HashMap<EventId, i64>,
+) -> Result<Option<EventId>, String> {
+    let descriptor_event_id_b64: Option<String> = conn
+        .query_row(
+            "SELECT descriptor_event_id
+             FROM file_slices
+             WHERE event_id = ?1
+               AND descriptor_event_id != ''
+             ORDER BY recorded_by ASC
+             LIMIT 1",
+            rusqlite::params![event_id_to_base64(event_id)],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()
+        .map_err(|e| format!("load file_slice descriptor dependency: {e}"))?;
+    Ok(descriptor_event_id_b64
+        .and_then(|event_id_b64| crate::crypto::event_id_from_base64(&event_id_b64))
+        .filter(|descriptor_event_id| {
+            shared_event_sendable_for_selected_dep(
+                conn,
+                store,
+                recorded_by,
+                descriptor_event_id,
+                created_at_by_id,
+            )
+            .unwrap_or(false)
+        }))
+}
+
+fn visit_selected_send_order(
+    conn: &Connection,
+    store: &Store<'_>,
+    recorded_by: Option<&str>,
+    workspace_id: &str,
+    event_id: EventId,
+    created_at_by_id: &mut HashMap<EventId, i64>,
+    dep_cache: &mut HashMap<EventId, Vec<EventId>>,
+    emitted: &mut HashSet<EventId>,
+    visiting: &mut HashSet<EventId>,
+    ordered: &mut Vec<EventId>,
+) -> Result<(), String> {
+    if emitted.contains(&event_id) {
+        return Ok(());
+    }
+    if !visiting.insert(event_id) {
+        return Ok(());
+    }
+
+    for dep_id in load_selected_direct_deps(
+        conn,
+        store,
+        recorded_by,
+        workspace_id,
+        &event_id,
+        created_at_by_id,
+        dep_cache,
+    )? {
+        let dep_plan = decide_selected_dep_order_plan(&normalize_selected_dep_order_context(
+            SelectedDepOrderRawRows {
+                dep_is_selected: true,
+                dep_already_emitted: emitted.contains(&dep_id),
+                dep_currently_visiting: visiting.contains(&dep_id),
+            },
+        ));
+        match dep_plan {
+            SelectedDepOrderPlan::EmitDepBeforeRoot => {
+                visit_selected_send_order(
+                    conn,
+                    store,
+                    recorded_by,
+                    workspace_id,
+                    dep_id,
+                    created_at_by_id,
+                    dep_cache,
+                    emitted,
+                    visiting,
+                    ordered,
+                )?;
+            }
+            SelectedDepOrderPlan::SkipDepEdge => continue,
+        }
+    }
+
+    visiting.remove(&event_id);
+    emitted.insert(event_id);
+    ordered.push(event_id);
+    Ok(())
+}
+
 fn order_requested_ids_for_send(
     conn: &Connection,
     store: &Store<'_>,
@@ -982,7 +1163,7 @@ fn order_requested_ids_for_send(
         return Ok(Vec::new());
     }
 
-    let (eligible_roots, created_at_by_id) = eligible_shared_send_root_ids(
+    let (eligible_roots, mut created_at_by_id) = eligible_shared_send_root_ids(
         conn,
         store,
         live_suppression_seed,
@@ -991,11 +1172,31 @@ fn order_requested_ids_for_send(
         requested_ids,
         require_workspace_index_membership,
     )?;
-    Ok(prioritize_send_order_with_created_at(
+    let ordered_roots = prioritize_send_order_with_created_at(
         &eligible_roots,
         &created_at_by_id,
         live_suppression_seed,
-    ))
+    );
+    let mut ordered = Vec::new();
+    let mut emitted = HashSet::new();
+    let mut visiting = HashSet::new();
+    let mut dep_cache = HashMap::new();
+
+    for event_id in ordered_roots {
+        visit_selected_send_order(
+            conn,
+            store,
+            live_suppression_seed,
+            workspace_id,
+            event_id,
+            &mut created_at_by_id,
+            &mut dep_cache,
+            &mut emitted,
+            &mut visiting,
+            &mut ordered,
+        )?;
+    }
+    Ok(ordered)
 }
 
 fn order_phase2_then_phase1_requested_ids_for_send(

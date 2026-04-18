@@ -53,6 +53,7 @@ const SUMMARY_TABLES: &[&str] = &[
     "reactions",
     "removals",
     "rejected_events",
+    "shared_event_index",
     "tenants",
     "user_invites",
     "users",
@@ -624,6 +625,15 @@ impl NodeBehaviorEngine {
                 .load_blob(&event_id_to_base64(&event_id))?
                 .ok_or("stored replay event missing blob")?;
             let parsed = events::parse_event(&blob)?;
+            if matches!(
+                semantic_event_owned(&parsed),
+                ParsedEvent::KeyHistory(_) | ParsedEvent::KeyRotation(_) | ParsedEvent::KeyShared(_)
+            ) {
+                self.state
+                    .borrow_mut()
+                    .valid_events
+                    .remove(&event_id_to_base64(&event_id));
+            }
             let _ = self.project_parsed_event(&event_id, &parsed)?;
         }
         Ok(())
@@ -804,6 +814,18 @@ fn table_rows_for_recorded<'a>(
                 || row_text(row, "peer_id") == Some(recorded_by)
         })
         .collect()
+}
+
+fn insert_or_ignore_key_matches(table: &str, left: &BehaviorRow, right: &BehaviorRow) -> bool {
+    let key_columns: &[&str] = match table {
+        "key_secrets" => &["recorded_by", "event_id"],
+        _ => return left == right,
+    };
+    key_columns.iter().all(|column| {
+        left.values.get(*column).zip(right.values.get(*column)).is_some_and(
+            |(left_value, right_value)| left_value == right_value,
+        )
+    })
 }
 
 fn first_row_for_recorded<'a>(
@@ -1643,6 +1665,154 @@ impl ProjectionQueries for NodeBehaviorEngine {
         })
     }
 
+    fn load_key_rotation_context(
+        &self,
+        frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        _event_id_b64: &str,
+        key_rotation: &events::KeyRotationEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let state = self.state.borrow();
+        let Some((local_recipient_event_id_b64, private_key_bytes)) =
+            table_rows_for_recorded(&state, "peer_secrets", recorded_by)
+                .into_iter()
+                .filter_map(|row| {
+                    Some((
+                        row_text(row, "signer_event_id")?.to_string(),
+                        row_blob(row, "private_key")?.to_vec(),
+                        row_int(row, "created_at").unwrap_or_default(),
+                        row_text(row, "event_id").unwrap_or_default().to_string(),
+                    ))
+                })
+                .max_by(|left, right| (left.2, &left.3).cmp(&(right.2, &right.3)))
+                .map(|(signer_event_id, private_key, _, _)| (signer_event_id, private_key))
+        else {
+            return Ok(ProjectorDecisionContext::default());
+        };
+        let Some(local_recipient_event_id) = event_id_from_base64(&local_recipient_event_id_b64)
+        else {
+            return Ok(ProjectorDecisionContext::default());
+        };
+        let Some(slot_index) = key_rotation
+            .recipient_slots
+            .iter()
+            .position(|slot| *slot == local_recipient_event_id)
+        else {
+            return Ok(ProjectorDecisionContext::default());
+        };
+        if private_key_bytes.len() != 32 {
+            return Ok(ProjectorDecisionContext::default());
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&private_key_bytes);
+        let local_signing_key = ed25519_dalek::SigningKey::from_bytes(&key_arr);
+        let Some(current_signer) = frame.current_signer.as_ref() else {
+            return Ok(ProjectorDecisionContext::default());
+        };
+        let Some(current_signer_event_id) =
+            crate::crypto::event_id_from_base64(&current_signer.event_id)
+        else {
+            return Ok(ProjectorDecisionContext::default());
+        };
+        let sender_key =
+            match resolve_signer_key_behavior(&state, recorded_by, &current_signer_event_id)? {
+                SignerResolution::Found(key) => key,
+                _ => return Ok(ProjectorDecisionContext::default()),
+            };
+        let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key.public_key) {
+            Ok(key) => key,
+            Err(_) => return Ok(ProjectorDecisionContext::default()),
+        };
+        let plaintext_key = crate::projection::encrypted::unwrap_key_from_sender(
+            &local_signing_key,
+            &sender_pub,
+            &key_rotation.wrapped_keys[slot_index],
+        );
+        Ok(ProjectorDecisionContext {
+            unwrapped_secret_material: Some(crate::projection::projector::UnwrappedSecretMaterial {
+                key_bytes: plaintext_key,
+            }),
+            ..ProjectorDecisionContext::default()
+        })
+    }
+
+    fn load_key_history_context(
+        &self,
+        frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        _event_id_b64: &str,
+        key_history: &events::KeyHistoryEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let state = self.state.borrow();
+        let Some(private_key_bytes) =
+            table_rows_for_recorded(&state, "invite_secrets", recorded_by)
+                .into_iter()
+                .filter_map(|row| row_blob(row, "private_key").map(|v| v.to_vec()))
+                .find(|private_key_bytes| {
+                    if private_key_bytes.len() != 32 {
+                        return false;
+                    }
+                    let mut key_arr = [0u8; 32];
+                    key_arr.copy_from_slice(private_key_bytes);
+                    ed25519_dalek::SigningKey::from_bytes(&key_arr)
+                        .verifying_key()
+                        .to_bytes()
+                        == key_history.recipient_public_key
+                })
+        else {
+            return Ok(ProjectorDecisionContext::default());
+        };
+        if private_key_bytes.len() != 32 {
+            return Ok(ProjectorDecisionContext::default());
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&private_key_bytes);
+        let local_signing_key = ed25519_dalek::SigningKey::from_bytes(&key_arr);
+        let Some(current_signer) = frame.current_signer.as_ref() else {
+            return Ok(ProjectorDecisionContext::default());
+        };
+        let Some(current_signer_event_id) =
+            crate::crypto::event_id_from_base64(&current_signer.event_id)
+        else {
+            return Ok(ProjectorDecisionContext::default());
+        };
+        let sender_key =
+            match resolve_signer_key_behavior(&state, recorded_by, &current_signer_event_id)? {
+                SignerResolution::Found(key) => key,
+                _ => return Ok(ProjectorDecisionContext::default()),
+            };
+        let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key.public_key) {
+            Ok(key) => key,
+            Err(_) => return Ok(ProjectorDecisionContext::default()),
+        };
+        let plaintext = match crate::crypto::decrypt_bundle_from_sender(
+            &local_signing_key,
+            &sender_pub,
+            &key_history.nonce,
+            &key_history.ciphertext,
+            &key_history.auth_tag,
+        ) {
+            Ok(plaintext) => plaintext,
+            Err(_) => return Ok(ProjectorDecisionContext::default()),
+        };
+        let entries = match crate::event_modules::key_history::decode_key_history_plaintext(&plaintext)
+        {
+            Ok(entries) => entries,
+            Err(_) => return Ok(ProjectorDecisionContext::default()),
+        };
+
+        Ok(ProjectorDecisionContext {
+            unwrapped_key_history_material: entries
+                .into_iter()
+                .map(|entry| crate::projection::projector::HistoricalKeyMaterial {
+                    key_event_id: entry.key_event_id,
+                    key_bytes: entry.key_bytes,
+                })
+                .collect(),
+            ..ProjectorDecisionContext::default()
+        })
+    }
+
     fn load_key_request_context(
         &self,
         _frame: &ProjectionFrameContext,
@@ -1755,7 +1925,10 @@ impl ProjectionBackend for NodeBehaviorEngine {
                     }
                     let row = BehaviorRow { values: row_values };
                     let rows = state.tables.entry((*table).to_string()).or_default();
-                    if !rows.contains(&row) {
+                    if !rows
+                        .iter()
+                        .any(|existing| insert_or_ignore_key_matches(table, existing, &row))
+                    {
                         rows.push(row);
                         rows.sort();
                     }
@@ -1813,6 +1986,73 @@ impl ProjectionBackend for NodeBehaviorEngine {
                 EmitCommand::RetryWorkspaceEvent { workspace_id } => {
                     if let Some(event_id) = event_id_from_base64(workspace_id) {
                         let _ = self.project_and_cascade(&event_id)?;
+                    }
+                }
+                EmitCommand::RetryBlockedEncryptedByKey { key_event_id } => {
+                    let blocked_candidates = {
+                        let state = self.state.borrow();
+                        state
+                            .blocked_events
+                            .keys()
+                            .filter_map(|event_id_b64| {
+                                let blob = state.events.get(event_id_b64)?.blob.clone();
+                                let parsed = parse_semantic_event_for_retry(&blob).ok()?;
+                                let ParsedEvent::Encrypted(enc) = parsed else {
+                                    return None;
+                                };
+                                if event_id_to_base64(&enc.key_event_id) == *key_event_id {
+                                    event_id_from_base64(event_id_b64)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    for event_id in blocked_candidates {
+                        let _ = self.project_and_cascade(&event_id)?;
+                    }
+                }
+                EmitCommand::IndexEndpointSharedForWorkspace {
+                    workspace_id,
+                    endpoint_shared_event_id,
+                } => {
+                    let Some(endpoint_event_id) = event_id_from_base64(endpoint_shared_event_id)
+                    else {
+                        continue;
+                    };
+                    let Some(blob) = self
+                        .state
+                        .borrow()
+                        .events
+                        .get(endpoint_shared_event_id)
+                        .map(|event| event.blob.clone())
+                    else {
+                        continue;
+                    };
+                    let parsed = parse_event(&blob)?;
+                    if !matches!(parsed, ParsedEvent::EndpointShared(_)) {
+                        continue;
+                    }
+                    let Some(created_at_ms) = crate::event_modules::extract_created_at_ms(&blob)
+                    else {
+                        continue;
+                    };
+                    let mut row_values = BTreeMap::new();
+                    row_values.insert(
+                        "workspace_id".to_string(),
+                        BehaviorValue::Text(workspace_id.clone()),
+                    );
+                    row_values.insert("ts".to_string(), BehaviorValue::Int(created_at_ms as i64));
+                    row_values.insert(
+                        "id".to_string(),
+                        BehaviorValue::Blob(endpoint_event_id.to_vec()),
+                    );
+                    let row = BehaviorRow { values: row_values };
+                    let mut state = self.state.borrow_mut();
+                    let rows = state.tables.entry("shared_event_index".to_string()).or_default();
+                    if !rows.contains(&row) {
+                        rows.push(row);
+                        rows.sort();
                     }
                 }
                 EmitCommand::MaterializeTransportIdentity { .. }
@@ -1897,6 +2137,14 @@ fn key_secret_bytes(
 fn sort_rows(mut rows: Vec<BehaviorRow>) -> Vec<BehaviorRow> {
     rows.sort();
     rows
+}
+
+fn parse_semantic_event_for_retry(blob: &[u8]) -> Result<ParsedEvent, Box<dyn std::error::Error>> {
+    let parsed = events::parse_event(blob)?;
+    match parsed {
+        ParsedEvent::Signed(signed) => parse_semantic_event_for_retry(&signed.payload),
+        other => Ok(other),
+    }
 }
 
 pub fn sqlite_behavior_summary(
@@ -2015,9 +2263,18 @@ mod tests {
         table: &str,
         drop_columns: &[&str],
     ) {
+        let drop_created_at_for_key_secrets = table == "key_secrets"
+            && !drop_columns.iter().any(|column| *column == "created_at");
+        let drop_columns = if drop_created_at_for_key_secrets {
+            let mut columns = drop_columns.to_vec();
+            columns.push("created_at");
+            columns
+        } else {
+            drop_columns.to_vec()
+        };
         assert_eq!(
-            projected_table(actual, table, drop_columns),
-            projected_table(expected, table, drop_columns),
+            projected_table(actual, table, &drop_columns),
+            projected_table(expected, table, &drop_columns),
             "table mismatch for {table}"
         );
     }

@@ -111,11 +111,14 @@ fn test_stats_message_counts_after_sync() {
 #[test]
 fn test_replay_invariants_after_create_workspace() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let (db, _daemon) = setup_single_peer(&tmpdir, "replay");
+    let (db, mut daemon) = setup_single_peer(&tmpdir, "replay");
 
     // Send a few messages to create projection state
     send_message(&db, "message one");
     send_message(&db, "message two");
+
+    stop_daemon(&db, &mut daemon);
+    wait_for_daemon_stopped(&db, Duration::from_secs(10));
 
     assert_replay_pass(&db);
 }
@@ -128,7 +131,7 @@ fn test_replay_invariants_after_create_workspace() {
 fn test_replay_invariants_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 120000;
-    let (alice_db, bob_db, _alice, bob) = setup_two_peers(&tmpdir);
+    let (alice_db, bob_db, mut alice, mut bob) = setup_two_peers(&tmpdir);
 
     send_message(&alice_db, "Alice says hi");
     send_message(&bob_db, "Bob says hi");
@@ -136,13 +139,12 @@ fn test_replay_invariants_after_sync() {
     assert_eventually(&bob_db, "message_count == 2", timeout_ms);
 
     // Stop Bob's daemon so Alice has no active sync sessions
-    drop(bob);
+    stop_daemon(&bob_db, &mut bob);
     wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
+    stop_daemon(&alice_db, &mut alice);
+    wait_for_daemon_stopped(&alice_db, Duration::from_secs(10));
 
-    // Small delay for Alice's sync engine to notice the disconnection
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Replay on Alice (quiesced — no concurrent sync)
+    // Replay on Alice against a stopped local daemon.
     let fp_alice = assert_replay_pass(&alice_db);
     assert!(!fp_alice.is_empty());
 }
@@ -1499,7 +1501,7 @@ fn test_zero_loss_stress_converges() {
 fn test_recorded_at_monotonicity_via_replay() {
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 120000;
-    let (alice_db, bob_db, _alice, bob) = setup_two_peers(&tmpdir);
+    let (alice_db, bob_db, mut alice, mut bob) = setup_two_peers(&tmpdir);
 
     // Send messages with small delays to exercise recorded_at ordering
     send_message(&alice_db, "first");
@@ -1511,9 +1513,10 @@ fn test_recorded_at_monotonicity_via_replay() {
     assert_eventually(&bob_db, "message_count == 3", timeout_ms);
 
     // Stop Bob so Alice has no concurrent sync during replay
-    drop(bob);
+    stop_daemon(&bob_db, &mut bob);
     wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
-    std::thread::sleep(Duration::from_millis(300));
+    stop_daemon(&alice_db, &mut alice);
+    wait_for_daemon_stopped(&alice_db, Duration::from_secs(10));
 
     // All 4 replay passes (forward, idempotent, reverse, shuffle) must agree.
     // Disagreement would indicate timestamp-ordering sensitivity.

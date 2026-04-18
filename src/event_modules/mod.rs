@@ -12,6 +12,7 @@ pub mod file;
 pub mod file_slice;
 pub mod invite_accepted;
 pub mod invite_secret;
+pub mod key_history;
 pub mod key_request;
 pub mod key_rotation;
 pub mod key_secret;
@@ -67,6 +68,7 @@ pub use file::FileEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
 pub use invite_secret::InviteSecretEvent;
+pub use key_history::KeyHistoryEvent;
 pub use key_request::KeyRequestEvent;
 pub use key_rotation::KeyRotationEvent;
 pub use key_secret::KeySecretEvent;
@@ -111,6 +113,7 @@ pub const EVENT_TYPE_KEY_ROTATION: u8 = 32;
 pub const EVENT_TYPE_ENDPOINT_SECRET: u8 = 33;
 pub const EVENT_TYPE_ENDPOINT_SHARED: u8 = 34;
 pub const EVENT_TYPE_SIGNED: u8 = 35;
+pub const EVENT_TYPE_KEY_HISTORY: u8 = 36;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -142,6 +145,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     key_request::ensure_schema(conn)?;
     removal::ensure_schema(conn)?;
     key_rotation::ensure_schema(conn)?;
+    key_history::ensure_schema(conn)?;
     tenant::ensure_schema(conn)?;
     peer_secret::ensure_schema(conn)?;
     invite_secret::ensure_schema(conn)?;
@@ -163,6 +167,7 @@ pub enum ParsedEvent {
     InviteAccepted(InviteAcceptedEvent),
     Removal(RemovalEvent),
     KeyRotation(KeyRotationEvent),
+    KeyHistory(KeyHistoryEvent),
     KeyRequest(KeyRequestEvent),
     UserInvite(UserInviteEvent),
     DeviceInvite(DeviceInviteEvent),
@@ -193,6 +198,7 @@ impl ParsedEvent {
             ParsedEvent::InviteAccepted(a) => a.created_at_ms,
             ParsedEvent::Removal(r) => r.created_at_ms,
             ParsedEvent::KeyRotation(k) => k.created_at_ms,
+            ParsedEvent::KeyHistory(k) => k.created_at_ms,
             ParsedEvent::KeyRequest(k) => k.created_at_ms,
             ParsedEvent::UserInvite(u) => u.created_at_ms,
             ParsedEvent::DeviceInvite(d) => d.created_at_ms,
@@ -271,9 +277,25 @@ impl ParsedEvent {
                     .collect::<Vec<_>>();
                 deps
             }
-            ParsedEvent::KeyRequest(_) => vec![],
-            ParsedEvent::UserInvite(u) => vec![("authority_event_id", u.authority_event_id)],
-            ParsedEvent::DeviceInvite(d) => vec![("authority_event_id", d.authority_event_id)],
+            ParsedEvent::KeyRequest(k) => vec![
+                ("key_event_id", k.key_event_id),
+                ("recipient_event_id", k.recipient_event_id),
+            ],
+            ParsedEvent::KeyHistory(_) => vec![],
+            ParsedEvent::UserInvite(u) => {
+                let mut deps = vec![("authority_event_id", u.authority_event_id)];
+                if u.key_history_event_id != key_history::NO_KEY_HISTORY_EVENT_ID {
+                    deps.push(("key_history_event_id", u.key_history_event_id));
+                }
+                deps
+            }
+            ParsedEvent::DeviceInvite(d) => {
+                let mut deps = vec![("authority_event_id", d.authority_event_id)];
+                if d.key_history_event_id != key_history::NO_KEY_HISTORY_EVENT_ID {
+                    deps.push(("key_history_event_id", d.key_history_event_id));
+                }
+                deps
+            }
             ParsedEvent::User(_) => vec![],
             ParsedEvent::PeerShared(p) => {
                 vec![
@@ -289,7 +311,10 @@ impl ParsedEvent {
                     s.frontier_ref_3,
                     s.frontier_ref_4,
                 ];
-                let mut deps = vec![("recipient_event_id", s.recipient_event_id)];
+                let mut deps = vec![
+                    ("key_event_id", s.key_event_id),
+                    ("recipient_event_id", s.recipient_event_id),
+                ];
                 deps.extend(
                     removal::frontier_refs_from_slots(s.frontier_count, &slots)
                         .unwrap_or_default()
@@ -330,6 +355,7 @@ impl ParsedEvent {
             ParsedEvent::InviteAccepted(_) => EVENT_TYPE_INVITE_ACCEPTED,
             ParsedEvent::Removal(_) => EVENT_TYPE_REMOVAL,
             ParsedEvent::KeyRotation(_) => EVENT_TYPE_KEY_ROTATION,
+            ParsedEvent::KeyHistory(_) => EVENT_TYPE_KEY_HISTORY,
             ParsedEvent::KeyRequest(_) => EVENT_TYPE_KEY_REQUEST,
             ParsedEvent::UserInvite(_) => EVENT_TYPE_USER_INVITE,
             ParsedEvent::DeviceInvite(_) => EVENT_TYPE_DEVICE_INVITE,
@@ -361,6 +387,7 @@ impl ParsedEvent {
             ParsedEvent::InviteAccepted(e) => e.human_fields(),
             ParsedEvent::Removal(e) => e.human_fields(),
             ParsedEvent::KeyRotation(e) => e.human_fields(),
+            ParsedEvent::KeyHistory(e) => e.human_fields(),
             ParsedEvent::KeyRequest(e) => e.human_fields(),
             ParsedEvent::UserInvite(e) => e.human_fields(),
             ParsedEvent::DeviceInvite(e) => e.human_fields(),
@@ -459,6 +486,7 @@ pub fn registry() -> &'static EventRegistry {
             &invite_accepted::INVITE_ACCEPTED_META,
             &removal::REMOVAL_META,
             &key_rotation::KEY_ROTATION_META,
+            &key_history::KEY_HISTORY_META,
             &key_request::KEY_REQUEST_META,
             &user_invite::USER_INVITE_META,
             &device_invite::DEVICE_INVITE_META,

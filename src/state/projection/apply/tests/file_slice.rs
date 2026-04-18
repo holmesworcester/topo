@@ -235,14 +235,14 @@ fn test_project_attachment_valid() {
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-    // Create KeySecret (dep)
-    let sk = ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: now_ms(),
-        key_bytes: [0xAA; 32],
-    });
-    let sk_blob = events::encode_event(&sk).unwrap();
-    let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
-    project_one(&conn, recorded_by, &sk_eid).unwrap();
+    // Create KeyRotation (dep)
+    let sk_eid = insert_and_project_self_key_rotation(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signing_key,
+        [0xAA; 32],
+    );
 
     // Create attachment referencing both deps
     let (_att, att_blob) = make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &sk_eid);
@@ -267,14 +267,15 @@ fn test_attachment_blocks_on_missing_message() {
     let conn = setup();
     let recorded_by = "peer1";
 
-    // Create KeySecret but NOT message
-    let sk = ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: now_ms(),
-        key_bytes: [0xAA; 32],
-    });
-    let sk_blob = events::encode_event(&sk).unwrap();
-    let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
-    project_one(&conn, recorded_by, &sk_eid).unwrap();
+    // Create KeyRotation but NOT message
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let sk_eid = insert_and_project_self_key_rotation(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signing_key,
+        [0xAA; 32],
+    );
 
     let fake_msg_id = [88u8; 32];
     let (_att, att_blob) = make_file(&conn, recorded_by, &fake_msg_id, &sk_eid);
@@ -342,11 +343,8 @@ fn test_attachment_cascade_unblock() {
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "hello cascade");
     let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
-    let sk = ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: now_ms(),
-        key_bytes: [0xBB; 32],
-    });
-    let sk_blob = events::encode_event(&sk).unwrap();
+    let (_sk, sk_blob) =
+        make_self_key_rotation_blob(&conn, &signer_eid, &signing_key, [0xBB; 32]);
     let sk_eid = crate::crypto::hash_event(&sk_blob);
 
     // Insert attachment first (both deps missing → blocks)
@@ -496,6 +494,7 @@ fn test_file_slice_wrong_signer_rejected() {
         public_key: invite_pub,
         workspace_id: net_eid,
         authority_event_id: net_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let uib_event = ParsedEvent::UserInvite(uib);
     let uib_blob = sign_blob(&workspace_key, &net_eid, &uib_event);
@@ -522,6 +521,7 @@ fn test_file_slice_wrong_signer_rejected() {
         created_at_ms: now_ms(),
         public_key: device_invite_pub_a,
         authority_event_id: ub_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let dif_a_event = ParsedEvent::DeviceInvite(dif_a);
     let dif_a_blob = sign_blob(&user_key, &ub_eid, &dif_a_event);
@@ -553,6 +553,7 @@ fn test_file_slice_wrong_signer_rejected() {
         created_at_ms: now_ms(),
         public_key: device_invite_pub_b,
         authority_event_id: ub_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let dif_b_event = ParsedEvent::DeviceInvite(dif_b);
     let dif_b_blob = sign_blob(&user_key, &ub_eid, &dif_b_event);

@@ -150,7 +150,8 @@ fn test_encrypted_inner_dep_cascade_unblock() {
 
     // Create the secret key for encryption
     let key_bytes: [u8; 32] = rand::random();
-    let (_sk, sk_blob) = make_key_secret(key_bytes);
+    let (_sk, sk_blob) =
+        make_self_key_rotation_blob(&conn, &signer_eid, &signing_key, key_bytes);
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     // DON'T project key yet
 
@@ -502,7 +503,8 @@ fn test_source_isomorphism_encrypted_message() {
     // --- Path A: Direct (key first, then encrypted) ---
     let conn_a = setup();
     let (signer_a, signing_key_a) = make_identity_chain(&conn_a, recorded_by);
-    let (_sk_a, sk_blob_a) = make_key_secret(key_bytes);
+    let (_sk_a, sk_blob_a) =
+        make_self_key_rotation_blob(&conn_a, &signer_a, &signing_key_a, key_bytes);
     let sk_eid_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
     project_one(&conn_a, recorded_by, &sk_eid_a).unwrap();
 
@@ -526,7 +528,8 @@ fn test_source_isomorphism_encrypted_message() {
     // --- Path B: Cascade (encrypted first, blocks; then key unblocks) ---
     let conn_b = setup();
     let (signer_b, signing_key_b) = make_identity_chain(&conn_b, recorded_by);
-    let (_sk_b, sk_blob_b) = make_key_secret(key_bytes);
+    let (_sk_b, sk_blob_b) =
+        make_self_key_rotation_blob(&conn_b, &signer_b, &signing_key_b, key_bytes);
     let sk_eid_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
 
     let msg_b = ParsedEvent::Message(MessageEvent {
@@ -664,13 +667,27 @@ fn test_source_isomorphism_reverse_order_replay() {
     let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b);
     let del_eid_b = insert_event_raw(&conn_b, recorded_by, &del_blob_b);
 
+    let (tenant_recorded_by, tenant_eid, _tenant_blob) =
+        chain_b.first().expect("identity chain includes tenant root");
+    let (invite_recorded_by, invite_eid, _invite_blob) =
+        chain_b.get(1).expect("identity chain includes invite_accepted");
+    let (workspace_recorded_by, workspace_eid, _workspace_blob) =
+        chain_b.get(2).expect("identity chain includes workspace");
+    let (peer_secret_recorded_by, peer_secret_eid, _peer_secret_blob) =
+        chain_b.last().expect("identity chain includes peer_secret");
+    let reverse_projectable_chain = &chain_b[3..chain_b.len() - 1];
+
     // Project in reverse: deletion, reaction, message, then identity chain in reverse
     project_one(&conn_b, recorded_by, &del_eid_b).unwrap();
     project_one(&conn_b, recorded_by, &rxn_eid_b).unwrap();
     project_one(&conn_b, recorded_by, &msg_eid_b).unwrap();
-    for (event_recorded_by, eid, _blob) in chain_b.iter().rev() {
+    for (event_recorded_by, eid, _blob) in reverse_projectable_chain.iter().rev() {
         project_one(&conn_b, event_recorded_by, eid).unwrap();
     }
+    project_one(&conn_b, tenant_recorded_by, tenant_eid).unwrap();
+    project_one(&conn_b, invite_recorded_by, invite_eid).unwrap();
+    project_one(&conn_b, workspace_recorded_by, workspace_eid).unwrap();
+    project_one(&conn_b, peer_secret_recorded_by, peer_secret_eid).unwrap();
 
     // --- Compare ---
     assert_eq!(
@@ -774,7 +791,8 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
     let (signer_a, signing_key_a) = make_identity_chain(&conn_a, recorded_by);
 
     // Key
-    let (_sk_a, sk_blob_a) = make_key_secret(key_bytes);
+    let (_sk_a, sk_blob_a) =
+        make_self_key_rotation_blob(&conn_a, &signer_a, &signing_key_a, key_bytes);
     let sk_eid_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
     project_one(&conn_a, recorded_by, &sk_eid_a).unwrap();
 
@@ -806,7 +824,8 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
     let (signer_b, signing_key_b) = make_identity_chain(&conn_b, recorded_by);
 
     // Insert all but don't project content events yet
-    let (_sk_b, sk_blob_b) = make_key_secret(key_bytes);
+    let (_sk_b, sk_blob_b) =
+        make_self_key_rotation_blob(&conn_b, &signer_b, &signing_key_b, key_bytes);
     let sk_eid_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
 
     let (_msg_b, msg_blob_b) = make_message_signed(&signing_key_b, &signer_b, "enc rxn target");

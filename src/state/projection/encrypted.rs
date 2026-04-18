@@ -34,8 +34,8 @@ pub fn project_encrypted(
         Ok(k) => k,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             return Ok((
-                ProjectionDecision::Reject {
-                    reason: "secret key not found in key_secrets table".to_string(),
+                ProjectionDecision::BlockOnMissingDeps {
+                    missing: Vec::new(),
                 },
                 None,
             ));

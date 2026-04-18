@@ -553,7 +553,7 @@ mod tests {
             .query_row(
                 "SELECT workspace_id FROM shared_event_index WHERE id = ?1",
                 rusqlite::params![event_id.as_slice()],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .unwrap();
         assert_eq!(
@@ -751,7 +751,7 @@ mod tests {
             .query_row(
                 "SELECT workspace_id FROM shared_event_index WHERE id = ?1",
                 rusqlite::params![event_id.as_slice()],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .unwrap();
         assert_eq!(indexed_workspace_id, event_id_b64);

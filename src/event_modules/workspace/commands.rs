@@ -72,6 +72,24 @@ fn resolve_local_endpoint_shared_event_id(
     super::command_plans::resolve_local_endpoint_shared_plan(plan)
 }
 
+fn resolve_or_materialize_local_endpoint_shared_event_id_for_accept(
+    db: &Connection,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    match resolve_local_endpoint_shared_event_id(db) {
+        Ok(event_id) => Ok(event_id),
+        Err(err)
+            if err.to_string()
+                == super::command_plans::MISSING_LOCAL_DAEMON_ENDPOINT_SHARED_ERROR =>
+        {
+            // Offline invite acceptance should be able to mint the local daemon
+            // endpoint identity lazily instead of forcing a daemon start first.
+            let _ = crate::transport::materialize_daemon_identity(db)?;
+            resolve_local_endpoint_shared_event_id(db)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// In a shared DB, sibling tenants can already have the workspace's shared
 /// event history in `events`/`shared_event_index` even though this tenant has not yet
 /// projected it into its own `valid_events` scope. Replay those shared events
@@ -489,6 +507,7 @@ fn create_workspace_inner(
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id: ws_eid,
         authority_event_id: ws_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let uib_eid =
         create_signed_event(db, &derived_peer_id, &ws_eid, &uib, &workspace_key)?;
@@ -517,6 +536,7 @@ fn create_workspace_inner(
         created_at_ms: next_created_at(&mut timestamps),
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: ub_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let dif_eid = create_signed_event(db, &derived_peer_id, &ub_eid, &dif, &user_key)?;
 
@@ -633,7 +653,7 @@ fn join_workspace_inner(
     peer_shared_key: SigningKey,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
-    let endpoint_shared_event_id = resolve_local_endpoint_shared_event_id(db)?;
+    let endpoint_shared_event_id = resolve_or_materialize_local_endpoint_shared_event_id_for_accept(db)?;
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_secret material. This is the key event
@@ -674,6 +694,7 @@ fn join_workspace_inner(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: user_event_id,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let device_invite_event_id = event_id_or_blocked(create_signed_event(
         db,
@@ -760,7 +781,7 @@ pub fn add_device_to_workspace(
     device_name: &str,
     peer_shared_key: SigningKey,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
-    let endpoint_shared_event_id = resolve_local_endpoint_shared_event_id(db)?;
+    let endpoint_shared_event_id = resolve_or_materialize_local_endpoint_shared_event_id_for_accept(db)?;
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_secret material so invite_accepted projection

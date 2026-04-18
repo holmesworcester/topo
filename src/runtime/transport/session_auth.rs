@@ -2748,6 +2748,7 @@ mod tests {
             public_key: invite_signing_key.verifying_key().to_bytes(),
             workspace_id: [0x43; 32],
             authority_event_id: [0x44; 32],
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         }))
         .expect("encode invite");
 
@@ -2902,6 +2903,7 @@ mod tests {
             public_key: invite_signing_key.verifying_key().to_bytes(),
             workspace_id: [0x63; 32],
             authority_event_id: [0x64; 32],
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         }))
         .expect("encode invite");
 
@@ -3017,6 +3019,7 @@ mod tests {
             public_key: invite_signing_key.verifying_key().to_bytes(),
             workspace_id: [0x93; 32],
             authority_event_id: [0x94; 32],
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         }))
         .expect("encode invite");
 

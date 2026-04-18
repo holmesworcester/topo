@@ -16,9 +16,16 @@ fn key_shared_does_not_block_non_recipient_observers_on_local_invite_secret() {
         )
         .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
         .unwrap();
+    let key_event_id = insert_and_project_key_rotation_for_recipient(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signer_key,
+        &recipient_event_id,
+    );
     let key_shared = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: now_ms(),
-        key_event_id: [0x44; 32],
+        key_event_id,
         frontier_count: 0,
         frontier_ref_1: [0u8; 32],
         frontier_ref_2: [0u8; 32],
@@ -26,7 +33,7 @@ fn key_shared_does_not_block_non_recipient_observers_on_local_invite_secret() {
         frontier_ref_4: [0u8; 32],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
         delivery_target_id: crate::event_modules::key_request::delivery_target_id(
-            &[0x44; 32],
+            &key_event_id,
             &crate::event_modules::removal::frontier_hash_from_refs(&[]),
             &recipient_event_id,
             &[0x55; 32],
@@ -98,6 +105,13 @@ fn key_shared_blocks_on_missing_frontier_then_projects() {
         )
         .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
         .unwrap();
+    let key_event_id = insert_and_project_key_rotation_for_recipient(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signer_key,
+        &recipient_event_id,
+    );
 
     let removal = ParsedEvent::Removal(crate::event_modules::RemovalEvent {
         created_at_ms: now_ms(),
@@ -116,7 +130,7 @@ fn key_shared_blocks_on_missing_frontier_then_projects() {
     let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[removal_eid]);
     let key_shared = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: now_ms(),
-        key_event_id: [0x44; 32],
+        key_event_id,
         frontier_count: 1,
         frontier_ref_1: removal_eid,
         frontier_ref_2: [0u8; 32],
@@ -124,7 +138,7 @@ fn key_shared_blocks_on_missing_frontier_then_projects() {
         frontier_ref_4: [0u8; 32],
         frontier_hash,
         delivery_target_id: crate::event_modules::key_request::delivery_target_id(
-            &[0x44; 32],
+            &key_event_id,
             &frontier_hash,
             &recipient_event_id,
             &[0x55; 32],
@@ -182,6 +196,13 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
         )
         .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
         .unwrap();
+    let key_event_id = insert_and_project_key_rotation_for_recipient(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signer_key,
+        &recipient_event_id,
+    );
 
     let left_removal = ParsedEvent::Removal(crate::event_modules::RemovalEvent {
         created_at_ms: now_ms(),
@@ -232,7 +253,7 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
     let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&sorted_frontier);
     let key_shared = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: now_ms(),
-        key_event_id: [0x44; 32],
+        key_event_id,
         frontier_count: 2,
         frontier_ref_1: unsorted_frontier[0],
         frontier_ref_2: unsorted_frontier[1],
@@ -240,7 +261,7 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
         frontier_ref_4: [0u8; 32],
         frontier_hash,
         delivery_target_id: crate::event_modules::key_request::delivery_target_id(
-            &[0x44; 32],
+            &key_event_id,
             &frontier_hash,
             &recipient_event_id,
             &[0x55; 32],
@@ -271,10 +292,24 @@ fn test_project_key_request_valid_with_delivery_target_binding() {
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
 
     let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[]);
-    let recipient_event_id = [0x33; 32];
+    let recipient_event_id: EventId = conn
+        .query_row(
+            "SELECT event_id FROM user_invites WHERE recorded_by = ?1 LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
+        .unwrap();
+    let key_event_id = insert_and_project_key_rotation_for_recipient(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signer_key,
+        &recipient_event_id,
+    );
     let unwrap_key_event_id = [0x44; 32];
     let delivery_target_id = crate::event_modules::key_request::delivery_target_id(
-        &[0x22; 32],
+        &key_event_id,
         &frontier_hash,
         &recipient_event_id,
         &unwrap_key_event_id,
@@ -282,7 +317,7 @@ fn test_project_key_request_valid_with_delivery_target_binding() {
     let key_request = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: now_ms(),
         blocked_event_id: [0x11; 32],
-        key_event_id: [0x22; 32],
+        key_event_id,
         frontier_hash,
         delivery_target_id,
         recipient_event_id,
@@ -325,10 +360,24 @@ fn test_project_key_request_sets_suppress_sharing_after_matching_key_shared() {
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
 
     let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[]);
-    let recipient_event_id = [0x33; 32];
+    let recipient_event_id: EventId = conn
+        .query_row(
+            "SELECT event_id FROM user_invites WHERE recorded_by = ?1 LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
+        .unwrap();
+    let key_event_id = insert_and_project_key_rotation_for_recipient(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signer_key,
+        &recipient_event_id,
+    );
     let unwrap_key_event_id = [0x44; 32];
     let delivery_target_id = crate::event_modules::key_request::delivery_target_id(
-        &[0x22; 32],
+        &key_event_id,
         &frontier_hash,
         &recipient_event_id,
         &unwrap_key_event_id,
@@ -342,7 +391,7 @@ fn test_project_key_request_sets_suppress_sharing_after_matching_key_shared() {
         rusqlite::params![
             recorded_by,
             event_id_to_base64(&[0x77; 32]),
-            event_id_to_base64(&[0x22; 32]),
+            event_id_to_base64(&key_event_id),
             event_id_to_base64(&[0u8; 32]),
             event_id_to_base64(&frontier_hash),
             event_id_to_base64(&delivery_target_id),
@@ -355,7 +404,7 @@ fn test_project_key_request_sets_suppress_sharing_after_matching_key_shared() {
     let key_request = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: now_ms(),
         blocked_event_id: [0x11; 32],
-        key_event_id: [0x22; 32],
+        key_event_id,
         frontier_hash,
         delivery_target_id,
         recipient_event_id,
@@ -397,9 +446,16 @@ fn test_project_key_shared_retroactively_suppresses_matching_key_request() {
         )
         .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
         .unwrap();
+    let key_event_id = insert_and_project_key_rotation_for_recipient(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signer_key,
+        &recipient_event_id,
+    );
     let unwrap_key_event_id = [0x44; 32];
     let delivery_target_id = crate::event_modules::key_request::delivery_target_id(
-        &[0x22; 32],
+        &key_event_id,
         &frontier_hash,
         &recipient_event_id,
         &unwrap_key_event_id,
@@ -408,7 +464,7 @@ fn test_project_key_shared_retroactively_suppresses_matching_key_request() {
     let key_request = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: now_ms(),
         blocked_event_id: [0x11; 32],
-        key_event_id: [0x22; 32],
+        key_event_id,
         frontier_hash,
         delivery_target_id,
         recipient_event_id,
@@ -433,7 +489,7 @@ fn test_project_key_shared_retroactively_suppresses_matching_key_request() {
 
     let key_shared = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: now_ms(),
-        key_event_id: [0x22; 32],
+        key_event_id,
         frontier_count: 0,
         frontier_ref_1: [0u8; 32],
         frontier_ref_2: [0u8; 32],
@@ -473,13 +529,28 @@ fn test_project_key_request_rejects_delivery_target_mismatch() {
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
 
     let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[]);
+    let recipient_event_id: EventId = conn
+        .query_row(
+            "SELECT event_id FROM user_invites WHERE recorded_by = ?1 LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
+        .unwrap();
+    let key_event_id = insert_and_project_key_rotation_for_recipient(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signer_key,
+        &recipient_event_id,
+    );
     let key_request = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: now_ms(),
         blocked_event_id: [0x11; 32],
-        key_event_id: [0x22; 32],
+        key_event_id,
         frontier_hash,
         delivery_target_id: [0x99; 32],
-        recipient_event_id: [0x33; 32],
+        recipient_event_id,
         unwrap_key_event_id: [0x44; 32],
     });
     let blob = sign_blob(&signer_key, &signer_eid, &key_request);
@@ -513,10 +584,17 @@ fn test_key_shared_rejects_delivery_target_mismatch_at_projection() {
         )
         .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
         .unwrap();
+    let key_event_id = insert_and_project_key_rotation_for_recipient(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signer_key,
+        &recipient_event_id,
+    );
     let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[]);
     let key_shared = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: now_ms(),
-        key_event_id: [0x44; 32],
+        key_event_id,
         frontier_count: 0,
         frontier_ref_1: [0u8; 32],
         frontier_ref_2: [0u8; 32],

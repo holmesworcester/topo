@@ -77,3 +77,4 @@ pub fn decide_shared_send_eligibility_plan(
 }
 
 } // verus!
+// Mirror maintenance: synced with shared-dependency send closure updates in runtime range session.

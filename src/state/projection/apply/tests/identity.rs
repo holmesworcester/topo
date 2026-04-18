@@ -463,6 +463,7 @@ fn create_bootstrap_user_invite(
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id: workspace_eid,
         authority_event_id: workspace_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let invite_eid = create_signed_event(
         conn,
@@ -511,6 +512,7 @@ fn project_valid_bootstrap_device_invite(
         created_at_ms: now_ms(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: user_event_id,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let device_invite_eid = create_signed_event(
         conn,
@@ -749,6 +751,7 @@ fn test_admin_projects_with_workspace_signer_family() {
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id: workspace_eid,
         authority_event_id: workspace_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let user_invite_event = ParsedEvent::UserInvite(user_invite);
     let user_invite_blob = sign_blob(&workspace_key, &workspace_eid, &user_invite_event);
@@ -932,6 +935,7 @@ fn test_peer_shared_rejects_peer_signed_device_link_user_mismatch() {
         created_at_ms: now_ms(),
         public_key: link_device_invite_key.verifying_key().to_bytes(),
         authority_event_id: user_a_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let link_device_invite_blob = sign_blob(
         &admin_peer_shared_key,
@@ -990,6 +994,7 @@ fn test_user_invite_rejects_bootstrap_authority_mismatch_at_projection() {
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         workspace_id: workspace_eid,
         authority_event_id: admin_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let bad_invite_blob = sign_blob(&workspace_key, &workspace_eid, &bad_invite);
 
@@ -1027,6 +1032,7 @@ fn test_user_invite_projects_with_peer_signed_admin_authority() {
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         workspace_id: workspace_eid,
         authority_event_id: admin_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let user_invite_blob = sign_blob(&admin_peer_shared_key, &admin_peer_shared_eid, &user_invite);
     let user_invite_eid = insert_event_raw(&conn, recorded_by, &user_invite_blob);
@@ -1074,6 +1080,7 @@ fn test_user_invite_rejects_wrong_signer_family_at_projection() {
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         workspace_id: workspace_eid,
         authority_event_id: workspace_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let bad_invite_eid = crate::projection::create::store_signed_event_only(
         &conn,
@@ -1132,6 +1139,7 @@ fn test_user_invite_rejects_peer_signed_authority_mismatch_at_projection() {
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         workspace_id: workspace_eid,
         authority_event_id: admin_b_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let bad_invite_blob = sign_blob(&admin_peer_shared_key, &admin_peer_shared_eid, &bad_invite);
 
@@ -1183,6 +1191,7 @@ fn test_device_invite_rejects_wrong_signer_family_at_projection() {
         created_at_ms: now_ms(),
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         authority_event_id: user_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let bad_invite_eid = crate::projection::create::store_signed_event_only(
         &conn,
@@ -1222,6 +1231,7 @@ fn test_device_invite_rejects_bootstrap_authority_mismatch_at_projection() {
         created_at_ms: now_ms(),
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         authority_event_id: user_b_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let bad_invite_blob = sign_blob(&user_key, &user_eid, &bad_invite);
 
@@ -1258,6 +1268,7 @@ fn test_device_invite_projects_with_peer_signed_admin_authority() {
         created_at_ms: now_ms(),
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         authority_event_id: user_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let device_invite_blob = sign_blob(
         &admin_peer_shared_key,
@@ -1310,6 +1321,7 @@ fn test_device_invite_rejects_peer_signed_authority_mismatch_at_projection() {
         created_at_ms: now_ms(),
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         authority_event_id: user_b_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
     let bad_invite_blob = sign_blob(&admin_peer_shared_key, &admin_peer_shared_eid, &bad_invite);
 

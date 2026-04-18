@@ -636,6 +636,8 @@ impl Peer {
         use crate::event_modules::workspace::commands::create_workspace;
 
         let db = open_connection(&self.db_path).expect("failed to open db");
+        crate::transport::materialize_daemon_identity(&db)
+            .expect("failed to materialize daemon identity before workspace bootstrap");
         let old_identity = self.identity.clone();
         let result = create_workspace(
             &db,
@@ -1289,6 +1291,33 @@ impl Peer {
     /// Returns the event ID.
     pub fn create_key_secret(&self, key_bytes: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        if let Ok((recipient_event_id, _)) =
+            crate::event_modules::peer_shared::load_local_peer_signer_required(&db, &self.identity)
+        {
+            let recipient_event_id_b64 = event_id_to_base64(&recipient_event_id);
+            let public_key: Vec<u8> = db
+                .query_row(
+                    "SELECT public_key
+                     FROM peers_shared
+                     WHERE recorded_by = ?1 AND event_id = ?2
+                     LIMIT 1",
+                    rusqlite::params![&self.identity, &recipient_event_id_b64],
+                    |row| crate::db::sql_types::get_blob(row, 0),
+                )
+                .expect("failed to load local peer public key for key rotation");
+            let mut public_key_arr = [0u8; 32];
+            public_key_arr.copy_from_slice(&public_key);
+            return crate::event_modules::workspace::identity_ops::create_key_rotation_event_with_selected_recipients_at(
+                &db,
+                &self.identity,
+                &[],
+                key_bytes,
+                &[(recipient_event_id, public_key_arr)],
+                current_timestamp_ms_u64(),
+            )
+            .expect("failed to create key rotation");
+        }
+
         let sk = ParsedEvent::KeySecret(KeySecretEvent {
             created_at_ms: current_timestamp_ms_u64(),
             key_bytes,
@@ -1305,6 +1334,33 @@ impl Peer {
         created_at_ms: u64,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        if let Ok((recipient_event_id, _)) =
+            crate::event_modules::peer_shared::load_local_peer_signer_required(&db, &self.identity)
+        {
+            let recipient_event_id_b64 = event_id_to_base64(&recipient_event_id);
+            let public_key: Vec<u8> = db
+                .query_row(
+                    "SELECT public_key
+                     FROM peers_shared
+                     WHERE recorded_by = ?1 AND event_id = ?2
+                     LIMIT 1",
+                    rusqlite::params![&self.identity, &recipient_event_id_b64],
+                    |row| crate::db::sql_types::get_blob(row, 0),
+                )
+                .expect("failed to load local peer public key for deterministic key rotation");
+            let mut public_key_arr = [0u8; 32];
+            public_key_arr.copy_from_slice(&public_key);
+            return crate::event_modules::workspace::identity_ops::create_key_rotation_event_with_selected_recipients_at(
+                &db,
+                &self.identity,
+                &[],
+                key_bytes,
+                &[(recipient_event_id, public_key_arr)],
+                created_at_ms,
+            )
+            .expect("failed to create deterministic key rotation");
+        }
+
         let sk = ParsedEvent::KeySecret(KeySecretEvent {
             created_at_ms,
             key_bytes,
@@ -1509,6 +1565,7 @@ impl Peer {
             public_key,
             workspace_id: *workspace_id,
             authority_event_id: *workspace_id,
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         create_signed_event_staged(&db, &self.identity, workspace_id, &evt, signing_key)
             .expect("failed to create user_invite")
@@ -1527,6 +1584,7 @@ impl Peer {
             public_key: invite_public_key,
             workspace_id: *workspace_id,
             authority_event_id: *workspace_id,
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         create_signed_event_staged(&db, &self.identity, workspace_id, &evt, signing_key)
             .expect("failed to create user_invite")
@@ -1575,6 +1633,7 @@ impl Peer {
             created_at_ms: current_timestamp_ms_u64(),
             public_key: device_invite_public_key,
             authority_event_id: *user_event_id,
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         create_signed_event_staged(&db, &self.identity, user_event_id, &evt, signing_key)
             .expect("failed to create device_invite")
@@ -2248,7 +2307,7 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         name: "key_secrets",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
-        columns: None,
+        columns: Some("event_id, key_bytes, recorded_by"),
     },
     FingerprintTable {
         name: "deleted_messages",
@@ -2607,6 +2666,35 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     .ok();
 }
 
+fn clear_reactive_key_replay_valid_state(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) {
+    let Ok(blob) = db.query_row(
+        "SELECT blob FROM events WHERE event_id = ?1",
+        rusqlite::params![event_id_b64],
+        |row| crate::db::sql_types::get_blob(row, 0),
+    ) else {
+        return;
+    };
+    let Ok(parsed) = crate::event_modules::parse_event(&blob) else {
+        return;
+    };
+    if !matches!(
+        parsed,
+        crate::event_modules::ParsedEvent::KeyHistory(_)
+            | crate::event_modules::ParsedEvent::KeyRotation(_)
+            | crate::event_modules::ParsedEvent::KeyShared(_)
+    ) {
+        return;
+    }
+    let _ = db.execute(
+        "DELETE FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+    );
+}
+
 /// Clear all projection and operational tables for a tenant, then re-project
 /// all recorded events through `project_one` in the given order.
 fn replay_and_fingerprint(
@@ -2635,6 +2723,7 @@ fn replay_and_fingerprint(
         .expect("failed to collect events");
 
     for eid_b64 in &event_ids {
+        clear_reactive_key_replay_valid_state(db, recorded_by, eid_b64);
         if let Some(eid) = event_id_from_base64(eid_b64) {
             let _ = project_one(db, recorded_by, &eid);
         }
@@ -2664,6 +2753,7 @@ fn replay_no_clear_and_fingerprint(
         .expect("failed to collect events");
 
     for eid_b64 in &event_ids {
+        clear_reactive_key_replay_valid_state(db, recorded_by, eid_b64);
         if let Some(eid) = event_id_from_base64(eid_b64) {
             let _ = project_one(db, recorded_by, &eid);
         }
@@ -2703,6 +2793,7 @@ fn replay_shuffled_and_fingerprint(
     let mut last = None;
     for _ in 0..8 {
         for eid_b64 in &event_ids {
+            clear_reactive_key_replay_valid_state(db, recorded_by, eid_b64);
             if let Some(eid) = event_id_from_base64(eid_b64) {
                 let _ = project_one(db, recorded_by, &eid);
             }
@@ -2848,6 +2939,20 @@ pub fn run_replay_pass(
         event_count,
         fingerprint: hex(&fp.overall),
     })
+}
+
+pub fn run_replay_pass_on_snapshot(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    pass: &str,
+) -> Result<ReplayResult, String> {
+    let tempdir = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let snapshot_path = tempdir.path().join("replay-snapshot.db");
+    let snapshot_sql = snapshot_path.to_string_lossy().replace('\'', "''");
+    db.execute_batch(&format!("VACUUM main INTO '{snapshot_sql}'"))
+        .map_err(|err| err.to_string())?;
+    let snapshot_db = rusqlite::Connection::open(&snapshot_path).map_err(|err| err.to_string())?;
+    run_replay_pass(&snapshot_db, recorded_by, pass)
 }
 
 // ---------------------------------------------------------------------------

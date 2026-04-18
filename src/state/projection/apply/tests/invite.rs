@@ -581,6 +581,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
         public_key: invite_pub,
         workspace_id: ws_eid,
         authority_event_id: ws_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let uib_event = ParsedEvent::UserInvite(uib);
     let uib_blob = sign_blob(&workspace_key, &ws_eid, &uib_event);
@@ -664,6 +665,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
         authority_event_id: ub_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
     let dif_blob = sign_blob(&user_key, &ub_eid, &dif_event);

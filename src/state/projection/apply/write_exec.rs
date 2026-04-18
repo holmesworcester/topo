@@ -1,10 +1,12 @@
 use super::super::projector::{EmitCommand, SqlVal, WriteOp};
 use crate::crypto::event_id_from_base64;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use topo_verus_proofs::state::projection::apply::tenant_isolation::{
     check_writes_tenant_isolated, WriteOpTenantView,
 };
-use topo_verus_proofs::state::projection::apply::writeop_idempotency::{is_idempotent_writeop, WriteOpKind};
+use topo_verus_proofs::state::projection::apply::writeop_idempotency::{
+    is_idempotent_writeop, WriteOpKind,
+};
 
 /// Trusted extractor: exhaustive match over runtime `WriteOp` variants into the
 /// verus-proofs `WriteOpKind` tag. If a new `WriteOp` variant is ever added, this
@@ -215,9 +217,91 @@ pub(crate) fn execute_emit_commands(
             EmitCommand::EmitDeterministicBlob { blob } => {
                 let _ = crate::projection::create::emit_deterministic_blob(conn, recorded_by, blob)?;
             }
+            EmitCommand::IndexEndpointSharedForWorkspace {
+                workspace_id,
+                endpoint_shared_event_id,
+            } => {
+                let endpoint_row: Option<(i64, Vec<u8>)> = conn
+                    .query_row(
+                        "SELECT created_at, blob
+                         FROM events
+                         WHERE event_id = ?1
+                           AND event_type = 'endpoint_shared'
+                           AND share_scope = 'shared'
+                         LIMIT 1",
+                        rusqlite::params![endpoint_shared_event_id],
+                        |row| Ok((row.get(0)?, crate::db::sql_types::get_blob(row, 1)?)),
+                    )
+                    .optional()?;
+                let Some((created_at_ms, endpoint_blob)) = endpoint_row else {
+                    continue;
+                };
+                let Some(endpoint_shared_event_id_raw) =
+                    event_id_from_base64(endpoint_shared_event_id)
+                else {
+                    continue;
+                };
+                crate::db::store::insert_shared_event_index_entry_if_shared(
+                    conn,
+                    crate::event_modules::ShareScope::Shared,
+                    created_at_ms,
+                    &endpoint_shared_event_id_raw,
+                    workspace_id,
+                    &endpoint_blob,
+                )?;
+                crate::state::shared_workspace_fanout::fanout_shared_event_immediate(
+                    conn,
+                    recorded_by,
+                    workspace_id,
+                    &endpoint_shared_event_id_raw,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            EmitCommand::RetryBlockedEncryptedByKey { key_event_id } => {
+                let mut stmt = conn.prepare(
+                    "SELECT be.event_id, e.blob
+                     FROM blocked_events be
+                     JOIN events e ON e.event_id = be.event_id
+                     WHERE be.peer_id = ?1
+                       AND e.event_type IN ('signed', 'encrypted')
+                     ORDER BY e.created_at ASC, e.event_id ASC",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+                    Ok((
+                        crate::db::sql_types::get_text(row, 0)?,
+                        crate::db::sql_types::get_blob(row, 1)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (event_id_b64, blob) = row?;
+                    let parsed = crate::event_modules::parse_event(&blob)?;
+                    let semantic = unwrap_signed_for_retry(parsed)?;
+                    let crate::event_modules::ParsedEvent::Encrypted(enc) = semantic else {
+                        continue;
+                    };
+                    if crate::crypto::event_id_to_base64(&enc.key_event_id) != *key_event_id {
+                        continue;
+                    }
+                    if let Some(event_id) = event_id_from_base64(&event_id_b64) {
+                        let _ = super::project_one(conn, recorded_by, &event_id)?;
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn unwrap_signed_for_retry(
+    parsed: crate::event_modules::ParsedEvent,
+) -> Result<crate::event_modules::ParsedEvent, Box<dyn std::error::Error>> {
+    match parsed {
+        crate::event_modules::ParsedEvent::Signed(signed) => {
+            let inner = crate::event_modules::parse_event(&signed.payload)?;
+            unwrap_signed_for_retry(inner)
+        }
+        other => Ok(other),
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +309,7 @@ mod tests {
     use super::*;
     use crate::contracts::transport_identity_contract::TransportIdentitySpec;
     use crate::db::{open_in_memory, schema::create_tables};
+    use crate::event_modules::{encode_event, endpoint_shared, ShareScope};
     use rusqlite::OptionalExtension;
 
     fn insert_invite_secret(
@@ -329,5 +414,55 @@ mod tests {
         let (peer_id, source) = row.expect("pipeline must write local_transport_targets");
         assert!(!peer_id.is_empty(), "transport_peer_id must be non-empty");
         assert_eq!(source, crate::db::transport_creds::CRED_SOURCE_PEER_SHARED);
+    }
+
+    #[test]
+    fn execute_emit_commands_indexes_endpoint_shared_for_workspace() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let workspace_id = crate::crypto::event_id_to_base64(&[0x41; 32]);
+        let endpoint_event =
+            endpoint_shared::deterministic_endpoint_shared_event([0x55; 32]);
+        let endpoint_blob = encode_event(&endpoint_event).unwrap();
+        let endpoint_event_id = crate::crypto::hash_event(&endpoint_blob);
+        let endpoint_event_id_b64 = crate::crypto::event_id_to_base64(&endpoint_event_id);
+        let created_at_ms = crate::event_modules::extract_created_at_ms(&endpoint_blob).unwrap();
+
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, 'endpoint_shared', ?2, ?3, ?4, ?4)",
+            rusqlite::params![
+                &endpoint_event_id_b64,
+                endpoint_blob,
+                ShareScope::Shared.as_str(),
+                created_at_ms as i64
+            ],
+        )
+        .unwrap();
+
+        execute_emit_commands(
+            &conn,
+            "tenant-a",
+            &[EmitCommand::IndexEndpointSharedForWorkspace {
+                workspace_id: workspace_id.clone(),
+                endpoint_shared_event_id: endpoint_event_id_b64.clone(),
+            }],
+        )
+        .unwrap();
+
+        let indexed: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM shared_event_index
+                     WHERE workspace_id = ?1
+                       AND id = ?2
+                 )",
+                rusqlite::params![workspace_id, endpoint_event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(indexed, "endpoint_shared should be indexed for the workspace");
     }
 }

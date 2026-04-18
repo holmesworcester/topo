@@ -15,7 +15,8 @@ use crate::db::{
 };
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
-    KeyRequestEvent, KeySecretEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent,
+    KeyRequestEvent, KeyRotationEvent, KeySecretEvent, KeySharedEvent, MessageDeletionEvent,
+    MessageEvent, PeerSecretEvent,
     ParsedEvent, ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
     EVENT_TYPE_REACTION,
 };
@@ -78,6 +79,25 @@ pub(super) fn test_content_key_bytes() -> [u8; 32] {
     [0xA5; 32]
 }
 
+fn test_content_key_blob() -> &'static Vec<u8> {
+    static BLOB: OnceLock<Vec<u8>> = OnceLock::new();
+    BLOB.get_or_init(|| {
+        let event = ParsedEvent::KeyRotation(KeyRotationEvent {
+            created_at_ms: TEST_CONTENT_KEY_CREATED_AT_MS,
+            frontier_count: 0,
+            frontier_ref_1: [0u8; 32],
+            frontier_ref_2: [0u8; 32],
+            frontier_ref_3: [0u8; 32],
+            frontier_ref_4: [0u8; 32],
+            frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
+            rotated_by: [0u8; 32],
+            recipient_slots: vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP],
+            wrapped_keys: vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP],
+        });
+        events::encode_event(&event).unwrap()
+    })
+}
+
 pub(super) fn encrypt_test_content_blob(plaintext: &[u8]) -> ([u8; 12], Vec<u8>, [u8; 16]) {
     let cipher = Aes256Gcm::new_from_slice(&test_content_key_bytes()).unwrap();
     let event_hash = hash_event(plaintext);
@@ -94,14 +114,11 @@ pub(super) fn encrypt_test_content_blob(plaintext: &[u8]) -> ([u8; 12], Vec<u8>,
 }
 
 pub(super) fn test_content_key_event() -> ParsedEvent {
-    ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: TEST_CONTENT_KEY_CREATED_AT_MS,
-        key_bytes: test_content_key_bytes(),
-    })
+    events::parse_event(test_content_key_blob()).unwrap()
 }
 
 pub(super) fn test_content_key_event_id() -> EventId {
-    hash_event(&events::encode_event(&test_content_key_event()).unwrap())
+    hash_event(test_content_key_blob())
 }
 
 pub(super) fn ensure_test_content_key(conn: &Connection, recorded_by: &str) -> EventId {
@@ -118,22 +135,65 @@ pub(super) fn ensure_test_content_key(conn: &Connection, recorded_by: &str) -> E
         return key_event_id;
     }
 
-    let key_event = test_content_key_event();
-    let key_blob = events::encode_event(&key_event).unwrap();
+    let key_blob = test_content_key_blob();
     let ts = now_ms() as i64;
     insert_event(
         conn,
         &key_event_id,
-        "key_secret",
-        &key_blob,
-        crate::event_modules::ShareScope::Local,
-        key_event.created_at_ms() as i64,
+        "key_rotation",
+        key_blob,
+        crate::event_modules::ShareScope::Shared,
+        TEST_CONTENT_KEY_CREATED_AT_MS as i64,
         ts,
     )
     .unwrap();
+    insert_shared_event_index_entry_if_shared(
+        conn,
+        crate::event_modules::ShareScope::Shared,
+        TEST_CONTENT_KEY_CREATED_AT_MS as i64,
+        &key_event_id,
+        "",
+        key_blob,
+    )
+    .unwrap();
     insert_recorded_event(conn, recorded_by, &key_event_id, ts, "test").unwrap();
-    let decision = project_one(conn, recorded_by, &key_event_id).unwrap();
-    assert_eq!(decision, ProjectionDecision::Valid);
+    mark_valid_for_test(
+        conn,
+        recorded_by,
+        &key_event_id,
+        crate::event_modules::EVENT_TYPE_KEY_ROTATION,
+    );
+    let key_event_id_b64 = event_id_to_base64(&key_event_id);
+    let frontier_hash_b64 =
+        event_id_to_base64(&crate::event_modules::removal::frontier_hash_from_refs(&[]));
+    let zero_b64 = event_id_to_base64(&[0u8; 32]);
+    conn.execute(
+        "INSERT OR IGNORE INTO key_rotations (
+             recorded_by,
+             event_id,
+             key_event_id,
+             frontier_hash,
+             frontier_count,
+             frontier_ref_1,
+             frontier_ref_2,
+             frontier_ref_3,
+             frontier_ref_4,
+             rotator_signer_event_id
+         ) VALUES (?1, ?2, ?2, ?3, 0, ?4, ?4, ?4, ?4, ?4)",
+        rusqlite::params![recorded_by, &key_event_id_b64, &frontier_hash_b64, &zero_b64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO key_secrets (event_id, key_bytes, created_at, recorded_by)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            &key_event_id_b64,
+            test_content_key_bytes().to_vec(),
+            TEST_CONTENT_KEY_CREATED_AT_MS as i64,
+            recorded_by,
+        ],
+    )
+    .unwrap();
     key_event_id
 }
 
@@ -344,6 +404,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         public_key: invite_pub,
         workspace_id: net_eid,
         authority_event_id: net_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let uib_event = ParsedEvent::UserInvite(uib);
     let uib_eid =
@@ -370,6 +431,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
         authority_event_id: ub_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
     let dif_eid =
@@ -403,6 +465,12 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         &device_invite_key,
     )
     .unwrap();
+    let peer_secret_event = ParsedEvent::PeerSecret(PeerSecretEvent {
+        created_at_ms: now_ms(),
+        signer_event_id: psf_eid,
+        private_key_bytes: peer_shared_key.to_bytes(),
+    });
+    create_event_synchronous(conn, recorded_by, &peer_secret_event).unwrap();
 
     register_signer_user(psf_eid, ub_eid);
     (psf_eid, peer_shared_key)
@@ -457,6 +525,7 @@ pub(super) fn build_identity_chain_deferred(
         public_key: invite_pub,
         workspace_id: net_eid,
         authority_event_id: net_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let uib_event = ParsedEvent::UserInvite(uib);
     let uib_blob = sign_blob(&workspace_key, &net_eid, &uib_event);
@@ -481,6 +550,7 @@ pub(super) fn build_identity_chain_deferred(
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
         authority_event_id: ub_eid,
+        key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
     let dif_blob = sign_blob(&user_key, &ub_eid, &dif_event);
@@ -508,6 +578,12 @@ pub(super) fn build_identity_chain_deferred(
     let psf_event = ParsedEvent::PeerShared(psf);
     let psf_blob = sign_blob(&device_invite_key, &dif_eid, &psf_event);
     let psf_eid = hash_event(&psf_blob);
+    let peer_secret_event = ParsedEvent::PeerSecret(PeerSecretEvent {
+        created_at_ms: now_ms(),
+        signer_event_id: psf_eid,
+        private_key_bytes: peer_shared_key.to_bytes(),
+    });
+    let peer_secret_blob = events::encode_event(&peer_secret_event).unwrap();
 
     register_signer_user(psf_eid, ub_eid);
 
@@ -521,6 +597,7 @@ pub(super) fn build_identity_chain_deferred(
         (_recorded_by.to_string(), dif_eid, dif_blob),
         (endpoint_recorded_by, endpoint_eid, endpoint_blob),
         (_recorded_by.to_string(), psf_eid, psf_blob),
+        (_recorded_by.to_string(), hash_event(&peer_secret_blob), peer_secret_blob),
     ];
 
     (psf_eid, peer_shared_key, chain_blobs)
@@ -674,6 +751,95 @@ pub(super) fn make_key_secret(key_bytes: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
     });
     let blob = events::encode_event(&sk).unwrap();
     (sk, blob)
+}
+
+pub(super) fn make_self_key_rotation_blob(
+    conn: &Connection,
+    signer_event_id: &EventId,
+    signing_key: &SigningKey,
+    key_bytes: [u8; 32],
+) -> (ParsedEvent, Vec<u8>) {
+    let _ = conn;
+    let mut recipient_slots =
+        vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
+    let mut wrapped_keys =
+        vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
+    recipient_slots[0] = *signer_event_id;
+    wrapped_keys[0] = crate::projection::encrypted::wrap_key_for_recipient(
+        signing_key,
+        &signing_key.verifying_key(),
+        &key_bytes,
+    );
+    let event = ParsedEvent::KeyRotation(KeyRotationEvent {
+        created_at_ms: now_ms(),
+        frontier_count: 0,
+        frontier_ref_1: [0u8; 32],
+        frontier_ref_2: [0u8; 32],
+        frontier_ref_3: [0u8; 32],
+        frontier_ref_4: [0u8; 32],
+        frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
+        rotated_by: *signer_event_id,
+        recipient_slots,
+        wrapped_keys,
+    });
+    let blob = encode_signed_wrapper_blob(&event, signer_event_id, signing_key).unwrap();
+    (event, blob)
+}
+
+pub(super) fn insert_and_project_self_key_rotation(
+    conn: &Connection,
+    recorded_by: &str,
+    signer_event_id: &EventId,
+    signing_key: &SigningKey,
+    key_bytes: [u8; 32],
+) -> EventId {
+    let (_event, blob) = make_self_key_rotation_blob(conn, signer_event_id, signing_key, key_bytes);
+    let event_id = insert_event_raw(conn, recorded_by, &blob);
+    let decision = project_one(conn, recorded_by, &event_id).unwrap();
+    assert_eq!(decision, ProjectionDecision::Valid);
+    event_id
+}
+
+pub(super) fn make_key_rotation_blob_for_recipient(
+    signer_event_id: &EventId,
+    signing_key: &SigningKey,
+    recipient_event_id: &EventId,
+) -> (ParsedEvent, Vec<u8>) {
+    let mut recipient_slots =
+        vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
+    let mut wrapped_keys =
+        vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
+    recipient_slots[0] = *recipient_event_id;
+    wrapped_keys[0] = [0xAB; 32];
+    let event = ParsedEvent::KeyRotation(KeyRotationEvent {
+        created_at_ms: now_ms(),
+        frontier_count: 0,
+        frontier_ref_1: [0u8; 32],
+        frontier_ref_2: [0u8; 32],
+        frontier_ref_3: [0u8; 32],
+        frontier_ref_4: [0u8; 32],
+        frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
+        rotated_by: *signer_event_id,
+        recipient_slots,
+        wrapped_keys,
+    });
+    let blob = encode_signed_wrapper_blob(&event, signer_event_id, signing_key).unwrap();
+    (event, blob)
+}
+
+pub(super) fn insert_and_project_key_rotation_for_recipient(
+    conn: &Connection,
+    recorded_by: &str,
+    signer_event_id: &EventId,
+    signing_key: &SigningKey,
+    recipient_event_id: &EventId,
+) -> EventId {
+    let (_event, blob) =
+        make_key_rotation_blob_for_recipient(signer_event_id, signing_key, recipient_event_id);
+    let event_id = insert_event_raw(conn, recorded_by, &blob);
+    let decision = project_one(conn, recorded_by, &event_id).unwrap();
+    assert_eq!(decision, ProjectionDecision::Valid);
+    event_id
 }
 
 pub(super) fn make_encrypted_event(

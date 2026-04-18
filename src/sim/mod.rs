@@ -23,8 +23,8 @@ pub use clock::SimTime;
 pub use key_repair::{
     create_encrypted_message_with_key, create_key_rotation, create_removal,
     emit_key_requests_for_dbs, emit_key_requests_for_peers, emit_key_shared_responses_for_dbs,
-    emit_key_shared_responses_for_peers, seed_deterministic_key_secret, KeyRepairEmitStats,
-    KeyResponsePolicy,
+    emit_key_shared_responses_for_peers, seed_deterministic_key_secret,
+    seed_key_rotation_for_recipients, KeyRepairEmitStats, KeyResponsePolicy,
 };
 pub use knowledge::{exact_matrix_bytes, SparseKnowledge};
 pub use large_graph_sample::{

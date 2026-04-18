@@ -1,7 +1,11 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::decision_context::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
+use crate::projection::decision_context::{
+    ContextLoadResult, ProjectionFrameContext, ProjectionQueries,
+};
+use crate::projection::projector::{
+    EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
+};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
@@ -82,14 +86,22 @@ pub fn project_pure(
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Blob(public_key.to_vec()),
             SqlVal::Blob(transport_fingerprint.to_vec()),
-            SqlVal::Text(endpoint_shared_event_id_b64),
+            SqlVal::Text(endpoint_shared_event_id_b64.clone()),
             SqlVal::Text(endpoint_id.clone()),
             SqlVal::Text(user_event_id_b64),
             SqlVal::Text(device_name.to_string()),
         ],
     }];
 
-    ProjectorResult::valid(ops)
+    let mut commands = Vec::new();
+    if let Some(workspace_id) = ctx.accepted_workspace_id.clone() {
+        commands.push(EmitCommand::IndexEndpointSharedForWorkspace {
+            workspace_id,
+            endpoint_shared_event_id: endpoint_shared_event_id_b64,
+        });
+    }
+
+    ProjectorResult::valid_with_commands(ops, commands)
 }
 
 #[cfg(test)]
@@ -166,6 +178,7 @@ mod projector_tests {
             created_at_ms: 1,
             public_key: [4u8; 32],
             authority_event_id: [6u8; 32],
+            key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         let blob = encode_event(&event).expect("encode device invite");
         conn.execute(

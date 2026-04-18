@@ -138,6 +138,7 @@ pub fn create_workspace_for_db_with_seed(
 
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
+    crate::transport::materialize_daemon_identity(&conn)?;
 
     let network_age_ms = match network_age.map(str::trim).filter(|value| !value.is_empty()) {
         Some(spec) => Some(
@@ -547,7 +548,6 @@ mod tests {
     use super::resolve_invite_bootstrap_endpoint_id;
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
-    use crate::event_modules::workspace::command_plans;
     use crate::event_modules::workspace::invite_link::parse_invite_link;
     use crate::transport::{materialize_daemon_identity, MISSING_DAEMON_IDENTITY_ERROR};
 
@@ -619,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_invite_requires_materialized_daemon_identity() {
+    fn accept_invite_materializes_daemon_identity_when_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let creator_db = temp.path().join("creator.sqlite3");
         let creator_db = creator_db.to_str().expect("creator db");
@@ -639,15 +639,30 @@ mod tests {
 
         let joiner_db = temp.path().join("joiner.sqlite3");
         let joiner_db = joiner_db.to_str().expect("joiner db");
-        let err = accept_invite(joiner_db, &invite.invite_link, "bob", "tablet").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            command_plans::MISSING_LOCAL_DAEMON_ENDPOINT_SHARED_ERROR
+        let accepted =
+            accept_invite(joiner_db, &invite.invite_link, "bob", "tablet").expect("accept invite");
+        assert!(
+            !accepted.peer_id.is_empty(),
+            "accepted invite should return the derived local peer id"
+        );
+
+        let joiner = crate::db::open_connection(joiner_db).expect("open joiner db");
+        assert!(
+            crate::transport::load_local_daemon_endpoint_id(&joiner)
+                .expect("load local daemon endpoint id")
+                .is_some(),
+            "accept invite should lazily materialize daemon endpoint identity"
+        );
+        assert!(
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&joiner)
+                .expect("load endpoint_shared row")
+                .is_some(),
+            "accept invite should persist local endpoint_shared projection"
         );
     }
 
     #[test]
-    fn accept_device_link_requires_materialized_daemon_identity() {
+    fn accept_device_link_materializes_daemon_identity_when_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let creator_db = temp.path().join("creator.sqlite3");
         let creator_db = creator_db.to_str().expect("creator db");
@@ -667,10 +682,25 @@ mod tests {
 
         let joiner_db = temp.path().join("joiner.sqlite3");
         let joiner_db = joiner_db.to_str().expect("joiner db");
-        let err = accept_device_link(joiner_db, &invite.invite_link, "phone").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            command_plans::MISSING_LOCAL_DAEMON_ENDPOINT_SHARED_ERROR
+        let accepted =
+            accept_device_link(joiner_db, &invite.invite_link, "phone").expect("accept link");
+        assert!(
+            !accepted.peer_id.is_empty(),
+            "accepted device link should return the derived local peer id"
+        );
+
+        let joiner = crate::db::open_connection(joiner_db).expect("open joiner db");
+        assert!(
+            crate::transport::load_local_daemon_endpoint_id(&joiner)
+                .expect("load local daemon endpoint id")
+                .is_some(),
+            "accept device link should lazily materialize daemon endpoint identity"
+        );
+        assert!(
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&joiner)
+                .expect("load endpoint_shared row")
+                .is_some(),
+            "accept device link should persist local endpoint_shared projection"
         );
     }
 }

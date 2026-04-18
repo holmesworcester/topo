@@ -123,7 +123,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_ENCRYPTED_ADMISSIBLE_01 | (admissibility) | CHK_ENCRYPTED_ADMISSIBLE | pipeline_integration | apply::tests::encryption::test_encrypted_identity_event_rejects | break |
 | SPEC_ENCRYPTED_ADMISSIBLE_01 | (admissibility) | CHK_ENCRYPTED_ADMISSIBLE | pipeline_integration | apply::tests::encryption::test_encrypted_message_valid | pass |
 | SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | key_shared_projector_tests::tests::test_key_shared_valid | pass |
-| SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | key_shared_projector_tests::tests::test_key_shared_rejects_key_event_id_mismatch | break |
+| SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | key_shared_projector_tests::tests::test_key_shared_rejects_delivery_target_mismatch | break |
 | SPEC_KS_TARGET_01 | NON_MODELED::repair_target_binding | CHK_KS_TARGET_BINDING | projector_unit | key_shared_projector_tests::tests::test_key_shared_valid | pass |
 | SPEC_KS_TARGET_01 | NON_MODELED::repair_target_binding | CHK_KS_TARGET_BINDING | projector_unit | key_shared_projector_tests::tests::test_key_shared_rejects_delivery_target_mismatch | break |
 | SPEC_KS_TARGET_01 | NON_MODELED::repair_target_binding | CHK_KS_TARGET_BINDING | pipeline_integration | apply::tests::core_projection::key_shared_does_not_block_non_recipient_observers_on_local_invite_secret | pass |

@@ -7,7 +7,7 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::key_rotation::{project_pure, KeyRotationEvent};
+    use topo::event_modules::key_rotation::{project_pure, KeyRotationEvent, KEY_ROTATION_CAP};
     use topo::event_modules::removal::frontier_hash_from_refs;
     use topo::event_modules::{ParsedEvent, TenantEvent, EVENT_TYPE_KEY_ROTATION};
 
@@ -22,7 +22,6 @@ mod tests {
     ) -> ParsedEvent {
         ParsedEvent::KeyRotation(KeyRotationEvent {
             created_at_ms: 8_000,
-            key_event_id: [1u8; 32],
             frontier_count,
             frontier_ref_1,
             frontier_ref_2,
@@ -30,6 +29,8 @@ mod tests {
             frontier_ref_4: [0u8; 32],
             frontier_hash,
             rotated_by,
+            recipient_slots: vec![[0u8; 32]; KEY_ROTATION_CAP],
+            wrapped_keys: vec![[0u8; 32]; KEY_ROTATION_CAP],
         })
     }
 

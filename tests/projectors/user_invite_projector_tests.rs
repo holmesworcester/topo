@@ -19,6 +19,7 @@ mod tests {
             public_key,
             workspace_id: [10u8; 32],
             authority_event_id: [10u8; 32],
+            key_history_event_id: topo::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         })
     }
 

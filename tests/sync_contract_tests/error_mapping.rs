@@ -5,6 +5,7 @@
 //! frame-size enforcement, out-of-order delivery, frame fragmentation,
 //! and deterministic protocol violation scenarios.
 
+use negentropy::NegentropyStorageBase;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +20,139 @@ use crate::fake_session_io::{
     fake_session_io_pair_with_config, run_local, test_session_meta, FakeIoConfig,
     ProtocolViolation,
 };
+
+const CONTROL_PHASE1: u8 = 1;
+const CONTROL_PHASE1_DONE: u8 = 2;
+const CONTROL_DEP_CANDIDATE_DONE: u8 = 4;
+const CONTROL_PHASE2_DONE: u8 = 6;
+
+enum TestDepSyncControlPayload {
+    Phase1(Vec<u8>),
+    Phase1Done,
+    DepCandidateDone,
+    Phase2Done,
+}
+
+fn encode_dep_sync_control(payload: TestDepSyncControlPayload) -> Vec<u8> {
+    match payload {
+        TestDepSyncControlPayload::Phase1(msg) => {
+            let mut out = Vec::with_capacity(1 + msg.len());
+            out.push(CONTROL_PHASE1);
+            out.extend_from_slice(&msg);
+            out
+        }
+        TestDepSyncControlPayload::Phase1Done => vec![CONTROL_PHASE1_DONE],
+        TestDepSyncControlPayload::DepCandidateDone => vec![CONTROL_DEP_CANDIDATE_DONE],
+        TestDepSyncControlPayload::Phase2Done => vec![CONTROL_PHASE2_DONE],
+    }
+}
+
+fn decode_dep_sync_control(msg: &[u8]) -> TestDepSyncControlPayload {
+    match msg.first().copied() {
+        Some(CONTROL_PHASE1) => TestDepSyncControlPayload::Phase1(msg[1..].to_vec()),
+        Some(CONTROL_PHASE1_DONE) => TestDepSyncControlPayload::Phase1Done,
+        Some(CONTROL_DEP_CANDIDATE_DONE) => TestDepSyncControlPayload::DepCandidateDone,
+        Some(CONTROL_PHASE2_DONE) => TestDepSyncControlPayload::Phase2Done,
+        other => panic!("unexpected dep-sync control tag: {:?}", other),
+    }
+}
+
+#[derive(Default)]
+struct EmptyDepRangeStorage;
+
+impl negentropy::DepReconcileRangeStorage for EmptyDepRangeStorage {
+    fn root_size(&self) -> Result<usize, negentropy::Error> {
+        Ok(0)
+    }
+
+    fn get_root_item(&self, _i: usize) -> Result<Option<negentropy::Item>, negentropy::Error> {
+        Ok(None)
+    }
+
+    fn find_lower_bound(&self, _first: usize, _last: usize, _value: &negentropy::Bound) -> usize {
+        0
+    }
+
+    fn combined_fingerprint(
+        &self,
+        _begin: usize,
+        _end: usize,
+    ) -> Result<negentropy::Fingerprint, negentropy::Error> {
+        let mut storage = negentropy::NegentropyStorageVector::with_capacity(0);
+        storage.seal().unwrap();
+        storage.fingerprint(0, storage.size()?)
+    }
+
+    fn root_ids(
+        &self,
+        _begin: usize,
+        _end: usize,
+    ) -> Result<Vec<negentropy::Id>, negentropy::Error> {
+        Ok(Vec::new())
+    }
+}
+
+async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSide) {
+    let storage = EmptyDepRangeStorage;
+    let mut phase1 = negentropy::DepReconciler::borrowed(&storage);
+    let initial_msg = topo::sync::session::windowing::encode_initial_neg_open(
+        topo::sync::session::windowing::SyncWindow {
+            kind: topo::sync::session::windowing::SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: None,
+        },
+        encode_dep_sync_control(TestDepSyncControlPayload::Phase1(
+            phase1.initiate().unwrap(),
+        )),
+    );
+    peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
+        .await;
+
+    let phase1_reply = peer
+        .recv_control_msg_timeout(Duration::from_secs(2))
+        .await
+        .expect("expected phase1 response");
+    let Frame::NegMsg { msg } = phase1_reply else {
+        panic!("expected NegMsg from responder");
+    };
+    let TestDepSyncControlPayload::Phase1(msg) = decode_dep_sync_control(&msg) else {
+        panic!("expected phase1 response payload");
+    };
+    let mut diff = negentropy::DepReconcileDiff::default();
+    let next = phase1
+        .reconcile_with_ids(&msg, &mut diff)
+        .expect("reconcile empty phase1");
+    assert!(
+        next.is_none(),
+        "empty dep-aware phase1 should complete in one round"
+    );
+
+    peer.send_control_msg(&Frame::NegMsg {
+        msg: encode_dep_sync_control(TestDepSyncControlPayload::Phase1Done),
+    })
+    .await;
+    peer.send_control_msg(&Frame::NegMsg {
+        msg: encode_dep_sync_control(TestDepSyncControlPayload::DepCandidateDone),
+    })
+    .await;
+
+    let dep_candidate_reply = peer
+        .recv_control_msg_timeout(Duration::from_secs(2))
+        .await
+        .expect("expected dep candidate terminator");
+    let Frame::NegMsg { msg } = dep_candidate_reply else {
+        panic!("expected NegMsg dep candidate reply");
+    };
+    assert!(matches!(
+        decode_dep_sync_control(&msg),
+        TestDepSyncControlPayload::DepCandidateDone
+    ));
+
+    peer.send_control_msg(&Frame::NegMsg {
+        msg: encode_dep_sync_control(TestDepSyncControlPayload::Phase2Done),
+    })
+    .await;
+}
 
 /// When the peer drops the control channel (half-close), the handler should
 /// detect ConnectionLost and terminate.
@@ -300,14 +434,14 @@ async fn out_of_order_data_delivery() {
 // ---------------------------------------------------------------------------
 
 /// Verify that fragment_data_frames splits each data frame into 2 chunks.
-/// The handler receives fragments (not complete protocol messages) on the
-/// data channel. The data receiver task encounters parse errors on the
-/// fragmented frames, but the responder's control loop is tolerant and the
-/// session terminates without hanging or panicking.
+/// The handler receives fragmented raw range-data bytes on the data channel
+/// after the control negotiation has completed. The data receiver task must
+/// tolerate an incomplete trailing payload and the session must still
+/// terminate without hanging or panicking when the peer closes the channel.
 ///
 /// This documents the handler's resilience to transport-layer fragmentation:
-/// the data receiver task fails gracefully, and the control protocol drives
-/// the session to completion.
+/// the data receiver task tolerates fragmented/incomplete range-data bytes,
+/// and the control protocol still drives the session to completion.
 #[tokio::test]
 async fn fragmented_data_frames_handler_completes() {
     run_local(async {
@@ -327,34 +461,21 @@ async fn fragmented_data_frames_handler_completes() {
             async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
-        // Drive the normal protocol: NegOpen -> NegMsg -> then send events
-        // on the data channel, which will be fragmented.
-        let storage = empty_negentropy_storage();
-        let mut neg =
-            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-        let initial_msg = topo::sync::session::windowing::encode_initial_neg_open(
-            topo::sync::session::windowing::SyncWindow {
-                kind: topo::sync::session::windowing::SyncWindowKind::LastDay,
-                ts_min_inclusive_ms: Some(0),
-                ts_max_exclusive_ms: None,
-            },
-            neg.initiate().unwrap(),
-        );
-        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
-            .await;
+        // Drive the modern dep-sync control handshake so the responder starts
+        // its range-data receive task before we inject fragmented payload
+        // bytes on the data channel.
+        drive_empty_inbound_round(&mut peer).await;
 
-        // Consume NegMsg
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
-
-        // Send an Event with a multi-byte payload that WILL be fragmented.
-        // The data receiver will get a partial frame and fail to parse it.
-        peer.send_data_msg(&Frame::Event {
-            blob: vec![0xAA; 100],
-        })
-        .await;
+        // Send raw range-data bytes with no complete length-prefixed record.
+        // Fragmentation will split them into multiple recv_chunk calls; the
+        // receiver must not hang when the peer closes mid-record.
+        peer.data_send
+            .send(vec![0xAA; 100])
+            .await
+            .expect("data channel closed before fragmented payload send");
 
         // Drop channels to ensure handler can exit after seeing the malformed
-        // fragmented event path. The connection-scoped data lane no longer
+        // fragmented payload path. The connection-scoped data lane no longer
         // relies on per-session completion markers.
         drop(peer.control_send);
         drop(peer.data_send);
@@ -364,10 +485,11 @@ async fn fragmented_data_frames_handler_completes() {
             .expect("handler timed out with fragmented frames -- must not hang")
             .expect("handler panicked");
 
-        // The responder may surface the truncated data path as a connection
-        // close, but it must still terminate promptly instead of hanging.
+        // The responder may treat the truncated tail as a clean close or a
+        // connection-close race, but it must terminate promptly.
         assert!(
-            matches!(result, Err(ref err) if err.contains("Connection closed")),
+            result.is_ok()
+                || matches!(result, Err(ref err) if err.contains("Connection closed")),
             "handler should terminate promptly on fragmented data frames, got: {:?}",
             result
         );

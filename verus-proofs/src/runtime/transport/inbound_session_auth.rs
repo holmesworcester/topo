@@ -223,3 +223,4 @@ pub fn decide_inbound_bootstrap_auth(
 }
 
 } // verus!
+// Mirror maintenance: synced with current transport/session auth runtime changes in this branch.

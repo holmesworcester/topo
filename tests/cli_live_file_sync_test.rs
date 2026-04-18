@@ -509,3 +509,145 @@ fn test_cli_file_slice_projection_is_staggered_during_download() {
         file_slice_event_ids.len()
     );
 }
+
+#[test]
+#[ignore = "xfail for now: combined topo view does not yet expose stable real progress under load; dedicated progress work is tracked separately"]
+fn test_cli_topo_view_progress_advances_across_manual_refreshes() {
+    hold_network_test_lock_for_binary();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir
+        .path()
+        .join("alice_view_progress.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bob_db = tmpdir
+        .path()
+        .join("bob_view_progress.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let file_name = "projection-timeline-progress.bin";
+    let source_path = tmpdir.path().join(file_name);
+    let mut source_file = std::fs::File::create(&source_path).unwrap();
+    let mut chunk = vec![0u8; 1024 * 1024];
+    for (i, b) in chunk.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    for _ in 0..20 {
+        source_file.write_all(&chunk).unwrap();
+    }
+    source_file.flush().unwrap();
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            disable_relay: true,
+            ..Default::default()
+        },
+    );
+    let alice_real_addr = daemon_listen_addr(&alice_db)
+        .parse::<SocketAddr>()
+        .expect("parse alice listen addr");
+    let bob_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, random_port()));
+    let _shaper = UdpTrafficShaper::new(
+        alice_real_addr,
+        bob_bind_addr,
+        NetworkProfile {
+            slug: "projection-timeline-progress",
+            title: "Projection Timeline Progress",
+            note: "Shaped link for projected_at stagger assertions during file sync",
+            bandwidth_mbps_per_direction: 4.0,
+            rtt_ms: 80,
+            jitter_ms: 0,
+            loss_percent: 0.0,
+        },
+    );
+    let invite_link = create_invite_with_spki(
+        &alice_db,
+        &_shaper.left_addr().to_string(),
+        Some(&daemon_identity_fingerprint(&alice_db)),
+    );
+    let mut bob_accept_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            bind_ip: Some(bob_bind_addr.ip().to_string()),
+            bind_port: Some(bob_bind_addr.port()),
+            disable_discovery: true,
+            disable_relay: true,
+            ..Default::default()
+        },
+    );
+    accept_invite_with_identity_on_running_daemon(
+        &bob_db,
+        &invite_link,
+        "user",
+        "device",
+        Duration::from_secs(30),
+    );
+    stop_daemon(&bob_db, &mut bob_accept_daemon);
+    wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
+    let _bob = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            bind_ip: Some(bob_bind_addr.ip().to_string()),
+            bind_port: Some(bob_bind_addr.port()),
+            disable_discovery: true,
+            disable_relay: true,
+            ..Default::default()
+        },
+    );
+
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    let gate_eid = send_message(&alice_db, "pre-view-progress-gate");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", gate_eid.trim()),
+        60_000,
+    );
+
+    let send_out = Command::new(bin())
+        .args([
+            "--db",
+            &alice_db,
+            "send-file",
+            "projection timeline progress",
+            "--file",
+            source_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run send-file");
+    assert!(
+        send_out.status.success(),
+        "send-file failed: {}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut view_refreshes = 0usize;
+    let mut completed_snapshot = None;
+    while Instant::now() < deadline {
+        view_refreshes += 1;
+        let view_snapshot = get_view_raw_no_wait(&bob_db);
+        if view_snapshot.contains(&format!("\u{2714}  {file_name}")) {
+            completed_snapshot = Some(view_snapshot);
+        }
+        if completed_snapshot.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let completed_snapshot =
+        completed_snapshot.expect("topo view never showed the attachment as complete");
+    assert!(
+        view_refreshes >= 2,
+        "manual topo view refresh loop should observe more than one snapshot before completion, saw {} refresh(es)\nfinal topo view snapshot:\n{}",
+        view_refreshes,
+        completed_snapshot
+    );
+}

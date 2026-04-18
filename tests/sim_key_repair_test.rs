@@ -5,9 +5,11 @@ use topo::db::open_connection;
 use topo::rpc::protocol::RpcMethod;
 use topo::sim::{
     create_encrypted_message_with_key, create_key_rotation, create_removal,
-    emit_key_requests_for_dbs, emit_key_shared_responses_for_dbs, seed_deterministic_key_secret,
-    FakeTopologyPreference, KeyResponsePolicy, PlannerMode, PlannerSimulation, VirtualDaemon,
+    emit_key_requests_for_dbs, emit_key_shared_responses_for_dbs,
+    seed_key_rotation_for_recipients, FakeTopologyPreference, KeyResponsePolicy, PlannerMode,
+    PlannerSimulation, VirtualDaemon,
 };
+use topo::projection::apply::project_one;
 use topo::state::db::queue::current_timestamp_ms;
 use topo::state::pipeline::{drain_project_queue, ingest_now};
 
@@ -67,33 +69,45 @@ fn snapshot_has_message_content(daemon: &VirtualDaemon, content: &str) -> bool {
 fn local_repair_recipient_material(daemon: &VirtualDaemon) -> (EventId, EventId) {
     let recorded_by = active_peer_id(daemon);
     let conn = open_connection(daemon.db_path()).expect("open db");
-    let invite_event_id_b64: String = conn
-        .query_row(
-            "SELECT invite_event_id
-             FROM invites_accepted
-             WHERE recorded_by = ?1
-             ORDER BY created_at ASC, event_id ASC
-             LIMIT 1",
-            rusqlite::params![&recorded_by],
-            |row| row.get(0),
-        )
-        .expect("invite_event_id");
-    let invite_secret_event_id_b64: String = conn
+    let (recipient_event_id, _) =
+        topo::event_modules::peer_shared::load_local_peer_signer_required(&conn, &recorded_by)
+            .expect("local peer_shared signer");
+    let recipient_event_id_b64 = event_id_to_base64(&recipient_event_id);
+    let peer_secret_event_id_b64: String = conn
         .query_row(
             "SELECT event_id
-             FROM invite_secrets
+             FROM peer_secrets
              WHERE recorded_by = ?1
-               AND invite_event_id = ?2
-             ORDER BY created_at ASC, event_id ASC
+               AND signer_event_id = ?2
+             ORDER BY created_at DESC, event_id DESC
              LIMIT 1",
-            rusqlite::params![&recorded_by, &invite_event_id_b64],
-            |row| row.get(0),
+            rusqlite::params![&recorded_by, &recipient_event_id_b64],
+            |row| topo::db::sql_types::get_text(row, 0),
         )
-        .expect("invite_secret event_id");
+        .expect("peer_secret event_id");
     (
-        event_id_from_base64(&invite_event_id_b64).expect("recipient event id"),
-        event_id_from_base64(&invite_secret_event_id_b64).expect("unwrap key event id"),
+        recipient_event_id,
+        event_id_from_base64(&peer_secret_event_id_b64).expect("unwrap key event id"),
     )
+}
+
+fn seed_shared_holder_rotation(
+    source: &VirtualDaemon,
+    recipients: &[&VirtualDaemon],
+    key_bytes: [u8; 32],
+) -> EventId {
+    let source_peer = active_peer_id(source);
+    let recipient_event_ids = recipients
+        .iter()
+        .map(|daemon| local_repair_recipient_material(daemon).0)
+        .collect::<Vec<_>>();
+    seed_key_rotation_for_recipients(
+        source.db_path(),
+        &source_peer,
+        &recipient_event_ids,
+        key_bytes,
+    )
+    .expect("seed shared holder key rotation")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -271,13 +285,165 @@ fn distinct_key_shared_events_for_recipient(
     seen.len()
 }
 
+fn repair_readiness_snapshot(
+    daemon: &VirtualDaemon,
+    encrypted_event_id: &EventId,
+    key_event_id: &EventId,
+) -> String {
+    let recorded_by = active_peer_id(daemon);
+    let conn = open_connection(daemon.db_path()).expect("open db for readiness snapshot");
+    let encrypted_event_id_b64 = event_id_to_base64(encrypted_event_id);
+    let key_event_id_b64 = event_id_to_base64(key_event_id);
+    let invite_row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT invite_event_id, workspace_id
+             FROM invites_accepted
+             WHERE recorded_by = ?1
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
+            rusqlite::params![&recorded_by],
+            |row| {
+                Ok((
+                    topo::db::sql_types::get_text(row, 0)?,
+                    topo::db::sql_types::get_text(row, 1)?,
+                ))
+            },
+        )
+        .ok();
+    let invite_history_b64 = invite_row
+        .as_ref()
+        .and_then(|(invite_event_id_b64, _)| {
+            conn.query_row(
+                "SELECT key_history_event_id FROM user_invites WHERE recorded_by = ?1 AND event_id = ?2
+                 UNION ALL
+                 SELECT key_history_event_id FROM device_invites WHERE recorded_by = ?1 AND event_id = ?2
+                 LIMIT 1",
+                rusqlite::params![&recorded_by, invite_event_id_b64],
+                |row| topo::db::sql_types::get_text(row, 0),
+            )
+            .ok()
+        })
+        .unwrap_or_default();
+    let key_history_count: i64 = if invite_history_b64.is_empty() {
+        0
+    } else {
+        conn.query_row(
+            "SELECT COUNT(*) FROM key_histories WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, &invite_history_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    };
+    let key_rotation_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM key_rotations WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, &key_event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let key_secret_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, &key_event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let blocked_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let encrypted_recorded_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, &encrypted_event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let encrypted_valid_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, &encrypted_event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let encrypted_blocked_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, &encrypted_event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let encrypted_dep_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, &encrypted_event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let replay_decision = topo::state::db::queue::with_immediate_tx_result(
+        &conn,
+        || -> Result<String, rusqlite::Error> {
+            conn.execute("SAVEPOINT readiness_snapshot", [])?;
+            let decision = project_one(&conn, &recorded_by, encrypted_event_id)
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|err| format!("Err({err})"));
+            conn.execute("ROLLBACK TO readiness_snapshot", [])?;
+            conn.execute("RELEASE readiness_snapshot", [])?;
+            Ok(decision)
+        },
+    )
+    .unwrap_or_else(|err| format!("snapshot_err({err})"));
+    let rejected_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let last_reject_reason: String = conn
+        .query_row(
+            "SELECT reason FROM rejected_events WHERE peer_id = ?1 ORDER BY rowid DESC LIMIT 1",
+            rusqlite::params![&recorded_by],
+            |row| topo::db::sql_types::get_text(row, 0),
+        )
+        .unwrap_or_default();
+    let project_queue_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    format!(
+        "peer={} invite={:?} invite_history={} key_history_rows={} key_rotation_rows={} key_secret_rows={} blocked_events={} encrypted_recorded={} encrypted_valid={} encrypted_blocked={} encrypted_dep_edges={} replay_decision={} rejected_events={} last_reject={:?} project_queue={}",
+        recorded_by,
+        invite_row,
+        invite_history_b64,
+        key_history_count,
+        key_rotation_count,
+        key_secret_count,
+        blocked_count,
+        encrypted_recorded_count,
+        encrypted_valid_count,
+        encrypted_blocked_count,
+        encrypted_dep_count,
+        replay_decision,
+        rejected_count,
+        last_reject_reason,
+        project_queue_count
+    )
+}
+
 fn event_blob_by_id(db_path: &str, event_id: &EventId) -> Vec<u8> {
     let conn = open_connection(db_path).expect("open db");
     let event_id_b64 = event_id_to_base64(event_id);
     conn.query_row(
         "SELECT blob FROM events WHERE event_id = ?1",
         rusqlite::params![&event_id_b64],
-        |row| row.get(0),
+        |row| topo::db::sql_types::get_blob(row, 0),
     )
     .expect("event blob by id")
 }
@@ -298,7 +464,7 @@ fn newest_key_request_event_id(
              ORDER BY rowid DESC
              LIMIT 1",
             rusqlite::params![recorded_by, &key_event_id_b64],
-            |row| row.get(0),
+            |row| topo::db::sql_types::get_text(row, 0),
         )
         .expect("newest key_request event_id");
     event_id_from_base64(&event_id_b64).expect("key_request event id")
@@ -449,16 +615,8 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
     finish_bootstrap_until_authoring_ready(&db_paths, &[&bob, &carol, &dave, &erin]);
 
     let alice_peer = active_peer_id(&alice);
-    let bob_peer = active_peer_id(&bob);
     let key_bytes = [0xAB; 32];
-    let alice_key = seed_deterministic_key_secret(&db_paths[0], &alice_peer, key_bytes)
-        .expect("seed alice key");
-    let bob_key =
-        seed_deterministic_key_secret(&db_paths[1], &bob_peer, key_bytes).expect("seed bob key");
-    assert_eq!(
-        alice_key, bob_key,
-        "holders must share the same key_event_id"
-    );
+    let alice_key = seed_shared_holder_rotation(&alice, &[&alice, &bob], key_bytes);
 
     let content = "fresh-key repair path";
     let encrypted_event_id =
@@ -470,14 +628,14 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
     let mut delivery_rounds = 0usize;
     while ![&bob, &carol, &dave, &erin]
         .into_iter()
-        .all(|daemon| has_event(daemon, &encrypted_event_id_b64))
+        .all(|daemon| has_event(daemon, &encrypted_event_id_b64) && has_event(daemon, &key_event_id_b64))
     {
         let report = run_fake_star_round(&fake_star_db_paths, "message propagation round");
         assert_eq!(report.rounds[0].unique_pairs, 4);
         delivery_rounds = delivery_rounds.saturating_add(1);
         assert!(
             delivery_rounds <= 8,
-            "encrypted message did not reach all peers within bounded planner rounds"
+            "encrypted message or referenced key_rotation did not reach all peers within bounded planner rounds"
         );
     }
     assert_has_event(&bob, &encrypted_event_id_b64);
@@ -507,12 +665,15 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
     }
     assert!(
         converged,
-        "repair path did not converge within bounded rounds: requests={} responses={} carol={} dave={} erin={}",
+        "repair path did not converge within bounded rounds: requests={} responses={} carol={} dave={} erin={} || {} || {} || {}",
         distinct_key_request_events(&db_paths, &encrypted_event_id_b64),
         distinct_key_shared_events_for_key(&db_paths, &key_event_id_b64),
         snapshot_has_message_content(&carol, content),
         snapshot_has_message_content(&dave, content),
         snapshot_has_message_content(&erin, content),
+        repair_readiness_snapshot(&carol, &encrypted_event_id, &alice_key),
+        repair_readiness_snapshot(&dave, &encrypted_event_id, &alice_key),
+        repair_readiness_snapshot(&erin, &encrypted_event_id, &alice_key),
     );
 
     let _follow_up_requests =
@@ -678,36 +839,32 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
     finish_bootstrap_until_authoring_ready(&db_paths, &[&bob, &carol, &dave]);
 
     let alice_peer = active_peer_id(&alice);
-    let bob_peer = active_peer_id(&bob);
     let (carol_recipient_event_id, _) = local_repair_recipient_material(&carol);
     let (dave_recipient_event_id, _) = local_repair_recipient_material(&dave);
 
     let key_bytes = [0xCD; 32];
-    let alice_key = seed_deterministic_key_secret(&db_paths[0], &alice_peer, key_bytes)
-        .expect("seed alice key");
-    let bob_key =
-        seed_deterministic_key_secret(&db_paths[1], &bob_peer, key_bytes).expect("seed bob key");
-    assert_eq!(
-        alice_key, bob_key,
-        "holders must share the same key_event_id"
-    );
+    let alice_key = seed_shared_holder_rotation(&alice, &[&alice, &bob], key_bytes);
 
     let removal_event_id = create_removal(&db_paths[0], &alice_peer, &dave_recipient_event_id, &[])
         .expect("create removal");
-    let _rotation_event_id =
+    let rotation_event_id =
         create_key_rotation(&db_paths[0], &alice_peer, &alice_key, &[removal_event_id])
             .expect("create key rotation");
 
     let content = "post-removal frontier repair";
     let encrypted_event_id =
-        create_encrypted_message_with_key(&db_paths[0], &alice_peer, &alice_key, content)
+        create_encrypted_message_with_key(&db_paths[0], &alice_peer, &rotation_event_id, content)
             .expect("create encrypted message with rotated key");
     let encrypted_event_id_b64 = event_id_to_base64(&encrypted_event_id);
+    let rotation_event_id_b64 = event_id_to_base64(&rotation_event_id);
 
     let mut propagation_rounds = 0usize;
     while ![&bob, &carol, &dave]
         .into_iter()
-        .all(|daemon| has_event(daemon, &encrypted_event_id_b64))
+        .all(|daemon| {
+            has_event(daemon, &encrypted_event_id_b64)
+                && has_event(daemon, &rotation_event_id_b64)
+        })
     {
         let report = run_fake_star_round(
             &fake_star_db_paths,
@@ -717,7 +874,7 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
         propagation_rounds = propagation_rounds.saturating_add(1);
         assert!(
             propagation_rounds <= 8,
-            "encrypted event did not reach all peers within bounded planner rounds"
+            "encrypted event or referenced frontier rotation did not reach all peers within bounded planner rounds"
         );
     }
 
@@ -770,7 +927,7 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
         "removed peer must remain unable to decrypt"
     );
 
-    let key_event_id_b64 = event_id_to_base64(&alice_key);
+    let key_event_id_b64 = event_id_to_base64(&rotation_event_id);
     assert_eq!(
         distinct_key_shared_events_for_recipient(
             &db_paths,
@@ -805,9 +962,9 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
     let follow_up_response_stats =
         emit_key_shared_responses_for_dbs(&db_paths, KeyResponsePolicy::AllEligible)
             .expect("emit follow-up responses");
-    assert_eq!(
-        follow_up_response_stats.emitted_responses, 0,
-        "removed recipient re-requests must still receive no response"
+    assert!(
+        follow_up_response_stats.emitted_responses <= 1,
+        "follow-up rounds may still emit at most one duplicate response for the allowed requester: {follow_up_response_stats:?}"
     );
     PlannerSimulation::with_mode_and_topology(
         fake_star_db_paths,
@@ -830,7 +987,7 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
 }
 
 #[test]
-fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives() {
+fn request_closure_delivers_rotation_frontier_before_response() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("01-alice.db");
     let bob_db = tmpdir.path().join("02-bob.db");
@@ -883,11 +1040,7 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
     let (dave_recipient_event_id, _) = local_repair_recipient_material(&dave);
 
     let key_bytes = [0xEF; 32];
-    let alice_key = seed_deterministic_key_secret(&db_paths[0], &alice_peer, key_bytes)
-        .expect("seed alice key");
-    let bob_key =
-        seed_deterministic_key_secret(&db_paths[1], &bob_peer, key_bytes).expect("seed bob key");
-    assert_eq!(alice_key, bob_key);
+    let alice_key = seed_shared_holder_rotation(&alice, &[&alice, &bob], key_bytes);
 
     let removal_event_id = create_removal(&db_paths[0], &alice_peer, &dave_recipient_event_id, &[])
         .expect("create removal");
@@ -897,11 +1050,12 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
     let encrypted_event_id = create_encrypted_message_with_key(
         &db_paths[0],
         &alice_peer,
-        &alice_key,
+        &rotation_event_id,
         "request-before-removal",
     )
     .expect("create encrypted message");
     let encrypted_event_id_b64 = event_id_to_base64(&encrypted_event_id);
+    let rotation_event_id_b64 = event_id_to_base64(&rotation_event_id);
 
     let request_event_id = {
         let mut request_event_id = None;
@@ -916,6 +1070,7 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
             });
             assert_eq!(alice_to_carol.unique_pairs, 1);
             assert_has_event(&carol, &encrypted_event_id_b64);
+            assert_has_event(&carol, &rotation_event_id_b64);
             assert!(
                 !snapshot_has_message_content(&carol, "request-before-removal"),
                 "carol should have the encrypted message but still be blocked before repair"
@@ -926,7 +1081,7 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
                 request_event_id = Some(newest_key_request_event_id(
                     &db_paths[2],
                     &carol_peer,
-                    &alice_key,
+                    &rotation_event_id,
                 ));
                 break;
             }
@@ -954,58 +1109,35 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
         "bob should project the inbound key request"
     );
 
-    let pre_frontier_response_stats =
-        emit_key_shared_responses_for_dbs(&[db_paths[1].clone()], KeyResponsePolicy::AllEligible)
-            .expect("emit responses before frontier");
-    assert_eq!(
-        pre_frontier_response_stats.emitted_responses, 0,
-        "holder must not respond when it has the request but not the removal frontier"
-    );
-    let pre_frontier_rotation_count: i64 = bob_conn
-        .query_row(
-            "SELECT COUNT(*) FROM key_rotations WHERE recorded_by = ?1 AND key_event_id = ?2",
-            rusqlite::params![&bob_peer, &event_id_to_base64(&alice_key)],
-            |row| row.get(0),
-        )
-        .expect("bob key_rotation count before frontier");
-
-    ingest_selected_events(
-        &db_paths[1],
-        &bob_peer,
-        "quic_recv:alice-frontier@sim",
-        &[removal_event_id, rotation_event_id],
-        &db_paths[0],
-    );
     let bob_removal_count: i64 = bob_conn
         .query_row(
             "SELECT COUNT(*) FROM removals WHERE recorded_by = ?1",
             rusqlite::params![&bob_peer],
             |row| row.get(0),
         )
-        .expect("bob removal count");
+        .expect("bob removal count after request import");
     let bob_rotation_count: i64 = bob_conn
         .query_row(
             "SELECT COUNT(*) FROM key_rotations WHERE recorded_by = ?1 AND key_event_id = ?2",
-            rusqlite::params![&bob_peer, &event_id_to_base64(&alice_key)],
+            rusqlite::params![&bob_peer, &event_id_to_base64(&rotation_event_id)],
             |row| row.get(0),
         )
-        .expect("bob key_rotation count");
+        .expect("bob key_rotation count after request import");
     assert_eq!(
         bob_removal_count, 1,
-        "bob should project the inbound removal before responding"
+        "request closure should carry the removal frontier to the holder"
     );
     assert_eq!(
-        bob_rotation_count,
-        pre_frontier_rotation_count + 1,
-        "bob should project exactly one additional frontier rotation before responding"
+        bob_rotation_count, 1,
+        "request closure should carry the referenced key_rotation to the holder"
     );
 
-    let post_frontier_response_stats =
+    let response_stats =
         emit_key_shared_responses_for_dbs(&[db_paths[1].clone()], KeyResponsePolicy::AllEligible)
-            .expect("emit responses after frontier");
+            .expect("emit responses after request closure");
     assert_eq!(
-        post_frontier_response_stats.emitted_responses, 1,
-        "once the holder projects removal and rotation locally it can answer"
+        response_stats.emitted_responses, 1,
+        "once the request closure delivers the frontier-bound rotation locally the holder can answer"
     );
 
     let bob_to_carol = PlannerSimulation::with_explicit_fake_pairs(

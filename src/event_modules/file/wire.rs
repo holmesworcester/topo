@@ -187,7 +187,7 @@ pub static FILE_META: EventTypeMeta = crate::event_modules::registry::event_type
     projection_table: "files",
     share_scope: ShareScope::Shared,
     dep_fields: &["message_id", "key_event_id"],
-    dep_field_type_codes: &[&[1], &[6]],
+    dep_field_type_codes: &[&[1], &[32]],
     signer_required: true,
     signature_byte_len: 0,
     encryptable: true,

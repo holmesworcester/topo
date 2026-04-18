@@ -12,6 +12,17 @@ pub use wire::{
 
 use rusqlite::Connection;
 
+fn column_exists(conn: &Connection, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(user_invites)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if crate::db::sql_types::get_text(row, 1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -23,5 +34,11 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         ",
     )?;
+    if !column_exists(conn, "key_history_event_id")? {
+        conn.execute(
+            "ALTER TABLE user_invites ADD COLUMN key_history_event_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     Ok(())
 }

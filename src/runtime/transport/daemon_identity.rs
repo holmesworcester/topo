@@ -300,6 +300,7 @@ pub fn load_daemon_iroh_secret_key_from_db(
 ) -> Result<iroh::SecretKey, Box<dyn std::error::Error + Send + Sync>> {
     let conn = crate::db::open_connection(db_path)?;
     crate::db::schema::create_tables(&conn)?;
+    let _ = ensure_daemon_identity(&conn)?;
     load_daemon_iroh_secret_key(&conn)
 }
 

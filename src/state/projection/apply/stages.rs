@@ -622,8 +622,8 @@ fn apply_projection_frame<B: ProjectionBackend>(
         }
         let Some(key_bytes) = backend.load_key_secret_bytes(recorded_by, &enc.key_event_id)? else {
             return Ok((
-                ProjectionDecision::Reject {
-                    reason: "secret key not found in key_secrets table".to_string(),
+                ProjectionDecision::BlockOnMissingDeps {
+                    missing: Vec::new(),
                 },
                 None,
                 false,
@@ -761,9 +761,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
         ProjectionDecisionEffectPlan::EmitCommandsOnly { missing } => {
-            if !missing.is_empty() {
-                backend.record_block(recorded_by, event_id_b64, &missing)?;
-            }
+            backend.record_block(recorded_by, event_id_b64, &missing)?;
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
         ProjectionDecisionEffectPlan::NoEffects => {}

@@ -350,10 +350,10 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
     wait_for_authoring_ready(&phone, &[phone_db.to_string_lossy().into_owned()]);
 
     let phone_link = create_device_link(&phone);
-    let phone_key_shared_ids = event_ids_of_type(&phone, "key_shared");
+    let phone_key_history_ids = event_ids_of_type(&phone, "key_history");
     assert!(
-        !phone_key_shared_ids.is_empty(),
-        "phone device-link creation should emit at least one real key_shared event"
+        !phone_key_history_ids.is_empty(),
+        "phone device-link creation should emit at least one real key_history event"
     );
     let accepted_laptop = laptop.call(RpcMethod::AcceptLink {
         invite: phone_link,
@@ -456,7 +456,7 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
 
     assert_has_event(&laptop, &routed_message);
     assert_has_event(&tablet, &routed_message);
-    for event_id in &phone_key_shared_ids {
+    for event_id in &phone_key_history_ids {
         assert_has_event(&tablet, event_id);
     }
 
@@ -472,7 +472,7 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
 }
 
 #[test]
-fn nearest_neighbor_no_auth_propagates_key_shared_along_chain() {
+fn nearest_neighbor_no_auth_propagates_key_history_along_chain() {
     let tmpdir = tempfile::tempdir().unwrap();
     let phone_db = tmpdir.path().join("01-phone.db");
     let laptop_db = tmpdir.path().join("02-laptop.db");
@@ -494,10 +494,10 @@ fn nearest_neighbor_no_auth_propagates_key_shared_along_chain() {
     wait_for_authoring_ready(&phone, &[phone_db.to_string_lossy().into_owned()]);
 
     let phone_link = create_device_link(&phone);
-    let phone_key_shared_ids = event_ids_of_type(&phone, "key_shared");
+    let phone_key_history_ids = event_ids_of_type(&phone, "key_history");
     assert!(
-        !phone_key_shared_ids.is_empty(),
-        "phone device-link creation should emit at least one real key_shared event"
+        !phone_key_history_ids.is_empty(),
+        "phone device-link creation should emit at least one real key_history event"
     );
     let accepted_laptop = laptop.call(RpcMethod::AcceptLink {
         invite: phone_link,
@@ -562,7 +562,7 @@ fn nearest_neighbor_no_auth_propagates_key_shared_along_chain() {
     assert_eq!(report.fake_topology, Some(FakeTopologyPreference::Star));
     assert_eq!(report.unique_pairs, 2);
 
-    for event_id in &phone_key_shared_ids {
+    for event_id in &phone_key_history_ids {
         assert_has_event(&tablet, event_id);
     }
 }

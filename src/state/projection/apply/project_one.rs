@@ -19,6 +19,22 @@ fn event_is_valid_for_peer(
     )
 }
 
+fn clear_terminal_block_state(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+    )?;
+    conn.execute(
+        "DELETE FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+    )?;
+    Ok(())
+}
+
 /// Single-event projection step (no cascade).
 ///
 /// Executes the 7-step projection algorithm for one event:
@@ -86,7 +102,6 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
         }
         ProjectionDecision::BlockOnMissingDeps { ref missing } => {
             backend.mark_guard_blocked(&event_id_b64)?;
-            let _ = missing;
             return Ok((decision, Some(parsed)));
         }
         _ => {}
@@ -120,8 +135,11 @@ pub fn project_one(
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
     crate::db::queue::with_immediate_tx_result(conn, || {
         let (decision, parsed) = project_one_step(conn, recorded_by, event_id)?;
+        let event_id_b64 = event_id_to_base64(event_id);
+        if !matches!(decision, ProjectionDecision::BlockOnMissingDeps { .. }) {
+            clear_terminal_block_state(conn, recorded_by, &event_id_b64)?;
+        }
         if matches!(decision, ProjectionDecision::Valid) {
-            let event_id_b64 = event_id_to_base64(event_id);
             if event_is_valid_for_peer(conn, recorded_by, &event_id_b64)? {
                 cascade_unblocked(conn, recorded_by, &event_id_b64, parsed.as_ref())?;
                 if matches!(parsed.as_ref(), Some(ParsedEvent::EndpointShared(_))) {

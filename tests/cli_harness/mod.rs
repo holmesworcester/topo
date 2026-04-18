@@ -2139,6 +2139,14 @@ pub fn get_files_raw(db: &str) -> String {
 /// Get raw `topo view` output.
 pub fn get_view_raw(db: &str) -> String {
     ensure_active_peer(db, Duration::from_secs(10));
+    get_view_raw_no_wait(db)
+}
+
+/// Get raw `topo view` output without waiting for an active peer first.
+///
+/// This is useful for tests that are explicitly checking refresh behavior
+/// while a live sync session is already in progress.
+pub fn get_view_raw_no_wait(db: &str) -> String {
     let output = Command::new(bin())
         .arg("--db")
         .arg(db)
@@ -2992,9 +3000,19 @@ pub fn sync_log_json(db: &str, limit: usize) -> serde_json::Value {
 pub fn assert_replay_pass(db: &str) -> String {
     let passes = ["forward", "idempotent", "reverse", "shuffle"];
     let mut fingerprints: Vec<(String, String)> = Vec::new();
+    let offline_socket = std::path::PathBuf::from(format!("{db}.replay-offline.sock"));
+    let _ = std::fs::remove_file(&offline_socket);
     for pass in &passes {
         let out = Command::new(bin())
-            .args(["--db", db, "replay", pass, "--json"])
+            .args([
+                "--db",
+                db,
+                "--socket",
+                offline_socket.to_str().unwrap_or(""),
+                "replay",
+                pass,
+                "--json",
+            ])
             .output()
             .unwrap_or_else(|e| panic!("failed to run topo replay {}: {}", pass, e));
         assert!(

@@ -13,7 +13,7 @@ mod tests {
     use topo::event_modules::peer_shared::project_pure;
     use topo::event_modules::peer_shared::PeerSharedEvent;
     use topo::event_modules::ParsedEvent;
-    use topo::projection::projector::{SqlVal, WriteOp};
+    use topo::projection::projector::{EmitCommand, SqlVal, WriteOp};
 
     const PEER: &str = "peer_alice";
 
@@ -34,11 +34,23 @@ mod tests {
         let parsed = make_peer_shared([5u8; 32], [6u8; 32]);
         let mut ctx = empty_ctx();
         ctx.peer_shared_endpoint_id = Some("endpoint-1".to_string());
+        ctx.accepted_workspace_id = Some(b64(&[0x44; 32]));
         let event_id = b64(&[21u8; 32]);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "peers_shared");
+        assert!(
+            result.emit_commands.iter().any(|command| matches!(
+                command,
+                EmitCommand::IndexEndpointSharedForWorkspace {
+                    workspace_id,
+                    endpoint_shared_event_id
+                } if workspace_id == &b64(&[0x44; 32])
+                    && endpoint_shared_event_id == &b64(&[7u8; 32])
+            )),
+            "peer_shared should schedule endpoint_shared indexing once workspace scope is known"
+        );
     }
 
     // ── SPEC_PEER_SHARED_TRUST_02: pass (correct column values) ──
