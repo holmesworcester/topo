@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use negentropy::{Id, NegentropyStorageBase, NegentropyStorageVector};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tracing::debug;
@@ -202,6 +202,20 @@ pub struct LiveSuppressionReceiveState {
     remote_done_notified: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedDepOrderRawRows {
+    dep_is_selected: bool,
+    dep_already_emitted: bool,
+    dep_currently_visiting: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedDepOrderDecisionContext {
+    dep_is_selected: bool,
+    dep_already_emitted: bool,
+    dep_currently_visiting: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NegentropyStorageCacheKey {
     db_path: String,
@@ -215,6 +229,32 @@ struct NegentropyStorageCacheEntry {
     ts_min_inclusive_ms: Option<i64>,
     ts_max_exclusive_ms: Option<i64>,
     storage: Arc<NegentropyStorageVector>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedDepOrderPlan {
+    EmitDepBeforeRoot,
+    SkipDepEdge,
+}
+
+fn normalize_selected_dep_order_context(
+    raw_rows: SelectedDepOrderRawRows,
+) -> SelectedDepOrderDecisionContext {
+    SelectedDepOrderDecisionContext {
+        dep_is_selected: raw_rows.dep_is_selected,
+        dep_already_emitted: raw_rows.dep_already_emitted,
+        dep_currently_visiting: raw_rows.dep_currently_visiting,
+    }
+}
+
+fn decide_selected_dep_order_plan(
+    context: &SelectedDepOrderDecisionContext,
+) -> SelectedDepOrderPlan {
+    if context.dep_is_selected && !context.dep_already_emitted && !context.dep_currently_visiting {
+        SelectedDepOrderPlan::EmitDepBeforeRoot
+    } else {
+        SelectedDepOrderPlan::SkipDepEdge
+    }
 }
 
 fn load_shared_index_entries(

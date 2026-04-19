@@ -17,6 +17,8 @@ verus! {
 
 /// One variant per registered event-type code in the runtime registry.
 /// Keep in sync with the `EVENT_TYPE_*` constants in `src/event_modules/mod.rs`.
+/// The current registry includes the capped shared-key fanout model
+/// (`KeyRotation`, `KeyHistory`, `KeyRequest`) used by the runtime.
 /// Retired codes (e.g., PEER at code 23) are intentionally absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventTypeCode {

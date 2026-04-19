@@ -720,6 +720,9 @@ fn join_workspace_inner(
         &device_invite_key,
     ))?;
     index_endpoint_shared_for_workspace(db, recorded_by, &workspace_id, &endpoint_shared_event_id)?;
+    // Re-run the same-workspace seed after the local accept chain exists so
+    // older encrypted history can be retried with invite-derived key state in place.
+    let _ = replay_existing_workspace_shared_events_for_tenant(db, recorded_by, &workspace_id)?;
 
     // 5. Key unwrap is dep-driven via:
     //    key_shared --deps on invite_secret--> deterministic secret emit.
@@ -817,6 +820,9 @@ pub fn add_device_to_workspace(
         device_invite_key,
     ))?;
     index_endpoint_shared_for_workspace(db, recorded_by, &workspace_id, &endpoint_shared_event_id)?;
+    // Mirror join replay semantics for linked devices so prior workspace
+    // history re-runs after local identity materialization.
+    let _ = replay_existing_workspace_shared_events_for_tenant(db, recorded_by, &workspace_id)?;
 
     Ok(LinkChain {
         endpoint_shared_event_id,

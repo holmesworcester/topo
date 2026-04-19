@@ -97,6 +97,19 @@ pub async fn acquire_peer_session_ingest_guard(
         .map_err(|_| format!("peer session ingest gate closed for {peer_id}"))
 }
 
+pub fn try_acquire_peer_session_ingest_guard(
+    db_path: &str,
+    peer_id: &str,
+) -> Result<Option<OwnedSemaphorePermit>, String> {
+    match peer_session_ingest_gate(db_path, peer_id).try_acquire_owned() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(tokio::sync::TryAcquireError::NoPermits) => Ok(None),
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            Err(format!("peer session ingest gate closed for {peer_id}"))
+        }
+    }
+}
+
 fn spawn_direct_ingest_worker(db_path: &str, state: &Arc<DirectIngestState>) -> Result<(), String> {
     let db_path = db_path.to_string();
     let state = state.clone();

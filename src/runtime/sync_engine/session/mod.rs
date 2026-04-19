@@ -25,7 +25,10 @@ pub use responder::run_sync_responder;
 /// regardless of set size.
 pub(super) const NEGENTROPY_FRAME_SIZE_LIMIT: u64 = 0;
 /// Maximum time a session may sit without any initial control-round progress.
-/// If a session never gets past the first negentropy exchange, restarting it is
-/// better than blocking the connection supervisor for the full activity timeout.
+/// Invite bootstrap and first-range planning now stage 8k-slot `key_rotation`
+/// and `key_history` payloads, so the first control reply can take far longer
+/// than the pre-change small-event baseline. Keep this comfortably above the
+/// largest expected first-session planning + transfer spike while still below
+/// the general activity timeout for genuinely dead sessions.
 pub(super) const INITIAL_CONTROL_PROGRESS_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(5);
+    std::time::Duration::from_secs(120);

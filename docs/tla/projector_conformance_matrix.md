@@ -74,10 +74,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_user_invite_projects_with_workspace_signer_family | pass |
 | SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_user_invite_projects_with_peer_signed_admin_authority | pass |
 | SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_user_invite_rejects_wrong_signer_family_at_projection | break |
-| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | event_modules::user_invite_shared::projector::user_invite_projector_tests::test_user_invite_basic_valid | pass |
-| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | event_modules::user_invite_shared::projector::user_invite_projector_tests::test_user_invite_rejects_bootstrap_signer_mismatch | break |
-| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | event_modules::user_invite_shared::projector::user_invite_projector_tests::test_user_invite_rejects_bootstrap_authority_mismatch | break |
-| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | event_modules::user_invite_shared::projector::user_invite_projector_tests::test_user_invite_rejects_peer_signed_authority_mismatch | break |
+| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | user_invite_projector_tests::tests::test_user_invite_basic_valid | pass |
 | SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | pipeline_integration | apply::tests::identity::test_user_invite_projects_with_peer_signed_admin_authority | pass |
 | SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | pipeline_integration | apply::tests::identity::test_user_invite_rejects_bootstrap_authority_mismatch_at_projection | break |
 | SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | pipeline_integration | apply::tests::identity::test_user_invite_rejects_peer_signed_authority_mismatch_at_projection | break |
@@ -86,9 +83,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DI_SIGNER_01 | InvDeviceInviteChain | CHK_DI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_device_invite_projects_with_user_signer_family | pass |
 | SPEC_DI_SIGNER_01 | InvDeviceInviteChain | CHK_DI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_device_invite_projects_with_peer_signed_admin_authority | pass |
 | SPEC_DI_SIGNER_01 | InvDeviceInviteChain | CHK_DI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_device_invite_rejects_wrong_signer_family_at_projection | break |
-| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | projector_unit | event_modules::peer_invite_shared::projector::device_invite_projector_tests::test_device_invite_writes_pending_trust | pass |
-| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | projector_unit | event_modules::peer_invite_shared::projector::device_invite_projector_tests::test_device_invite_rejects_bootstrap_authority_mismatch | break |
-| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | projector_unit | event_modules::peer_invite_shared::projector::device_invite_projector_tests::test_device_invite_rejects_peer_signed_authority_mismatch | break |
+| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | projector_unit | device_invite_projector_tests::tests::test_device_invite_writes_pending_trust | pass |
 | SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | pipeline_integration | apply::tests::identity::test_device_invite_projects_with_peer_signed_admin_authority | pass |
 | SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | pipeline_integration | apply::tests::identity::test_device_invite_rejects_bootstrap_authority_mismatch_at_projection | break |
 | SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | pipeline_integration | apply::tests::identity::test_device_invite_rejects_peer_signed_authority_mismatch_at_projection | break |

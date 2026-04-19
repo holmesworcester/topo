@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+const MANUAL_ROUND_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Result of a manually-triggered negentropy round.
 #[derive(Debug, Clone, Serialize)]
 pub struct ManualSyncRoundCapture {
@@ -119,9 +121,12 @@ impl SyncControlRegistry {
             });
         }
         drop(reply_tx);
-        match reply_rx.recv_timeout(Duration::from_secs(30)) {
+        match reply_rx.recv_timeout(MANUAL_ROUND_REPLY_TIMEOUT) {
             Ok(result) => result,
-            Err(_) => Err("timeout waiting for round reply (30s)".to_string()),
+            Err(_) => Err(format!(
+                "timeout waiting for round reply ({}s)",
+                MANUAL_ROUND_REPLY_TIMEOUT.as_secs()
+            )),
         }
     }
 
@@ -141,7 +146,7 @@ impl SyncControlRegistry {
         }
         drop(reply_tx);
         let mut results = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + MANUAL_ROUND_REPLY_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -154,7 +159,10 @@ impl SyncControlRegistry {
             }
         }
         if results.is_empty() {
-            Err("timeout waiting for round reply (30s)".to_string())
+            Err(format!(
+                "timeout waiting for round reply ({}s)",
+                MANUAL_ROUND_REPLY_TIMEOUT.as_secs()
+            ))
         } else {
             Ok(results)
         }

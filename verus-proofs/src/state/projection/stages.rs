@@ -9,6 +9,10 @@
 //! variant to a payload-less tag. The runtime wraps the core by projecting its
 //! concrete payloads to tags, calling the verified dispatcher, and rehydrating
 //! the original payloads in the output plan.
+//!
+//! Runtime now uses the same stage dispatcher when direct `key_rotation` /
+//! `key_history` materialization unblocks encrypted content, so the verified Block /
+//! Reject / Valid effect split continues to cover the key-repair path.
 
 use vstd::prelude::*;
 

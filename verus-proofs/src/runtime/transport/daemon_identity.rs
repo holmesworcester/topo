@@ -3,6 +3,8 @@
 //! This seam consumes raw table-presence query results and emits the startup
 //! materialization plan. Command paths are intentionally excluded; they use the
 //! load-only planners in `event_modules/workspace/command_plans.rs`.
+//! Runtime now also repairs mismatched `endpoint_shared` material deterministically
+//! from the local secret, but that still reduces to the same four startup plan tags.
 //!
 //! Every `pub fn` below is executable Rust consumed by
 //! `src/runtime/transport/daemon_identity.rs`. Postconditions (`ensures`) are
@@ -26,10 +28,26 @@ pub enum DaemonIdentityMaterializationPlan {
     RejectSharedWithoutSecret,
 }
 
+pub open spec fn daemon_identity_materialization_plan_spec(
+    endpoint_secret_present: bool,
+    endpoint_shared_present: bool,
+) -> DaemonIdentityMaterializationPlan {
+    match (endpoint_secret_present, endpoint_shared_present) {
+        (true, true) => DaemonIdentityMaterializationPlan::AlreadyMaterialized,
+        (false, false) => DaemonIdentityMaterializationPlan::CreateSecretAndShared,
+        (true, false) => DaemonIdentityMaterializationPlan::CreateSharedFromExistingSecret,
+        (false, true) => DaemonIdentityMaterializationPlan::RejectSharedWithoutSecret,
+    }
+}
+
 pub fn decide_daemon_identity_materialization_plan(
     context: &DaemonIdentityMaterializationDecisionContext,
 ) -> (plan: DaemonIdentityMaterializationPlan)
     ensures
+        plan == daemon_identity_materialization_plan_spec(
+            context.endpoint_secret_present,
+            context.endpoint_shared_present,
+        ),
         context.endpoint_secret_present && context.endpoint_shared_present
             ==> plan == DaemonIdentityMaterializationPlan::AlreadyMaterialized,
         !context.endpoint_secret_present && !context.endpoint_shared_present
@@ -75,45 +93,29 @@ pub open spec fn materialized_daemon_identity_state_after_plan(
 
 proof fn startup_noops_when_daemon_identity_is_already_materialized()
     ensures
-        decide_daemon_identity_materialization_plan(
-            DaemonIdentityMaterializationDecisionContext {
-                endpoint_secret_present: true,
-                endpoint_shared_present: true,
-            }
-        ) == DaemonIdentityMaterializationPlan::AlreadyMaterialized,
+        daemon_identity_materialization_plan_spec(true, true)
+            == DaemonIdentityMaterializationPlan::AlreadyMaterialized,
 {
 }
 
 proof fn startup_materializes_both_rows_when_identity_is_absent()
     ensures
-        decide_daemon_identity_materialization_plan(
-            DaemonIdentityMaterializationDecisionContext {
-                endpoint_secret_present: false,
-                endpoint_shared_present: false,
-            }
-        ) == DaemonIdentityMaterializationPlan::CreateSecretAndShared,
+        daemon_identity_materialization_plan_spec(false, false)
+            == DaemonIdentityMaterializationPlan::CreateSecretAndShared,
 {
 }
 
 proof fn startup_repairs_missing_endpoint_shared_when_secret_exists()
     ensures
-        decide_daemon_identity_materialization_plan(
-            DaemonIdentityMaterializationDecisionContext {
-                endpoint_secret_present: true,
-                endpoint_shared_present: false,
-            }
-        ) == DaemonIdentityMaterializationPlan::CreateSharedFromExistingSecret,
+        daemon_identity_materialization_plan_spec(true, false)
+            == DaemonIdentityMaterializationPlan::CreateSharedFromExistingSecret,
 {
 }
 
 proof fn startup_rejects_shared_without_secret()
     ensures
-        decide_daemon_identity_materialization_plan(
-            DaemonIdentityMaterializationDecisionContext {
-                endpoint_secret_present: false,
-                endpoint_shared_present: true,
-            }
-        ) == DaemonIdentityMaterializationPlan::RejectSharedWithoutSecret,
+        daemon_identity_materialization_plan_spec(false, true)
+            == DaemonIdentityMaterializationPlan::RejectSharedWithoutSecret,
 {
 }
 

@@ -7,6 +7,11 @@
 //! Total size = `CIPHERTEXT_OFFSET + inner_wire_size + AUTH_TAG_LEN`. `inner_wire_size`
 //! is a static lookup from inner_type_code, so a well-formed blob has a *deterministic*
 //! length given its `inner_type_code` byte.
+//!
+//! This invariant remains the same after the direct-key-rotation refactor: encrypted
+//! content still names one logical key event id in the header, even though that key
+//! material now projects from shared `key_rotation` / `key_history` events instead of
+//! the earlier key-share/key-secret event split.
 
 use vstd::prelude::*;
 

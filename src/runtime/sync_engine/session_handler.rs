@@ -246,8 +246,8 @@ impl SyncConnectionHandler {
             None => (None, None),
         };
 
-        // No hard total-session timeout.  Liveness is enforced at each phase:
-        //   - Negentropy control: INITIAL_CONTROL_PROGRESS_TIMEOUT (5 s per message)
+        // No hard total-session timeout. Liveness is enforced at each phase:
+        //   - Negentropy control: INITIAL_CONTROL_PROGRESS_TIMEOUT (bounded per message)
         //   - Data receive: activity_timeout (idle between chunks)
         // A session that is still transferring data should never be killed.
         let mut stats: Option<crate::runtime::SyncStats> = None;

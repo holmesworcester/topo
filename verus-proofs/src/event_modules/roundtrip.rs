@@ -10,6 +10,10 @@
 //! The verified predicate below captures the minimal round-trip property at the
 //! type-code level. Richer structural round-trip (all fields preserved) is
 //! checked in runtime property tests per event module.
+//!
+//! Invite and key-delivery wire formats are especially sensitive here because the
+//! runtime now round-trips invite-carried `key_history_event_id` references and the
+//! fixed-width `key_rotation` slot bundles through the same registry entrypoints.
 
 use vstd::prelude::*;
 

@@ -621,6 +621,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
             ));
         }
         let Some(key_bytes) = backend.load_key_secret_bytes(recorded_by, &enc.key_event_id)? else {
+            backend.record_block(recorded_by, event_id_b64, &[])?;
             return Ok((
                 ProjectionDecision::BlockOnMissingDeps {
                     missing: Vec::new(),

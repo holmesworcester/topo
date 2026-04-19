@@ -470,7 +470,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         signer_event_id: psf_eid,
         private_key_bytes: peer_shared_key.to_bytes(),
     });
-    create_event_synchronous(conn, recorded_by, &peer_secret_event).unwrap();
+    create_event(conn, recorded_by, &peer_secret_event).unwrap();
 
     register_signer_user(psf_eid, ub_eid);
     (psf_eid, peer_shared_key)

@@ -12,6 +12,10 @@
 //! The runtime calls `is_idempotent_writeop` per op immediately before executing via
 //! `debug_assert!` — so a future variant that is not idempotent fires in debug test
 //! runs as well as in the formal proof.
+//!
+//! Recent runtime changes added more post-write emit-command handlers, but they still
+//! execute strictly outside the `WriteOp` surface covered here; this mirror continues
+//! to prove replay safety for the actual DB mutations themselves.
 
 use vstd::prelude::*;
 

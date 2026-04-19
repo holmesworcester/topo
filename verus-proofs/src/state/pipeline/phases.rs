@@ -15,6 +15,10 @@
 //! Runtime carries `workspace_binding: Option<String>`; the verified core reduces
 //! that to `has_workspace_binding: bool` — the runtime wrapper keeps the concrete
 //! workspace_id locally and only consults the core for the tag-level dispatch.
+//!
+//! The current runtime additionally persists large shared `key_rotation` / `key_history`
+//! events through the same persist-phase dispatch, so these workspace-target and
+//! fanout rules remain the governing abstraction for the new key-delivery model too.
 
 use vstd::prelude::*;
 

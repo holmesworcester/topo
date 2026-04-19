@@ -18,7 +18,9 @@ use crate::sync::session::range_session::{
     open_live_suppression_session, order_phase2_then_phase1_shared_event_ids_for_send_for_peer,
     send_selected_events, spawn_receive_task,
 };
-use crate::sync::session::receive::{acquire_peer_session_ingest_guard, wait_for_ingest_waiters};
+use crate::sync::session::receive::{
+    try_acquire_peer_session_ingest_guard, wait_for_ingest_waiters,
+};
 use crate::sync::session::windowing::{
     decode_sync_window_kind, encode_initial_neg_open, is_low_mem_allowed_window,
     mark_outbound_window_completed, restrict_outbound_windows_to_last_week, select_outbound_window,
@@ -109,7 +111,6 @@ where
 
     let db = open_connection(db_path)?;
     let ws_id = resolve_sync_admission(&db, recorded_by)?;
-    let _peer_session_ingest_guard = acquire_peer_session_ingest_guard(db_path, peer_id).await?;
     let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
     let range = select_outbound_window(
         db_path,
@@ -411,14 +412,24 @@ where
         rx_capture,
         receive_live_suppression,
     );
-    let (events_sent, bytes_sent) = send_selected_events(
-        &store,
-        &mut data_send,
-        &ordered_send_event_ids,
-        range,
-        live_suppression.as_mut(),
-    )
-    .await?;
+    // If a local responder session already owns the per-peer gate, let that
+    // session carry outbound data for this peer and keep this initiator
+    // receive-only. That avoids duplicate resend bursts after reconnects
+    // without blocking the control phase into a deadlock.
+    let maybe_peer_session_ingest_guard =
+        try_acquire_peer_session_ingest_guard(db_path, peer_id)?;
+    let (events_sent, bytes_sent) = if maybe_peer_session_ingest_guard.is_some() {
+        send_selected_events(
+            &store,
+            &mut data_send,
+            &ordered_send_event_ids,
+            range,
+            live_suppression.as_mut(),
+        )
+        .await?
+    } else {
+        (0, 0)
+    };
     drop(data_send);
 
     let received = match receive_task.await {

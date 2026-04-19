@@ -13,6 +13,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use rusqlite::OptionalExtension;
 use topo::testutil::DaemonGuard;
 
 static DAEMON_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -931,6 +932,20 @@ pub fn wait_for_tenant_bootstrap_ready(db: &str, tenant_peer_id: &str, timeout: 
     }
 }
 
+pub fn wait_for_tenant_inviter_route_ready(db: &str, tenant_peer_id: &str, timeout: Duration) {
+    match wait_for_tenant_inviter_route_ready_debug(db, tenant_peer_id, timeout) {
+        Ok(()) => {}
+        Err(err) => panic!(
+            "timed out waiting for tenant {} inviter route readiness after {:?}; last value: {}\n{}\n{}",
+            tenant_peer_id,
+            timeout,
+            err,
+            assert_eventually_debug_context(db),
+            daemon_debug_context(db)
+        ),
+    }
+}
+
 pub fn wait_for_tenant_ready_by_username(
     db: &str,
     username: &str,
@@ -1462,6 +1477,7 @@ fn accept_invite_with_identity_inner(
         let accepted_peer_id = active_tenant_peer_id(db)
             .expect("accepted invite should set the new tenant active on the running daemon");
         wait_for_tenant_transport_converged(db, &accepted_peer_id, accept_timeout);
+        wait_for_tenant_inviter_route_ready(db, &accepted_peer_id, accept_timeout);
     }
     // Stop temporary daemon; callers decide daemon lifecycle.
     stop_daemon(db, &mut tmp_daemon);
@@ -1752,6 +1768,78 @@ fn wait_for_tenant_bootstrap_ready_debug(
             );
         } else {
             last = format!("tenant_peer_id={} db unavailable", tenant_peer_id);
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(last)
+}
+
+fn wait_for_tenant_inviter_route_ready_debug(
+    db: &str,
+    tenant_peer_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last = String::from("invite route unavailable");
+    while start.elapsed() < timeout {
+        match topo::db::open_connection(db) {
+            Ok(conn) => {
+                let invite_event_id = conn
+                    .query_row(
+                        "SELECT invite_event_id
+                         FROM invites_accepted
+                         WHERE recorded_by = ?1
+                         ORDER BY created_at ASC, event_id ASC
+                         LIMIT 1",
+                        rusqlite::params![tenant_peer_id],
+                        |row| topo::db::sql_types::get_text(row, 0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                let Some(invite_event_id) = invite_event_id else {
+                    last = format!("tenant_peer_id={} invite_event_id missing", tenant_peer_id);
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+
+                let inviter_peer_id =
+                    topo::transport::resolve_bootstrap_inviter_peer_id(
+                        &conn,
+                        tenant_peer_id,
+                        &invite_event_id,
+                    )
+                    .ok()
+                    .flatten();
+                let Some(inviter_peer_id) = inviter_peer_id else {
+                    last = format!(
+                        "tenant_peer_id={} invite_event_id={} inviter peer not projected yet",
+                        tenant_peer_id, invite_event_id
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+
+                let bound_daemon_peer_id = topo::transport::resolve_bound_daemon_peer_id(
+                    &conn,
+                    tenant_peer_id,
+                    &inviter_peer_id,
+                )
+                .ok()
+                .flatten();
+                if bound_daemon_peer_id.is_some() {
+                    return Ok(());
+                }
+
+                last = format!(
+                    "tenant_peer_id={} invite_event_id={} inviter_peer_id={} bound_daemon_peer_id=None",
+                    tenant_peer_id, invite_event_id, inviter_peer_id
+                );
+            }
+            Err(err) => {
+                last = format!("tenant_peer_id={} db unavailable: {}", tenant_peer_id, err);
+            }
         }
 
         std::thread::sleep(Duration::from_millis(100));

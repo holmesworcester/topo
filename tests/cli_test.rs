@@ -2856,6 +2856,11 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         &bob_alpha_peer_id,
         Duration::from_millis(timeout_ms),
     );
+    wait_for_tenant_inviter_route_ready(
+        &shared_db,
+        &bob_alpha_peer_id,
+        Duration::from_millis(timeout_ms),
+    );
     accept_invite_with_identity_on_running_daemon(
         &shared_db,
         &zeta_invite_fresh,
@@ -2870,6 +2875,11 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         &yuki_zeta_peer_id,
         Duration::from_millis(timeout_ms),
     );
+    wait_for_tenant_inviter_route_ready(
+        &shared_db,
+        &yuki_zeta_peer_id,
+        Duration::from_millis(timeout_ms),
+    );
     accept_invite_with_identity_on_running_daemon(
         &shared_db,
         &alpha_invite_reused,
@@ -2880,6 +2890,11 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
     wait_for_active_tenant_ready(&shared_db, Duration::from_millis(timeout_ms));
     let carol_alpha_peer_id = wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
     wait_for_tenant_transport_converged(
+        &shared_db,
+        &carol_alpha_peer_id,
+        Duration::from_millis(timeout_ms),
+    );
+    wait_for_tenant_inviter_route_ready(
         &shared_db,
         &carol_alpha_peer_id,
         Duration::from_millis(timeout_ms),
@@ -3983,19 +3998,30 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
         ],
     );
 
-    accept_invite_with_identity(
+    let _shared_daemon = start_daemon(&shared_db);
+    accept_invite_with_identity_on_running_daemon(
         &shared_db,
         &alpha_explicit_invite,
         "bob-alpha",
         "bob-terminal",
+        Duration::from_secs(10),
     );
-    accept_invite_with_identity(
+    let bob_peer_id = active_tenant_peer_id(&shared_db)
+        .expect("bob invite acceptance should make bob tenant active");
+    wait_for_tenant_transport_converged(&shared_db, &bob_peer_id, Duration::from_secs(10));
+    wait_for_tenant_inviter_route_ready(&shared_db, &bob_peer_id, Duration::from_secs(10));
+
+    accept_invite_with_identity_on_running_daemon(
         &shared_db,
         &alpha_explicit_invite_for_carol,
         "carol-alpha",
         "carol-terminal",
+        Duration::from_secs(10),
     );
-    let _shared_daemon = start_daemon(&shared_db);
+    let carol_peer_id = active_tenant_peer_id(&shared_db)
+        .expect("carol invite acceptance should make carol tenant active");
+    wait_for_tenant_transport_converged(&shared_db, &carol_peer_id, Duration::from_secs(10));
+    wait_for_tenant_inviter_route_ready(&shared_db, &carol_peer_id, Duration::from_secs(10));
     let alpha_transport_peer_id = daemon_transport_fingerprint(&alpha.db);
     wait_for_endpoint_observation(
         &shared_db,

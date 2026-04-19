@@ -4,13 +4,16 @@
 //! `DecisionContext` consumed by projector/context-load planners.
 //!
 //! Every `pub fn` below is an executable Rust core dispatcher consumed by
-//! `src/state/projection/queries.rs`. Postconditions (`ensures`) are SMT-checked
+//! `src/state/projection/decision_context.rs`. Postconditions (`ensures`) are SMT-checked
 //! against the function body by `cargo-verus verify`.
 //!
 //! Runtime carries rich payloads (String signer_event_ids, Vec<Option<String>>
 //! user_id lists). This Verus core reduces each dispatch to primitive booleans
 //! and counts — the runtime keeps the rich payloads locally and only delegates
 //! the tag-level dispatch decision.
+//!
+//! That includes the newer key-delivery context loaders, which now supply direct
+//! key-rotation and invite-history material into `ProjectorDecisionContext`.
 
 use vstd::prelude::*;
 

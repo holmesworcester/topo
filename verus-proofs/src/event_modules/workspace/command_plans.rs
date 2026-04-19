@@ -9,6 +9,10 @@
 //! core reduces each state/plan to a payload-less tag. The runtime wraps the core by
 //! projecting its rich variants down to tags, calling the verified dispatcher, then
 //! rehydrating the concrete payloads on the `Use*` branches.
+//!
+//! The mirrored runtime command surface now also carries invite bootstrap history ids
+//! and prefers deterministic local endpoint-shared resolution from daemon identity
+//! material when that state is present.
 
 use vstd::prelude::*;
 

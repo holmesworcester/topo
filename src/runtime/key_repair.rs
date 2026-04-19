@@ -373,9 +373,6 @@ fn accumulate_response_stats(
 fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> KeyRepairResult<usize> {
     let conn = open_connection(db_path)?;
     crate::db::schema::create_tables(&conn)?;
-    if !accepted_invite_history_ready(&conn, recorded_by)? {
-        return Ok(0);
-    }
     let blocked = blocked_encrypted_events(&conn, recorded_by)?;
     if blocked.is_empty() {
         return Ok(0);
@@ -589,61 +586,6 @@ fn local_repair_recipient_material(
     let unwrap_key_event_id = event_id_from_base64(&peer_secret_event_id_b64)
         .ok_or("invalid peer_secret.event_id base64")?;
     Ok((recipient_event_id, unwrap_key_event_id))
-}
-
-fn accepted_invite_history_ready(conn: &Connection, recorded_by: &str) -> KeyRepairResult<bool> {
-    let accepted: Option<(String, String)> = conn
-        .query_row(
-            "SELECT invite_event_id, workspace_id
-             FROM invites_accepted
-             WHERE recorded_by = ?1
-             ORDER BY created_at ASC, event_id ASC
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| {
-                Ok((
-                    crate::db::sql_types::get_text(row, 0)?,
-                    crate::db::sql_types::get_text(row, 1)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((invite_event_id_b64, workspace_id_b64)) = accepted else {
-        return Ok(true);
-    };
-    if invite_event_id_b64 == workspace_id_b64 {
-        return Ok(true);
-    }
-    let invite_row: Option<String> = conn
-        .query_row(
-            "SELECT key_history_event_id FROM user_invites WHERE recorded_by = ?1 AND event_id = ?2
-             UNION ALL
-             SELECT key_history_event_id FROM device_invites WHERE recorded_by = ?1 AND event_id = ?2
-             LIMIT 1",
-            rusqlite::params![recorded_by, &invite_event_id_b64],
-            |row| crate::db::sql_types::get_text(row, 0),
-        )
-        .optional()?;
-    let Some(key_history_event_id_b64) = invite_row else {
-        return Ok(false);
-    };
-    if key_history_event_id_b64.is_empty() {
-        return Ok(true);
-    }
-    let Some(key_history_event_id) = event_id_from_base64(&key_history_event_id_b64) else {
-        return Ok(false);
-    };
-    if key_history_event_id == [0u8; 32] {
-        return Ok(true);
-    }
-    Ok(conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM key_histories
-             WHERE recorded_by = ?1 AND event_id = ?2
-         )",
-        rusqlite::params![recorded_by, &key_history_event_id_b64],
-        |row| row.get(0),
-    )?)
 }
 
 fn known_key_requests(conn: &Connection, recorded_by: &str) -> KeyRepairResult<Vec<RequestRow>> {
