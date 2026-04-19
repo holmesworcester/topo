@@ -5,6 +5,7 @@
 
 mod drain;
 mod effects;
+mod immediate;
 mod phases;
 
 use std::collections::HashMap;
@@ -31,6 +32,9 @@ use self::effects::{
 use self::phases::{run_persist_phase, PersistPhaseOutput};
 
 pub use self::drain::drain_project_queue;
+pub use self::immediate::{
+    enqueue_direct_ingest_waiter, wait_for_ingest_waiters, DirectIngestWaiter, IngestWaiter,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImmediateIngestResult {

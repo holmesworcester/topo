@@ -1,40 +1,43 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use negentropy::{Id, NegentropyStorageBase, NegentropyStorageVector};
 use rusqlite::Connection;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot;
-use tracing::debug;
 
-use crate::crypto::{event_id_to_base64, hash_event, EventId};
+use crate::crypto::EventId;
 use crate::db::negentropy_cache::{sum_day_epochs, sum_week_epochs};
-use crate::db::queue::current_timestamp_ms;
 use crate::db::store::Store;
-use crate::protocol::{neg_id_to_event_id, Frame, MSG_TYPE_EVENT};
-use crate::sync::session::logging::SyncRunRxCapture;
-use crate::sync::session::receive::{enqueue_direct_ingest_waiter, IngestWaiter};
+use crate::protocol::{neg_id_to_event_id, MSG_TYPE_EVENT};
+use crate::sync::session::live_suppression::{send_have_events_live, LiveSuppressionSession};
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
-
 use topo_verus_proofs::runtime::sync_engine::session::range_session::{
     decide_shared_send_eligibility_plan, normalize_shared_send_eligibility_context,
     SharedSendEligibilityPlan, SharedSendEligibilityRawRows,
 };
-use crate::transport::connection::ConnectionError;
-use crate::transport::{StreamRecv, StreamSend};
-use crate::tuning::{
-    live_suppression_batch_settle_ms, live_suppression_event_id_cap, live_suppression_mode,
-    live_suppression_send_batch_size, low_mem_mode, response_send_quantum_bytes,
-};
+use crate::transport::StreamSend;
+use crate::tuning::{live_suppression_mode, live_suppression_prefetch_ids};
 
-const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
-const LIVE_SUPPRESSION_PREFETCH_IDS: usize = 32;
-const LOW_MEM_LIVE_SUPPRESSION_PREFETCH_IDS: usize = 8;
-const DIRECT_RECEIVE_BATCH_ITEM_CAP: usize = 8192;
-const DIRECT_RECEIVE_LARGE_BLOB_THRESHOLD_BYTES: usize = 64 * 1024;
-const DIRECT_RECEIVE_LARGE_BLOB_BATCH_MAX_BYTES: usize = 256 * 1024;
-const DIRECT_RECEIVE_SMALL_BLOB_BATCH_MAX_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::time::Duration;
+
+#[cfg(test)]
+use crate::crypto::event_id_to_base64;
+#[cfg(test)]
+use crate::protocol::Frame;
+#[cfg(test)]
+use crate::sync::session::live_suppression::{
+    live_suppression_key, open_live_suppression_session, publish_live_suppression_event,
+};
+#[cfg(test)]
+use crate::sync::session::receive_task::spawn_receive_task;
+#[cfg(test)]
+use crate::transport::connection::ConnectionError;
+#[cfg(test)]
+use crate::transport::StreamRecv;
+
 fn sync_order_profile_enabled() -> bool {
     std::env::var_os("TOPO_SYNC_ORDER_PROFILE").is_some()
 }
@@ -63,143 +66,6 @@ pub(crate) fn trace_negentropy_storage_items(
         Ok(true)
     })?;
     Ok(items)
-}
-
-pub struct RangeReceiveResult {
-    pub events_received: u64,
-    pub bytes_received: u64,
-    pub ingest_waiters: Vec<IngestWaiter>,
-}
-
-struct DirectReceiveBatchBuffer {
-    db_path: String,
-    recorded_by: String,
-    source_tag: String,
-    live_suppression_publish: Option<(LiveSuppressionCohortKey, u64)>,
-    batch: Vec<crate::contracts::event_pipeline_contract::IngestItem>,
-    batch_bytes: usize,
-    batch_has_large_blob: bool,
-    ingest_waiters: Vec<IngestWaiter>,
-}
-
-impl DirectReceiveBatchBuffer {
-    fn open(
-        db_path: String,
-        recorded_by: String,
-        source_tag: String,
-        live_suppression_publish: Option<(LiveSuppressionCohortKey, u64)>,
-    ) -> Self {
-        Self {
-            db_path,
-            recorded_by,
-            source_tag,
-            live_suppression_publish,
-            batch: Vec::with_capacity(DIRECT_RECEIVE_BATCH_ITEM_CAP),
-            batch_bytes: 0,
-            batch_has_large_blob: false,
-            ingest_waiters: Vec::new(),
-        }
-    }
-
-    fn append_blob(&mut self, event_id: &EventId, blob: &[u8], created_at_ms: Option<i64>) {
-        self.batch_bytes = self.batch_bytes.saturating_add(blob.len());
-        self.batch_has_large_blob |= blob.len() >= DIRECT_RECEIVE_LARGE_BLOB_THRESHOLD_BYTES;
-        self.batch.push((
-            *event_id,
-            blob.to_vec(),
-            self.recorded_by.clone(),
-            self.source_tag.clone(),
-            current_timestamp_ms(),
-            0,
-        ));
-        if let (Some((key, session_id)), Some(created_at_ms)) =
-            (&self.live_suppression_publish, created_at_ms)
-        {
-            publish_live_suppression_event(key, *session_id, *event_id, created_at_ms);
-        }
-    }
-
-    fn should_flush(&self) -> bool {
-        self.batch.len() >= DIRECT_RECEIVE_BATCH_ITEM_CAP
-            || self.batch_bytes >= self.batch_max_bytes()
-    }
-
-    fn batch_max_bytes(&self) -> usize {
-        if self.batch_has_large_blob {
-            DIRECT_RECEIVE_LARGE_BLOB_BATCH_MAX_BYTES
-        } else {
-            DIRECT_RECEIVE_SMALL_BLOB_BATCH_MAX_BYTES
-        }
-    }
-
-    async fn flush(&mut self) -> Result<(), String> {
-        if self.batch.is_empty() {
-            return Ok(());
-        }
-        let batch = std::mem::take(&mut self.batch);
-        self.batch_bytes = 0;
-        self.batch_has_large_blob = false;
-        let direct_waiter = enqueue_direct_ingest_waiter(&self.db_path, batch)
-            .await
-            .map_err(|e| format!("enqueue direct ingest batch: {e}"))?;
-        let (completion_tx, completion_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let result = match direct_waiter.await {
-                Ok(Ok(result)) => Ok(result.persisted_event_ids.len()),
-                Ok(Err(e)) => Err(format!("direct ingest batch: {e}")),
-                Err(e) => Err(format!("direct ingest waiter dropped: {e}")),
-            };
-            let _ = completion_tx.send(result);
-        });
-        self.ingest_waiters.push(completion_rx);
-        Ok(())
-    }
-
-    async fn finish(mut self) -> Result<Vec<IngestWaiter>, String> {
-        self.flush().await?;
-        Ok(self.ingest_waiters)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct LiveSuppressionCohortKey {
-    db_path: String,
-    recorded_by: String,
-    workspace_id: String,
-}
-
-struct LiveSuppressionRegistrySession {
-    remote_peer_id: String,
-    tx: UnboundedSender<EventId>,
-}
-
-#[derive(Default)]
-struct LiveSuppressionCohort {
-    sessions: HashMap<u64, LiveSuppressionRegistrySession>,
-    recent_order: VecDeque<EventId>,
-    recent_known: HashSet<EventId>,
-}
-
-struct LiveSuppressionRegistration {
-    key: LiveSuppressionCohortKey,
-    session_id: u64,
-    remote_peer_id: String,
-}
-
-pub struct LiveSuppressionSession {
-    _registration: LiveSuppressionRegistration,
-    settle_between_batches: bool,
-    outbound_suppression_rx: UnboundedReceiver<EventId>,
-    inbound_suppression_rx: UnboundedReceiver<Vec<EventId>>,
-    remote_done_rx: UnboundedReceiver<()>,
-}
-
-pub struct LiveSuppressionReceiveState {
-    key: LiveSuppressionCohortKey,
-    session_id: u64,
-    inbound_suppression_tx: UnboundedSender<Vec<EventId>>,
-    remote_done_tx: UnboundedSender<()>,
-    remote_done_notified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -682,293 +548,6 @@ fn prioritize_send_order(
     ))
 }
 
-fn live_suppression_registry(
-) -> &'static Mutex<HashMap<LiveSuppressionCohortKey, LiveSuppressionCohort>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<LiveSuppressionCohortKey, LiveSuppressionCohort>>> =
-        OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn live_suppression_key(
-    db_path: &str,
-    recorded_by: &str,
-    workspace_id: &str,
-) -> LiveSuppressionCohortKey {
-    LiveSuppressionCohortKey {
-        db_path: db_path.to_string(),
-        recorded_by: recorded_by.to_string(),
-        workspace_id: workspace_id.to_string(),
-    }
-}
-
-impl Drop for LiveSuppressionRegistration {
-    fn drop(&mut self) {
-        let mut registry = live_suppression_registry()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(cohort) = registry.get_mut(&self.key) {
-            cohort.sessions.remove(&self.session_id);
-        }
-    }
-}
-
-pub fn open_live_suppression_session(
-    db_path: &str,
-    recorded_by: &str,
-    workspace_id: &str,
-    remote_peer_id: &str,
-    settle_between_batches: bool,
-    _range: SyncWindow,
-    session_id: u64,
-) -> Option<(LiveSuppressionSession, LiveSuppressionReceiveState)> {
-    if !live_suppression_mode() {
-        return None;
-    }
-
-    let key = live_suppression_key(db_path, recorded_by, workspace_id);
-    let (outbound_suppression_tx, outbound_suppression_rx) = mpsc::unbounded_channel();
-    {
-        let mut registry = live_suppression_registry()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cohort = registry.entry(key.clone()).or_default();
-        for event_id in &cohort.recent_order {
-            let _ = outbound_suppression_tx.send(*event_id);
-        }
-        cohort.sessions.insert(
-            session_id,
-            LiveSuppressionRegistrySession {
-                remote_peer_id: remote_peer_id.to_string(),
-                tx: outbound_suppression_tx,
-            },
-        );
-    }
-
-    let (inbound_suppression_tx, inbound_suppression_rx) = mpsc::unbounded_channel();
-    let (remote_done_tx, remote_done_rx) = mpsc::unbounded_channel();
-    Some((
-        LiveSuppressionSession {
-            _registration: LiveSuppressionRegistration {
-                key: key.clone(),
-                session_id,
-                remote_peer_id: remote_peer_id.to_string(),
-            },
-            settle_between_batches,
-            outbound_suppression_rx,
-            inbound_suppression_rx,
-            remote_done_rx,
-        },
-        LiveSuppressionReceiveState {
-            key,
-            session_id,
-            inbound_suppression_tx,
-            remote_done_tx,
-            remote_done_notified: false,
-        },
-    ))
-}
-
-impl LiveSuppressionSession {
-    fn should_settle_between_batches(&self) -> bool {
-        self.settle_between_batches
-            || live_suppression_has_distinct_remote_peer(&self._registration)
-    }
-}
-
-fn live_suppression_has_distinct_remote_peer(registration: &LiveSuppressionRegistration) -> bool {
-    let registry = live_suppression_registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registry
-        .get(&registration.key)
-        .map(|cohort| {
-            cohort.sessions.iter().any(|(session_id, session)| {
-                *session_id != registration.session_id
-                    && session.remote_peer_id != registration.remote_peer_id
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn publish_live_suppression_event(
-    key: &LiveSuppressionCohortKey,
-    origin_session_id: u64,
-    event_id: EventId,
-    _created_at_ms: i64,
-) {
-    let mut registry = live_suppression_registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut stale_sessions = Vec::new();
-    let cap = live_suppression_event_id_cap();
-    if let Some(cohort) = registry.get_mut(key) {
-        if cohort.recent_known.insert(event_id) {
-            cohort.recent_order.push_back(event_id);
-            while cohort.recent_order.len() > cap {
-                if let Some(evicted) = cohort.recent_order.pop_front() {
-                    cohort.recent_known.remove(&evicted);
-                }
-            }
-        }
-        for (session_id, session) in cohort.sessions.iter() {
-            if *session_id == origin_session_id {
-                continue;
-            }
-            if session.tx.send(event_id).is_err() {
-                stale_sessions.push(*session_id);
-            }
-        }
-        for session_id in stale_sessions {
-            cohort.sessions.remove(&session_id);
-        }
-    }
-}
-
-fn live_suppression_prefetch_ids() -> usize {
-    if low_mem_mode() {
-        LOW_MEM_LIVE_SUPPRESSION_PREFETCH_IDS
-    } else {
-        LIVE_SUPPRESSION_PREFETCH_IDS
-    }
-}
-
-fn enqueue_remote_suppressions(ids: &[EventId], suppressed_ids: &mut HashSet<EventId>, cap: usize) {
-    for event_id in ids {
-        if suppressed_ids.len() >= cap && !suppressed_ids.contains(event_id) {
-            break;
-        }
-        suppressed_ids.insert(*event_id);
-    }
-}
-
-fn drain_remote_suppression_rx(
-    rx: &mut UnboundedReceiver<Vec<EventId>>,
-    suppressed_ids: &mut HashSet<EventId>,
-    cap: usize,
-) {
-    while let Ok(ids) = rx.try_recv() {
-        enqueue_remote_suppressions(&ids, suppressed_ids, cap);
-    }
-}
-
-fn enqueue_outbound_suppression(
-    event_id: EventId,
-    outbound_pending: &mut VecDeque<EventId>,
-    outbound_known: &mut HashSet<EventId>,
-    cap: usize,
-) {
-    if outbound_known.len() >= cap && !outbound_known.contains(&event_id) {
-        return;
-    }
-    if outbound_known.insert(event_id) {
-        outbound_pending.push_back(event_id);
-    }
-}
-
-fn drain_outbound_suppression_rx(
-    rx: &mut UnboundedReceiver<EventId>,
-    outbound_pending: &mut VecDeque<EventId>,
-    outbound_known: &mut HashSet<EventId>,
-    cap: usize,
-) {
-    while let Ok(event_id) = rx.try_recv() {
-        enqueue_outbound_suppression(event_id, outbound_pending, outbound_known, cap);
-    }
-}
-
-async fn wait_for_live_suppression_signal(
-    live_suppression: &mut LiveSuppressionSession,
-    outbound_pending: &mut VecDeque<EventId>,
-    outbound_known: &mut HashSet<EventId>,
-    suppressed_ids: &mut HashSet<EventId>,
-    remote_done: &mut bool,
-    cap: usize,
-) {
-    let settle_ms = live_suppression_batch_settle_ms();
-    if settle_ms == 0 {
-        return;
-    }
-    if !live_suppression.should_settle_between_batches() {
-        // The settle delay exists to give other source peers time to receive
-        // suppression. In a 1:1 cohort it only throttles the sole sender.
-        return;
-    }
-
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_millis(settle_ms)) => {}
-        maybe_event_id = live_suppression.outbound_suppression_rx.recv() => {
-            if let Some(event_id) = maybe_event_id {
-                enqueue_outbound_suppression(event_id, outbound_pending, outbound_known, cap);
-            }
-        }
-        maybe_ids = live_suppression.inbound_suppression_rx.recv() => {
-            if let Some(ids) = maybe_ids {
-                enqueue_remote_suppressions(&ids, suppressed_ids, cap);
-            }
-        }
-        maybe_done = live_suppression.remote_done_rx.recv() => {
-            if maybe_done.is_some() {
-                *remote_done = true;
-            }
-        }
-    }
-}
-
-fn maybe_note_remote_done(state: &mut Option<LiveSuppressionReceiveState>) {
-    let Some(state) = state.as_mut() else {
-        return;
-    };
-    if state.remote_done_notified {
-        return;
-    }
-    let _ = state.remote_done_tx.send(());
-    state.remote_done_notified = true;
-}
-
-fn refill_live_send_queue(
-    store: &Store<'_>,
-    ordered_ids: &[EventId],
-    next_idx: &mut usize,
-    suppressed_ids: &HashSet<EventId>,
-    send_queue: &mut VecDeque<(EventId, Vec<u8>)>,
-) -> Result<(), String> {
-    let prefetch = live_suppression_prefetch_ids();
-    while send_queue.len() < prefetch && *next_idx < ordered_ids.len() {
-        let remaining = prefetch.saturating_sub(send_queue.len()).max(1);
-        let mut refill_ids = Vec::with_capacity(remaining);
-        while refill_ids.len() < remaining && *next_idx < ordered_ids.len() {
-            let event_id = ordered_ids[*next_idx];
-            *next_idx += 1;
-            if suppressed_ids.contains(&event_id) {
-                continue;
-            }
-            refill_ids.push(event_id);
-        }
-        if refill_ids.is_empty() {
-            break;
-        }
-        let loaded = load_shared_send_batch(store, &refill_ids)?;
-        if trace_dep_send_ids_enabled() {
-            let loaded_ids = loaded
-                .iter()
-                .map(|(event_id, _)| *event_id)
-                .collect::<Vec<_>>();
-            debug!(
-                target: "topo::sync_operation",
-                refill_requested_ids = ?trace_event_id_list(&refill_ids),
-                refill_loaded_ids = ?trace_event_id_list(&loaded_ids),
-                "live send queue refill"
-            );
-        }
-        for (event_id, blob) in loaded {
-            if !suppressed_ids.contains(&event_id) {
-                send_queue.push_back((event_id, blob));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn order_requested_ids_for_send(
     conn: &Connection,
     store: &Store<'_>,
@@ -1099,198 +678,6 @@ pub fn order_phase2_then_phase1_shared_event_ids_for_send_for_peer(
     )
 }
 
-async fn send_have_events_live<S>(
-    store: &Store<'_>,
-    data_send: &mut S,
-    ordered_ids: &[EventId],
-    range: SyncWindow,
-    live_suppression: &mut LiveSuppressionSession,
-) -> Result<(u64, u64), String>
-where
-    S: StreamSend,
-{
-    let cap = live_suppression_event_id_cap();
-    let suppression_batch_size = live_suppression_send_batch_size();
-    let mut events_sent = 0u64;
-    let mut bytes_sent = 0u64;
-    debug!(
-        target: "topo::sync_operation",
-        range = ?range.kind,
-        requested_count = ordered_ids.len(),
-        ordered_count = ordered_ids.len(),
-        suppression_cap = cap,
-        suppression_batch_size,
-        "live suppression sender starting"
-    );
-    let mut next_idx = 0usize;
-    let mut send_queue = VecDeque::<(EventId, Vec<u8>)>::new();
-    let mut suppressed_ids = HashSet::<EventId>::new();
-    let mut outbound_known = HashSet::<EventId>::new();
-    let mut outbound_pending = VecDeque::<EventId>::new();
-    let mut local_done_sent = false;
-    let mut remote_done = false;
-
-    loop {
-        drain_outbound_suppression_rx(
-            &mut live_suppression.outbound_suppression_rx,
-            &mut outbound_pending,
-            &mut outbound_known,
-            cap,
-        );
-        drain_remote_suppression_rx(
-            &mut live_suppression.inbound_suppression_rx,
-            &mut suppressed_ids,
-            cap,
-        );
-        while live_suppression.remote_done_rx.try_recv().is_ok() {
-            remote_done = true;
-        }
-        while matches!(
-            send_queue.front(),
-            Some((event_id, _)) if suppressed_ids.contains(event_id)
-        ) {
-            send_queue.pop_front();
-        }
-        refill_live_send_queue(
-            store,
-            &ordered_ids,
-            &mut next_idx,
-            &suppressed_ids,
-            &mut send_queue,
-        )?;
-        while matches!(
-            send_queue.front(),
-            Some((event_id, _)) if suppressed_ids.contains(event_id)
-        ) {
-            send_queue.pop_front();
-        }
-
-        if !outbound_pending.is_empty() {
-            let mut ids = Vec::with_capacity(suppression_batch_size);
-            while ids.len() < suppression_batch_size {
-                let Some(event_id) = outbound_pending.pop_front() else {
-                    break;
-                };
-                ids.push(event_id);
-            }
-            if !ids.is_empty() {
-                data_send
-                    .send(&Frame::SuppressIds { ids })
-                    .await
-                    .map_err(|e| format!("send suppression frame: {e}"))?;
-                data_send
-                    .flush()
-                    .await
-                    .map_err(|e| format!("flush suppression frame: {e}"))?;
-                continue;
-            }
-        }
-
-        if let Some((event_id, blob)) = send_queue.pop_front() {
-            let mut payload = Vec::new();
-            let batch_cap = live_suppression_prefetch_ids();
-            let byte_cap = response_send_quantum_bytes();
-            let mut batch_events = 0usize;
-            let mut next_item = Some((event_id, blob));
-            while let Some((event_id, blob)) = next_item.take() {
-                if suppressed_ids.contains(&event_id) {
-                    next_item = send_queue.pop_front();
-                    continue;
-                }
-                let frame_len = 1usize.saturating_add(4).saturating_add(blob.len());
-                if !payload.is_empty()
-                    && (batch_events >= batch_cap
-                        || payload.len().saturating_add(frame_len) > byte_cap)
-                {
-                    send_queue.push_front((event_id, blob));
-                    break;
-                }
-                append_event_frame_bytes(&mut payload, &blob)?;
-                bytes_sent += blob.len() as u64;
-                events_sent += 1;
-                batch_events += 1;
-                if batch_events >= batch_cap {
-                    break;
-                }
-                next_item = send_queue.pop_front();
-            }
-            if !payload.is_empty() {
-                data_send
-                    .send_bytes(&payload)
-                    .await
-                    .map_err(|e| format!("send live suppression event batch: {e}"))?;
-                data_send
-                    .flush()
-                    .await
-                    .map_err(|e| format!("flush live suppression event batch: {e}"))?;
-                wait_for_live_suppression_signal(
-                    live_suppression,
-                    &mut outbound_pending,
-                    &mut outbound_known,
-                    &mut suppressed_ids,
-                    &mut remote_done,
-                    cap,
-                )
-                .await;
-            }
-            continue;
-        }
-
-        if !local_done_sent {
-            data_send
-                .send(&Frame::RangeDataDone)
-                .await
-                .map_err(|e| format!("send range data done: {e}"))?;
-            data_send
-                .flush()
-                .await
-                .map_err(|e| format!("flush range data done: {e}"))?;
-            local_done_sent = true;
-            if remote_done {
-                break;
-            }
-            continue;
-        }
-
-        if remote_done {
-            break;
-        }
-
-        tokio::select! {
-            maybe_event_id = live_suppression.outbound_suppression_rx.recv() => {
-                if let Some(event_id) = maybe_event_id {
-                    enqueue_outbound_suppression(event_id, &mut outbound_pending, &mut outbound_known, cap);
-                }
-            }
-            maybe_ids = live_suppression.inbound_suppression_rx.recv() => {
-                if let Some(ids) = maybe_ids {
-                    enqueue_remote_suppressions(&ids, &mut suppressed_ids, cap);
-                }
-            }
-            maybe_done = live_suppression.remote_done_rx.recv() => {
-                if maybe_done.is_some() {
-                    remote_done = true;
-                }
-            }
-        }
-    }
-
-    data_send
-        .flush()
-        .await
-        .map_err(|e| format!("flush range data stream: {e}"))?;
-    debug!(
-        target: "topo::sync_operation",
-        range = ?range.kind,
-        events_sent,
-        bytes_sent,
-        remote_suppressed_count = suppressed_ids.len(),
-        local_suppressed_count = outbound_known.len(),
-        "live suppression sender complete"
-    );
-    Ok((events_sent, bytes_sent))
-}
-
 pub async fn send_selected_events<S>(
     store: &Store<'_>,
     data_send: &mut S,
@@ -1371,158 +758,13 @@ where
     .await
 }
 
-fn parse_next_blob_record(buffer: &[u8], offset: &mut usize) -> Result<Option<Vec<u8>>, String> {
-    if *offset >= buffer.len() {
-        return Ok(None);
-    }
-    if buffer.len() - *offset < RANGE_DATA_RECORD_PREFIX_LEN {
-        return Ok(None);
-    }
-    let blob_len = u32::from_le_bytes(
-        buffer[*offset..*offset + RANGE_DATA_RECORD_PREFIX_LEN]
-            .try_into()
-            .map_err(|_| "range data record length truncated".to_string())?,
-    ) as usize;
-    let record_len = RANGE_DATA_RECORD_PREFIX_LEN.saturating_add(blob_len);
-    if buffer.len() - *offset < record_len {
-        return Ok(None);
-    }
-    let blob_start = *offset + RANGE_DATA_RECORD_PREFIX_LEN;
-    let blob_end = blob_start + blob_len;
-    let blob = buffer[blob_start..blob_end].to_vec();
-    *offset += record_len;
-    Ok(Some(blob))
-}
-
-fn event_created_at_ms(blob: &[u8]) -> Option<i64> {
-    crate::event_modules::extract_created_at_ms(blob)
-        .and_then(|created_at_ms| i64::try_from(created_at_ms).ok())
-}
-
-fn append_event_frame_bytes(payload: &mut Vec<u8>, blob: &[u8]) -> Result<(), String> {
+pub(crate) fn append_event_frame_bytes(payload: &mut Vec<u8>, blob: &[u8]) -> Result<(), String> {
     let blob_len = u32::try_from(blob.len())
         .map_err(|_| format!("range event too large: {} bytes", blob.len()))?;
     payload.push(MSG_TYPE_EVENT);
     payload.extend_from_slice(&blob_len.to_le_bytes());
     payload.extend_from_slice(blob);
     Ok(())
-}
-
-pub fn spawn_receive_task<R>(
-    data_recv: R,
-    db_path: String,
-    recorded_by: String,
-    _workspace_id: String,
-    _range: SyncWindow,
-    session_id: u64,
-    source_tag: String,
-    idle_timeout: Duration,
-    rx_capture: Option<SyncRunRxCapture>,
-    live_suppression: Option<LiveSuppressionReceiveState>,
-) -> tokio::task::JoinHandle<Result<RangeReceiveResult, String>>
-where
-    R: StreamRecv + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut data_recv = data_recv;
-        let live_suppression_publish = live_suppression
-            .as_ref()
-            .map(|state| (state.key.clone(), state.session_id));
-        let mut receive_buffer = DirectReceiveBatchBuffer::open(
-            db_path.clone(),
-            recorded_by.clone(),
-            source_tag.clone(),
-            live_suppression_publish,
-        );
-        let mut events_received = 0u64;
-        let mut bytes_received = 0u64;
-        let mut live_suppression = live_suppression;
-
-        if live_suppression.is_some() {
-            debug!(
-                target: "topo::sync_operation",
-                session_id,
-                source = %source_tag,
-                "live suppression receive task starting"
-            );
-            loop {
-                let next = tokio::time::timeout(idle_timeout, data_recv.recv()).await;
-                match next {
-                    Ok(Ok(Frame::Event { blob })) => {
-                        let event_id = hash_event(&blob);
-                        let created_at_ms = event_created_at_ms(&blob);
-                        if let Some(capture) = &rx_capture {
-                            capture.record_event_id_b64(event_id_to_base64(&event_id));
-                        }
-                        receive_buffer.append_blob(&event_id, &blob, created_at_ms);
-                        if receive_buffer.should_flush() {
-                            receive_buffer.flush().await?;
-                        }
-                        bytes_received += blob.len() as u64;
-                        events_received += 1;
-                    }
-                    Ok(Ok(Frame::SuppressIds { ids })) => {
-                        if let Some(state) = &live_suppression {
-                            let _ = state.inbound_suppression_tx.send(ids);
-                        }
-                    }
-                    Ok(Ok(Frame::RangeDataDone)) => {
-                        maybe_note_remote_done(&mut live_suppression);
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(ConnectionError::Closed)) | Ok(Err(_)) | Err(_) => {
-                        maybe_note_remote_done(&mut live_suppression);
-                        break;
-                    }
-                }
-            }
-            debug!(
-                target: "topo::sync_operation",
-                session_id,
-                source = %source_tag,
-                events_received,
-                bytes_received,
-                "live suppression receive task complete"
-            );
-        } else {
-            let mut buffer = Vec::<u8>::with_capacity(64 * 1024);
-            loop {
-                let next = tokio::time::timeout(idle_timeout, data_recv.recv_chunk()).await;
-                match next {
-                    Ok(Ok(chunk)) => {
-                        buffer.extend_from_slice(&chunk);
-                        let mut offset = 0usize;
-                        while let Some(blob) = parse_next_blob_record(&buffer, &mut offset)? {
-                            let event_id = hash_event(&blob);
-                            let created_at_ms = event_created_at_ms(&blob);
-                            if let Some(capture) = &rx_capture {
-                                capture.record_event_id_b64(event_id_to_base64(&event_id));
-                            }
-                            receive_buffer.append_blob(&event_id, &blob, created_at_ms);
-                            if receive_buffer.should_flush() {
-                                receive_buffer.flush().await?;
-                            }
-                            bytes_received += blob.len() as u64;
-                            events_received += 1;
-                        }
-                        if offset > 0 {
-                            buffer.drain(..offset);
-                        }
-                    }
-                    Ok(Err(ConnectionError::Closed)) => break,
-                    Ok(Err(_)) => break,
-                    Err(_) => break,
-                }
-            }
-        }
-
-        let ingest_waiters = receive_buffer.finish().await?;
-        Ok(RangeReceiveResult {
-            events_received,
-            bytes_received,
-            ingest_waiters,
-        })
-    })
 }
 
 #[cfg(test)]
@@ -2878,11 +2120,6 @@ mod tests {
     #[test]
     fn live_suppression_registry_replays_recent_state_between_sessions() {
         let _env = EnvGuard::enable_live_suppression();
-        let range = SyncWindow {
-            kind: SyncWindowKind::LastDay,
-            ts_min_inclusive_ms: Some(10),
-            ts_max_exclusive_ms: None,
-        };
         let key = live_suppression_key("/tmp/live-suppress.db", "tenant-a", "workspace-a");
         let (_session_a, _) = open_live_suppression_session(
             "/tmp/live-suppress.db",
@@ -2890,7 +2127,6 @@ mod tests {
             "workspace-a",
             "remote-a",
             false,
-            range,
             1,
         )
         .expect("open first suppression session");
@@ -2900,7 +2136,6 @@ mod tests {
             "workspace-a",
             "remote-b",
             false,
-            range,
             2,
         )
         .expect("open second suppression session");
@@ -2923,7 +2158,6 @@ mod tests {
             "workspace-a",
             "remote-c",
             false,
-            range,
             3,
         )
         .expect("open fresh suppression session");
@@ -2939,18 +2173,12 @@ mod tests {
     #[test]
     fn live_suppression_settle_requires_distinct_remote_peer() {
         let _env = EnvGuard::enable_live_suppression();
-        let range = SyncWindow {
-            kind: SyncWindowKind::LastDay,
-            ts_min_inclusive_ms: Some(10),
-            ts_max_exclusive_ms: None,
-        };
         let (session_a, _) = open_live_suppression_session(
             "/tmp/live-settle.db",
             "tenant-a",
             "workspace-a",
             "remote-a",
             false,
-            range,
             1,
         )
         .expect("open first suppression session");
@@ -2965,7 +2193,6 @@ mod tests {
             "workspace-a",
             "remote-a",
             false,
-            range,
             2,
         )
         .expect("open duplicate-peer suppression session");
@@ -2981,7 +2208,6 @@ mod tests {
             "workspace-a",
             "remote-b",
             false,
-            range,
             3,
         )
         .expect("open distinct-peer suppression session");
@@ -2992,16 +2218,6 @@ mod tests {
     #[test]
     fn live_suppression_event_notifies_same_workspace_regardless_of_range() {
         let _env = EnvGuard::enable_live_suppression();
-        let hot_range = SyncWindow {
-            kind: SyncWindowKind::LastDay,
-            ts_min_inclusive_ms: Some(10),
-            ts_max_exclusive_ms: Some(100),
-        };
-        let cold_range = SyncWindow {
-            kind: SyncWindowKind::LastWeek,
-            ts_min_inclusive_ms: Some(100),
-            ts_max_exclusive_ms: Some(200),
-        };
         let key = live_suppression_key("/tmp/live-overlap.db", "tenant-a", "workspace-a");
         let (_origin_session, _) = open_live_suppression_session(
             "/tmp/live-overlap.db",
@@ -3009,7 +2225,6 @@ mod tests {
             "workspace-a",
             "remote-a",
             false,
-            hot_range,
             1,
         )
         .expect("open origin suppression session");
@@ -3019,7 +2234,6 @@ mod tests {
             "workspace-a",
             "remote-b",
             false,
-            hot_range,
             2,
         )
         .expect("open overlapping suppression session");
@@ -3029,7 +2243,6 @@ mod tests {
             "workspace-a",
             "remote-c",
             false,
-            cold_range,
             3,
         )
         .expect("open non-overlapping suppression session");
@@ -3039,7 +2252,6 @@ mod tests {
             "workspace-b",
             "remote-d",
             false,
-            hot_range,
             4,
         )
         .expect("open other workspace suppression session");
@@ -3110,7 +2322,6 @@ mod tests {
             "workspace-live-sender",
             "remote-a",
             false,
-            range,
             11,
         )
         .expect("open live suppression sender state");
@@ -3229,7 +2440,6 @@ mod tests {
             &workspace_id,
             "remote-a",
             false,
-            range,
             21,
         )
         .expect("open sibling suppression session");
@@ -3239,7 +2449,6 @@ mod tests {
             &workspace_id,
             "remote-b",
             false,
-            range,
             22,
         )
         .expect("open primary suppression session");
@@ -3263,8 +2472,6 @@ mod tests {
             ]),
             db_path.to_str().unwrap().to_string(),
             "tenant-a".to_string(),
-            workspace_id.clone(),
-            range,
             22,
             "quic_recv:peer@example".to_string(),
             Duration::from_secs(1),
@@ -3282,7 +2489,7 @@ mod tests {
                 .expect("sibling suppression delivery before ingest wait"),
             event_id
         );
-        crate::sync::session::receive::wait_for_ingest_waiters(result.ingest_waiters)
+        crate::state::pipeline::wait_for_ingest_waiters(result.ingest_waiters)
             .await
             .unwrap();
         assert_eq!(

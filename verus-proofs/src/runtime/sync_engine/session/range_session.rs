@@ -1,5 +1,9 @@
 //! Range-session shared-send eligibility planner — verified core.
 //!
+//! Live suppression and receive-task mechanics now live in dedicated runtime
+//! modules; this mirror continues to cover the durable send-planning
+//! normalization that remains in `range_session.rs`.
+//!
 //! Each `pub fn` below is executable Rust consumed by
 //! `src/runtime/sync_engine/session/range_session.rs`. Postconditions (`ensures`) are
 //! SMT-checked against the function body by `cargo-verus verify`.
