@@ -45,14 +45,6 @@ EXEMPT_FILES = {
     # the decide-fn outcome against its own richer auth planner via
     # debug_assert_eq! in src/runtime/transport/session_auth.rs.
     "runtime/transport/session_auth.rs",
-    # state/access_control.rs: system-level access-control theorem over an
-    # abstract event-graph spec. All spec/proof fns (engine_invariant,
-    # apply_preserves_invariant, lemma_*, non_invited_cannot_decrypt,
-    # system_invariant_holds) are SMT-proven; the file has no runtime exec fn
-    # because the abstract apply_spec has no runtime counterpart yet. The
-    # next stage is to show the runtime projector refines apply_spec. This
-    # exemption should be removed when that refinement bridge lands.
-    "state/access_control.rs",
 }
 
 SPEC_FN_PATTERN = re.compile(r"^\s*(pub\s+)?(open|closed)\s+spec\s+fn\s+(\w+)", re.MULTILINE)
