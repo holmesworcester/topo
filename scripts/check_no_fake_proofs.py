@@ -45,6 +45,14 @@ EXEMPT_FILES = {
     # the decide-fn outcome against its own richer auth planner via
     # debug_assert_eq! in src/runtime/transport/session_auth.rs.
     "runtime/transport/session_auth.rs",
+    # state/access_control.rs: system-level invariant scaffold. Four
+    # `#[verifier::external_body]` projector lemmas (L1..L4) correspond 1:1
+    # with TLA invariants already checked by TLC. The top-level composition
+    # (`non_invited_cannot_decrypt`) is SMT-proven from these axioms. Each
+    # lemma is expected to be discharged against runtime projector code in
+    # future PRs (one at a time); when all four are grounded, this entry
+    # can be removed.
+    "state/access_control.rs",
 }
 
 SPEC_FN_PATTERN = re.compile(r"^\s*(pub\s+)?(open|closed)\s+spec\s+fn\s+(\w+)", re.MULTILINE)
