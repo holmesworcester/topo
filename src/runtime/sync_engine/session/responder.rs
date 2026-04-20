@@ -8,17 +8,18 @@ use crate::db::{open_connection, store::Store};
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::peering::loops::live_session_peer_ids;
 use crate::runtime::sync_engine::session::admission::resolve_sync_admission;
+use crate::runtime::sync_engine::session::data_plane::{
+    drain_manual_commands, reply_manual_rounds, run_range_data_plane, sort_dedup_event_ids,
+    sort_dedup_ids,
+};
 use crate::runtime::sync_engine::session::depsync::{
     build_candidate_storage, build_range_dep_storage, decode_dep_sync_control,
     encode_dep_sync_control, DepSyncControlPayload,
 };
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
-use crate::sync::session::range_session::{
-    open_live_suppression_session, order_phase2_then_phase1_shared_event_ids_for_send_for_peer,
-    send_selected_events, spawn_receive_task,
-};
-use crate::sync::session::receive::{acquire_peer_session_ingest_guard, wait_for_ingest_waiters};
+use crate::sync::session::range_session::order_phase2_then_phase1_shared_event_ids_for_send_for_peer;
+use crate::sync::session::receive::acquire_peer_session_ingest_guard;
 use crate::sync::session::windowing::{
     decode_initial_neg_open, encode_sync_window_kind, is_low_mem_allowed_window, SyncWindowKind,
 };
@@ -26,54 +27,6 @@ use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SI
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use crate::tuning::low_mem_mode;
 use negentropy::{DepReconcileDiff, DepReconciler, Id, Negentropy};
-
-type ManualRoundReply =
-    std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>>;
-
-fn drain_manual_commands(
-    command_rx: &mut Option<
-        tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
-    >,
-    pending_round_replies: &mut Vec<ManualRoundReply>,
-) {
-    let Some(rx) = command_rx.as_mut() else {
-        return;
-    };
-    while let Ok(cmd) = rx.try_recv() {
-        match cmd {
-            crate::runtime::sync_control::SessionCommand::ForceRound { reply } => {
-                pending_round_replies.push(reply);
-            }
-        }
-    }
-}
-
-fn reply_manual_rounds(
-    peer_id: &str,
-    need_ids: &[crate::crypto::EventId],
-    pending_round_replies: &mut Vec<ManualRoundReply>,
-) {
-    if pending_round_replies.is_empty() {
-        return;
-    }
-    let observed_ids: Vec<String> = need_ids.iter().map(hex::encode).collect();
-    for reply in pending_round_replies.drain(..) {
-        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRoundCapture {
-            peer_id: peer_id.to_string(),
-            observed_ids: observed_ids.clone(),
-        }));
-    }
-}
-
-fn sort_dedup_ids(ids: &mut Vec<Id>) {
-    ids.sort_unstable();
-    ids.dedup();
-}
-
-fn sort_dedup_event_ids(ids: &mut Vec<crate::crypto::EventId>) {
-    ids.sort_unstable();
-    ids.dedup();
-}
 
 /// Run sync as the responder for one requested range.
 #[allow(clippy::too_many_arguments)]
@@ -97,7 +50,7 @@ where
 {
     let DualConnection {
         mut control,
-        mut data_send,
+        data_send,
         data_recv,
     } = conn;
     let start = Instant::now();
@@ -362,69 +315,33 @@ where
     }
 
     let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
-    let settle_between_batches = live_peer_ids.len() > 1;
-    let (mut live_suppression, receive_live_suppression) = if let Some((session, receive_state)) =
-        open_live_suppression_session(
-            db_path,
-            recorded_by,
-            &ws_id,
-            peer_id,
-            settle_between_batches,
-            range,
-            session_id,
-        ) {
-        (Some(session), Some(receive_state))
-    } else {
-        (None, None)
-    };
-    let receive_task = spawn_receive_task(
+    let data_plane = run_range_data_plane(
+        &store,
+        data_send,
         data_recv,
-        db_path.to_string(),
-        recorded_by.to_string(),
-        ws_id.clone(),
+        Some(_peer_session_ingest_guard),
+        db_path,
+        recorded_by,
+        &ws_id,
+        peer_id,
         range,
         session_id,
-        ingress_source_tag.to_string(),
+        ingress_source_tag,
         activity_timeout,
         rx_capture,
-        receive_live_suppression,
-    );
-    let (events_sent, bytes_sent) = send_selected_events(
-        &store,
-        &mut data_send,
+        live_peer_ids.len(),
         &ordered_send_event_ids,
-        range,
-        live_suppression.as_mut(),
+        "responder sync session complete",
     )
     .await?;
-    drop(data_send);
-
-    let received = match receive_task.await {
-        Ok(result) => result.map_err(|e| format!("receive task: {e}"))?,
-        Err(e) => return Err(format!("receive task join: {e}").into()),
-    };
-    if let Err(e) = wait_for_ingest_waiters(received.ingest_waiters).await {
-        return Err(format!("direct ingest wait: {e}").into());
-    }
-    debug!(
-        target: "topo::sync_operation",
-        session_id,
-        peer = %&peer_id[..peer_id.len().min(16)],
-        range = ?range.kind,
-        events_sent,
-        events_received = received.events_received,
-        bytes_sent,
-        bytes_received = received.bytes_received,
-        "responder sync session complete"
-    );
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
 
     Ok(SyncStats {
-        events_sent,
-        events_received: received.events_received,
+        events_sent: data_plane.events_sent,
+        events_received: data_plane.events_received,
         neg_rounds: 1 + u64::from(phase2_used),
-        bytes_sent,
-        bytes_received: received.bytes_received,
+        bytes_sent: data_plane.bytes_sent,
+        bytes_received: data_plane.bytes_received,
         duration_ms: start.elapsed().as_millis(),
     })
 }

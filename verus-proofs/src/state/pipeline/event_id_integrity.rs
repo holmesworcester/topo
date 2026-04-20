@@ -10,6 +10,9 @@
 //! verify here is the structural boundary: the claimed id must byte-for-byte equal
 //! the computed hash. `ingest_now` calls this per item before writing to the
 //! `events` table; a mismatch panics with the offending id.
+//! The runtime pipeline now re-exports the direct-ingest helpers from
+//! `src/state/pipeline/immediate.rs`, but those helpers still consume
+//! `IngestItem` values produced at the same wire boundary.
 
 use vstd::prelude::*;
 
