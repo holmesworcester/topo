@@ -97,7 +97,11 @@ both `pass` and `break` polarity unless waived.
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::tenant::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::core_projection::test_project_reaction_blocked | break |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_admin_projects_with_workspace_signer_family | pass |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_admin_projects_with_peer_signed_admin_authority | pass |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_admin_rejects_wrong_signer_family_at_projection | break |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_AUTHORITY | pipeline_integration | apply::tests::identity::test_admin_projects_with_workspace_signer_family | pass |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_AUTHORITY | pipeline_integration | apply::tests::identity::test_admin_projects_with_peer_signed_admin_authority | pass |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_AUTHORITY | pipeline_integration | apply::tests::identity::test_admin_rejects_peer_signed_authority_mismatch_at_projection | break |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | projector_unit | event_modules::admin::projector::projector_tests::test_admin_valid_with_matching_user_binding | pass |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | pipeline_integration | apply::tests::identity::test_admin_rejects_public_key_that_does_not_match_user | break |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | pipeline_integration | apply::tests::identity::test_admin_rejects_malformed_user_public_key_at_projection | break |
@@ -138,6 +142,10 @@ both `pass` and `break` polarity unless waived.
 | SPEC_KR_TARGET_01 | NON_MODELED::repair_target_binding | CHK_KR_TARGET_BINDING | pipeline_integration | apply::tests::core_projection::test_project_key_request_rejects_delivery_target_mismatch | break |
 | SPEC_RM_SIGNER_01 | NON_MODELED::remover_self_binding | CHK_RM_SIGNER_BINDING | projector_unit | removal_projector_tests::tests::test_removal_valid | pass |
 | SPEC_RM_SIGNER_01 | NON_MODELED::remover_self_binding | CHK_RM_SIGNER_BINDING | projector_unit | removal_projector_tests::tests::test_removal_rejects_removed_by_signer_mismatch | break |
+| SPEC_RM_ADMIN_01 | NON_MODELED::removal_admin_peer_signer | CHK_RM_ADMIN_SIGNER | projector_unit | removal_projector_tests::tests::test_removal_valid | pass |
+| SPEC_RM_ADMIN_01 | NON_MODELED::removal_admin_peer_signer | CHK_RM_ADMIN_SIGNER | projector_unit | removal_projector_tests::tests::test_removal_rejects_non_admin_signer | break |
+| SPEC_RM_TARGET_01 | NON_MODELED::removal_target_kind | CHK_RM_TARGET_KIND | projector_unit | removal_projector_tests::tests::test_removal_valid | pass |
+| SPEC_RM_TARGET_01 | NON_MODELED::removal_target_kind | CHK_RM_TARGET_KIND | projector_unit | removal_projector_tests::tests::test_removal_rejects_missing_target_kind | break |
 | SPEC_RM_FRONTIER_01 | NON_MODELED::removal_frontier_hash | CHK_RM_FRONTIER_HASH | projector_unit | removal_projector_tests::tests::test_removal_valid | pass |
 | SPEC_RM_FRONTIER_01 | NON_MODELED::removal_frontier_hash | CHK_RM_FRONTIER_HASH | projector_unit | removal_projector_tests::tests::test_removal_rejects_frontier_hash_mismatch | break |
 | SPEC_RM_FRONTIER_01 | NON_MODELED::removal_frontier_hash | CHK_RM_FRONTIER_HASH | pipeline_integration | apply::tests::removal_rotation::test_removal_projects_and_rejects_bad_frontier_hash | pass |

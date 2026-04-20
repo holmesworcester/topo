@@ -66,6 +66,41 @@ pub enum LocalEndpointSharedPlanCore {
     RejectMalformedLocalDaemonIdentity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveMemberTargetKindCore {
+    User,
+    Peer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveMemberDecisionContextCore {
+    pub actor_is_admin: bool,
+    pub targets_self: bool,
+    pub already_removed: bool,
+    pub target_kind: RemoveMemberTargetKindCore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveMemberPlanCore {
+    Proceed,
+    RejectNotAdmin,
+    RejectSelfTarget,
+    RejectAlreadyRemoved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantAdminDecisionContextCore {
+    pub actor_is_admin: bool,
+    pub target_already_admin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantAdminPlanCore {
+    Proceed,
+    RejectNotAdmin,
+    RejectAlreadyAdmin,
+}
+
 pub fn decide_invite_bootstrap_endpoint_plan_core(
     context: InviteBootstrapEndpointDecisionContextCore,
 ) -> (plan: InviteBootstrapEndpointPlanCore)
@@ -120,6 +155,48 @@ pub fn decide_local_endpoint_shared_plan_core(
         LocalEndpointSharedStateCore::Present => LocalEndpointSharedPlanCore::UseLocalEndpointShared,
         LocalEndpointSharedStateCore::Missing => LocalEndpointSharedPlanCore::RejectMissingLocalDaemonIdentity,
         LocalEndpointSharedStateCore::Malformed => LocalEndpointSharedPlanCore::RejectMalformedLocalDaemonIdentity,
+    }
+}
+
+pub fn decide_remove_member_plan_core(
+    context: RemoveMemberDecisionContextCore,
+) -> (plan: RemoveMemberPlanCore)
+    ensures
+        !context.actor_is_admin ==> plan == RemoveMemberPlanCore::RejectNotAdmin,
+        (context.actor_is_admin && context.targets_self)
+            ==> plan == RemoveMemberPlanCore::RejectSelfTarget,
+        (context.actor_is_admin && !context.targets_self && context.already_removed)
+            ==> plan == RemoveMemberPlanCore::RejectAlreadyRemoved,
+        (context.actor_is_admin && !context.targets_self && !context.already_removed)
+            ==> plan == RemoveMemberPlanCore::Proceed,
+{
+    if !context.actor_is_admin {
+        RemoveMemberPlanCore::RejectNotAdmin
+    } else if context.targets_self {
+        RemoveMemberPlanCore::RejectSelfTarget
+    } else if context.already_removed {
+        RemoveMemberPlanCore::RejectAlreadyRemoved
+    } else {
+        RemoveMemberPlanCore::Proceed
+    }
+}
+
+pub fn decide_grant_admin_plan_core(
+    context: GrantAdminDecisionContextCore,
+) -> (plan: GrantAdminPlanCore)
+    ensures
+        !context.actor_is_admin ==> plan == GrantAdminPlanCore::RejectNotAdmin,
+        (context.actor_is_admin && context.target_already_admin)
+            ==> plan == GrantAdminPlanCore::RejectAlreadyAdmin,
+        (context.actor_is_admin && !context.target_already_admin)
+            ==> plan == GrantAdminPlanCore::Proceed,
+{
+    if !context.actor_is_admin {
+        GrantAdminPlanCore::RejectNotAdmin
+    } else if context.target_already_admin {
+        GrantAdminPlanCore::RejectAlreadyAdmin
+    } else {
+        GrantAdminPlanCore::Proceed
     }
 }
 

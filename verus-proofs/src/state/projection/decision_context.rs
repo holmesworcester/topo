@@ -235,6 +235,14 @@ pub enum AdminAuthorityRowsCore {
     MissingCurrentSigner,
     UnsupportedSignerType,
     WorkspaceSigner {
+        authority_matches_signer: bool,
+        row_count: u64,
+        all_user_keys_equal: bool,
+        representative_key_matches_admin_key: bool,
+        malformed: bool,
+    },
+    PeerSharedSigner {
+        authority_matches_signer: bool,
         row_count: u64,
         all_user_keys_equal: bool,
         representative_key_matches_admin_key: bool,
@@ -244,7 +252,14 @@ pub enum AdminAuthorityRowsCore {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminAuthorityDecisionContextCore {
-    UniqueUserKey { admin_key_matches_user_key: bool },
+    WorkspaceUserKey {
+        authority_matches_signer: bool,
+        admin_key_matches_user_key: bool,
+    },
+    PeerSharedUserKey {
+        authority_matches_signer: bool,
+        admin_key_matches_user_key: bool,
+    },
     RejectMissingCurrentSigner,
     RejectUnsupportedSignerType,
     RejectMissingUser,
@@ -275,6 +290,7 @@ pub fn normalize_admin_authority_core(
             AdminAuthorityDecisionContextCore::RejectUnsupportedSignerType
         }
         AdminAuthorityRowsCore::WorkspaceSigner {
+            authority_matches_signer,
             row_count,
             all_user_keys_equal,
             representative_key_matches_admin_key,
@@ -285,7 +301,28 @@ pub fn normalize_admin_authority_core(
             } else if row_count == 0 {
                 AdminAuthorityDecisionContextCore::RejectMissingUser
             } else if all_user_keys_equal {
-                AdminAuthorityDecisionContextCore::UniqueUserKey {
+                AdminAuthorityDecisionContextCore::WorkspaceUserKey {
+                    authority_matches_signer,
+                    admin_key_matches_user_key: representative_key_matches_admin_key,
+                }
+            } else {
+                AdminAuthorityDecisionContextCore::RejectAmbiguousUser
+            }
+        }
+        AdminAuthorityRowsCore::PeerSharedSigner {
+            authority_matches_signer,
+            row_count,
+            all_user_keys_equal,
+            representative_key_matches_admin_key,
+            malformed,
+        } => {
+            if malformed {
+                AdminAuthorityDecisionContextCore::RejectMalformedUserKey
+            } else if row_count == 0 {
+                AdminAuthorityDecisionContextCore::RejectMissingUser
+            } else if all_user_keys_equal {
+                AdminAuthorityDecisionContextCore::PeerSharedUserKey {
+                    authority_matches_signer,
                     admin_key_matches_user_key: representative_key_matches_admin_key,
                 }
             } else {
@@ -299,10 +336,28 @@ pub fn decide_admin_authority_plan_core(
     context: AdminAuthorityDecisionContextCore,
 ) -> (plan: AdminAuthorityPlanCore)
     ensures
-        context == (AdminAuthorityDecisionContextCore::UniqueUserKey {
+        context == (AdminAuthorityDecisionContextCore::WorkspaceUserKey {
+            authority_matches_signer: true,
             admin_key_matches_user_key: true,
         }) ==> plan == AdminAuthorityPlanCore::Ready,
-        context == (AdminAuthorityDecisionContextCore::UniqueUserKey {
+        context == (AdminAuthorityDecisionContextCore::PeerSharedUserKey {
+            authority_matches_signer: true,
+            admin_key_matches_user_key: true,
+        }) ==> plan == AdminAuthorityPlanCore::Ready,
+        context == (AdminAuthorityDecisionContextCore::WorkspaceUserKey {
+            authority_matches_signer: false,
+            admin_key_matches_user_key: true,
+        }) ==> plan == AdminAuthorityPlanCore::Reject,
+        context == (AdminAuthorityDecisionContextCore::PeerSharedUserKey {
+            authority_matches_signer: false,
+            admin_key_matches_user_key: true,
+        }) ==> plan == AdminAuthorityPlanCore::Reject,
+        context == (AdminAuthorityDecisionContextCore::WorkspaceUserKey {
+            authority_matches_signer: true,
+            admin_key_matches_user_key: false,
+        }) ==> plan == AdminAuthorityPlanCore::Reject,
+        context == (AdminAuthorityDecisionContextCore::PeerSharedUserKey {
+            authority_matches_signer: true,
             admin_key_matches_user_key: false,
         }) ==> plan == AdminAuthorityPlanCore::Reject,
         context == AdminAuthorityDecisionContextCore::RejectMissingCurrentSigner
@@ -317,8 +372,15 @@ pub fn decide_admin_authority_plan_core(
             ==> plan == AdminAuthorityPlanCore::Reject,
 {
     match context {
-        AdminAuthorityDecisionContextCore::UniqueUserKey { admin_key_matches_user_key } => {
-            if admin_key_matches_user_key {
+        AdminAuthorityDecisionContextCore::WorkspaceUserKey {
+            authority_matches_signer,
+            admin_key_matches_user_key,
+        }
+        | AdminAuthorityDecisionContextCore::PeerSharedUserKey {
+            authority_matches_signer,
+            admin_key_matches_user_key,
+        } => {
+            if authority_matches_signer && admin_key_matches_user_key {
                 AdminAuthorityPlanCore::Ready
             } else {
                 AdminAuthorityPlanCore::Reject
@@ -546,6 +608,124 @@ pub fn decide_deletion_signer_plan_core(
         | DeletionSignerDecisionContextCore::RejectMalformedSignerUser => {
             DeletionSignerPlanCore::Reject
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Removal authority / target kind
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalSignerRowsCore {
+    MissingCurrentSigner,
+    UnsupportedSignerType,
+    PeerSharedSigner { is_admin: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalSignerDecisionContextCore {
+    ReadyAdminPeerShared,
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType,
+    RejectNonAdminPeerShared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalSignerPlanCore {
+    Ready,
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType,
+    RejectNonAdminPeerShared,
+}
+
+pub fn normalize_removal_signer_core(
+    rows: RemovalSignerRowsCore,
+) -> (context: RemovalSignerDecisionContextCore)
+    ensures
+        rows == RemovalSignerRowsCore::MissingCurrentSigner
+            ==> context == RemovalSignerDecisionContextCore::RejectMissingCurrentSigner,
+        rows == RemovalSignerRowsCore::UnsupportedSignerType
+            ==> context == RemovalSignerDecisionContextCore::RejectUnsupportedSignerType,
+        rows == (RemovalSignerRowsCore::PeerSharedSigner { is_admin: true })
+            ==> context == RemovalSignerDecisionContextCore::ReadyAdminPeerShared,
+        rows == (RemovalSignerRowsCore::PeerSharedSigner { is_admin: false })
+            ==> context == RemovalSignerDecisionContextCore::RejectNonAdminPeerShared,
+{
+    match rows {
+        RemovalSignerRowsCore::MissingCurrentSigner => {
+            RemovalSignerDecisionContextCore::RejectMissingCurrentSigner
+        }
+        RemovalSignerRowsCore::UnsupportedSignerType => {
+            RemovalSignerDecisionContextCore::RejectUnsupportedSignerType
+        }
+        RemovalSignerRowsCore::PeerSharedSigner { is_admin } => {
+            if is_admin {
+                RemovalSignerDecisionContextCore::ReadyAdminPeerShared
+            } else {
+                RemovalSignerDecisionContextCore::RejectNonAdminPeerShared
+            }
+        }
+    }
+}
+
+pub fn decide_removal_signer_plan_core(
+    context: RemovalSignerDecisionContextCore,
+) -> (plan: RemovalSignerPlanCore)
+    ensures
+        context == RemovalSignerDecisionContextCore::ReadyAdminPeerShared
+            ==> plan == RemovalSignerPlanCore::Ready,
+        context == RemovalSignerDecisionContextCore::RejectMissingCurrentSigner
+            ==> plan == RemovalSignerPlanCore::RejectMissingCurrentSigner,
+        context == RemovalSignerDecisionContextCore::RejectUnsupportedSignerType
+            ==> plan == RemovalSignerPlanCore::RejectUnsupportedSignerType,
+        context == RemovalSignerDecisionContextCore::RejectNonAdminPeerShared
+            ==> plan == RemovalSignerPlanCore::RejectNonAdminPeerShared,
+{
+    match context {
+        RemovalSignerDecisionContextCore::ReadyAdminPeerShared => RemovalSignerPlanCore::Ready,
+        RemovalSignerDecisionContextCore::RejectMissingCurrentSigner => {
+            RemovalSignerPlanCore::RejectMissingCurrentSigner
+        }
+        RemovalSignerDecisionContextCore::RejectUnsupportedSignerType => {
+            RemovalSignerPlanCore::RejectUnsupportedSignerType
+        }
+        RemovalSignerDecisionContextCore::RejectNonAdminPeerShared => {
+            RemovalSignerPlanCore::RejectNonAdminPeerShared
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalTargetRowsCore {
+    Missing,
+    User,
+    Peer,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalTargetPlanCore {
+    Missing,
+    ReadyUser,
+    ReadyPeer,
+    RejectUnsupported,
+}
+
+pub fn decide_removal_target_plan_core(
+    rows: RemovalTargetRowsCore,
+) -> (plan: RemovalTargetPlanCore)
+    ensures
+        rows == RemovalTargetRowsCore::Missing ==> plan == RemovalTargetPlanCore::Missing,
+        rows == RemovalTargetRowsCore::User ==> plan == RemovalTargetPlanCore::ReadyUser,
+        rows == RemovalTargetRowsCore::Peer ==> plan == RemovalTargetPlanCore::ReadyPeer,
+        rows == RemovalTargetRowsCore::Unsupported
+            ==> plan == RemovalTargetPlanCore::RejectUnsupported,
+{
+    match rows {
+        RemovalTargetRowsCore::Missing => RemovalTargetPlanCore::Missing,
+        RemovalTargetRowsCore::User => RemovalTargetPlanCore::ReadyUser,
+        RemovalTargetRowsCore::Peer => RemovalTargetPlanCore::ReadyPeer,
+        RemovalTargetRowsCore::Unsupported => RemovalTargetPlanCore::RejectUnsupported,
     }
 }
 

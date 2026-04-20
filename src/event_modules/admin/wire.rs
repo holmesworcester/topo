@@ -1,5 +1,5 @@
 use super::super::layout::field_spec::{
-    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+    decode_fields, wire_size_for_fields, FieldSpec,
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN};
@@ -7,17 +7,19 @@ use super::super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN};
 pub const ADMIN_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("public_key"),
+    FieldSpec::EventId("authority_event_id"),
     FieldSpec::EventId("user_event_id"),
 ];
 
-/// Admin (type 18): type(1) + created_at(8) + public_key(32) + user_event_id(32)
-/// = 73
+/// Admin (type 18): type(1) + created_at(8) + public_key(32)
+/// + authority_event_id(32) + user_event_id(32) = 105
 pub const ADMIN_WIRE_SIZE: usize = wire_size_for_fields(ADMIN_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
+    pub authority_event_id: [u8; 32],
     pub user_event_id: [u8; 32],
 }
 
@@ -28,12 +30,13 @@ impl super::super::Describe for AdminEvent {
 }
 
 pub fn parse_admin(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if let Some((ts, public_key, user_event_id)) =
-        topo_verus_proofs::event_modules::layout::ts_id2::parse_ts_id2(EVENT_TYPE_ADMIN, blob)
+    if let Some((ts, public_key, authority_event_id, user_event_id)) =
+        topo_verus_proofs::event_modules::layout::ts_id3::parse_ts_id3(EVENT_TYPE_ADMIN, blob)
     {
         return Ok(ParsedEvent::Admin(AdminEvent {
             created_at_ms: ts,
             public_key,
+            authority_event_id,
             user_event_id,
         }));
     }
@@ -41,7 +44,8 @@ pub fn parse_admin(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     Ok(ParsedEvent::Admin(AdminEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         public_key: values[1].as_event_id().unwrap(),
-        user_event_id: values[2].as_event_id().unwrap(),
+        authority_event_id: values[2].as_event_id().unwrap(),
+        user_event_id: values[3].as_event_id().unwrap(),
     }))
 }
 
@@ -50,10 +54,11 @@ pub fn encode_admin(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::Admin(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
+    Ok(topo_verus_proofs::event_modules::layout::ts_id3::encode_ts_id3(
         EVENT_TYPE_ADMIN,
         e.created_at_ms,
         &e.public_key,
+        &e.authority_event_id,
         &e.user_event_id,
     ))
 }
@@ -63,8 +68,8 @@ pub static ADMIN_META: EventTypeMeta = crate::event_modules::registry::event_typ
     type_name: "admin",
     projection_table: "admins",
     share_scope: ShareScope::Shared,
-    dep_fields: &["user_event_id"],
-    dep_field_type_codes: &[&[14]],
+    dep_fields: &["authority_event_id", "user_event_id"],
+    dep_field_type_codes: &[&[super::super::EVENT_TYPE_WORKSPACE, EVENT_TYPE_ADMIN], &[14]],
     signer_required: true,
     signature_byte_len: 0,
     encryptable: false,
@@ -84,7 +89,8 @@ mod tests {
         let event = ParsedEvent::Admin(AdminEvent {
             created_at_ms: 123,
             public_key: [1u8; 32],
-            user_event_id: [2u8; 32],
+            authority_event_id: [2u8; 32],
+            user_event_id: [3u8; 32],
         });
 
         let blob = encode_event(&event).unwrap();

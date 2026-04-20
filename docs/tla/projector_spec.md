@@ -124,7 +124,7 @@ signer's user, not an admin event.
 | 15 | retired (code reserved) | — | rejected as unknown type |
 | 16 | project_peer_shared | peers_shared | rejects when claimed `user_event_id` does not match the user authorized by the signing DeviceInvite chain; emits SupersedeBootstrapTrust |
 | 17 | retired (code reserved) | — | rejected as unknown type |
-| 18 | project_admin | admins | rejects when `admin.public_key` does not match `users.public_key` for `user_event_id` |
+| 18 | project_admin | admins | bootstrap requires workspace signer+authority; peer-signed grants require signer peer to resolve to the claimed admin authority; rejects when `admin.public_key` does not match `users.public_key` for `user_event_id` |
 | 19 | retired (code reserved) | — | rejected as unknown type |
 | 20 | retired (unused) | — | rejected as unknown type |
 | 21 | retired (unused) | — | rejected as unknown type |

@@ -160,7 +160,10 @@ pub fn encode_removal(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 }
 
 use crate::crypto::event_id_to_base64;
-use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::decision_context::define_query_context_loader;
+use crate::projection::projector::{
+    ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
+};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -202,6 +205,9 @@ pub fn project_pure(
     {
         return ProjectorResult::reject("removed_by must equal current signer".to_string());
     }
+    if let Some(reason) = ctx.removal_signer_reject_reason.as_ref() {
+        return ProjectorResult::reject(reason.clone());
+    }
     let slots = [
         removal.parent_1,
         removal.parent_2,
@@ -220,49 +226,69 @@ pub fn project_pure(
         return ProjectorResult::reject("frontier_hash does not match parent frontier".to_string());
     }
 
-    ProjectorResult::valid(vec![WriteOp::InsertOrIgnore {
-        table: "removals",
-        columns: vec![
-            "recorded_by",
-            "event_id",
-            "removed_member_ref",
-            "frontier_hash",
-            "parent_count",
-            "parent_1",
-            "parent_2",
-            "parent_3",
-            "parent_4",
-            "remover_signer_event_id",
-        ],
-        values: vec![
-            SqlVal::Text(recorded_by.to_string()),
-            SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Text(event_id_to_base64(&removal.removed_member_ref)),
-            SqlVal::Text(event_id_to_base64(&removal.frontier_hash)),
-            SqlVal::Int(removal.parent_count as i64),
-            SqlVal::Text(event_id_to_base64(&removal.parent_1)),
-            SqlVal::Text(event_id_to_base64(&removal.parent_2)),
-            SqlVal::Text(event_id_to_base64(&removal.parent_3)),
-            SqlVal::Text(event_id_to_base64(&removal.parent_4)),
-            SqlVal::Text(current_signer.event_id.clone()),
-        ],
-    }])
+    let Some(target_kind) = ctx.removal_target_kind else {
+        return ProjectorResult::reject(
+            "removal target must be a projected user or peer_shared event".to_string(),
+        );
+    };
+    let removed_member_ref_b64 = event_id_to_base64(&removal.removed_member_ref);
+    ProjectorResult::valid(vec![
+        WriteOp::InsertOrIgnore {
+            table: "removals",
+            columns: vec![
+                "recorded_by",
+                "event_id",
+                "removed_member_ref",
+                "frontier_hash",
+                "parent_count",
+                "parent_1",
+                "parent_2",
+                "parent_3",
+                "parent_4",
+                "remover_signer_event_id",
+            ],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(removed_member_ref_b64.clone()),
+                SqlVal::Text(event_id_to_base64(&removal.frontier_hash)),
+                SqlVal::Int(removal.parent_count as i64),
+                SqlVal::Text(event_id_to_base64(&removal.parent_1)),
+                SqlVal::Text(event_id_to_base64(&removal.parent_2)),
+                SqlVal::Text(event_id_to_base64(&removal.parent_3)),
+                SqlVal::Text(event_id_to_base64(&removal.parent_4)),
+                SqlVal::Text(current_signer.event_id.clone()),
+            ],
+        },
+        WriteOp::InsertOrIgnore {
+            table: "removed_entities",
+            columns: vec!["recorded_by", "event_id", "target_event_id", "removal_type"],
+            values: vec![
+                SqlVal::Text(recorded_by.to_string()),
+                SqlVal::Text(event_id_b64.to_string()),
+                SqlVal::Text(removed_member_ref_b64),
+                SqlVal::Text(target_kind.as_str().to_string()),
+            ],
+        },
+    ])
 }
+
+define_query_context_loader!(build_projector_context, Removal, load_removal_context, "removal");
 
 pub static REMOVAL_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_REMOVAL,
     type_name: "removal",
     projection_table: "removals",
     share_scope: ShareScope::Shared,
-    dep_fields: &["parent_1", "parent_2", "parent_3", "parent_4"],
-    dep_field_type_codes: &[&[], &[], &[], &[]],
+    dep_fields: &["removed_member_ref", "parent_1", "parent_2", "parent_3", "parent_4"],
+    dep_field_type_codes: &[&[super::EVENT_TYPE_USER, super::EVENT_TYPE_PEER_SHARED], &[], &[], &[], &[]],
     signer_required: true,
     signature_byte_len: 0,
     encryptable: false,
     parse: parse_removal,
     encode: encode_removal,
     projector: project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: build_projector_context,
 };
 
 #[cfg(test)]

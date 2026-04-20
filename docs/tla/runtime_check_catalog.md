@@ -44,6 +44,8 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_KS_FRONTIER_HASH | event_modules/key_shared::project_pure | NON_MODELED::repair_response_frontier_hash | projector_local |
 | CHK_KS_FRONTIER_ORDER | event_modules/key_shared::project_pure | NON_MODELED::repair_response_frontier_canonical_order | projector_local |
 | CHK_RM_SIGNER_BINDING | event_modules/removal::project_pure | NON_MODELED::remover_self_binding | projector_local |
+| CHK_RM_ADMIN_SIGNER | state/projection/decision_context::load_removal_context + event_modules/removal::project_pure | NON_MODELED::removal_admin_peer_signer | projector_context |
+| CHK_RM_TARGET_KIND | state/projection/decision_context::load_removal_context + event_modules/removal::project_pure | NON_MODELED::removal_target_kind | projector_context |
 | CHK_RM_FRONTIER_HASH | event_modules/removal::project_pure | NON_MODELED::removal_frontier_hash | projector_local |
 | CHK_RM_FRONTIER_ORDER | event_modules/removal::project_pure | NON_MODELED::removal_frontier_canonical_order | projector_local |
 | CHK_KROT_SIGNER_BINDING | event_modules/key_rotation::project_pure | NON_MODELED::rotation_self_binding | projector_local |
@@ -71,7 +73,8 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_PS_MATCH_CARRIED | event_modules/peer_shared::project_pure | InvPeerSharedTrustMatchesCarried | projector_local |
 | CHK_PS_SUPERSEDE | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvBootstrapConsumedByPeerShared | transport_credential |
 | CHK_ADM_INSERT | event_modules/admin::project_pure | InvAdminChain | projector_local |
-| CHK_ADM_MATCH_USER_KEY | state/projection/queries::decide_admin_authority_plan + event_modules/admin::build_projector_context | InvAdminChain | projector_context |
+| CHK_ADM_AUTHORITY | state/projection/decision_context::decide_admin_authority_plan + event_modules/admin::build_projector_context | InvAdminChain | projector_context |
+| CHK_ADM_MATCH_USER_KEY | state/projection/decision_context::decide_admin_authority_plan + event_modules/admin::build_projector_context | InvAdminChain | projector_context |
 | CHK_SK_INSERT | event_modules/secret_key::project_pure | InvEncryptedKey | projector_local |
 | CHK_BD_NOOP | event_modules/bench_dep::project_pure | NON_MODELED::benchmark_only | projector_local |
 | CHK_IA_ANCHOR_SOURCE | event_modules/invite_accepted::project_pure | InvTrustAnchorSource | projector_local |
@@ -93,7 +96,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_UI_SIGNER_FAMILY | event_modules/user_invite::build_projector_context | InvUserInviteChain | projector_local |
 | CHK_DI_SIGNER_FAMILY | event_modules/device_invite::build_projector_context | InvDeviceInviteChain | projector_local |
 | CHK_PS_SIGNER_FAMILY | state/projection/queries::decide_peer_shared_authority_plan + event_modules/peer_shared::build_projector_context | InvDeviceInviteChain | projector_context |
-| CHK_ADM_SIGNER_FAMILY | state/projection/queries::decide_admin_authority_plan + event_modules/admin::build_projector_context | InvAdminChain | projector_context |
+| CHK_ADM_SIGNER_FAMILY | state/projection/decision_context::decide_admin_authority_plan + event_modules/admin::build_projector_context | InvAdminChain | projector_context |
 
 ## Pipeline-Shared Checks
 

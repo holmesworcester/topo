@@ -68,6 +68,12 @@ pub enum RpcMethod {
     },
     Reactions,
     Users,
+    GrantAdmin {
+        target: String,
+    },
+    BanUser {
+        target: String,
+    },
     Keys {
         summary: bool,
     },
@@ -131,6 +137,10 @@ pub enum RpcMethod {
     },
     /// List all known peers with local/remote status and endpoint info.
     Peers,
+    /// Admin-only: unlink a device by peer selector.
+    UnlinkDevice {
+        target: String,
+    },
     /// Combined view: sidebar (workspace, users, tenants) + messages with inline reactions.
     View {
         #[serde(default = "default_view_limit")]

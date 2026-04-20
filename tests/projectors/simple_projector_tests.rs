@@ -64,7 +64,8 @@ mod tests {
         let parsed = ParsedEvent::Admin(AdminEvent {
             created_at_ms: 2000,
             public_key: [1u8; 32],
-            user_event_id: [2u8; 32],
+            authority_event_id: [2u8; 32],
+            user_event_id: [3u8; 32],
         });
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);

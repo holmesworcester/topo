@@ -1686,6 +1686,7 @@ impl Peer {
         let evt = ParsedEvent::Admin(AdminEvent {
             created_at_ms: current_timestamp_ms_u64(),
             public_key: admin_public_key,
+            authority_event_id: *workspace_id,
             user_event_id: *user_event_id,
         });
         create_signed_event(&db, &self.identity, workspace_id, &evt, signing_key)

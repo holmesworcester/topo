@@ -167,6 +167,21 @@ pub struct CurrentSignerInfo {
     pub semantic_type_code: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalTargetKind {
+    User,
+    Peer,
+}
+
+impl RemovalTargetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemovalTargetKind::User => "user",
+            RemovalTargetKind::Peer => "peer",
+        }
+    }
+}
+
 /// Read-model decision context passed to pure projectors for decision-context queries.
 ///
 /// Projectors must not access the database directly. Instead, the pipeline
@@ -253,6 +268,11 @@ pub struct ProjectorDecisionContext {
     /// recorded from the accepted invite link. Local self-create remains
     /// valid when invite_event_id == workspace_id.
     pub invite_accepted_link_workspace_mismatch_reason: Option<String>,
+
+    /// For Removal: only admin peer_shared signers may author removal events.
+    pub removal_signer_reject_reason: Option<String>,
+    /// For Removal: whether the target resolves to a user or peer_shared row.
+    pub removal_target_kind: Option<RemovalTargetKind>,
 
     /// For KeyRequest: projection may suppress later sharing once a projected
     /// response already exists for the same delivery target.

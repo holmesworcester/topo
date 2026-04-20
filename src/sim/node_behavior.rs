@@ -1189,23 +1189,63 @@ impl ProjectionQueries for NodeBehaviorEngine {
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         let state = self.state.borrow();
         let user_event_id_b64 = event_id_to_base64(&admin.user_event_id);
+        let authority_event_id_b64 = event_id_to_base64(&admin.authority_event_id);
         let raw_rows = match frame.current_signer.as_ref() {
             None => AdminAuthorityRawRows::MissingCurrentSigner,
             Some(current_signer)
-                if current_signer.semantic_type_code != events::EVENT_TYPE_WORKSPACE =>
+                if current_signer.semantic_type_code == events::EVENT_TYPE_WORKSPACE =>
             {
-                AdminAuthorityRawRows::UnsupportedSignerType {
-                    semantic_type_code: current_signer.semantic_type_code,
+                AdminAuthorityRawRows::WorkspaceSigner {
+                    authority_matches_signer: current_signer.event_id == authority_event_id_b64,
+                    user_event_id: user_event_id_b64.clone(),
+                    user_public_keys: table_rows_for_recorded(&state, "users", recorded_by)
+                        .into_iter()
+                        .filter(|row| row_text(row, "event_id") == Some(&user_event_id_b64))
+                        .map(|row| row_blob(row, "public_key").map(ToOwned::to_owned))
+                        .collect(),
+                    malformed: false,
                 }
             }
-            Some(_) => AdminAuthorityRawRows::WorkspaceSigner {
-                user_event_id: user_event_id_b64.clone(),
-                user_public_keys: table_rows_for_recorded(&state, "users", recorded_by)
-                    .into_iter()
-                    .filter(|row| row_text(row, "event_id") == Some(&user_event_id_b64))
-                    .map(|row| row_blob(row, "public_key").map(ToOwned::to_owned))
-                    .collect(),
-                malformed: false,
+            Some(current_signer)
+                if current_signer.semantic_type_code == events::EVENT_TYPE_PEER_SHARED =>
+            {
+                let signer_b64 = current_signer.event_id.clone();
+                let authority_matches_signer =
+                    table_rows_for_recorded(&state, "peers_shared", recorded_by)
+                        .into_iter()
+                        .find(|row| row_text(row, "event_id") == Some(&signer_b64))
+                        .and_then(|row| row_text(row, "user_event_id").map(ToOwned::to_owned))
+                        .is_some_and(|user_event_id| {
+                            table_rows_for_recorded(&state, "users", recorded_by)
+                                .into_iter()
+                                .find(|row| row_text(row, "event_id") == Some(&user_event_id))
+                                .and_then(|user_row| {
+                                    row_blob(user_row, "public_key").map(|v| v.to_vec())
+                                })
+                                .is_some_and(|public_key| {
+                                    table_rows_for_recorded(&state, "admins", recorded_by)
+                                        .into_iter()
+                                        .any(|row| {
+                                            row_text(row, "event_id")
+                                                == Some(&authority_event_id_b64)
+                                                && row_blob(row, "public_key")
+                                                    .is_some_and(|admin_key| admin_key == public_key)
+                                        })
+                                })
+                        });
+                AdminAuthorityRawRows::PeerSharedSigner {
+                    authority_matches_signer,
+                    user_event_id: user_event_id_b64.clone(),
+                    user_public_keys: table_rows_for_recorded(&state, "users", recorded_by)
+                        .into_iter()
+                        .filter(|row| row_text(row, "event_id") == Some(&user_event_id_b64))
+                        .map(|row| row_blob(row, "public_key").map(ToOwned::to_owned))
+                        .collect(),
+                    malformed: false,
+                }
+            }
+            Some(current_signer) => AdminAuthorityRawRows::UnsupportedSignerType {
+                semantic_type_code: current_signer.semantic_type_code,
             },
         };
         let context = normalize_admin_authority(&raw_rows, &admin.public_key);

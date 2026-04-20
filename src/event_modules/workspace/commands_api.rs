@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::{
     add_device_to_workspace, create_device_link_invite, create_user_invite,
-    create_workspace_with_options, join_workspace_as_new_user, persist_join_peer_secret,
-    persist_link_peer_secret, CreateWorkspaceOptions,
+    create_workspace_with_options, grant_admin, join_workspace_as_new_user,
+    persist_join_peer_secret, persist_link_peer_secret, remove_member, CreateWorkspaceOptions,
 };
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::service::{open_db_for_peer, open_db_load};
@@ -40,6 +40,21 @@ pub struct RotateKeyResponse {
     pub key_event_id: String,
     pub rotation_event_id: String,
     pub proactive_share_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RemoveMemberResponse {
+    pub target_event_id: String,
+    pub target_kind: String,
+    pub removal_event_id: String,
+    pub key_event_id: String,
+    pub rotation_event_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrantAdminResponse {
+    pub target_event_id: String,
+    pub admin_event_id: String,
 }
 
 fn signer_is_admin(
@@ -101,6 +116,64 @@ fn resolve_admin_event_for_signer(
         }
         None => Ok(None),
     }
+}
+
+fn require_admin_peer_signer(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<(EventId, SigningKey), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = super::load_local_authoring_context(db, recorded_by)?;
+    let (signer_event_id, signer_key) =
+        crate::event_modules::peer_shared::load_local_peer_signer_required(db, recorded_by)?;
+    if !signer_is_admin(db, recorded_by, &signer_event_id)? {
+        return Err("Local peer signer is not admin for this workspace.".into());
+    }
+    Ok((signer_event_id, signer_key))
+}
+
+fn removal_target_already_removed(
+    db: &Connection,
+    recorded_by: &str,
+    target_event_id: &EventId,
+    removal_type: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM removed_entities
+             WHERE recorded_by = ?1
+               AND target_event_id = ?2
+               AND removal_type = ?3
+         )",
+        rusqlite::params![
+            recorded_by,
+            event_id_to_base64(target_event_id),
+            removal_type,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+fn user_is_admin(
+    db: &Connection,
+    recorded_by: &str,
+    target_user_event_id: &EventId,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM users u
+             JOIN admins a
+               ON a.recorded_by = u.recorded_by
+              AND a.public_key = u.public_key
+             WHERE u.recorded_by = ?1
+               AND u.event_id = ?2
+         )",
+        rusqlite::params![recorded_by, event_id_to_base64(target_user_event_id)],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
 }
 
 fn resolve_invite_bootstrap_endpoint_id(
@@ -183,11 +256,7 @@ fn create_invite_for_recorded_by(
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let _ = super::load_local_authoring_context(db, recorded_by)?;
     let ws_eid = super::resolve_workspace_for_peer(db, recorded_by)?;
-    let (sender_peer_eid, sender_peer_key) =
-        crate::event_modules::peer_shared::load_local_peer_signer_required(db, recorded_by)?;
-    if !signer_is_admin(db, recorded_by, &sender_peer_eid)? {
-        return Err("Local peer signer is not admin for this workspace.".into());
-    }
+    let (sender_peer_eid, sender_peer_key) = require_admin_peer_signer(db, recorded_by)?;
     let admin_event_id = resolve_admin_event_for_signer(db, recorded_by, &sender_peer_eid)?
         .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
             "Could not resolve admin event for local peer signer.".into()
@@ -228,6 +297,112 @@ fn rotate_key_for_recorded_by(
     })
 }
 
+fn ban_user_for_recorded_by(
+    db: &Connection,
+    recorded_by: &str,
+    target: &str,
+) -> Result<RemoveMemberResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let authoring = super::load_local_authoring_context(db, recorded_by)?;
+    let target_event_id =
+        crate::event_modules::user::resolve(db, recorded_by, target).map_err(
+            |err| -> Box<dyn std::error::Error + Send + Sync> { err.into() },
+        )?;
+    let is_admin = signer_is_admin(db, recorded_by, &authoring.signer_event_id)?;
+    let plan = super::command_plans::decide_remove_member_plan(
+        &super::command_plans::RemoveMemberDecisionContext {
+            actor_is_admin: is_admin,
+            targets_self: target_event_id == authoring.author_id,
+            already_removed: removal_target_already_removed(db, recorded_by, &target_event_id, "user")?,
+            target_kind: super::command_plans::RemoveMemberTargetKind::User,
+        },
+    );
+    super::command_plans::resolve_remove_member_plan(
+        plan,
+        super::command_plans::RemoveMemberTargetKind::User,
+    )?;
+    let result = remove_member(db, recorded_by, &target_event_id)?;
+    Ok(RemoveMemberResponse {
+        target_event_id: event_id_to_base64(&target_event_id),
+        target_kind: "user".to_string(),
+        removal_event_id: event_id_to_base64(&result.removal_event_id),
+        key_event_id: event_id_to_base64(&result.key_event_id),
+        rotation_event_id: event_id_to_base64(&result.rotation_event_id),
+    })
+}
+
+fn grant_admin_for_recorded_by(
+    db: &Connection,
+    recorded_by: &str,
+    target: &str,
+) -> Result<GrantAdminResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let authoring = super::load_local_authoring_context(db, recorded_by)?;
+    let target_event_id =
+        crate::event_modules::user::resolve(db, recorded_by, target).map_err(
+            |err| -> Box<dyn std::error::Error + Send + Sync> { err.into() },
+        )?;
+    let is_admin = signer_is_admin(db, recorded_by, &authoring.signer_event_id)?;
+    let plan = super::command_plans::decide_grant_admin_plan(
+        &super::command_plans::GrantAdminDecisionContext {
+            actor_is_admin: is_admin,
+            target_already_admin: user_is_admin(db, recorded_by, &target_event_id)?,
+        },
+    );
+    super::command_plans::resolve_grant_admin_plan(plan)?;
+    let authority_admin_event_id = resolve_admin_event_for_signer(
+        db,
+        recorded_by,
+        &authoring.signer_event_id,
+    )?
+    .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+        "Could not resolve admin event for local peer signer.".into()
+    })?;
+    let result = grant_admin(
+        db,
+        recorded_by,
+        &authoring.signing_key,
+        &authoring.signer_event_id,
+        &authority_admin_event_id,
+        &target_event_id,
+    )?;
+    Ok(GrantAdminResponse {
+        target_event_id: event_id_to_base64(&result.target_user_event_id),
+        admin_event_id: event_id_to_base64(&result.admin_event_id),
+    })
+}
+
+fn unlink_device_for_recorded_by(
+    db: &Connection,
+    recorded_by: &str,
+    target: &str,
+) -> Result<RemoveMemberResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let authoring = super::load_local_authoring_context(db, recorded_by)?;
+    let target_event_id =
+        crate::event_modules::peer_shared::resolve_peer(db, recorded_by, target).map_err(
+            |err| -> Box<dyn std::error::Error + Send + Sync> { err.into() },
+        )?;
+    let is_admin = signer_is_admin(db, recorded_by, &authoring.signer_event_id)?;
+    let plan = super::command_plans::decide_remove_member_plan(
+        &super::command_plans::RemoveMemberDecisionContext {
+            actor_is_admin: is_admin,
+            targets_self: target_event_id == authoring.signer_event_id,
+            already_removed: removal_target_already_removed(db, recorded_by, &target_event_id, "peer")?,
+            target_kind: super::command_plans::RemoveMemberTargetKind::Peer,
+        },
+    );
+    super::command_plans::resolve_remove_member_plan(
+        plan,
+        super::command_plans::RemoveMemberTargetKind::Peer,
+    )?;
+    let result = remove_member(db, recorded_by, &target_event_id)?;
+    Ok(RemoveMemberResponse {
+        target_event_id: event_id_to_base64(&target_event_id),
+        target_kind: "peer".to_string(),
+        removal_event_id: event_id_to_base64(&result.removal_event_id),
+        key_event_id: event_id_to_base64(&result.key_event_id),
+        rotation_event_id: event_id_to_base64(&result.rotation_event_id),
+    })
+}
+
 pub fn create_invite_for_db(
     db_path: &str,
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
@@ -248,6 +423,66 @@ pub fn rotate_key_for_db(
             format!("No transport identity: {}", e).into()
         })?;
     rotate_key_for_recorded_by(&db, &recorded_by)
+}
+
+pub fn ban_user_for_db(
+    db_path: &str,
+    target: &str,
+) -> Result<RemoveMemberResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("No transport identity: {}", e).into()
+        })?;
+    ban_user_for_recorded_by(&db, &recorded_by, target)
+}
+
+pub fn grant_admin_for_db(
+    db_path: &str,
+    target: &str,
+) -> Result<GrantAdminResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("No transport identity: {}", e).into()
+        })?;
+    grant_admin_for_recorded_by(&db, &recorded_by, target)
+}
+
+pub fn ban_user_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    target: &str,
+) -> Result<RemoveMemberResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    ban_user_for_recorded_by(&db, peer_id, target)
+}
+
+pub fn grant_admin_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    target: &str,
+) -> Result<GrantAdminResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    grant_admin_for_recorded_by(&db, peer_id, target)
+}
+
+pub fn unlink_device_for_db(
+    db_path: &str,
+    target: &str,
+) -> Result<RemoveMemberResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("No transport identity: {}", e).into()
+        })?;
+    unlink_device_for_recorded_by(&db, &recorded_by, target)
+}
+
+pub fn unlink_device_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    target: &str,
+) -> Result<RemoveMemberResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    unlink_device_for_recorded_by(&db, peer_id, target)
 }
 
 /// Create invite with an explicit SPKI hex.

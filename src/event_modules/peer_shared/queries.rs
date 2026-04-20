@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{event_id_from_base64, EventId};
+use crate::crypto::{event_id_from_base64, event_id_from_hex, EventId};
 use crate::event_modules::{parse_event, ParsedEvent};
 
 // ---------------------------------------------------------------------------
@@ -368,6 +368,41 @@ pub fn list_peers(db: &Connection, recorded_by: &str) -> Result<Vec<PeerItem>, r
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+pub fn resolve_peer_number(
+    db: &Connection,
+    recorded_by: &str,
+    num: usize,
+) -> Result<EventId, String> {
+    if num == 0 {
+        return Err("peer number must be >= 1".into());
+    }
+    let rows = list_peers(db, recorded_by).map_err(|e| e.to_string())?;
+    let Some(row) = rows.get(num - 1) else {
+        return Err(format!(
+            "invalid peer number {}; available: 1-{}",
+            num,
+            rows.len()
+        ));
+    };
+    event_id_from_base64(&row.peer_id)
+        .ok_or_else(|| format!("invalid event ID for peer {}", num))
+}
+
+pub fn resolve_peer(
+    db: &Connection,
+    recorded_by: &str,
+    selector: &str,
+) -> Result<EventId, String> {
+    let stripped = selector.strip_prefix('#').unwrap_or(selector);
+    if let Ok(num) = stripped.parse::<usize>() {
+        return resolve_peer_number(db, recorded_by, num);
+    }
+    if let Some(event_id) = event_id_from_base64(selector) {
+        return Ok(event_id);
+    }
+    event_id_from_hex(selector).ok_or_else(|| format!("invalid peer selector: {}", selector))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

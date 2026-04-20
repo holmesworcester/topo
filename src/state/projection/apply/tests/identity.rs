@@ -528,22 +528,24 @@ fn project_valid_bootstrap_device_invite(
 fn project_valid_admin_for_user(
     conn: &Connection,
     recorded_by: &str,
-    workspace_eid: EventId,
-    workspace_key: &SigningKey,
+    authority_event_id: EventId,
+    signer_event_id: EventId,
+    signer_key: &SigningKey,
     user_event_id: EventId,
     user_public_key: [u8; 32],
 ) -> EventId {
     let admin_event = ParsedEvent::Admin(crate::event_modules::AdminEvent {
         created_at_ms: now_ms(),
         public_key: user_public_key,
+        authority_event_id,
         user_event_id,
     });
     create_signed_event(
         conn,
         recorded_by,
-        &workspace_eid,
+        &signer_event_id,
         &admin_event,
-        workspace_key,
+        signer_key,
     )
     .unwrap()
 }
@@ -591,6 +593,7 @@ fn setup_admin_signer_peer(
     let admin_eid = project_valid_admin_for_user(
         conn,
         recorded_by,
+        workspace_eid,
         workspace_eid,
         workspace_key,
         user_event_id,
@@ -648,6 +651,7 @@ fn test_peer_shared_rejects_wrong_signer_family_at_projection() {
     let admin_event = ParsedEvent::Admin(crate::event_modules::AdminEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
+        authority_event_id: workspace_eid,
         user_event_id: user_eid,
     });
     let admin_eid = create_signed_event(
@@ -688,6 +692,7 @@ fn test_admin_rejects_wrong_signer_family_at_projection() {
     let event = ParsedEvent::Admin(crate::event_modules::AdminEvent {
         created_at_ms: now_ms(),
         public_key: [1u8; 32],
+        authority_event_id: workspace_eid,
         user_event_id: user_eid,
     });
     let blob = sign_blob(&invite_key, &invite_eid, &event);
@@ -695,7 +700,7 @@ fn test_admin_rejects_wrong_signer_family_at_projection() {
         &conn,
         recorded_by,
         &blob,
-        "admin signer must be workspace, got semantic type 10",
+        "admin signer must be workspace or peer_shared, got semantic type 10",
     );
 }
 
@@ -778,6 +783,7 @@ fn test_admin_projects_with_workspace_signer_family() {
     let admin_event = ParsedEvent::Admin(crate::event_modules::AdminEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
+        authority_event_id: workspace_eid,
         user_event_id: user_eid,
     });
     let admin_blob = sign_blob(&workspace_key, &workspace_eid, &admin_event);
@@ -786,6 +792,112 @@ fn test_admin_projects_with_workspace_signer_family() {
     assert_eq!(
         project_one(&conn, recorded_by, &admin_eid).unwrap(),
         ProjectionDecision::Valid
+    );
+}
+
+#[test]
+fn test_admin_projects_with_peer_signed_admin_authority() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
+    let (invite_a_eid, invite_a_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (admin_user_eid, admin_user_key) = project_valid_user_from_invite(
+        &conn,
+        recorded_by,
+        invite_a_eid,
+        &invite_a_key,
+        "alice",
+    );
+    let (authority_admin_eid, admin_peer_shared_eid, admin_peer_shared_key) =
+        setup_admin_signer_peer(
+            &conn,
+            recorded_by,
+            workspace_eid,
+            &workspace_key,
+            admin_user_eid,
+            &admin_user_key,
+            "alice-laptop",
+        );
+
+    let (invite_b_eid, invite_b_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (target_user_eid, target_user_key) =
+        project_valid_user_from_invite(&conn, recorded_by, invite_b_eid, &invite_b_key, "bob");
+
+    let admin_event = ParsedEvent::Admin(crate::event_modules::AdminEvent {
+        created_at_ms: now_ms(),
+        public_key: target_user_key.verifying_key().to_bytes(),
+        authority_event_id: authority_admin_eid,
+        user_event_id: target_user_eid,
+    });
+    let admin_blob = sign_blob(&admin_peer_shared_key, &admin_peer_shared_eid, &admin_event);
+    let admin_eid = insert_event_raw(&conn, recorded_by, &admin_blob);
+
+    assert_eq!(
+        project_one(&conn, recorded_by, &admin_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+}
+
+#[test]
+fn test_admin_rejects_peer_signed_authority_mismatch_at_projection() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
+    let (invite_a_eid, invite_a_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (admin_user_eid, admin_user_key) = project_valid_user_from_invite(
+        &conn,
+        recorded_by,
+        invite_a_eid,
+        &invite_a_key,
+        "alice",
+    );
+    let (_alice_admin_eid, admin_peer_shared_eid, admin_peer_shared_key) = setup_admin_signer_peer(
+        &conn,
+        recorded_by,
+        workspace_eid,
+        &workspace_key,
+        admin_user_eid,
+        &admin_user_key,
+        "alice-laptop",
+    );
+
+    let (invite_b_eid, invite_b_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (user_b_eid, user_b_key) =
+        project_valid_user_from_invite(&conn, recorded_by, invite_b_eid, &invite_b_key, "bob");
+    let bob_admin_eid = project_valid_admin_for_user(
+        &conn,
+        recorded_by,
+        workspace_eid,
+        workspace_eid,
+        &workspace_key,
+        user_b_eid,
+        user_b_key.verifying_key().to_bytes(),
+    );
+
+    let (invite_c_eid, invite_c_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (user_c_eid, user_c_key) =
+        project_valid_user_from_invite(&conn, recorded_by, invite_c_eid, &invite_c_key, "carol");
+
+    let bad_admin = ParsedEvent::Admin(crate::event_modules::AdminEvent {
+        created_at_ms: now_ms(),
+        public_key: user_c_key.verifying_key().to_bytes(),
+        authority_event_id: bob_admin_eid,
+        user_event_id: user_c_eid,
+    });
+    let bad_admin_blob = sign_blob(&admin_peer_shared_key, &admin_peer_shared_eid, &bad_admin);
+
+    assert_projection_rejection_contains(
+        &conn,
+        recorded_by,
+        &bad_admin_blob,
+        "peer-signed admin authority does not match signer admin identity",
     );
 }
 
@@ -803,6 +915,7 @@ fn test_admin_rejects_public_key_that_does_not_match_user() {
     let bad_admin = ParsedEvent::Admin(crate::event_modules::AdminEvent {
         created_at_ms: now_ms(),
         public_key: [0xAA; 32],
+        authority_event_id: workspace_eid,
         user_event_id: user_eid,
     });
     let bad_admin_blob = sign_blob(&workspace_key, &workspace_eid, &bad_admin);
@@ -838,6 +951,7 @@ fn test_admin_rejects_malformed_user_public_key_at_projection() {
     let admin = ParsedEvent::Admin(crate::event_modules::AdminEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
+        authority_event_id: workspace_eid,
         user_event_id: user_eid,
     });
     let admin_blob = sign_blob(&workspace_key, &workspace_eid, &admin);
@@ -900,6 +1014,7 @@ fn test_peer_shared_rejects_peer_signed_device_link_user_mismatch() {
     let _admin_eid = project_valid_admin_for_user(
         &conn,
         recorded_by,
+        workspace_eid,
         workspace_eid,
         &workspace_key,
         user_a_eid,
@@ -983,6 +1098,7 @@ fn test_user_invite_rejects_bootstrap_authority_mismatch_at_projection() {
     let admin_eid = project_valid_admin_for_user(
         &conn,
         recorded_by,
+        workspace_eid,
         workspace_eid,
         &workspace_key,
         user_eid,
@@ -1128,6 +1244,7 @@ fn test_user_invite_rejects_peer_signed_authority_mismatch_at_projection() {
     let admin_b_eid = project_valid_admin_for_user(
         &conn,
         recorded_by,
+        workspace_eid,
         workspace_eid,
         &workspace_key,
         user_b_eid,
@@ -1311,6 +1428,7 @@ fn test_device_invite_rejects_peer_signed_authority_mismatch_at_projection() {
     let _admin_b_eid = project_valid_admin_for_user(
         &conn,
         recorded_by,
+        workspace_eid,
         workspace_eid,
         &workspace_key,
         user_b_eid,
@@ -1521,6 +1639,7 @@ fn test_admin_signer_can_delete_other_users_message() {
     let admin_eid = project_valid_admin_for_user(
         &conn,
         recorded_by,
+        workspace_eid,
         workspace_eid,
         &workspace_key,
         admin_user_eid,

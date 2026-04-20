@@ -1,7 +1,8 @@
 //! `admin` event (type 18): promotes a user (`user_event_id`) to admin, binding the
-//! admin's public_key to that user. The bootstrap admin is signed by the workspace key;
-//! ongoing admin grants must chain from the existing authority. Referenced by invite
-//! creation and message-deletion authorization (an admin signer may delete any message).
+//! admin's public_key to that user. Bootstrap grants depend on and are signed by the
+//! workspace; ongoing grants depend on a prior `admin` event and are signed by an
+//! admin `peer_shared` identity. Referenced by invite creation, removal authorization,
+//! and message-deletion authorization.
 
 pub mod projector;
 pub mod queries;

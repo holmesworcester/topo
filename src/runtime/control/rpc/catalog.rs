@@ -140,6 +140,18 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Users"}"#,
     },
     MethodInfo {
+        name: "GrantAdmin",
+        purpose: "Admin-only: promote a user by selector",
+        params: params!["target", "string", true, None],
+        example_json: r#"{"type":"GrantAdmin","target":"2"}"#,
+    },
+    MethodInfo {
+        name: "BanUser",
+        purpose: "Admin-only: remove a user by selector",
+        params: params!["target", "string", true, None],
+        example_json: r#"{"type":"BanUser","target":"1"}"#,
+    },
+    MethodInfo {
         name: "Keys",
         purpose: "List keys from projection",
         params: params!["summary", "bool", true, None],
@@ -259,6 +271,12 @@ static CATALOG: &[MethodInfo] = &[
         purpose: "List all known peers with connection status",
         params: PARAM_NONE,
         example_json: r#"{"type":"Peers"}"#,
+    },
+    MethodInfo {
+        name: "UnlinkDevice",
+        purpose: "Admin-only: unlink a device by peer selector",
+        params: params!["target", "string", true, None],
+        example_json: r#"{"type":"UnlinkDevice","target":"2"}"#,
     },
     MethodInfo {
         name: "View",

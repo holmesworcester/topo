@@ -211,6 +211,21 @@ pub(crate) enum Commands {
     /// List users from projection
     Users,
 
+    /// Admin-management commands
+    Admin {
+        #[command(subcommand)]
+        action: AdminAction,
+    },
+
+    /// Admin-only: remove a user by `topo users` number or event ID
+    Ban {
+        /// Target: user number (N or #N from `topo users`) or user event ID (base64 or hex)
+        target: Option<String>,
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
+        target_flag: Option<String>,
+    },
+
     /// List keys from projection
     Keys {
         /// Show summary only
@@ -247,6 +262,15 @@ pub(crate) enum Commands {
 
     /// List all known peers (local + remote) with connection endpoint info
     Peers,
+
+    /// Admin-only: unlink a device by `topo peers` number or event ID
+    Unlink {
+        /// Target: peer number (N or #N from `topo peers`) or peer event ID (base64 or hex)
+        target: Option<String>,
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
+        target_flag: Option<String>,
+    },
 
     /// Event inspection commands (tree, list)
     #[command(
@@ -572,6 +596,18 @@ pub(crate) enum TenantAction {
     },
     /// Show currently active tenant
     Active,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AdminAction {
+    /// Admin-only: promote a user by `topo users` number or event ID
+    Add {
+        /// Target: user number (N or #N from `topo users`) or user event ID (base64 or hex)
+        target: Option<String>,
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
+        target_flag: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

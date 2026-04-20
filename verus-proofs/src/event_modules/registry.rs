@@ -80,6 +80,8 @@ pub fn formal_family_of(code: EventTypeCode) -> (family: FormalProjectorFamily)
         code == EventTypeCode::FileSlice ==> family == FormalProjectorFamily::FileSlice,
         code == EventTypeCode::InviteAccepted ==> family == FormalProjectorFamily::InviteAccepted,
         code == EventTypeCode::PeerShared ==> family == FormalProjectorFamily::PeerShared,
+        (code == EventTypeCode::Removal || code == EventTypeCode::KeyRotation)
+            ==> family == FormalProjectorFamily::SignerFrontier,
         code == EventTypeCode::BenchDep ==> family == FormalProjectorFamily::NoWrite,
 {
     match code {

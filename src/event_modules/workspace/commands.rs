@@ -525,6 +525,7 @@ fn create_workspace_inner(
     let admin_evt = ParsedEvent::Admin(AdminEvent {
         created_at_ms: next_created_at(&mut timestamps),
         public_key: user_key.verifying_key().to_bytes(),
+        authority_event_id: ws_eid,
         user_event_id: ub_eid,
     });
     let _admin_eid =
@@ -857,6 +858,19 @@ pub struct InviteResult {
     pub invite_event_id: EventId,
 }
 
+/// Result of removing a member reference and immediately rotating content keys.
+pub struct RemoveMemberResult {
+    pub removal_event_id: EventId,
+    pub key_event_id: EventId,
+    pub rotation_event_id: EventId,
+}
+
+/// Result of granting admin authority to an existing user.
+pub struct GrantAdminResult {
+    pub target_user_event_id: EventId,
+    pub admin_event_id: EventId,
+}
+
 /// Create a user invite for the workspace.
 ///
 /// Event-domain logic: ensures content key material → creates invite event chain
@@ -955,6 +969,95 @@ pub fn create_device_link_invite(
     })
 }
 
+pub fn remove_member(
+    db: &Connection,
+    recorded_by: &str,
+    removed_member_ref: &EventId,
+) -> Result<RemoveMemberResult, Box<dyn std::error::Error + Send + Sync>> {
+    let authoring = super::load_local_authoring_context(db, recorded_by)?;
+    let frontier_refs = ops::current_removal_frontier_for_peer(db, recorded_by)?;
+    let parent_refs = crate::event_modules::removal::canonicalize_frontier_refs(&frontier_refs)
+        .map_err(|reason| format!("invalid current removal frontier: {reason}"))?;
+    if parent_refs.len() > crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS {
+        return Err(format!(
+            "current removal frontier has {} refs, exceeds max {}",
+            parent_refs.len(),
+            crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS
+        )
+        .into());
+    }
+    let mut parent_slots =
+        [[0u8; 32]; crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS];
+    for (slot, parent_ref) in parent_slots.iter_mut().zip(parent_refs.iter()) {
+        *slot = *parent_ref;
+    }
+    let removal = ParsedEvent::Removal(crate::event_modules::RemovalEvent {
+        created_at_ms: current_timestamp_ms_u64(),
+        removed_member_ref: *removed_member_ref,
+        parent_count: parent_refs.len() as u8,
+        parent_1: parent_slots[0],
+        parent_2: parent_slots[1],
+        parent_3: parent_slots[2],
+        parent_4: parent_slots[3],
+        frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&parent_refs),
+        removed_by: authoring.signer_event_id,
+    });
+    let removal_event_id = event_id_or_blocked(create_signed_event(
+        db,
+        recorded_by,
+        &authoring.signer_event_id,
+        &removal,
+        &authoring.signing_key,
+    ))?;
+    let rotated = ops::rotate_content_key_for_peer(db, recorded_by)?;
+    Ok(RemoveMemberResult {
+        removal_event_id,
+        key_event_id: rotated.key_event_id,
+        rotation_event_id: rotated.rotation_event_id,
+    })
+}
+
+pub fn grant_admin(
+    db: &Connection,
+    recorded_by: &str,
+    admin_peer_shared_key: &SigningKey,
+    admin_peer_shared_event_id: &EventId,
+    authority_admin_event_id: &EventId,
+    target_user_event_id: &EventId,
+) -> Result<GrantAdminResult, Box<dyn std::error::Error + Send + Sync>> {
+    let target_user_b64 = event_id_to_base64(target_user_event_id);
+    let target_user_public_key: Vec<u8> = db.query_row(
+        "SELECT public_key
+         FROM users
+         WHERE recorded_by = ?1
+           AND event_id = ?2
+         LIMIT 1",
+        rusqlite::params![recorded_by, &target_user_b64],
+        |row| crate::db::sql_types::get_blob(row, 0),
+    )?;
+    let public_key: [u8; 32] = target_user_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("user {target_user_b64} has invalid public_key length"))?;
+    let admin_event = ParsedEvent::Admin(AdminEvent {
+        created_at_ms: current_timestamp_ms_u64(),
+        public_key,
+        authority_event_id: *authority_admin_event_id,
+        user_event_id: *target_user_event_id,
+    });
+    let admin_event_id = event_id_or_blocked(create_signed_event(
+        db,
+        recorded_by,
+        admin_peer_shared_event_id,
+        &admin_event,
+        admin_peer_shared_key,
+    ))?;
+    Ok(GrantAdminResult {
+        target_user_event_id: *target_user_event_id,
+        admin_event_id,
+    })
+}
+
 // ─── 6. Test-only helpers ───
 
 /// Create a user invite without bootstrap context.
@@ -1013,10 +1116,12 @@ pub(super) fn load_local_peer_signer(
 // ─── Response types ───
 
 pub use super::commands_api::{
-    accept_device_link, accept_invite, create_device_link_for_peer, create_invite_for_db,
-    create_invite_for_peer, create_invite_with_spki, create_workspace_for_db,
-    create_workspace_for_db_with_seed, rotate_key_for_db, rotate_key_for_peer,
-    AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse, CreateWorkspaceResponse,
+    accept_device_link, accept_invite, ban_user_for_db, ban_user_for_peer,
+    create_device_link_for_peer, create_invite_for_db, create_invite_for_peer,
+    create_invite_with_spki, create_workspace_for_db, create_workspace_for_db_with_seed,
+    grant_admin_for_db, grant_admin_for_peer, rotate_key_for_db, rotate_key_for_peer,
+    unlink_device_for_db, unlink_device_for_peer, AcceptDeviceLinkResponse, AcceptInviteResponse,
+    CreateInviteResponse, CreateWorkspaceResponse, GrantAdminResponse, RemoveMemberResponse,
     RotateKeyResponse,
 };
 

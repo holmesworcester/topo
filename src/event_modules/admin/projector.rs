@@ -59,6 +59,7 @@ mod projector_tests {
         ParsedEvent::Admin(AdminEvent {
             created_at_ms: 1,
             public_key: [9u8; 32],
+            authority_event_id: [3u8; 32],
             user_event_id: [7u8; 32],
         })
     }

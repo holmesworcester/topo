@@ -8,7 +8,7 @@ pub mod queries;
 pub mod wire;
 
 pub use projector::project_pure;
-pub use queries::{count, first_event_id, list, list_items, UserItem, UserRow};
+pub use queries::{count, first_event_id, list, list_items, resolve, resolve_number, UserItem, UserRow};
 pub use wire::{encode_user, parse_user, UserEvent, USER_META, USER_WIRE_SIZE};
 
 use rusqlite::Connection;

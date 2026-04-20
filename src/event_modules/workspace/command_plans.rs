@@ -55,6 +55,41 @@ pub(crate) enum LocalEndpointSharedPlan {
     RejectMalformedLocalDaemonIdentity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoveMemberTargetKind {
+    User,
+    Peer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoveMemberDecisionContext {
+    pub actor_is_admin: bool,
+    pub targets_self: bool,
+    pub already_removed: bool,
+    pub target_kind: RemoveMemberTargetKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoveMemberPlan {
+    Proceed,
+    RejectNotAdmin,
+    RejectSelfTarget,
+    RejectAlreadyRemoved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GrantAdminDecisionContext {
+    pub actor_is_admin: bool,
+    pub target_already_admin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantAdminPlan {
+    Proceed,
+    RejectNotAdmin,
+    RejectAlreadyAdmin,
+}
+
 fn decode_hex32(value: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(value).ok()?;
     let bytes: [u8; 32] = bytes.try_into().ok()?;
@@ -239,6 +274,83 @@ pub(crate) fn resolve_local_endpoint_shared_plan(
     }
 }
 
+pub(crate) fn decide_remove_member_plan(
+    context: &RemoveMemberDecisionContext,
+) -> RemoveMemberPlan {
+    use topo_verus_proofs::event_modules::workspace::command_plans::{
+        decide_remove_member_plan_core, RemoveMemberDecisionContextCore, RemoveMemberPlanCore,
+        RemoveMemberTargetKindCore,
+    };
+    let core_ctx = RemoveMemberDecisionContextCore {
+        actor_is_admin: context.actor_is_admin,
+        targets_self: context.targets_self,
+        already_removed: context.already_removed,
+        target_kind: match context.target_kind {
+            RemoveMemberTargetKind::User => RemoveMemberTargetKindCore::User,
+            RemoveMemberTargetKind::Peer => RemoveMemberTargetKindCore::Peer,
+        },
+    };
+    match decide_remove_member_plan_core(core_ctx) {
+        RemoveMemberPlanCore::Proceed => RemoveMemberPlan::Proceed,
+        RemoveMemberPlanCore::RejectNotAdmin => RemoveMemberPlan::RejectNotAdmin,
+        RemoveMemberPlanCore::RejectSelfTarget => RemoveMemberPlan::RejectSelfTarget,
+        RemoveMemberPlanCore::RejectAlreadyRemoved => RemoveMemberPlan::RejectAlreadyRemoved,
+    }
+}
+
+pub(crate) fn resolve_remove_member_plan(
+    plan: RemoveMemberPlan,
+    target_kind: RemoveMemberTargetKind,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match (plan, target_kind) {
+        (RemoveMemberPlan::Proceed, _) => Ok(()),
+        (RemoveMemberPlan::RejectNotAdmin, _) => {
+            Err("Local peer signer is not admin for this workspace.".into())
+        }
+        (RemoveMemberPlan::RejectSelfTarget, RemoveMemberTargetKind::User) => {
+            Err("cannot ban the active local user".into())
+        }
+        (RemoveMemberPlan::RejectSelfTarget, RemoveMemberTargetKind::Peer) => {
+            Err("cannot unlink the active local device".into())
+        }
+        (RemoveMemberPlan::RejectAlreadyRemoved, RemoveMemberTargetKind::User) => {
+            Err("user is already removed".into())
+        }
+        (RemoveMemberPlan::RejectAlreadyRemoved, RemoveMemberTargetKind::Peer) => {
+            Err("device is already unlinked".into())
+        }
+    }
+}
+
+pub(crate) fn decide_grant_admin_plan(
+    context: &GrantAdminDecisionContext,
+) -> GrantAdminPlan {
+    use topo_verus_proofs::event_modules::workspace::command_plans::{
+        decide_grant_admin_plan_core, GrantAdminDecisionContextCore, GrantAdminPlanCore,
+    };
+    let core_ctx = GrantAdminDecisionContextCore {
+        actor_is_admin: context.actor_is_admin,
+        target_already_admin: context.target_already_admin,
+    };
+    match decide_grant_admin_plan_core(core_ctx) {
+        GrantAdminPlanCore::Proceed => GrantAdminPlan::Proceed,
+        GrantAdminPlanCore::RejectNotAdmin => GrantAdminPlan::RejectNotAdmin,
+        GrantAdminPlanCore::RejectAlreadyAdmin => GrantAdminPlan::RejectAlreadyAdmin,
+    }
+}
+
+pub(crate) fn resolve_grant_admin_plan(
+    plan: GrantAdminPlan,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match plan {
+        GrantAdminPlan::Proceed => Ok(()),
+        GrantAdminPlan::RejectNotAdmin => {
+            Err("Local peer signer is not admin for this workspace.".into())
+        }
+        GrantAdminPlan::RejectAlreadyAdmin => Err("user is already admin".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +395,71 @@ mod tests {
             plan,
             LocalEndpointSharedPlan::RejectMissingLocalDaemonIdentity
         );
+    }
+
+    #[test]
+    fn remove_member_plan_rejects_non_admin_before_other_checks() {
+        let plan = decide_remove_member_plan(&RemoveMemberDecisionContext {
+            actor_is_admin: false,
+            targets_self: false,
+            already_removed: false,
+            target_kind: RemoveMemberTargetKind::User,
+        });
+        assert_eq!(plan, RemoveMemberPlan::RejectNotAdmin);
+    }
+
+    #[test]
+    fn remove_member_plan_rejects_self_target_for_peer() {
+        let plan = decide_remove_member_plan(&RemoveMemberDecisionContext {
+            actor_is_admin: true,
+            targets_self: true,
+            already_removed: false,
+            target_kind: RemoveMemberTargetKind::Peer,
+        });
+        assert_eq!(plan, RemoveMemberPlan::RejectSelfTarget);
+        let err = resolve_remove_member_plan(plan, RemoveMemberTargetKind::Peer)
+            .expect_err("self-target unlink must reject");
+        assert_eq!(err.to_string(), "cannot unlink the active local device");
+    }
+
+    #[test]
+    fn remove_member_plan_rejects_already_removed_user() {
+        let plan = decide_remove_member_plan(&RemoveMemberDecisionContext {
+            actor_is_admin: true,
+            targets_self: false,
+            already_removed: true,
+            target_kind: RemoveMemberTargetKind::User,
+        });
+        assert_eq!(plan, RemoveMemberPlan::RejectAlreadyRemoved);
+        let err = resolve_remove_member_plan(plan, RemoveMemberTargetKind::User)
+            .expect_err("already removed user must reject");
+        assert_eq!(err.to_string(), "user is already removed");
+    }
+
+    #[test]
+    fn grant_admin_plan_rejects_non_admin_before_already_admin() {
+        let plan = decide_grant_admin_plan(&GrantAdminDecisionContext {
+            actor_is_admin: false,
+            target_already_admin: true,
+        });
+        assert_eq!(plan, GrantAdminPlan::RejectNotAdmin);
+        let err = resolve_grant_admin_plan(plan)
+            .expect_err("non-admin grant should reject");
+        assert_eq!(
+            err.to_string(),
+            "Local peer signer is not admin for this workspace."
+        );
+    }
+
+    #[test]
+    fn grant_admin_plan_rejects_already_admin_target() {
+        let plan = decide_grant_admin_plan(&GrantAdminDecisionContext {
+            actor_is_admin: true,
+            target_already_admin: true,
+        });
+        assert_eq!(plan, GrantAdminPlan::RejectAlreadyAdmin);
+        let err = resolve_grant_admin_plan(plan)
+            .expect_err("already-admin target must reject");
+        assert_eq!(err.to_string(), "user is already admin");
     }
 }

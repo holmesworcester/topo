@@ -244,7 +244,9 @@ impl ParsedEvent {
             ParsedEvent::InviteAccepted(a) => vec![("tenant_event_id", a.tenant_event_id)],
             ParsedEvent::Removal(r) => {
                 let slots = [r.parent_1, r.parent_2, r.parent_3, r.parent_4];
-                let deps = removal::frontier_refs_from_slots(r.parent_count, &slots)
+                let mut deps = vec![("removed_member_ref", r.removed_member_ref)];
+                deps.extend(
+                    removal::frontier_refs_from_slots(r.parent_count, &slots)
                     .unwrap_or_default()
                     .into_iter()
                     .enumerate()
@@ -253,8 +255,8 @@ impl ParsedEvent {
                         1 => ("parent_2", id),
                         2 => ("parent_3", id),
                         _ => ("parent_4", id),
-                    })
-                    .collect::<Vec<_>>();
+                    }),
+                );
                 deps
             }
             ParsedEvent::KeyRotation(k) => {
@@ -303,7 +305,10 @@ impl ParsedEvent {
                     ("endpoint_shared_event_id", p.endpoint_shared_event_id),
                 ]
             }
-            ParsedEvent::Admin(a) => vec![("user_event_id", a.user_event_id)],
+            ParsedEvent::Admin(a) => vec![
+                ("authority_event_id", a.authority_event_id),
+                ("user_event_id", a.user_event_id),
+            ],
             ParsedEvent::KeyShared(s) => {
                 let slots = [
                     s.frontier_ref_1,

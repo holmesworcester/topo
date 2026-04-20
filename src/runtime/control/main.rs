@@ -859,6 +859,86 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        Commands::Admin { action } => match action {
+            AdminAction::Add { target, target_flag } => {
+                let target = resolve_target_selector(target, target_flag, "admin add", None)?;
+                let method = RpcMethod::GrantAdmin {
+                    target: target.clone(),
+                };
+                let data = match rpc_call(
+                    &target_socket_path(db, socket_override.as_deref()),
+                    method.clone(),
+                ) {
+                    Ok(resp) => {
+                        if !resp.ok {
+                            return Err(resp
+                                .error
+                                .unwrap_or_else(|| "admin add failed".to_string())
+                                .into());
+                        }
+                        resp.data.unwrap_or(serde_json::Value::Null)
+                    }
+                    Err(RpcClientError::DaemonNotRunning(_)) => serde_json::to_value(
+                        topo::event_modules::workspace::commands::grant_admin_for_db(
+                            db, &target,
+                        )?,
+                    )?,
+                    Err(e) => return Err(e.to_string().into()),
+                };
+                println!(
+                    "Granted admin: {}",
+                    short_id(data["target_event_id"].as_str().unwrap_or(""))
+                );
+                println!(
+                    "admin_event_id:{}",
+                    data["admin_event_id"].as_str().unwrap_or("")
+                );
+            }
+        },
+
+        Commands::Ban { target, target_flag } => {
+            let target = resolve_target_selector(target, target_flag, "ban", None)?;
+            let method = RpcMethod::BanUser {
+                target: target.clone(),
+            };
+            let data = match rpc_call(
+                &target_socket_path(db, socket_override.as_deref()),
+                method.clone(),
+            ) {
+                Ok(resp) => {
+                    if !resp.ok {
+                        return Err(resp
+                            .error
+                            .unwrap_or_else(|| "ban failed".to_string())
+                            .into());
+                    }
+                    resp.data.unwrap_or(serde_json::Value::Null)
+                }
+                Err(RpcClientError::DaemonNotRunning(_)) => {
+                    serde_json::to_value(topo::event_modules::workspace::commands::ban_user_for_db(
+                        db, &target,
+                    )?)?
+                }
+                Err(e) => return Err(e.to_string().into()),
+            };
+            println!(
+                "Removed user: {}",
+                short_id(data["target_event_id"].as_str().unwrap_or(""))
+            );
+            println!(
+                "removal_event_id:{}",
+                data["removal_event_id"].as_str().unwrap_or("")
+            );
+            println!(
+                "rotation_event_id:{}",
+                data["rotation_event_id"].as_str().unwrap_or("")
+            );
+            println!(
+                "key_event_id:{}",
+                data["key_event_id"].as_str().unwrap_or("")
+            );
+        }
+
         Commands::Keys { summary } => {
             let data =
                 rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Keys { summary })?;
@@ -1047,6 +1127,47 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } else {
                 println!("  (none)");
             }
+        }
+
+        Commands::Unlink { target, target_flag } => {
+            let target = resolve_target_selector(target, target_flag, "unlink", None)?;
+            let method = RpcMethod::UnlinkDevice {
+                target: target.clone(),
+            };
+            let data = match rpc_call(
+                &target_socket_path(db, socket_override.as_deref()),
+                method.clone(),
+            ) {
+                Ok(resp) => {
+                    if !resp.ok {
+                        return Err(resp
+                            .error
+                            .unwrap_or_else(|| "unlink failed".to_string())
+                            .into());
+                    }
+                    resp.data.unwrap_or(serde_json::Value::Null)
+                }
+                Err(RpcClientError::DaemonNotRunning(_)) => serde_json::to_value(
+                    topo::event_modules::workspace::commands::unlink_device_for_db(db, &target)?,
+                )?,
+                Err(e) => return Err(e.to_string().into()),
+            };
+            println!(
+                "Unlinked device: {}",
+                short_id(data["target_event_id"].as_str().unwrap_or(""))
+            );
+            println!(
+                "removal_event_id:{}",
+                data["removal_event_id"].as_str().unwrap_or("")
+            );
+            println!(
+                "rotation_event_id:{}",
+                data["rotation_event_id"].as_str().unwrap_or("")
+            );
+            println!(
+                "key_event_id:{}",
+                data["key_event_id"].as_str().unwrap_or("")
+            );
         }
 
         Commands::Event { action } => {

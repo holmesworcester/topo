@@ -4,9 +4,6 @@ use cli_harness::*;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use topo::event_modules::workspace::commands::rotate_key_for_db;
-use topo::event_modules::workspace::invite_link::parse_invite_link;
-use topo::sim::key_repair::create_removal;
 
 fn rpc_data(response: &Value) -> &Value {
     assert!(
@@ -30,6 +27,19 @@ fn count_event_type(db: &str, event_type: &str) -> usize {
 
 fn message_visible(db: &str, content: &str) -> bool {
     get_messages_raw(db).contains(content)
+}
+
+fn user_event_id_by_username(db: &str, username: &str) -> String {
+    let response = rpc_method_json(db, r#"{"type":"Users"}"#);
+    let Some(items) = rpc_data(&response).as_array() else {
+        panic!("Users RPC returned non-array: {response}");
+    };
+    items
+        .iter()
+        .find(|item| item["username"].as_str() == Some(username))
+        .and_then(|item| item["event_id"].as_str())
+        .unwrap_or_else(|| panic!("missing user {username} in Users RPC: {response}"))
+        .to_string()
 }
 
 #[allow(dead_code)]
@@ -106,9 +116,6 @@ fn test_cli_key_request_heals_partitioned_removal_for_unknown_joiner() {
     wait_for_active_tenant_ready(&alice_db, Duration::from_secs(30));
 
     let mallory_invite = create_invite(&bob_db, &invite_addr);
-    let mallory_invite_event_id = parse_invite_link(&mallory_invite)
-        .expect("parse mallory invite")
-        .invite_event_id;
     accept_invite_with_identity(&mallory_db, &mallory_invite, "mallory", "mallory-phone");
     let mut mallory = start_daemon(&mallory_db);
     wait_for_active_tenant_ready(&mallory_db, Duration::from_secs(30));
@@ -120,8 +127,17 @@ fn test_cli_key_request_heals_partitioned_removal_for_unknown_joiner() {
     assert_eventually(&bob_db, "user_count == 3", timeout_ms);
     assert_eventually(&alice_db, "user_count == 3", timeout_ms);
     assert_eventually(&mallory_db, "user_count == 3", timeout_ms);
+    let alice_user_event_id = user_event_id_by_username(&bob_db, "alice");
+    let mallory_user_event_id = user_event_id_by_username(&alice_db, "mallory");
 
-    let alice_peer_id = active_tenant_peer_id(&alice_db).expect("alice active tenant peer id");
+    let grant_alice = topo_cmd(&bob_db, &["admin", "add", &alice_user_event_id]);
+    assert!(
+        grant_alice.status.success(),
+        "granting Alice admin should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&grant_alice.stdout),
+        String::from_utf8_lossy(&grant_alice.stderr)
+    );
+    assert_eventually(&alice_db, "admin_count == 2", timeout_ms);
 
     drop(alice);
     wait_for_daemon_stopped(&alice_db, Duration::from_secs(10));
@@ -149,9 +165,13 @@ fn test_cli_key_request_heals_partitioned_removal_for_unknown_joiner() {
         || count_event_type(&mallory_db, "key_request") == mallory_request_baseline,
     );
 
-    create_removal(&alice_db, &alice_peer_id, &mallory_invite_event_id, &[])
-        .expect("create Alice-side removal for Mallory");
-    let _rotate = rotate_key_for_db(&alice_db).expect("offline rotate key on Alice");
+    let remove_mallory = topo_cmd(&alice_db, &["ban", &mallory_user_event_id]);
+    assert!(
+        remove_mallory.status.success(),
+        "offline Alice removal should succeed through real CLI flow: stdout={} stderr={}",
+        String::from_utf8_lossy(&remove_mallory.stdout),
+        String::from_utf8_lossy(&remove_mallory.stderr)
+    );
 
     let alice = start_daemon(&alice_db);
     wait_for_active_tenant_ready(&alice_db, Duration::from_secs(30));

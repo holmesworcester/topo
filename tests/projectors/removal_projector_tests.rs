@@ -9,6 +9,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::removal::{frontier_hash_from_refs, project_pure, RemovalEvent};
     use topo::event_modules::{ParsedEvent, TenantEvent, EVENT_TYPE_REMOVAL};
+    use topo::projection::projector::RemovalTargetKind;
 
     const PEER: &str = "peer_alice";
 
@@ -32,6 +33,12 @@ mod tests {
         })
     }
 
+    fn removal_ctx(signer: [u8; 32], target_kind: RemovalTargetKind) -> topo::projection::projector::ProjectorDecisionContext {
+        let mut ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_REMOVAL);
+        ctx.removal_target_kind = Some(target_kind);
+        ctx
+    }
+
     #[test]
     fn test_removal_valid() {
         let signer = [9u8; 32];
@@ -43,11 +50,12 @@ mod tests {
             signer,
         );
         let event_id = b64(&[7u8; 32]);
-        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_REMOVAL);
+        let ctx = removal_ctx(signer, RemovalTargetKind::User);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "removals");
+        assert_writes_to_table(&result, "removed_entities");
     }
 
     #[test]
@@ -61,7 +69,7 @@ mod tests {
             signer,
         );
         let event_id = b64(&[8u8; 32]);
-        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_REMOVAL);
+        let ctx = removal_ctx(signer, RemovalTargetKind::Peer);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
@@ -78,7 +86,7 @@ mod tests {
             [8u8; 32],
         );
         let event_id = b64(&[6u8; 32]);
-        let ctx = ctx_with_current_signer(&b64(&[88u8; 32]), EVENT_TYPE_REMOVAL);
+        let ctx = removal_ctx([88u8; 32], RemovalTargetKind::User);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "removed_by must equal current signer");
@@ -89,7 +97,7 @@ mod tests {
         let signer = [9u8; 32];
         let parsed = make_removal(1, [2u8; 32], [0u8; 32], [7u8; 32], signer);
         let event_id = b64(&[5u8; 32]);
-        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_REMOVAL);
+        let ctx = removal_ctx(signer, RemovalTargetKind::User);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "frontier_hash does not match parent frontier");
@@ -106,10 +114,46 @@ mod tests {
             signer,
         );
         let event_id = b64(&[3u8; 32]);
-        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_REMOVAL);
+        let ctx = removal_ctx(signer, RemovalTargetKind::User);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "frontier refs must be sorted in canonical order");
+    }
+
+    #[test]
+    fn test_removal_rejects_non_admin_signer() {
+        let signer = [9u8; 32];
+        let parsed = make_removal(
+            1,
+            [2u8; 32],
+            [0u8; 32],
+            frontier_hash_from_refs(&[[2u8; 32]]),
+            signer,
+        );
+        let event_id = b64(&[2u8; 32]);
+        let mut ctx = removal_ctx(signer, RemovalTargetKind::User);
+        ctx.removal_signer_reject_reason =
+            Some("removal signer must be an admin peer_shared identity".to_string());
+
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
+        assert_reject_contains(&result, "admin peer_shared");
+    }
+
+    #[test]
+    fn test_removal_rejects_missing_target_kind() {
+        let signer = [9u8; 32];
+        let parsed = make_removal(
+            1,
+            [2u8; 32],
+            [0u8; 32],
+            frontier_hash_from_refs(&[[2u8; 32]]),
+            signer,
+        );
+        let event_id = b64(&[10u8; 32]);
+        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_REMOVAL);
+
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
+        assert_reject_contains(&result, "projected user or peer_shared");
     }
 
     #[test]
@@ -119,7 +163,7 @@ mod tests {
             public_key: [7u8; 32],
         });
         let event_id = b64(&[4u8; 32]);
-        let ctx = ctx_with_current_signer(&b64(&[9u8; 32]), EVENT_TYPE_REMOVAL);
+        let ctx = removal_ctx([9u8; 32], RemovalTargetKind::User);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "not a removal event");

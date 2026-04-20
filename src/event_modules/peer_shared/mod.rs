@@ -10,8 +10,8 @@ pub use projector::project_pure;
 pub use queries::{
     count, first_event_id, identity, list_event_ids, list_peers, list_tenant_items, list_tenants,
     load_local_peer_signer, load_local_peer_signer_required,
-    resolve_event_id_by_transport_fingerprint, resolve_user_event_id, IdentityResponse, PeerItem,
-    TenantItem, TenantRow,
+    resolve_event_id_by_transport_fingerprint, resolve_peer, resolve_peer_number,
+    resolve_user_event_id, IdentityResponse, PeerItem, TenantItem, TenantRow,
 };
 pub use wire::{
     encode_peer_shared, parse_peer_shared, PeerSharedEvent, PEER_SHARED_META, PEER_SHARED_WIRE_SIZE,

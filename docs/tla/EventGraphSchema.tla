@@ -201,7 +201,9 @@ RawDeps(e) ==
        \* peer_shared: no raw deps beyond signer
        [] e = PeerShared -> {}
 
-       \* admin: depends on workspace + user
+       \* admin: abstractly depends on workspace + user.
+       \* Runtime bootstrap grants use workspace authority/signer; ongoing grants
+       \* use prior admin authority with a peer_shared signer that resolves to it.
        [] e = Admin -> {Workspace, User}
 
        [] e = PeerPrivkey -> {}
@@ -243,7 +245,9 @@ SignerDep(e) ==
        \* peer_shared: signed by the peer_invite_shared key
        [] e = PeerShared -> {DeviceInvite}
 
-       \* admin: signed by workspace
+       \* admin: abstractly signed by workspace.
+       \* Runtime bootstrap grants use workspace directly; ongoing grants are
+       \* signed by peer_shared and validated against the claimed admin authority.
        [] e = Admin -> {Workspace}
 
        \* Content: signed by a linked peer
@@ -716,6 +720,8 @@ InvDeviceLinkScopedToExistingWorkspace ==
     ELSE TRUE
 
 \* Admin requires user identity chain.
+\* Authority chaining is modeled by the runtime projector checks and is abstracted
+\* here under the workspace/admin chain invariant.
 InvAdminChain ==
     IF Admin \in EVENTS
     THEN \A p \in Peers: (Admin \in valid[p]) => (User \in valid[p])

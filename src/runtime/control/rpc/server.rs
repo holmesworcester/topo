@@ -1025,6 +1025,29 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }),
+        RpcMethod::GrantAdmin { target } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                match workspace::commands::grant_admin_for_peer(db_path, &peer_id, &target) {
+                    Ok(data) => {
+                        state.notify_runtime_recheck();
+                        RpcResponse::success(data)
+                    }
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::BanUser { target } => match state.require_active_peer() {
+            Ok(peer_id) => match workspace::commands::ban_user_for_peer(db_path, &peer_id, &target)
+            {
+                Ok(data) => {
+                    state.notify_runtime_recheck();
+                    RpcResponse::success(data)
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::Keys { summary } => with_active_peer_db(state, |_peer_id, recorded_by, db| {
             match workspace::keys(db, recorded_by, summary) {
                 Ok(data) => RpcResponse::success(data),
@@ -1040,6 +1063,18 @@ fn dispatch(
                 },
             )
         }
+        RpcMethod::UnlinkDevice { target } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                match workspace::commands::unlink_device_for_peer(db_path, &peer_id, &target) {
+                    Ok(data) => {
+                        state.notify_runtime_recheck();
+                        RpcResponse::success(data)
+                    }
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::Workspaces => match crate::db::open_connection(db_path) {
             Ok(db) => {
                 let _ = crate::db::schema::create_tables(&db);
