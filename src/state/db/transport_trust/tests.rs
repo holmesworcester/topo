@@ -1562,3 +1562,53 @@ fn test_bootstrap_context_deduplicates_addrs() {
     );
     assert_eq!(ctx.bootstrap_addrs[0], "10.0.0.1:4433");
 }
+
+#[test]
+fn pbt_axiom_db_faithfulness_invite_bootstrap_roundtrip_authorizes_written_spkis() {
+    // Exercises AXIOM_DB_FAITHFULNESS: rows written to invite_bootstrap_trust
+    // must be faithfully reflected by `is_authorized_for_tenant` reads.
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let now = now_ms_i64();
+    let mut rng = rand::thread_rng();
+    let mut inserted: Vec<([u8; 32], String, i64)> = Vec::with_capacity(50);
+
+    for i in 0..50 {
+        let mut spki = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rng, &mut spki);
+        let recorded_by = format!("tenant_db_faithful_{}", rand::Rng::gen::<u64>(&mut rng));
+        let invite_accepted_event_id = format!("ia_db_faithful_{i}");
+        let invite_event_id = format!("invite_db_faithful_{i}");
+        let workspace_id = format!("workspace_db_faithful_{i}");
+        let accepted_at = now - i as i64;
+        let expires_at = now + 60_000 + rand::Rng::gen_range(&mut rng, 0_i64..60_000_i64);
+
+        conn.execute(
+            "INSERT INTO invite_bootstrap_trust
+             (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                recorded_by,
+                invite_accepted_event_id,
+                invite_event_id,
+                workspace_id,
+                "127.0.0.1:4433",
+                spki.as_slice(),
+                accepted_at,
+                expires_at,
+            ],
+        )
+        .unwrap();
+
+        inserted.push((spki, recorded_by, expires_at));
+    }
+
+    for (spki, recorded_by, _expires_at) in inserted {
+        assert!(
+            is_authorized_for_tenant(&conn, &recorded_by, &spki).unwrap(),
+            "expected inserted invite_bootstrap_trust SPKI to be authorized for tenant"
+        );
+    }
+}
+
