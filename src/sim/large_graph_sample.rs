@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 
@@ -717,23 +720,23 @@ fn insert_path(
     }
 }
 
-#[derive(Clone)]
 struct ActualPeer {
     daemon: VirtualDaemon,
     recorded_by: String,
+    _keeper: Connection,
 }
 
 fn materialize_corridor_peers(
     logical_nodes: &BTreeSet<usize>,
 ) -> SimResult<BTreeMap<usize, ActualPeer>> {
-    let tmpdir = tempfile::tempdir()?;
-    let base = tmpdir.keep();
+    let run_id = next_large_graph_run_id();
     let sender = *logical_nodes
         .first()
         .expect("sender must be present as the first corridor node");
 
-    let sender_db = base.join(format!("{sender:06}.db"));
-    let sender_daemon = VirtualDaemon::new(sender_db.to_str().expect("sender db path utf8"));
+    let sender_db = shared_memory_db_uri(run_id, sender);
+    let sender_keeper = open_connection(&sender_db)?;
+    let sender_daemon = VirtualDaemon::new(&sender_db);
     let created = sender_daemon.call(RpcMethod::CreateWorkspace {
         workspace_name: "sim".into(),
         username: format!("user{sender}"),
@@ -751,12 +754,14 @@ fn materialize_corridor_peers(
         ActualPeer {
             recorded_by: active_peer_id(&sender_daemon)?,
             daemon: sender_daemon.clone(),
+            _keeper: sender_keeper,
         },
     );
 
     for &logical in logical_nodes.iter().skip(1) {
-        let db_path = base.join(format!("{logical:06}.db"));
-        let daemon = VirtualDaemon::new(db_path.to_str().expect("peer db path utf8"));
+        let db_path = shared_memory_db_uri(run_id, logical);
+        let keeper = open_connection(&db_path)?;
+        let daemon = VirtualDaemon::new(&db_path);
         let invite = create_invite(&sender_daemon)?;
         let accepted = daemon.call(RpcMethod::AcceptInvite {
             invite,
@@ -771,6 +776,7 @@ fn materialize_corridor_peers(
             ActualPeer {
                 recorded_by: active_peer_id(&daemon)?,
                 daemon,
+                _keeper: keeper,
             },
         );
     }
@@ -793,6 +799,22 @@ fn create_invite(daemon: &VirtualDaemon) -> SimResult<String> {
         .as_str()
         .expect("invite link")
         .to_string())
+}
+
+fn next_large_graph_run_id() -> u64 {
+    static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos
+        .wrapping_mul(31)
+        .wrapping_add(std::process::id() as u64)
+        .wrapping_add(NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn shared_memory_db_uri(run_id: u64, logical_peer: usize) -> String {
+    format!("file:topo-large-graph-{run_id:016x}-{logical_peer:06}?mode=memory&cache=shared")
 }
 
 #[cfg(test)]
@@ -820,5 +842,25 @@ mod tests {
             .sampled_peers
             .iter()
             .all(|peer| peer.first_visible_round.is_some()));
+    }
+
+    #[test]
+    fn materialized_sampled_peers_use_shared_memory_databases() {
+        let logical_nodes = [0usize, 4, 9].into_iter().collect::<BTreeSet<_>>();
+        let actual = materialize_corridor_peers(&logical_nodes).expect("materialize peers");
+
+        assert_eq!(actual.len(), 3);
+        for peer in actual.values() {
+            assert!(
+                peer.daemon.db_path().starts_with("file:topo-large-graph-"),
+                "expected shared-memory sqlite URI, got {}",
+                peer.daemon.db_path()
+            );
+            assert!(
+                peer.daemon.db_path().contains("mode=memory&cache=shared"),
+                "expected shared-memory sqlite mode, got {}",
+                peer.daemon.db_path()
+            );
+        }
     }
 }

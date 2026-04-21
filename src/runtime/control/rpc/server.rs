@@ -56,6 +56,7 @@ fn discover_tenant_scopes(
 /// Daemon-wide shared state: tracks active peer and invite refs.
 pub struct DaemonState {
     pub db_path: String,
+    pub synthetic_transport: bool,
     pub active_peer: RwLock<Option<String>>,
     /// Runtime lifecycle state.
     pub runtime_state: RwLock<RuntimeState>,
@@ -92,6 +93,14 @@ impl RuntimeState {
 impl DaemonState {
     /// Create state with auto-selected peer if exactly one tenant exists.
     pub fn new(db_path: &str) -> Self {
+        Self::new_with_transport_mode(db_path, false)
+    }
+
+    pub fn new_simulated(db_path: &str) -> Self {
+        Self::new_with_transport_mode(db_path, true)
+    }
+
+    fn new_with_transport_mode(db_path: &str, synthetic_transport: bool) -> Self {
         let active = match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
@@ -106,6 +115,7 @@ impl DaemonState {
         };
         DaemonState {
             db_path: db_path.to_string(),
+            synthetic_transport,
             active_peer: RwLock::new(active),
             // Runtime manager owns lifecycle transitions.
             runtime_state: RwLock::new(RuntimeState::IdleNoTenants),
@@ -403,6 +413,9 @@ fn runtime_relay_url(state: &DaemonState) -> Option<String> {
 }
 
 fn runtime_relay_url_for_bootstrap(state: &DaemonState) -> Option<String> {
+    if state.synthetic_transport {
+        return runtime_relay_url(state);
+    }
     if env_flag("TOPO_DISABLE_RELAY") {
         return None;
     }
