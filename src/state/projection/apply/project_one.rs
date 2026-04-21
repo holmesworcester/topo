@@ -108,6 +108,28 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
     }
 
     let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
+
+    // Refinement bridge to the abstract access-control model (see
+    // verus-proofs/src/state/access_control.rs). At this point all runtime
+    // dep/signer/guard stages have passed, so we pass all-honest flags to the
+    // verified checker. The call acts as a live linkage: if a future change
+    // to `apply_accepts_primitives_spec` starts rejecting an event kind the
+    // runtime still projects, this debug_assert fires. Non-tautological parts
+    // (kind-specific recipient matching) can be added as the model grows.
+    debug_assert!(
+        topo_verus_proofs::state::access_control::abstract_apply_accepts_primitives(
+            parsed.event_type_code(),
+            /* recipient_is_this_peer */ true,
+            /* has_required_dep */ true,
+            /* dep_is_valid */ true,
+            /* dep_kind_matches */ true,
+            /* dep_workspace_matches */ true,
+            /* dep_recipient_matches */ true,
+        ),
+        "abstract access-control model rejected an event the runtime is finalizing as Valid (kind_code={})",
+        parsed.event_type_code(),
+    );
+
     backend.finalize_valid_projection(recorded_by, &event_id_b64, sub_event, suppress_sharing)?;
 
     Ok((ProjectionDecision::Valid, Some(parsed)))
