@@ -70,6 +70,29 @@ The design goal is to keep protocol behavior auditable while still supporting re
 3. projection logic is deterministic and convergent,
 4. CLI workflows remain synchronous enough for imperative command chains.
 
+## Simulation Boundary
+
+The simulator intentionally sits at a principled boundary instead of trying to be either "all fake" or "all real."
+
+What remains real in sim:
+
+1. real daemon RPC command paths,
+2. real event creation, signing, ingest, and projection,
+3. real SQLite-backed runtime state,
+4. real planner/import logic for local daemon state and connectivity intent,
+5. real sync-side range/window selection, missing-id calculation, send ordering, dependency closure expansion, and projector drain after ingest.
+
+What is synthetic in sim:
+
+1. no real `iroh` endpoints, accept loops, dial workers, or network I/O,
+2. no real peer-to-peer negentropy session over sockets,
+3. synthetic pair sync computes what one peer lacks from SQLite and injects the resulting batch directly,
+4. large sampled swarm runs may use in-memory SQLite and may materialize only a sampled path subgraph rather than every logical peer.
+
+This is a deliberate balance. We could make the simulator more real by stubbing only network activity and storage while running the real negentropy/session machinery between peers over a stubbed network. We could also make it less real by collapsing sync to coarse full-round set merging. We chose the current middle ground because it preserves the event/command/projector/planner behavior that most affects correctness, while replacing the transport/reconciliation machinery that is too expensive to run at large scale in-process.
+
+In other words: the actual daemon is "real transport plus real sync," while the simulator is "real daemon behavior above the transport boundary, synthetic transport below it." That keeps sim/daemon behavior close where correctness matters, but still lets sampled large-swarm runs reach logical scales such as `10k` or `100k` peers on one machine.
+
 ## Context Queries And Pure Planners
 
 For security-sensitive runtime behavior, the preferred shape is:
