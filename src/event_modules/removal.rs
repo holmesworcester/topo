@@ -193,44 +193,110 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
+    use topo_verus_proofs::event_modules::removal::{
+        decide_removal_acceptance_core, RemovalAcceptanceInputs, RemovalDecisionCore,
+    };
     let removal = match parsed {
         ParsedEvent::Removal(event) => event,
         _ => return ProjectorResult::reject("not a removal event".to_string()),
     };
-    let Some(current_signer) = ctx.current_signer.as_ref() else {
-        return ProjectorResult::reject("removal missing current signer envelope".to_string());
-    };
-    if removal.removed_by
-        != crate::crypto::event_id_from_base64(&current_signer.event_id).unwrap_or([0u8; 32])
-    {
-        return ProjectorResult::reject("removed_by must equal current signer".to_string());
-    }
-    if let Some(reason) = ctx.removal_signer_reject_reason.as_ref() {
-        return ProjectorResult::reject(reason.clone());
-    }
+
+    // --- Extract the seven primitive flags the verified decision depends on.
+    let current_signer = ctx.current_signer.as_ref();
+    let has_current_signer = current_signer.is_some();
+    let removed_by_matches_signer = current_signer
+        .map(|sig| {
+            removal.removed_by
+                == crate::crypto::event_id_from_base64(&sig.event_id).unwrap_or([0u8; 32])
+        })
+        .unwrap_or(false);
+    let signer_not_rejected = ctx.removal_signer_reject_reason.is_none();
+
     let slots = [
         removal.parent_1,
         removal.parent_2,
         removal.parent_3,
         removal.parent_4,
     ];
-    let refs = match frontier_refs_from_slots(removal.parent_count, &slots) {
-        Ok(refs) => refs,
-        Err(reason) => return ProjectorResult::reject(reason),
-    };
-    if let Err(reason) = validate_canonical_frontier_refs(&refs) {
-        return ProjectorResult::reject(reason);
-    }
-    let expected_hash = frontier_hash_from_refs(&refs);
-    if expected_hash != removal.frontier_hash {
-        return ProjectorResult::reject("frontier_hash does not match parent frontier".to_string());
+    let refs_result = frontier_refs_from_slots(removal.parent_count, &slots);
+    let frontier_refs_well_formed = refs_result.is_ok();
+    let canonical_result = refs_result
+        .as_ref()
+        .ok()
+        .map(|refs| validate_canonical_frontier_refs(refs));
+    let frontier_refs_canonical = matches!(&canonical_result, Some(Ok(())));
+    let frontier_hash_matches = refs_result
+        .as_ref()
+        .ok()
+        .map(|refs| frontier_hash_from_refs(refs) == removal.frontier_hash)
+        .unwrap_or(false);
+    let target_kind_present = ctx.removal_target_kind.is_some();
+
+    // --- Delegate acceptance to the Verus-verified decision core.
+    let decision = decide_removal_acceptance_core(RemovalAcceptanceInputs {
+        has_current_signer,
+        removed_by_matches_signer,
+        signer_not_rejected,
+        frontier_refs_well_formed,
+        frontier_refs_canonical,
+        frontier_hash_matches,
+        target_kind_present,
+    });
+
+    match decision {
+        RemovalDecisionCore::RejectNoCurrentSigner => {
+            return ProjectorResult::reject(
+                "removal missing current signer envelope".to_string(),
+            );
+        }
+        RemovalDecisionCore::RejectRemovedByMismatch => {
+            return ProjectorResult::reject("removed_by must equal current signer".to_string());
+        }
+        RemovalDecisionCore::RejectSignerItselfRejected => {
+            // Flag was set only when removal_signer_reject_reason.is_some().
+            let reason = ctx
+                .removal_signer_reject_reason
+                .as_ref()
+                .expect("verified SignerItselfRejected requires reason to be present")
+                .clone();
+            return ProjectorResult::reject(reason);
+        }
+        RemovalDecisionCore::RejectFrontierRefsMalformed => {
+            // Flag was set only when refs_result is Err.
+            let reason = refs_result
+                .err()
+                .expect("verified FrontierRefsMalformed requires refs_result to be Err");
+            return ProjectorResult::reject(reason);
+        }
+        RemovalDecisionCore::RejectFrontierRefsNotCanonical => {
+            let reason = match canonical_result {
+                Some(Err(reason)) => reason,
+                _ => unreachable!(
+                    "verified FrontierRefsNotCanonical requires canonical_result == Some(Err)"
+                ),
+            };
+            return ProjectorResult::reject(reason);
+        }
+        RemovalDecisionCore::RejectFrontierHashMismatch => {
+            return ProjectorResult::reject(
+                "frontier_hash does not match parent frontier".to_string(),
+            );
+        }
+        RemovalDecisionCore::RejectTargetKindUnknown => {
+            return ProjectorResult::reject(
+                "removal target must be a projected user or peer_shared event".to_string(),
+            );
+        }
+        RemovalDecisionCore::Valid => {}
     }
 
-    let Some(target_kind) = ctx.removal_target_kind else {
-        return ProjectorResult::reject(
-            "removal target must be a projected user or peer_shared event".to_string(),
-        );
-    };
+    // --- Verified decision was Valid; all seven preconditions hold. Rehydrate
+    // --- the specific values the write_ops need.
+    let current_signer = current_signer
+        .expect("verified Valid requires current_signer to be Some");
+    let target_kind = ctx
+        .removal_target_kind
+        .expect("verified Valid requires removal_target_kind to be Some");
     let removed_member_ref_b64 = event_id_to_base64(&removal.removed_member_ref);
     ProjectorResult::valid(vec![
         WriteOp::InsertOrIgnore {
