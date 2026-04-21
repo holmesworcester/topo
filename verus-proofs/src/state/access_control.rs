@@ -376,10 +376,17 @@ pub proof fn system_invariant_holds(state: PeerState)
 // PeerState-level spec fn via its ensures.
 
 // --- primitive encoding of event kinds (matches runtime event_type codes) ---
+// These MUST match the canonical runtime codes in src/event_modules/mod.rs:
+//   EVENT_TYPE_ENCRYPTED        = 5
+//   EVENT_TYPE_INVITE_ACCEPTED  = 9
+//   EVENT_TYPE_PEER_SHARED      = 16
+//   EVENT_TYPE_KEY_SHARED       = 22
+// Runtime "KeyShared" is the envelope abstract "SecretShared" refers to
+// (both wrap a content key and target a recipient).
 pub open spec fn kind_is_encrypted(kind_code: u8) -> bool { kind_code == 5 }
-pub open spec fn kind_is_secret_shared(kind_code: u8) -> bool { kind_code == 9 }
-pub open spec fn kind_is_peer_shared(kind_code: u8) -> bool { kind_code == 8 }
-pub open spec fn kind_is_invite_accepted(kind_code: u8) -> bool { kind_code == 3 }
+pub open spec fn kind_is_secret_shared(kind_code: u8) -> bool { kind_code == 22 }
+pub open spec fn kind_is_peer_shared(kind_code: u8) -> bool { kind_code == 16 }
+pub open spec fn kind_is_invite_accepted(kind_code: u8) -> bool { kind_code == 9 }
 
 /// Does the event kind require a signer-chain dep?
 pub open spec fn kind_requires_dep(kind_code: u8) -> bool {
@@ -454,11 +461,11 @@ pub fn abstract_apply_accepts_primitives(
 // tying it to the corresponding spec fn.
 pub fn kind_is_chain_exec(kind_code: u8) -> (b: bool)
     ensures b == kind_is_chain(kind_code),
-{ kind_code == 3 || kind_code == 8 || kind_code == 9 }
+{ kind_code == 9 || kind_code == 16 || kind_code == 22 }
 
 pub fn kind_requires_dep_exec(kind_code: u8) -> (b: bool)
     ensures b == kind_requires_dep(kind_code),
-{ kind_code == 5 || kind_code == 8 || kind_code == 9 }
+{ kind_code == 5 || kind_code == 16 || kind_code == 22 }
 
 pub fn kind_is_encrypted_exec(kind_code: u8) -> (b: bool)
     ensures b == kind_is_encrypted(kind_code),
@@ -466,25 +473,26 @@ pub fn kind_is_encrypted_exec(kind_code: u8) -> (b: bool)
 
 pub fn kind_is_secret_shared_exec(kind_code: u8) -> (b: bool)
     ensures b == kind_is_secret_shared(kind_code),
-{ kind_code == 9 }
+{ kind_code == 22 }
 
 pub fn kind_is_peer_shared_exec(kind_code: u8) -> (b: bool)
     ensures b == kind_is_peer_shared(kind_code),
-{ kind_code == 8 }
+{ kind_code == 16 }
 
 pub fn kind_is_invite_accepted_exec(kind_code: u8) -> (b: bool)
     ensures b == kind_is_invite_accepted(kind_code),
-{ kind_code == 3 }
+{ kind_code == 9 }
 
 // --- soundness of the primitive check vs the abstract model ---
 
-/// Map an `EventKind` to its runtime kind_code.
+/// Map an `EventKind` to its runtime kind_code. Matches the canonical
+/// runtime constants in src/event_modules/mod.rs.
 pub open spec fn kind_to_code(k: EventKind) -> u8 {
     match k {
-        EventKind::InviteAccepted => 3,
-        EventKind::PeerShared => 8,
-        EventKind::SecretShared => 9,
         EventKind::Encrypted => 5,
+        EventKind::InviteAccepted => 9,
+        EventKind::PeerShared => 16,
+        EventKind::SecretShared => 22,   // -> EVENT_TYPE_KEY_SHARED
         EventKind::Workspace => 1,
         EventKind::UserInvite => 2,
         EventKind::Message => 6,

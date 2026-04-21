@@ -116,9 +116,11 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
     // to `apply_accepts_primitives_spec` starts rejecting an event kind the
     // runtime still projects, this debug_assert fires. Non-tautological parts
     // (kind-specific recipient matching) can be added as the model grows.
+    // Use `sub_event` (the semantic inner event for Encrypted wrappers), not
+    // `parsed` (the outer wire event). For non-wrapper events these coincide.
     debug_assert!(
         topo_verus_proofs::state::access_control::abstract_apply_accepts_primitives(
-            parsed.event_type_code(),
+            sub_event.event_type_code(),
             /* recipient_is_this_peer */ true,
             /* has_required_dep */ true,
             /* dep_is_valid */ true,
@@ -127,7 +129,7 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
             /* dep_recipient_matches */ true,
         ),
         "abstract access-control model rejected an event the runtime is finalizing as Valid (kind_code={})",
-        parsed.event_type_code(),
+        sub_event.event_type_code(),
     );
 
     backend.finalize_valid_projection(recorded_by, &event_id_b64, sub_event, suppress_sharing)?;
