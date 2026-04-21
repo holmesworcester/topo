@@ -23,7 +23,7 @@ pub struct VirtualDaemon {
 impl VirtualDaemon {
     pub fn new(db_path: &str) -> Self {
         Self {
-            state: Arc::new(DaemonState::new(db_path)),
+            state: Arc::new(DaemonState::new_simulated(db_path)),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
         }
@@ -107,5 +107,14 @@ mod tests {
             .as_array()
             .expect("messages array in response");
         assert!(!items.is_empty());
+    }
+
+    #[test]
+    fn virtual_daemon_uses_synthetic_transport_mode() {
+        let tmpdir = tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("virtual-daemon.db");
+        let daemon = VirtualDaemon::new(db_path.to_str().expect("db path utf8"));
+
+        assert!(daemon.state().synthetic_transport);
     }
 }

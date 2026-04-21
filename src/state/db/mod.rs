@@ -25,13 +25,23 @@ pub mod topo_log;
 pub mod transport_creds;
 pub mod transport_trust;
 
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::{Connection, OpenFlags, Result as SqliteResult};
 use std::path::Path;
 
 /// Open database connection with WAL mode and performance pragmas
 pub fn open_connection<P: AsRef<Path>>(path: P) -> SqliteResult<Connection> {
-    let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    let path_str = path.as_ref().to_string_lossy().into_owned();
+    let conn = if is_sqlite_uri(&path_str) {
+        Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?
+    } else {
+        Connection::open(path)?
+    };
+    apply_pragmas(&conn, Some(&path_str))?;
     Ok(conn)
 }
 
@@ -75,11 +85,12 @@ pub fn friendly_db_error<P: AsRef<Path>>(path: P, e: rusqlite::Error) -> String 
 #[cfg(test)]
 pub fn open_in_memory() -> SqliteResult<Connection> {
     let conn = Connection::open_in_memory()?;
-    apply_pragmas(&conn)?;
+    apply_pragmas(&conn, Some(":memory:"))?;
     Ok(conn)
 }
 
-fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
+fn apply_pragmas(conn: &Connection, path_hint: Option<&str>) -> SqliteResult<()> {
+    let memory_uri = path_hint.map(is_shared_memory_uri).unwrap_or(false);
     if low_mem_mode() {
         conn.execute_batch(
             "
@@ -96,6 +107,17 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
             PRAGMA foreign_keys = OFF;
             ",
         )?;
+    } else if memory_uri {
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode = MEMORY;
+            PRAGMA synchronous = OFF;
+            PRAGMA cache_size = -4096;
+            PRAGMA busy_timeout = 5000;
+            PRAGMA foreign_keys = OFF;
+            PRAGMA temp_store = MEMORY;
+            ",
+        )?;
     } else {
         conn.execute_batch(
             "
@@ -109,6 +131,14 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
         )?;
     }
     Ok(())
+}
+
+fn is_sqlite_uri(path: &str) -> bool {
+    path.starts_with("file:")
+}
+
+fn is_shared_memory_uri(path: &str) -> bool {
+    is_sqlite_uri(path) && path.contains("mode=memory")
 }
 
 use crate::tuning::low_mem_mode;
@@ -147,5 +177,25 @@ mod tests {
             .unwrap();
         // In-memory databases may report "memory" instead of "wal"
         assert!(journal_mode == "wal" || journal_mode == "memory");
+    }
+
+    #[test]
+    fn sqlite_uri_shared_memory_connections_share_state() {
+        let uri = "file:topo-db-test-shared-memory?mode=memory&cache=shared";
+        let keeper = open_connection(uri).unwrap();
+        keeper
+            .execute("CREATE TABLE shared_state (value TEXT NOT NULL)", [])
+            .unwrap();
+        keeper
+            .execute("INSERT INTO shared_state (value) VALUES ('ok')", [])
+            .unwrap();
+
+        let conn = open_connection(uri).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM shared_state LIMIT 1", [], |row| {
+                get_text(row, 0)
+            })
+            .unwrap();
+        assert_eq!(value, "ok");
     }
 }
