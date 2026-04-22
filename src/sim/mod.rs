@@ -1,14 +1,14 @@
 //! Deterministic in-process simulation harness for testing multi-peer scenarios without
-//! running real daemons. Hosts the node-behavior engine ([`node_behavior`]), scenario and
-//! [`topology`] builders, a virtual [`clock`], [`pair_sync`] for reconciliation trials,
-//! and the `key_repair` / `large_graph_sample` trial helpers used by integration tests.
+//! running real daemons. Centers on [`virtual_daemon`] (in-process real-daemon RPC),
+//! scenario and [`topology`] builders, a virtual [`clock`], [`pair_sync`] for
+//! reconciliation trials, and the `key_repair` / `large_graph_sample` trial helpers
+//! used by integration tests.
 
 pub mod clock;
 pub mod hash_graph;
 pub mod key_repair;
 pub mod knowledge;
 pub mod large_graph_sample;
-pub mod node_behavior;
 pub mod pair_sync;
 #[allow(dead_code)]
 mod peer_db_bridge;
@@ -30,10 +30,6 @@ pub use knowledge::{exact_matrix_bytes, SparseKnowledge};
 pub use large_graph_sample::{
     run_large_graph_sampled_decrypt_trial, LargeGraphSampleDecryptConfig,
     LargeGraphSampleDecryptPeerReport, LargeGraphSampleDecryptReport,
-};
-pub use node_behavior::{
-    sqlite_behavior_summary, BehaviorRow, BehaviorValue, EventProjectionFilter, NodeBehaviorEngine,
-    NodeBehaviorSummary,
 };
 pub use pair_sync::{
     plan_pair_sync_intents, run_pair_sync_session, PairSyncDirectionStats, PairSyncIntent,
