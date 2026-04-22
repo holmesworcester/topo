@@ -293,7 +293,7 @@ pub mod fixtures {
         match op {
             WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
             WriteOp::Delete { table: t, .. } => *t == table,
-            WriteOp::InsertKeySecret(_) => {
+            WriteOp::InsertKeySecretFromUnwrap(_) | WriteOp::InsertKeySecretLocal(_) => {
                 table == topo::event_modules::key_shared::KEY_SECRETS_TABLE
             }
         }

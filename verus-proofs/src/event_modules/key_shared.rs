@@ -222,34 +222,36 @@ pub fn key_secrets_column_count() -> (n: u8)
     4
 }
 
-/// THE ACCESS-CONTROL THEOREM at the write-construction boundary:
+/// THE UNWRAP-GATED ACCESS-CONTROL THEOREM at the write-construction
+/// boundary. Applies ONLY to rows produced via
+/// `KeySecretsRow::to_write_op_from_unwrap` (the `InsertKeySecretFromUnwrap`
+/// variant), which in production is emitted only by the KeyShared,
+/// KeyRotation, and KeyHistory projectors — each of which gates emission
+/// on `ctx.unwrapped_*_material.is_some()`.
 ///
-/// A key_secrets WriteOp produced by the KeyShared projector is emitted
-/// iff the projector's materialization decision was EmitKeySecretsRow,
-/// which itself holds iff `unwrap_successful_for_this_peer == true`.
+/// The CI gate (scripts/check_projection_write_sites.sh) mechanically
+/// enforces that only those three projector files call
+/// `to_write_op_from_unwrap`, and that no untyped `WriteOp::InsertOrIgnore`
+/// with `table: "key_secrets"` exists in production code.
 ///
-/// Combined with:
-///   - The CI gate (scripts/check_projection_write_sites.sh) which
-///     enforces that the KeyShared projector is the ONLY writer of
-///     key_secrets in production code.
-///   - `emit_requires_successful_unwrap` (existing).
-///   - `no_unwrap_means_skip` (existing).
-///
-/// The composed theorem:
-///   key_secrets row exists with (recorded_by=P, key_event_id=K)
-///   ⟹ the row was constructed via KeySecretsRow::to_write_op by the
-///     KeyShared projector
-///   ⟹ the projector's materialization decision for that (P, K) was
-///     EmitKeySecretsRow
+/// The theorem:
+///   InsertKeySecretFromUnwrap row exists with (recorded_by=P, key_event_id=K)
+///   ⟹ the emitting projector's materialization decision for that (P, K)
+///     was EmitKeySecretsRow
 ///   ⟹ `unwrap_successful_for_this_peer == true` at the time of
-///     projection — i.e., P's unwrap key decrypted the KeyShared's
+///     projection — i.e., P's unwrap key decrypted the wrapper's
 ///     wrapped_key.
 ///
 /// A peer who is not invited has no valid PeerShared (proven by the
 /// PeerShared gate), therefore no derivable unwrap key, therefore
-/// `unwrap_successful_for_this_peer == false`, therefore no key_secrets
-/// row. This closes the access-control chain at the write-construction
-/// layer.
+/// `unwrap_successful_for_this_peer == false`, therefore no
+/// InsertKeySecretFromUnwrap row for this peer.
+///
+/// This theorem does NOT cover `InsertKeySecretLocal` rows — those are
+/// the local peer planting its own key material (via KeySecret event),
+/// and carry no unwrap semantics. The access-control chain is closed
+/// because a non-invited peer projecting KeySecret plants a key FOR
+/// ITSELF; it does not enable reading OTHER peers' encrypted messages.
 pub proof fn key_secrets_write_requires_successful_unwrap(
     unwrap_successful_for_this_peer: bool,
 )

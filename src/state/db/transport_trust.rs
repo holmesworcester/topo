@@ -744,7 +744,27 @@ pub fn is_authorized_for_tenant(
         rusqlite::params![tenant_id, spki_fingerprint.as_slice(), now],
         |row| row.get(0),
     )?;
-    Ok(allowed != 0)
+    let result = allowed != 0;
+
+    // Cross-check against the verified decision core. Production transport
+    // admission flows through this function; the authorization must match
+    // the removal-aware ANY-match decision over peer_shared rows. Bootstrap
+    // trust rows have separate semantics so they're excluded here.
+    #[cfg(debug_assertions)]
+    {
+        let verified_peer_shared = verified_peer_shared_authz_cross_check(
+            conn, tenant_id, spki_fingerprint,
+        )?;
+        if verified_peer_shared {
+            debug_assert!(
+                result,
+                "is_authorized_for_tenant CTE denied a fingerprint that the \
+                 verified peer_shared authz says should be authorized (fp={:?})",
+                spki_fingerprint,
+            );
+        }
+    }
+    Ok(result)
 }
 
 /// Resolve one tenant that currently authorizes `spki_fingerprint`.
@@ -774,7 +794,43 @@ pub fn is_authorized_for_node(
         rusqlite::params![spki_fingerprint.as_slice(), now],
         |row| row.get(0),
     )?;
-    Ok(allowed != 0)
+    let result = allowed != 0;
+
+    // Cross-check: if the verified peer_shared authz (any tenant) says
+    // YES, the node-scope CTE must say YES too. This catches a drift
+    // where the node CTE drops a removed_entities filter in a way that
+    // the tenant CTE also drifts (since both flow from the same projected
+    // rows), the compound failure would show up here.
+    #[cfg(debug_assertions)]
+    {
+        // Walk tenants that have any peer_shared row; if any one yields
+        // verified_peer_shared_authz == true, the node CTE must admit.
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT recorded_by FROM peers_shared \
+             WHERE transport_fingerprint = ?1",
+        )?;
+        let tenants: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![spki_fingerprint.as_slice()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let any_verified = tenants.iter().try_fold(false, |acc, t| {
+            if acc {
+                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(true);
+            }
+            verified_peer_shared_authz_cross_check(conn, t, spki_fingerprint)
+        })?;
+        if any_verified {
+            debug_assert!(
+                result,
+                "is_authorized_for_node CTE denied a fingerprint that the \
+                 verified peer_shared authz says should be authorized (fp={:?})",
+                spki_fingerprint,
+            );
+        }
+    }
+    Ok(result)
 }
 
 /// Check whether any tenant-scoped transport authorization rows are currently

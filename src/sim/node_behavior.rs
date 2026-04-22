@@ -1987,7 +1987,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
                         });
                     }
                 }
-                WriteOp::InsertKeySecret(r) => {
+                WriteOp::InsertKeySecretFromUnwrap(r) | WriteOp::InsertKeySecretLocal(r) => {
                     let table = crate::event_modules::key_shared::KEY_SECRETS_TABLE;
                     let columns = crate::event_modules::key_shared::KEY_SECRETS_COLUMNS;
                     let mut row_values = BTreeMap::new();

@@ -50,11 +50,20 @@ impl KeySecretsRow {
         }
     }
 
-    /// Convert this typed row into the dedicated `InsertKeySecret` WriteOp
-    /// variant. The executor uses the variant's type information to bind
-    /// canonical columns; no positional name/value vecs are involved.
-    pub fn to_write_op(self) -> crate::projection::projector::WriteOp {
-        crate::projection::projector::WriteOp::InsertKeySecret(self)
+    /// Convert this typed row into the `InsertKeySecretFromUnwrap` WriteOp
+    /// variant — for unwrap-gated projectors (KeyShared, KeyRotation,
+    /// KeyHistory). The verified theorem `emit_requires_successful_unwrap`
+    /// applies to rows produced via this constructor.
+    pub fn to_write_op_from_unwrap(self) -> crate::projection::projector::WriteOp {
+        crate::projection::projector::WriteOp::InsertKeySecretFromUnwrap(self)
+    }
+
+    /// Convert this typed row into the `InsertKeySecretLocal` WriteOp
+    /// variant — for the key_secret projector (LOCAL peer own-key plant).
+    /// The unwrap theorem does NOT apply; this is the peer planting its
+    /// own key material. Only the key_secret projector should call this.
+    pub fn to_write_op_local(self) -> crate::projection::projector::WriteOp {
+        crate::projection::projector::WriteOp::InsertKeySecretLocal(self)
     }
 }
 
@@ -341,7 +350,7 @@ pub fn project_pure(
         ss.created_at_ms as i64,
         recorded_by.to_string(),
     );
-    ops.push(key_secrets_row.to_write_op());
+    ops.push(key_secrets_row.to_write_op_from_unwrap());
 
     ProjectorResult::valid_with_commands(
         ops,
@@ -380,22 +389,42 @@ mod typed_row_tests {
     use crate::projection::projector::WriteOp;
 
     #[test]
-    fn to_write_op_preserves_typed_fields() {
+    fn to_write_op_from_unwrap_preserves_typed_fields() {
         let row = KeySecretsRow::new(
             "abc".to_string(),
             [0x42u8; 32],
             1_700_000_000_000,
             "tenant_0".to_string(),
         );
-        let op = row.to_write_op();
+        let op = row.to_write_op_from_unwrap();
         match op {
-            WriteOp::InsertKeySecret(r) => {
+            WriteOp::InsertKeySecretFromUnwrap(r) => {
                 assert_eq!(r.event_id_b64, "abc");
                 assert_eq!(r.key_bytes, [0x42u8; 32]);
                 assert_eq!(r.created_at_ms, 1_700_000_000_000);
                 assert_eq!(r.recorded_by, "tenant_0");
             }
-            _ => panic!("expected InsertKeySecret, got {:?}", op),
+            _ => panic!("expected InsertKeySecretFromUnwrap, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn to_write_op_local_preserves_typed_fields() {
+        let row = KeySecretsRow::new(
+            "abc".to_string(),
+            [0x42u8; 32],
+            1_700_000_000_000,
+            "tenant_0".to_string(),
+        );
+        let op = row.to_write_op_local();
+        match op {
+            WriteOp::InsertKeySecretLocal(r) => {
+                assert_eq!(r.event_id_b64, "abc");
+                assert_eq!(r.key_bytes, [0x42u8; 32]);
+                assert_eq!(r.created_at_ms, 1_700_000_000_000);
+                assert_eq!(r.recorded_by, "tenant_0");
+            }
+            _ => panic!("expected InsertKeySecretLocal, got {:?}", op),
         }
     }
 

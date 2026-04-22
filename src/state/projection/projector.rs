@@ -27,16 +27,28 @@ pub enum WriteOp {
         table: &'static str,
         where_clause: Vec<(&'static str, SqlVal)>,
     },
-    /// Dedicated typed write variant for the `key_secrets` table.
+    /// Dedicated typed write variant for the `key_secrets` table, produced
+    /// ONLY by unwrap-gated projectors (KeyShared, KeyRotation, KeyHistory).
     ///
-    /// This variant exists so that EVERY production-path construction of a
-    /// key_secrets WriteOp must go through `KeySecretsRow`. The constructor
-    /// for the inner typed row lives in a single file (`key_shared.rs`);
-    /// the access-control chain for "user cannot read messages unless
-    /// invited" relies on `KeySecretsRow::new` being the only entry point.
+    /// The access-control theorem for "user cannot read messages unless
+    /// invited" derives: every row with this variant implies the peer
+    /// successfully unwrapped a wrapper targeting their invite-derived
+    /// identity. This is the invariant `emit_requires_successful_unwrap`
+    /// (verus-proofs/src/event_modules/key_shared.rs).
     ///
-    /// The executor substitutes canonical columns + values at apply time.
-    InsertKeySecret(crate::event_modules::key_shared::KeySecretsRow),
+    /// Constructor: `KeySecretsRow::new(...).to_write_op_from_unwrap()`.
+    InsertKeySecretFromUnwrap(crate::event_modules::key_shared::KeySecretsRow),
+
+    /// Dedicated typed write variant for a LOCAL peer's own key plant,
+    /// produced ONLY by the key_secret projector (projecting a locally-
+    /// authored `KeySecret` event, signer_required=false, share_scope=Local).
+    ///
+    /// This variant carries NO unwrap-gating semantics. The access-control
+    /// theorem about unwrap-gated rows does NOT apply: a local KeySecret
+    /// is the peer planting its own key for its own use, not receiving a
+    /// wrapped key from another peer. The theorem "key_secrets row exists
+    /// ⟹ unwrap_successful" applies only to `InsertKeySecretFromUnwrap`.
+    InsertKeySecretLocal(crate::event_modules::key_shared::KeySecretsRow),
 }
 
 /// A follow-on command to execute after write_ops are applied.

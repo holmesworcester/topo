@@ -116,16 +116,16 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a key_secret event".to_string()),
     };
 
-    // Local key_secret: the peer plants its own key. Uses the typed row
-    // constructor so the schema drift lint and access-control CI gate both
-    // stay closed.
+    // Local key_secret: the peer plants its own key. Uses the LOCAL
+    // variant — the unwrap-based access-control theorem does NOT apply
+    // here. The peer is writing its own key material for its own use.
     let ops = vec![super::key_shared::KeySecretsRow::new(
         event_id_b64.to_string(),
         sk.key_bytes,
         sk.created_at_ms as i64,
         recorded_by.to_string(),
     )
-    .to_write_op()];
+    .to_write_op_local()];
     ProjectorResult::valid(ops)
 }
 

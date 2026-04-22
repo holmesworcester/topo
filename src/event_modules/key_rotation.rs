@@ -267,7 +267,7 @@ pub fn project_pure(
                 rotation.created_at_ms as i64,
                 recorded_by.to_string(),
             )
-            .to_write_op(),
+            .to_write_op_from_unwrap(),
         );
         return ProjectorResult::valid_with_commands(
             ops,

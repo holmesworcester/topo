@@ -250,6 +250,82 @@ for root, dirs, files in os.walk(src_dir):
                 f"at {rel}:{start_line}: {snippet}"
             )
 
+# Third pass: enforce per-variant constructor scope.
+#   - InsertKeySecretFromUnwrap: only emitted by unwrap-gated projectors.
+#   - InsertKeySecretLocal: only emitted by the local-peer key_secret projector.
+# Any other file constructing these variants directly is a rule violation:
+# the variant's access-control semantics is determined by the emitting file,
+# so we pin which file is allowed to use which constructor method.
+VARIANT_ALLOW = {
+    "to_write_op_from_unwrap": {
+        "src/event_modules/key_shared.rs",
+        "src/event_modules/key_rotation.rs",
+        "src/event_modules/key_history.rs",
+    },
+    "to_write_op_local": {
+        "src/event_modules/key_secret.rs",
+    },
+}
+for method, allowed in VARIANT_ALLOW.items():
+    pattern = re.compile(r"\." + re.escape(method) + r"\s*\(")
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = [d for d in dirs if d not in ("target", "vendor")]
+        for fname in files:
+            if not fname.endswith(".rs"):
+                continue
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, os.path.dirname(src_dir)).replace(os.sep, "/")
+            if is_skipped_dir(rel) or is_test_only_file(rel):
+                continue
+            with open(fpath, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            # Also skip cfg(test) mod tests { ... } regions via a quick line check.
+            lines = text.splitlines(keepends=False)
+            cfg_test_lines = set()
+            in_test_block = False
+            test_brace_depth = 0
+            cfg_test_pending = False
+            for lineno, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if "#[cfg(test)]" in stripped:
+                    cfg_test_pending = True
+                    continue
+                if cfg_test_pending and "{" in stripped and (
+                    stripped.startswith("mod ") or stripped.startswith("fn ")
+                    or stripped.startswith("impl ") or stripped.startswith("pub fn ")
+                    or stripped.startswith("pub(crate) fn ")
+                    or stripped.startswith("pub(super) fn ")
+                ):
+                    in_test_block = True
+                    test_brace_depth = stripped.count("{") - stripped.count("}")
+                    cfg_test_pending = False
+                    if test_brace_depth <= 0:
+                        in_test_block = False
+                        test_brace_depth = 0
+                    continue
+                if in_test_block:
+                    test_brace_depth += stripped.count("{") - stripped.count("}")
+                    cfg_test_lines.add(lineno)
+                    if test_brace_depth <= 0:
+                        in_test_block = False
+                        test_brace_depth = 0
+                    continue
+            for lineno, line in enumerate(lines, 1):
+                if lineno in cfg_test_lines:
+                    continue
+                m = pattern.search(line)
+                if not m:
+                    continue
+                # Skip matches inside line comments.
+                pre = line[: m.start()]
+                if "//" in pre:
+                    continue
+                if rel not in allowed:
+                    errors.append(
+                        f"ERROR: method {method} called in {rel}:{lineno} "
+                        f"but only these files may call it: {sorted(allowed)}"
+                    )
+
 if errors:
     print()
     for e in errors:

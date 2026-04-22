@@ -17,7 +17,8 @@ fn writeop_kind(op: &WriteOp) -> WriteOpKind {
     match op {
         WriteOp::InsertOrIgnore { .. } => WriteOpKind::InsertOrIgnore,
         WriteOp::Delete { .. } => WriteOpKind::Delete,
-        WriteOp::InsertKeySecret(_) => WriteOpKind::InsertKeySecret,
+        WriteOp::InsertKeySecretFromUnwrap(_) => WriteOpKind::InsertKeySecretFromUnwrap,
+        WriteOp::InsertKeySecretLocal(_) => WriteOpKind::InsertKeySecretLocal,
     }
 }
 
@@ -60,8 +61,7 @@ fn writeop_tenant_view(op: &WriteOp, executing_tenant: &str) -> WriteOpTenantVie
                 recorded_by_matches_executing: false,
             }
         }
-        WriteOp::InsertKeySecret(row) => {
-            // Typed variant: recorded_by is always present as a struct field.
+        WriteOp::InsertKeySecretFromUnwrap(row) | WriteOp::InsertKeySecretLocal(row) => {
             WriteOpTenantView {
                 has_recorded_by: true,
                 recorded_by_matches_executing: row.recorded_by == executing_tenant,
@@ -128,10 +128,10 @@ pub(crate) fn execute_write_ops(
                     params.iter().map(|p| &**p).collect();
                 conn.execute(&sql, param_refs.as_slice())?;
             }
-            WriteOp::InsertKeySecret(row) => {
-                // Canonical columns pinned at the typed-row constructor.
-                // Table name + column count cross-checked against verus
-                // constants in key_shared.rs unit tests.
+            WriteOp::InsertKeySecretFromUnwrap(row) | WriteOp::InsertKeySecretLocal(row) => {
+                // Both variants write the same row shape; they differ only
+                // in which access-control invariant applies. Canonical
+                // columns pinned at the typed-row constructor.
                 let sql = format!(
                     "INSERT OR IGNORE INTO {} ({}) VALUES (?1, ?2, ?3, ?4)",
                     crate::event_modules::key_shared::KEY_SECRETS_TABLE,
