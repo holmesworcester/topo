@@ -1390,26 +1390,14 @@ fn load_removal_dep_facts(
     recorded_by: &str,
     removal: &RemovalEvent,
 ) -> ProjectionQueryResult<crate::projection::dep_facts::RemovalDepFacts> {
-    use crate::projection::dep_facts::{AdminResolution, RemovalDepFacts, SignerResolution};
+    use crate::projection::dep_facts::{AdminResolution, RemovalDepFacts};
 
-    // Signer: resolve from frame to a parsed event (peer_shared expected).
-    let signer = match frame.current_signer.as_ref() {
-        None => SignerResolution::Missing,
-        Some(current_signer) if current_signer.semantic_type_code != EVENT_TYPE_PEER_SHARED => {
-            SignerResolution::UnsupportedKind {
-                semantic_type_code: current_signer.semantic_type_code,
-            }
-        }
-        Some(current_signer) => {
-            let signer_b64 = current_signer.event_id.clone();
-            match load_valid_event_blob(conn, recorded_by, &signer_b64)? {
-                None => SignerResolution::MissingBlob {
-                    signer_event_id: signer_b64,
-                },
-                Some(blob) => resolve_peer_shared_signer(&signer_b64, &blob),
-            }
-        }
-    };
+    let signer = resolve_signer_from_frame(
+        conn,
+        recorded_by,
+        frame,
+        SignerKindExpectation::Exactly(EVENT_TYPE_PEER_SHARED),
+    )?;
 
     // Admin authority dep: the dep system has already validated the
     // event exists in valid_events; we parse it here to surface the
@@ -1462,41 +1450,6 @@ fn load_removal_guard_facts(
     Ok(crate::projection::dep_facts::RemovalGuardFacts { target_kind })
 }
 
-/// Parse a signer blob as a PeerShared (stripping any Signed wrapper)
-/// and return a matching `SignerResolution` variant.
-fn resolve_peer_shared_signer(
-    signer_event_id: &str,
-    blob: &[u8],
-) -> crate::projection::dep_facts::SignerResolution {
-    use crate::projection::dep_facts::SignerResolution;
-
-    let inner = match parse_event(blob) {
-        Ok(ParsedEvent::Signed(signed)) => parse_event(&signed.payload),
-        other => other,
-    };
-    match inner {
-        Ok(ParsedEvent::PeerShared(event)) => SignerResolution::PeerShared {
-            signer_event_id: signer_event_id.to_string(),
-            event,
-        },
-        Ok(other) => SignerResolution::Malformed {
-            signer_event_id: signer_event_id.to_string(),
-            reason: format!(
-                "removal signer {} resolved to unexpected event type {}",
-                signer_event_id,
-                other.event_type_code()
-            ),
-        },
-        Err(err) => SignerResolution::Malformed {
-            signer_event_id: signer_event_id.to_string(),
-            reason: format!(
-                "failed to parse peer_shared signer {}: {}",
-                signer_event_id, err
-            ),
-        },
-    }
-}
-
 /// Parse the admin-authority dep blob into an AdminEvent.
 fn resolve_admin_authority(
     event_id: &[u8; 32],
@@ -1526,35 +1479,24 @@ fn resolve_admin_authority(
 
 /// SQL-side dep-facts loader for PeerShared.
 ///
-/// Resolves the outer signer to a parsed `DeviceInviteEvent` (stripping
-/// any outer `Signed` envelope) and looks up the referenced
-/// endpoint_shared projection row. Both are immediate event deps of
-/// PeerShared — this is the dep-bundle the pure decide fn consumes.
+/// Signer resolution goes through the shared `resolve_signer_from_frame`
+/// helper (expecting DeviceInvite). Endpoint binding is looked up
+/// directly from the `endpoint_shared` projection — another immediate
+/// event dep carried into DepFacts as its already-resolved id.
 fn load_peer_shared_dep_facts(
     conn: &Connection,
     frame: &ProjectionFrameContext,
     recorded_by: &str,
     peer_shared: &PeerSharedEvent,
 ) -> ProjectionQueryResult<crate::projection::dep_facts::PeerSharedDepFacts> {
-    use crate::projection::dep_facts::{PeerSharedDepFacts, SignerResolution};
+    use crate::projection::dep_facts::PeerSharedDepFacts;
 
-    let signer = match frame.current_signer.as_ref() {
-        None => SignerResolution::Missing,
-        Some(current_signer) if current_signer.semantic_type_code != EVENT_TYPE_DEVICE_INVITE => {
-            SignerResolution::UnsupportedKind {
-                semantic_type_code: current_signer.semantic_type_code,
-            }
-        }
-        Some(current_signer) => {
-            let signer_b64 = current_signer.event_id.clone();
-            match load_valid_event_blob(conn, recorded_by, &signer_b64)? {
-                None => SignerResolution::MissingBlob {
-                    signer_event_id: signer_b64,
-                },
-                Some(blob) => resolve_device_invite_signer(&signer_b64, &blob),
-            }
-        }
-    };
+    let signer = resolve_signer_from_frame(
+        conn,
+        recorded_by,
+        frame,
+        SignerKindExpectation::Exactly(EVENT_TYPE_DEVICE_INVITE),
+    )?;
 
     let endpoint_shared_event_id_b64 =
         event_id_to_base64(&peer_shared.endpoint_shared_event_id);
@@ -1569,55 +1511,76 @@ fn load_peer_shared_dep_facts(
     })
 }
 
-/// Parse a signer blob as a DeviceInvite (stripping any Signed wrapper)
-/// and return a matching `SignerResolution` variant.
-fn resolve_device_invite_signer(
-    signer_event_id: &str,
-    blob: &[u8],
-) -> crate::projection::dep_facts::SignerResolution {
+/// Resolve the outer signer to a parsed event, stripping any outer
+/// `Signed` envelope. Shared between all signed-event projectors —
+/// the `expected_kind` mask controls which `SignerResolution` arm
+/// the success case lands in.
+///
+/// Moving the signer from `frame.current_signer` (ambient) into a
+/// DepFacts field is Phase 2 of the signer-as-dep plan; this helper
+/// is the single resolution point for that migration.
+pub(crate) fn resolve_signer_from_frame(
+    conn: &Connection,
+    recorded_by: &str,
+    frame: &ProjectionFrameContext,
+    expected_kind: SignerKindExpectation,
+) -> ProjectionQueryResult<crate::projection::dep_facts::SignerResolution> {
     use crate::projection::dep_facts::SignerResolution;
 
-    match parse_event(blob) {
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(SignerResolution::Missing);
+    };
+    if !expected_kind.accepts(current_signer.semantic_type_code) {
+        return Ok(SignerResolution::UnsupportedKind {
+            semantic_type_code: current_signer.semantic_type_code,
+        });
+    }
+    let signer_b64 = current_signer.event_id.clone();
+    let Some(blob) = load_valid_event_blob(conn, recorded_by, &signer_b64)? else {
+        return Ok(SignerResolution::MissingBlob {
+            signer_event_id: signer_b64,
+        });
+    };
+    let inner = match parse_event(&blob) {
+        Ok(ParsedEvent::Signed(signed)) => parse_event(&signed.payload),
+        other => other,
+    };
+    Ok(match inner {
         Ok(ParsedEvent::DeviceInvite(event)) => SignerResolution::DeviceInvite {
-            signer_event_id: signer_event_id.to_string(),
+            signer_event_id: signer_b64,
             event,
         },
-        Ok(ParsedEvent::Signed(signed)) => match parse_event(&signed.payload) {
-            Ok(ParsedEvent::DeviceInvite(event)) => SignerResolution::DeviceInvite {
-                signer_event_id: signer_event_id.to_string(),
-                event,
-            },
-            Ok(other) => SignerResolution::Malformed {
-                signer_event_id: signer_event_id.to_string(),
-                reason: format!(
-                    "peer_shared signer {} resolved to unexpected event type {}",
-                    signer_event_id,
-                    other.event_type_code()
-                ),
-            },
-            Err(err) => SignerResolution::Malformed {
-                signer_event_id: signer_event_id.to_string(),
-                reason: format!(
-                    "failed to parse signed device_invite signer {}: {}",
-                    signer_event_id, err
-                ),
-            },
+        Ok(ParsedEvent::PeerShared(event)) => SignerResolution::PeerShared {
+            signer_event_id: signer_b64,
+            event,
         },
         Ok(other) => SignerResolution::Malformed {
-            signer_event_id: signer_event_id.to_string(),
+            signer_event_id: signer_b64.clone(),
             reason: format!(
-                "peer_shared signer {} resolved to unexpected event type {}",
-                signer_event_id,
+                "signer {} resolved to unexpected event type {}",
+                signer_b64,
                 other.event_type_code()
             ),
         },
         Err(err) => SignerResolution::Malformed {
-            signer_event_id: signer_event_id.to_string(),
-            reason: format!(
-                "failed to parse device_invite signer {}: {}",
-                signer_event_id, err
-            ),
+            signer_event_id: signer_b64.clone(),
+            reason: format!("failed to parse signer {}: {}", signer_b64, err),
         },
+    })
+}
+
+/// Which semantic type codes a projector accepts as its signer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SignerKindExpectation {
+    /// Signer must be exactly this semantic type.
+    Exactly(u8),
+}
+
+impl SignerKindExpectation {
+    fn accepts(self, code: u8) -> bool {
+        match self {
+            Self::Exactly(expected) => expected == code,
+        }
     }
 }
 
