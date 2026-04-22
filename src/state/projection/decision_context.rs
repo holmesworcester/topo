@@ -1371,6 +1371,51 @@ fn deleted_message_purges_dep(
     Ok(deleted.then(|| dep_b64.to_string()))
 }
 
+/// SQL-side guard-facts loader for InviteAccepted.
+///
+/// Reads the narrow slice of ambient state that InviteAccepted's pure
+/// decision fn consults: local invite-secret presence, peer_shared
+/// transport-identity activity, and the locally recorded
+/// invite-link bootstrap binding (with its `already_peer_shared` marker).
+/// Everything SQL stays here; `decide_invite_accepted` is pure and only
+/// reads the returned `GuardFacts`.
+fn load_invite_accepted_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    invite_accepted: &InviteAcceptedEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::GuardFacts> {
+    let invite_event_id_b64 = event_id_to_base64(&invite_accepted.invite_event_id);
+
+    let has_local_invite_secret: bool = conn.query_row(
+        "SELECT EXISTS(
+                 SELECT 1
+                 FROM invite_secrets
+                 WHERE recorded_by = ?1
+                   AND invite_event_id = ?2
+                   AND length(private_key) = 32
+             )",
+        rusqlite::params![recorded_by, &invite_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let peer_shared_transport_identity_active =
+        peer_has_creds_with_source(conn, recorded_by, CRED_SOURCE_PEER_SHARED).unwrap_or(false);
+
+    let bootstrap_context =
+        load_bootstrap_decision_context(conn, recorded_by, &invite_event_id_b64)?;
+    let bootstrap_spki_already_peer_shared = if let Some(bc) = &bootstrap_context {
+        bootstrap_spki_already_peer_shared(conn, recorded_by, &bc.bootstrap_spki_fingerprint)?
+    } else {
+        false
+    };
+
+    Ok(crate::projection::dep_facts::GuardFacts {
+        bootstrap_context,
+        bootstrap_spki_already_peer_shared,
+        has_local_invite_secret,
+        peer_shared_transport_identity_active,
+    })
+}
+
 fn load_bootstrap_decision_context(
     conn: &Connection,
     recorded_by: &str,
@@ -2121,45 +2166,40 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         invite_accepted: &InviteAcceptedEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        use crate::projection::dep_facts::{
+            decide_invite_accepted, DepFacts, InviteAcceptedDecision,
+        };
+
+        let deps = DepFacts::default();
+        let guards = load_invite_accepted_guard_facts(self, recorded_by, invite_accepted)?;
+        let decision = decide_invite_accepted(invite_accepted, &deps, &guards);
+
         let mut ctx = ProjectorDecisionContext::default();
-        let invite_event_id_b64 = event_id_to_base64(&invite_accepted.invite_event_id);
-        let workspace_id_b64 = event_id_to_base64(&invite_accepted.workspace_id);
-
-        ctx.has_local_invite_secret = self.query_row(
-            "SELECT EXISTS(
-                     SELECT 1
-                     FROM invite_secrets
-                     WHERE recorded_by = ?1
-                       AND invite_event_id = ?2
-                       AND length(private_key) = 32
-                 )",
-            rusqlite::params![recorded_by, &invite_event_id_b64],
-            |row| row.get(0),
-        )?;
-        ctx.peer_shared_transport_identity_active =
-            peer_has_creds_with_source(self, recorded_by, CRED_SOURCE_PEER_SHARED).unwrap_or(false);
-
-        if let Some(bc) = load_bootstrap_decision_context(self, recorded_by, &invite_event_id_b64)?
-        {
-            if bc.workspace_id != workspace_id_b64 {
-                ctx.invite_accepted_link_workspace_mismatch_reason = Some(
-                    "invite_accepted workspace_id does not match locally recorded invite-link workspace"
-                        .to_string(),
-                );
+        match decision {
+            InviteAcceptedDecision::Ready {
+                bootstrap_context,
+                bootstrap_spki_already_peer_shared,
+                has_local_invite_secret,
+                peer_shared_transport_identity_active,
+            } => {
+                ctx.bootstrap_context = bootstrap_context;
+                ctx.bootstrap_spki_already_peer_shared = bootstrap_spki_already_peer_shared;
+                ctx.has_local_invite_secret = has_local_invite_secret;
+                ctx.peer_shared_transport_identity_active = peer_shared_transport_identity_active;
             }
-            ctx.bootstrap_spki_already_peer_shared = bootstrap_spki_already_peer_shared(
-                self,
-                recorded_by,
-                &bc.bootstrap_spki_fingerprint,
-            )?;
-            ctx.bootstrap_context = Some(bc);
-        } else if invite_accepted.invite_event_id != invite_accepted.workspace_id {
-            ctx.invite_accepted_link_workspace_mismatch_reason = Some(
-                "invite_accepted missing locally recorded invite-link workspace binding"
-                    .to_string(),
-            );
+            reject @ (InviteAcceptedDecision::RejectLinkWorkspaceMismatch
+            | InviteAcceptedDecision::RejectMissingLinkBinding) => {
+                ctx.has_local_invite_secret = guards.has_local_invite_secret;
+                ctx.peer_shared_transport_identity_active =
+                    guards.peer_shared_transport_identity_active;
+                ctx.bootstrap_spki_already_peer_shared =
+                    guards.bootstrap_spki_already_peer_shared;
+                ctx.bootstrap_context = guards.bootstrap_context.clone();
+                ctx.invite_accepted_link_workspace_mismatch_reason = reject
+                    .reject_reason()
+                    .map(|s| s.to_string());
+            }
         }
-
         Ok(ctx)
     }
 
