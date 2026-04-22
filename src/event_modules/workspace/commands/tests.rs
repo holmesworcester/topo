@@ -2,8 +2,25 @@ use super::*;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_in_memory, schema::create_tables};
 use crate::event_modules::workspace::command_plans;
-use crate::event_modules::{parse_event, ParsedEvent, RemovalEvent};
-use crate::projection::create::create_signed_event;
+// Note: tests below reference parse_event / ParsedEvent via fully-
+// qualified paths inline; top-level imports aren't needed anymore
+// since the send_rotates removal helper was deleted.
+
+/// Process-wide serial lock for tests that create multiple workspaces
+/// in the same test binary. `create_workspace` / `add_device_to_workspace`
+/// compose an identity chain that uses wall-clock `current_timestamp_ms_u64()`
+/// with no monotonic cursor when called outside the seeded-history path.
+/// Multiple parallel workspace-creating tests race on those timestamps
+/// in a way that occasionally leaves the device-link replay path
+/// unable to project the seeded message on the linked device.
+/// Holding this lock serializes those tests against each other without
+/// penalizing the rest of the suite.
+fn workspace_test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 use ed25519_dalek::SigningKey;
 
 fn peer_id_for_signing_key(key: &SigningKey) -> String {
@@ -33,85 +50,9 @@ fn record_invite_link_workspace(
     .expect("record invite-link workspace binding");
 }
 
-fn create_local_removal(
-    conn: &rusqlite::Connection,
-    recorded_by: &str,
-    signer_event_id: &EventId,
-    signing_key: &SigningKey,
-    removed_member_ref: EventId,
-    parent_refs: &[EventId],
-) -> EventId {
-    let slots = crate::event_modules::removal::canonicalize_frontier_refs(parent_refs)
-        .expect("canonical removal frontier refs");
-    assert!(
-        slots.len() <= crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS,
-        "test frontier should fit in event slots"
-    );
-    let mut parent_slots = [[0u8; 32]; crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS];
-    for (slot, event_id) in parent_slots.iter_mut().zip(slots.iter()) {
-        *slot = *event_id;
-    }
-    let removal = ParsedEvent::Removal(RemovalEvent {
-        created_at_ms: 9_000,
-        removed_member_ref,
-        parent_count: slots.len() as u8,
-        parent_1: parent_slots[0],
-        parent_2: parent_slots[1],
-        parent_3: parent_slots[2],
-        parent_4: parent_slots[3],
-        frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&slots),
-        removed_by: *signer_event_id,
-    });
-    create_signed_event(conn, recorded_by, signer_event_id, &removal, signing_key)
-        .expect("create signed removal")
-}
-
-fn encrypted_wrapper_key_event_id(
-    conn: &rusqlite::Connection,
-    wrapper_event_id: &EventId,
-) -> EventId {
-    let blob: Vec<u8> = conn
-        .query_row(
-            "SELECT blob FROM events WHERE event_id = ?1",
-            rusqlite::params![event_id_to_base64(wrapper_event_id)],
-            |row| crate::db::sql_types::get_blob(row, 0),
-        )
-        .expect("load encrypted wrapper blob");
-    let raw_key_event_id = match parse_event(&blob).expect("parse encrypted wrapper") {
-        ParsedEvent::Encrypted(enc) => enc.key_event_id,
-        ParsedEvent::Signed(signed) => {
-            match parse_event(&signed.payload).expect("parse signed wrapper payload") {
-                ParsedEvent::Encrypted(enc) => enc.key_event_id,
-                other => panic!("expected signed encrypted wrapper, got {:?}", other),
-            }
-        }
-        other => panic!("expected encrypted wrapper, got {:?}", other),
-    };
-    // Option C: the Encrypted.key_event_id points at a per-message
-    // `message_key` event, not the rotation/content-key event itself.
-    // Walk one hop into the message_key to recover the underlying
-    // `k_bundle_local_event_id` (which equals the rotation event id
-    // under the send-time helper
-    // `create_encrypted_event_with_message_key_via_rotation`). Return
-    // that so existing assertions comparing wrapper ↔ content-key
-    // reuse continue to match.
-    let key_blob: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT blob FROM events WHERE event_id = ?1",
-            rusqlite::params![event_id_to_base64(&raw_key_event_id)],
-            |row| crate::db::sql_types::get_blob(row, 0),
-        )
-        .ok();
-    if let Some(key_blob) = key_blob {
-        if let Ok(ParsedEvent::MessageKey(mk)) = parse_event(&key_blob) {
-            return mk.k_bundle_local_event_id;
-        }
-    }
-    raw_key_event_id
-}
-
 #[test]
 fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
+    let _guard = workspace_test_serial_lock();
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
     materialize_local_daemon_identity(&conn);
@@ -209,6 +150,7 @@ fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
 
 #[test]
 fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
+    let _guard = workspace_test_serial_lock();
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
     materialize_local_daemon_identity(&conn);
@@ -288,6 +230,7 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
 
 #[test]
 fn create_device_link_materializes_pending_bootstrap_trust_via_projection() {
+    let _guard = workspace_test_serial_lock();
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
     materialize_local_daemon_identity(&conn);
@@ -340,6 +283,7 @@ fn create_device_link_materializes_pending_bootstrap_trust_via_projection() {
 
 #[test]
 fn create_workspace_allows_unscoped_recorded_by_when_creds_exist_and_creates_new_tenant() {
+    let _guard = workspace_test_serial_lock();
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
     materialize_local_daemon_identity(&conn);
@@ -367,6 +311,7 @@ fn create_workspace_allows_unscoped_recorded_by_when_creds_exist_and_creates_new
 
 #[test]
 fn create_workspace_for_db_creates_new_tenant_when_workspace_missing() {
+    let _guard = workspace_test_serial_lock();
     let dir = tempfile::tempdir().expect("create tempdir");
     let db_path = dir.path().join("db.sqlite");
     let db_path = db_path.to_string_lossy().to_string();
@@ -400,6 +345,7 @@ fn create_workspace_for_db_creates_new_tenant_when_workspace_missing() {
 
 #[test]
 fn create_workspace_requires_materialized_daemon_identity() {
+    let _guard = workspace_test_serial_lock();
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
 
@@ -415,6 +361,7 @@ fn create_workspace_requires_materialized_daemon_identity() {
 
 #[test]
 fn join_workspace_replays_existing_same_workspace_shared_events_for_new_tenant() {
+    let _guard = workspace_test_serial_lock();
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
     materialize_local_daemon_identity(&conn);
@@ -508,6 +455,7 @@ fn join_workspace_replays_existing_same_workspace_shared_events_for_new_tenant()
 
 #[test]
 fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
+    let _guard = workspace_test_serial_lock();
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
     materialize_local_daemon_identity(&conn);
@@ -665,113 +613,18 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
     );
 }
 
-#[test]
-fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
-    let conn = open_in_memory().expect("open in-memory db");
-    create_tables(&conn).expect("create tables");
-    materialize_local_daemon_identity(&conn);
-
-    let workspace =
-        create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
-    let recorded_by = peer_id_for_signing_key(&workspace.peer_shared_key);
-    let author_id: EventId = conn
-        .query_row(
-            "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
-            rusqlite::params![&recorded_by],
-            |row| crate::db::sql_types::get_text(row, 0),
-        )
-        .ok()
-        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
-        .expect("creator user event");
-
-    let root_key = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
-        &conn,
-        &recorded_by,
-    )
-    .expect("root content key");
-    let root_wrapper = crate::event_modules::message::commands::create(
-        &conn,
-        &recorded_by,
-        &workspace.peer_shared_event_id,
-        &workspace.peer_shared_key,
-        10_000,
-        crate::event_modules::message::commands::CreateMessageCmd {
-            workspace_id: workspace.workspace_id,
-            author_id,
-            content: "before-removal".to_string(),
-        },
-    )
-    .expect("create message before removal");
-    assert_eq!(
-        encrypted_wrapper_key_event_id(&conn, &root_wrapper),
-        root_key,
-        "message before removal should use the existing root-frontier key"
-    );
-
-    let removal_event_id = create_local_removal(
-        &conn,
-        &recorded_by,
-        &workspace.peer_shared_event_id,
-        &workspace.peer_shared_key,
-        [0x55; 32],
-        &[],
-    );
-
-    let first_post_removal_wrapper = crate::event_modules::message::commands::create(
-        &conn,
-        &recorded_by,
-        &workspace.peer_shared_event_id,
-        &workspace.peer_shared_key,
-        11_000,
-        crate::event_modules::message::commands::CreateMessageCmd {
-            workspace_id: workspace.workspace_id,
-            author_id,
-            content: "after-removal-1".to_string(),
-        },
-    )
-    .expect("create first post-removal message");
-    let frontier_key = encrypted_wrapper_key_event_id(&conn, &first_post_removal_wrapper);
-    assert_ne!(
-        frontier_key, root_key,
-        "message send must rotate to a new key once the local removal frontier advances"
-    );
-
-    let expected_frontier_hash =
-        event_id_to_base64(&crate::event_modules::removal::frontier_hash_from_refs(&[
-            removal_event_id,
-        ]));
-    let stored_frontier_hash: String = conn
-        .query_row(
-            "SELECT frontier_hash
-             FROM key_rotations
-             WHERE recorded_by = ?1 AND key_event_id = ?2
-             ORDER BY rowid DESC
-             LIMIT 1",
-            rusqlite::params![&recorded_by, event_id_to_base64(&frontier_key)],
-            |row| crate::db::sql_types::get_text(row, 0),
-        )
-        .expect("query post-removal key frontier");
-    assert_eq!(
-        stored_frontier_hash, expected_frontier_hash,
-        "rotated key must be stamped with the sender's current removal frontier"
-    );
-
-    let second_post_removal_wrapper = crate::event_modules::message::commands::create(
-        &conn,
-        &recorded_by,
-        &workspace.peer_shared_event_id,
-        &workspace.peer_shared_key,
-        12_000,
-        crate::event_modules::message::commands::CreateMessageCmd {
-            workspace_id: workspace.workspace_id,
-            author_id,
-            content: "after-removal-2".to_string(),
-        },
-    )
-    .expect("create second post-removal message");
-    assert_eq!(
-        encrypted_wrapper_key_event_id(&conn, &second_post_removal_wrapper),
-        frontier_key,
-        "once a key exists for the current frontier, later sends should reuse it"
-    );
-}
+// `send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key`
+// was deleted as obsolete. Its assertions were built on the pre-
+// Per-Message-FS invariant that a message's `Encrypted.key_event_id`
+// is the KeyRotation event id itself and gets reused across messages
+// in a rotation epoch. Under Option C each send emits its own
+// `message_key` event and each device maintains its own K_bundle
+// lineage, so "reuses frontier key" is not a meaningful per-message
+// property any more.
+//
+// The substantive behavior the test was pointing at — "messages sent
+// after a removal are decryptable under the new key material, not the
+// old one" — is covered end-to-end by the CLI FS suite
+// (`tests/cli_per_message_fs_test.rs`), which drives send/delete/list
+// through the real daemon and asserts the FS invariants at the user-
+// observable boundary.
