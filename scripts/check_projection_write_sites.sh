@@ -351,27 +351,63 @@ VARIANT_ALLOW = {
     "to_write_op_local": {
         "src/event_modules/key_secret.rs",
     },
+    # UFCS call style (e.g., `KeySecretsRow::to_write_op_from_unwrap(row)`
+    # instead of `row.to_write_op_from_unwrap()`).
+    "KeySecretsRow::to_write_op_from_unwrap": {
+        "src/event_modules/key_shared.rs",
+        "src/event_modules/key_rotation.rs",
+        "src/event_modules/key_history.rs",
+    },
+    "KeySecretsRow::to_write_op_local": {
+        "src/event_modules/key_secret.rs",
+    },
     # Direct variant constructors. These are public enum variants so the
     # type system can't hide them; the gate has to.
     "WriteOp::InsertKeySecretFromUnwrap": {
-        # The typed method chain lives here and uses direct construction.
         "src/event_modules/key_shared.rs",
-        # The apply executor matches on the variant but never constructs.
-        # The projector.rs file has it in the enum definition; we skip
-        # comment-lines via the `//` check below so the variant declaration
-        # doesn't self-flag.
     },
     "WriteOp::InsertKeySecretLocal": {
         "src/event_modules/key_shared.rs",
     },
+    # Bare variant name after a `use WriteOp::InsertKeySecret*` import.
+    # These patterns catch code that imports the variant into scope and
+    # then calls it without the `WriteOp::` prefix. Used in combination
+    # with the scope-import check below; the bare identifier is treated
+    # as a constructor call when followed by `(`.
+    #
+    # projector.rs is whitelisted because the enum declaration itself
+    # uses the bare name as a variant (e.g., `InsertKeySecretFromUnwrap(...)`
+    # inside `pub enum WriteOp { ... }`). This is not a call site.
+    "InsertKeySecretFromUnwrap": {
+        "src/event_modules/key_shared.rs",
+        "src/state/projection/projector.rs",
+    },
+    "InsertKeySecretLocal": {
+        "src/event_modules/key_shared.rs",
+        "src/state/projection/projector.rs",
+    },
+    # Scope-import of the variant into a module's namespace — a strong
+    # signal of intent to construct without the `WriteOp::` prefix.
+    "use crate::projection::projector::WriteOp::InsertKeySecret": set(),
+    "use crate::state::projection::projector::WriteOp::InsertKeySecret": set(),
+    "use super::projector::WriteOp::InsertKeySecret": set(),
 }
 for method, allowed in VARIANT_ALLOW.items():
-    # Use DOTALL so `\s*` spans newlines: a call split across lines like
-    #   WriteOp::InsertKeySecretFromUnwrap
-    #   (todo!())
-    # is still matched.
-    if method.startswith("WriteOp::"):
+    # Use DOTALL so `\s*` spans newlines.
+    if method.startswith("use "):
+        # Scope-import of the variant — match up to a trailing `;`.
+        pattern = re.compile(re.escape(method) + r"[^;]*;", re.DOTALL)
+    elif method.startswith("WriteOp::") or method.startswith("KeySecretsRow::"):
+        # Fully-qualified (variant or UFCS) call — require trailing `(`.
         pattern = re.compile(r"\b" + re.escape(method) + r"\s*\(", re.DOTALL)
+    elif method.startswith("Insert"):
+        # Bare variant identifier (after a scope-import). Word boundary +
+        # identifier + `(` catches `InsertKeySecretFromUnwrap(row)` at a
+        # call site; the scope-import check above catches the import itself.
+        # Additional guard: avoid accidental matches inside `WriteOp::Insert...`
+        # (we already have a separate pattern for that) by requiring the
+        # preceding character not to be `:`.
+        pattern = re.compile(r"(?<![:\w])" + re.escape(method) + r"\s*\(", re.DOTALL)
     else:
         pattern = re.compile(r"\." + re.escape(method) + r"\s*\(", re.DOTALL)
     for root, dirs, files in os.walk(src_dir):
