@@ -162,20 +162,42 @@ for root, dirs, files in os.walk(src_dir):
                             f"ERROR: {op} on projection-tracked table '{table}' at {rel}:{lineno}: {line.rstrip()}"
                         )
 
-# Second pass: forbid DSL-level key_secrets construction via the generic
-# `WriteOp::InsertOrIgnore { ... table: "key_secrets", ... }` pattern. The
-# typed variant `WriteOp::InsertKeySecret(KeySecretsRow)` is the sole
-# legitimate construction path.
+# Second pass: forbid DSL-level access-control-critical table writes
+# through the generic `WriteOp::InsertOrIgnore { ... table: "<table>", ... }`
+# pattern.
+#
+# For key_secrets, the typed variant WriteOp::InsertKeySecret* is the
+# sole legitimate construction path.
+#
+# For peers_shared, writes come from a specific projector file which is
+# allow-listed explicitly.
 #
 # Uses DOTALL so the regex spans newlines: real code puts "WriteOp::InsertOrIgnore {"
-# on one line and `table: "key_secrets",` on a subsequent line. The `[^}]*?`
+# on one line and `table: "<name>",` on a subsequent line. The `[^}]*?`
 # non-greedy body match stays within a single struct literal so a later
 # WriteOp construction in the same file doesn't spuriously match across
 # struct boundaries.
-dsl_pattern = re.compile(
-    r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*"key_secrets"',
-    re.DOTALL,
-)
+dsl_patterns = {
+    "key_secrets": (
+        re.compile(
+            r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*"key_secrets"',
+            re.DOTALL,
+        ),
+        # Empty allow set: untyped key_secrets writes are categorically
+        # forbidden; the typed variant is the only path.
+        set(),
+    ),
+    "peers_shared": (
+        re.compile(
+            r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*"peers_shared"',
+            re.DOTALL,
+        ),
+        {
+            # The sole production writer of peers_shared.
+            "src/event_modules/peer_shared/projector.rs",
+        },
+    ),
+}
 # Anchor line number by matching the start of `WriteOp::InsertOrIgnore`.
 writeop_start = re.compile(r"WriteOp::InsertOrIgnore")
 for root, dirs, files in os.walk(src_dir):
@@ -236,19 +258,20 @@ for root, dirs, files in os.walk(src_dir):
                     in_test_block = False
                     test_brace_depth = 0
                 continue
-        for m in dsl_pattern.finditer(text):
-            # Attribute the match to the line where `WriteOp::InsertOrIgnore` starts.
-            start_line = offset_to_line(m.start())
-            if start_line in cfg_test_range:
-                continue
-            # Reconstruct a short snippet for the error message.
-            snippet = text[m.start():m.end()].replace("\n", " \\n ")
-            if len(snippet) > 160:
-                snippet = snippet[:160] + "..."
-            errors.append(
-                f"ERROR: DSL-level key_secrets construction via WriteOp::InsertOrIgnore "
-                f"at {rel}:{start_line}: {snippet}"
-            )
+        for table_name, (pat, allowed_writers) in dsl_patterns.items():
+            for m in pat.finditer(text):
+                start_line = offset_to_line(m.start())
+                if start_line in cfg_test_range:
+                    continue
+                if rel in allowed_writers:
+                    continue
+                snippet = text[m.start():m.end()].replace("\n", " \\n ")
+                if len(snippet) > 160:
+                    snippet = snippet[:160] + "..."
+                errors.append(
+                    f"ERROR: DSL-level {table_name} construction via WriteOp::InsertOrIgnore "
+                    f"at {rel}:{start_line}: {snippet}"
+                )
 
 # Third pass: enforce per-variant constructor scope.
 #   - InsertKeySecretFromUnwrap: only emitted by unwrap-gated projectors.
