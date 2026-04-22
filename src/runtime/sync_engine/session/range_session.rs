@@ -709,6 +709,7 @@ fn visit_selected_send_order(
     recorded_by: Option<&str>,
     workspace_id: &str,
     event_id: EventId,
+    selected_set: &HashSet<EventId>,
     created_at_by_id: &mut HashMap<EventId, i64>,
     dep_cache: &mut HashMap<EventId, Vec<EventId>>,
     emitted: &mut HashSet<EventId>,
@@ -731,9 +732,19 @@ fn visit_selected_send_order(
         created_at_by_id,
         dep_cache,
     )? {
+        // `dep_is_selected` must reflect whether the caller actually
+        // requested this dep. Earlier revisions hard-coded `true`,
+        // which caused send-ordering to recursively enumerate every
+        // ancestor — even ancestors that were outside the sync
+        // window or that the caller did not request — and emit them
+        // as send candidates. Under the `SelectedDepOrderPlan`
+        // contract, only deps that are in the selection set should
+        // be emitted-before-root; non-selected deps are skipped,
+        // leaving the caller to decide whether to request them in a
+        // follow-up round (see `load_shared_sync_entries_only_returns_range_roots`).
         let dep_plan = decide_selected_dep_order_plan(&normalize_selected_dep_order_context(
             SelectedDepOrderRawRows {
-                dep_is_selected: true,
+                dep_is_selected: selected_set.contains(&dep_id),
                 dep_already_emitted: emitted.contains(&dep_id),
                 dep_currently_visiting: visiting.contains(&dep_id),
             },
@@ -746,6 +757,7 @@ fn visit_selected_send_order(
                     recorded_by,
                     workspace_id,
                     dep_id,
+                    selected_set,
                     created_at_by_id,
                     dep_cache,
                     emitted,
@@ -789,6 +801,7 @@ fn order_requested_ids_for_send(
         &created_at_by_id,
         live_suppression_seed,
     );
+    let selected_set: HashSet<EventId> = requested_ids.iter().copied().collect();
     let mut ordered = Vec::new();
     let mut emitted = HashSet::new();
     let mut visiting = HashSet::new();
@@ -801,6 +814,7 @@ fn order_requested_ids_for_send(
             live_suppression_seed,
             workspace_id,
             event_id,
+            &selected_set,
             &mut created_at_by_id,
             &mut dep_cache,
             &mut emitted,
