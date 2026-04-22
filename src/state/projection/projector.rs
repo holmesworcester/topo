@@ -278,6 +278,27 @@ pub struct ProjectorDecisionContext {
     /// response already exists for the same delivery target.
     pub key_request_suppress_sharing: bool,
 
+    /// For `message_key` projection: `true` if the owning message
+    /// (`owning_message_event_id`) has a durable `deleted_messages`
+    /// tombstone row, or an admin-signed `deletion_intent` exists
+    /// pre-creation. Projector terminal-drops without materializing
+    /// K_m when this is set.
+    pub owning_message_tombstoned: Option<bool>,
+
+    /// For `message_key` projection: decrypted K_m bytes if K_bundle
+    /// was locally materialized. When `Some`, projector inserts K_m
+    /// into `key_secrets` keyed by this event's own event id so the
+    /// standard Encrypted hot path finds it on cascade retry.
+    pub decrypted_k_m_bytes: Option<[u8; 32]>,
+
+    /// For `key_broadcast` / `key_history_bundle` / `key_shared`:
+    /// locally-unwrapped K_bundle bytes if the recipient's slot was
+    /// in the event and `wrap_privkeys` held the matching privkey.
+    /// Projector emits a deterministic local `KeySecret(K_bundle)`
+    /// write keyed by `deterministic_key_secret_event_id(K_bundle)`
+    /// when this is `Some`.
+    pub unwrapped_k_bundle: Option<[u8; 32]>,
+
     /// Whether this event was locally created (source = 'local' in recorded_events).
     /// Used to gate pending bootstrap trust writes: only locally-created invite
     /// events should write pending trust rows. Synced invite events on the
