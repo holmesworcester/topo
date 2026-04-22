@@ -2036,30 +2036,6 @@ impl ProjectionBackend for NodeBehaviorEngine {
                         let _ = self.project_and_cascade(&event_id)?;
                     }
                 }
-                EmitCommand::RetryBlockedEncryptedByKey { key_event_id } => {
-                    let blocked_candidates = {
-                        let state = self.state.borrow();
-                        state
-                            .blocked_events
-                            .keys()
-                            .filter_map(|event_id_b64| {
-                                let blob = state.events.get(event_id_b64)?.blob.clone();
-                                let parsed = parse_semantic_event_for_retry(&blob).ok()?;
-                                let ParsedEvent::Encrypted(enc) = parsed else {
-                                    return None;
-                                };
-                                if event_id_to_base64(&enc.key_event_id) == *key_event_id {
-                                    event_id_from_base64(event_id_b64)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    };
-                    for event_id in blocked_candidates {
-                        let _ = self.project_and_cascade(&event_id)?;
-                    }
-                }
                 EmitCommand::IndexEndpointSharedForWorkspace {
                     workspace_id,
                     endpoint_shared_event_id,
