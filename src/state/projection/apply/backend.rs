@@ -11,6 +11,35 @@ use rusqlite::{Connection, OptionalExtension};
 use super::stages::record_rejection;
 use super::write_exec::{execute_emit_commands, execute_write_ops};
 
+/// Unforgeable token that gates every mutating `ProjectionBackend` method.
+///
+/// Only code inside `crate::state::projection::apply` can mint a
+/// `WriteCapability` (`new` is `pub(in crate::state::projection::apply)`),
+/// so every write through a `ProjectionBackend` is provably originated by
+/// the apply engine. Call sites outside the apply module that want to
+/// persist projection state must route through the apply entry points
+/// (`project_one`, `project_one_step_with_backend`, `apply_projection_with_backend`,
+/// `run_dep_and_projection_stages`), which mint a `WriteCapability` locally
+/// and thread it down.
+///
+/// The token is carried by reference so the apply engine can hold a single
+/// instance for an entire projection and hand out borrows at each call.
+#[derive(Debug)]
+pub(crate) struct WriteCapability {
+    // Private field blocks struct-literal construction even within this
+    // crate, forcing all mints through `WriteCapability::new`.
+    _private: (),
+}
+
+impl WriteCapability {
+    /// Mint a new `WriteCapability`. Restricted to the apply module so only
+    /// the projection apply engine can produce tokens.
+    #[inline]
+    pub(in crate::state::projection::apply) fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 fn is_zero_event_id(event_id: &EventId) -> bool {
     event_id.iter().all(|byte| *byte == 0)
 }
@@ -299,6 +328,7 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
 
     fn record_rejection(
         &self,
+        cap: &WriteCapability,
         recorded_by: &str,
         event_id_b64: &str,
         reason: &str,
@@ -306,6 +336,7 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
 
     fn record_block(
         &self,
+        cap: &WriteCapability,
         recorded_by: &str,
         event_id_b64: &str,
         missing: &[EventId],
@@ -317,18 +348,28 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
         signer_event_id: &[u8; 32],
     ) -> ProjectionApplyResult<SignerResolution>;
 
-    fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()>;
+    fn execute_write_ops(
+        &self,
+        cap: &WriteCapability,
+        ops: &[WriteOp],
+    ) -> ProjectionApplyResult<()>;
 
     fn execute_emit_commands(
         &self,
+        cap: &WriteCapability,
         recorded_by: &str,
         commands: &[EmitCommand],
     ) -> ProjectionApplyResult<()>;
 
-    fn mark_guard_blocked(&self, event_id_b64: &str) -> ProjectionApplyResult<()>;
+    fn mark_guard_blocked(
+        &self,
+        cap: &WriteCapability,
+        event_id_b64: &str,
+    ) -> ProjectionApplyResult<()>;
 
     fn finalize_valid_projection(
         &self,
+        cap: &WriteCapability,
         recorded_by: &str,
         event_id_b64: &str,
         sub_event: &ParsedEvent,
@@ -376,6 +417,7 @@ impl ProjectionBackend for Connection {
 
     fn record_rejection(
         &self,
+        _cap: &WriteCapability,
         recorded_by: &str,
         event_id_b64: &str,
         reason: &str,
@@ -386,6 +428,7 @@ impl ProjectionBackend for Connection {
 
     fn record_block(
         &self,
+        _cap: &WriteCapability,
         recorded_by: &str,
         event_id_b64: &str,
         missing: &[EventId],
@@ -410,25 +453,35 @@ impl ProjectionBackend for Connection {
         resolve_signer_key(self, recorded_by, signer_event_id)
     }
 
-    fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {
+    fn execute_write_ops(
+        &self,
+        _cap: &WriteCapability,
+        ops: &[WriteOp],
+    ) -> ProjectionApplyResult<()> {
         execute_write_ops(self, ops)
     }
 
     fn execute_emit_commands(
         &self,
+        _cap: &WriteCapability,
         recorded_by: &str,
         commands: &[EmitCommand],
     ) -> ProjectionApplyResult<()> {
         execute_emit_commands(self, recorded_by, commands)
     }
 
-    fn mark_guard_blocked(&self, event_id_b64: &str) -> ProjectionApplyResult<()> {
+    fn mark_guard_blocked(
+        &self,
+        _cap: &WriteCapability,
+        event_id_b64: &str,
+    ) -> ProjectionApplyResult<()> {
         let _ = EventTimeline::new(self).mark_blocked_b64(event_id_b64, current_timestamp_ms());
         Ok(())
     }
 
     fn finalize_valid_projection(
         &self,
+        _cap: &WriteCapability,
         recorded_by: &str,
         event_id_b64: &str,
         sub_event: &ParsedEvent,
@@ -577,6 +630,7 @@ mod tests {
 
         fn record_rejection(
             &self,
+            _cap: &WriteCapability,
             recorded_by: &str,
             event_id_b64: &str,
             reason: &str,
@@ -591,6 +645,7 @@ mod tests {
 
         fn record_block(
             &self,
+            _cap: &WriteCapability,
             _recorded_by: &str,
             event_id_b64: &str,
             missing: &[EventId],
@@ -622,13 +677,18 @@ mod tests {
             Ok(SignerResolution::NotFound)
         }
 
-        fn execute_write_ops(&self, _ops: &[WriteOp]) -> ProjectionApplyResult<()> {
+        fn execute_write_ops(
+            &self,
+            _cap: &WriteCapability,
+            _ops: &[WriteOp],
+        ) -> ProjectionApplyResult<()> {
             *self.write_batches.borrow_mut() += 1;
             Ok(())
         }
 
         fn execute_emit_commands(
             &self,
+            _cap: &WriteCapability,
             _recorded_by: &str,
             commands: &[EmitCommand],
         ) -> ProjectionApplyResult<()> {
@@ -639,7 +699,11 @@ mod tests {
             Ok(())
         }
 
-        fn mark_guard_blocked(&self, event_id_b64: &str) -> ProjectionApplyResult<()> {
+        fn mark_guard_blocked(
+            &self,
+            _cap: &WriteCapability,
+            event_id_b64: &str,
+        ) -> ProjectionApplyResult<()> {
             self.guard_blocked
                 .borrow_mut()
                 .push(event_id_b64.to_string());
@@ -648,6 +712,7 @@ mod tests {
 
         fn finalize_valid_projection(
             &self,
+            _cap: &WriteCapability,
             _recorded_by: &str,
             event_id_b64: &str,
             _sub_event: &ParsedEvent,

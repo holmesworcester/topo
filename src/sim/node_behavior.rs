@@ -9,6 +9,7 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventI
 use crate::event_modules::{self as events, parse_event, ParsedEvent};
 use crate::projection::apply::{
     project_one::project_one_step_with_backend, ProjectionApplyResult, ProjectionBackend,
+    WriteCapability,
 };
 use crate::projection::projector::{
     CurrentSignerInfo, DeletionIntentInfo, EmitCommand, FileDescriptorInfo,
@@ -1900,6 +1901,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
 
     fn record_rejection(
         &self,
+        _cap: &WriteCapability,
         _recorded_by: &str,
         event_id_b64: &str,
         reason: &str,
@@ -1914,6 +1916,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
 
     fn record_block(
         &self,
+        _cap: &WriteCapability,
         recorded_by: &str,
         event_id_b64: &str,
         missing: &[EventId],
@@ -1950,7 +1953,11 @@ impl ProjectionBackend for NodeBehaviorEngine {
         resolve_signer_key_behavior(&self.state.borrow(), recorded_by, signer_event_id)
     }
 
-    fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {
+    fn execute_write_ops(
+        &self,
+        _cap: &WriteCapability,
+        ops: &[WriteOp],
+    ) -> ProjectionApplyResult<()> {
         let mut state = self.state.borrow_mut();
         for op in ops {
             match op {
@@ -1994,6 +2001,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
 
     fn execute_emit_commands(
         &self,
+        _cap: &WriteCapability,
         _recorded_by: &str,
         commands: &[EmitCommand],
     ) -> ProjectionApplyResult<()> {
@@ -2102,12 +2110,17 @@ impl ProjectionBackend for NodeBehaviorEngine {
         Ok(())
     }
 
-    fn mark_guard_blocked(&self, _event_id_b64: &str) -> ProjectionApplyResult<()> {
+    fn mark_guard_blocked(
+        &self,
+        _cap: &WriteCapability,
+        _event_id_b64: &str,
+    ) -> ProjectionApplyResult<()> {
         Ok(())
     }
 
     fn finalize_valid_projection(
         &self,
+        _cap: &WriteCapability,
         recorded_by: &str,
         event_id_b64: &str,
         sub_event: &ParsedEvent,

@@ -1,5 +1,5 @@
 use super::super::decision::ProjectionDecision;
-use super::backend::{ProjectionApplyResult, ProjectionBackend};
+use super::backend::{ProjectionApplyResult, ProjectionBackend, WriteCapability};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::{self as events, ParsedEvent};
 use rusqlite::Connection;
@@ -65,6 +65,10 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
     recorded_by: &str,
     event_id: &EventId,
 ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
+    // Mint a WriteCapability for this projection step. Only the apply
+    // module can mint, so every downstream `ProjectionBackend` write is
+    // provably sourced from here.
+    let cap = WriteCapability::new();
     let event_id_b64 = event_id_to_base64(event_id);
 
     if backend.already_processed(recorded_by, &event_id_b64)? {
@@ -76,7 +80,7 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
         Some(b) => b,
         None => {
             let reason = format!("event {} not found in events table", event_id_b64);
-            backend.record_rejection(recorded_by, &event_id_b64, &reason)?;
+            backend.record_rejection(&cap, recorded_by, &event_id_b64, &reason)?;
             return Ok((ProjectionDecision::Reject { reason }, None));
         }
     };
@@ -86,7 +90,7 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
         Ok(p) => p,
         Err(e) => {
             let reason = format!("parse error: {}", e);
-            backend.record_rejection(recorded_by, &event_id_b64, &reason)?;
+            backend.record_rejection(&cap, recorded_by, &event_id_b64, &reason)?;
             return Ok((ProjectionDecision::Reject { reason }, None));
         }
     };
@@ -97,11 +101,11 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
         apply_projection_with_backend(backend, recorded_by, &event_id_b64, &blob, &parsed)?;
     match &decision {
         ProjectionDecision::Reject { ref reason } => {
-            backend.record_rejection(recorded_by, &event_id_b64, reason)?;
+            backend.record_rejection(&cap, recorded_by, &event_id_b64, reason)?;
             return Ok((decision, Some(parsed)));
         }
         ProjectionDecision::BlockOnMissingDeps { ref missing } => {
-            backend.mark_guard_blocked(&event_id_b64)?;
+            backend.mark_guard_blocked(&cap, &event_id_b64)?;
             return Ok((decision, Some(parsed)));
         }
         _ => {}
@@ -132,7 +136,7 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
         sub_event.event_type_code(),
     );
 
-    backend.finalize_valid_projection(recorded_by, &event_id_b64, sub_event, suppress_sharing)?;
+    backend.finalize_valid_projection(&cap, recorded_by, &event_id_b64, sub_event, suppress_sharing)?;
 
     Ok((ProjectionDecision::Valid, Some(parsed)))
 }

@@ -1,6 +1,6 @@
 use super::super::decision::ProjectionDecision;
 use super::super::signer::{verify_ed25519_signature, SignerResolution};
-use super::backend::{ProjectionApplyResult, ProjectionBackend};
+use super::backend::{ProjectionApplyResult, ProjectionBackend, WriteCapability};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
@@ -389,8 +389,10 @@ pub(crate) fn apply_projection_with_backend<B: ProjectionBackend>(
     blob: &[u8],
     parsed: &ParsedEvent,
 ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>, bool)> {
+    let cap = WriteCapability::new();
     apply_projection_frame(
         backend,
+        &cap,
         recorded_by,
         event_id_b64,
         blob,
@@ -431,10 +433,12 @@ pub(crate) fn run_dep_and_projection_stages_with_backend<B: ProjectionBackend>(
     is_encrypted_transport: bool,
     current_transport_key_event_id: Option<&str>,
 ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>, bool)> {
+    let cap = WriteCapability::new();
     let mut frame = ProjectionFrameContext::default();
     frame.current_transport_key_event_id = current_transport_key_event_id.map(ToOwned::to_owned);
     apply_projection_frame(
         backend,
+        &cap,
         recorded_by,
         event_id_b64,
         blob,
@@ -447,6 +451,7 @@ pub(crate) fn run_dep_and_projection_stages_with_backend<B: ProjectionBackend>(
 
 fn apply_projection_frame<B: ProjectionBackend>(
     backend: &B,
+    cap: &WriteCapability,
     recorded_by: &str,
     event_id_b64: &str,
     blob: &[u8],
@@ -487,7 +492,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
         },
         ContextLoadDispositionPlan::RecordBlockAndReturn { missing } => {
             if !missing.is_empty() {
-                backend.record_block(recorded_by, event_id_b64, &missing)?;
+                backend.record_block(cap, recorded_by, event_id_b64, &missing)?;
             }
             return Ok((ProjectionDecision::BlockOnMissingDeps { missing }, None, false));
         }
@@ -496,6 +501,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
         }
         ContextLoadDispositionPlan::EmitHardPurgeAndReturn { message_event_id } => {
             backend.execute_emit_commands(
+                cap,
                 recorded_by,
                 &[EmitCommand::HardPurgeMessageGraph { message_event_id }],
             )?;
@@ -599,6 +605,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
         next_frame.current_signer = Some(resolved.info.clone());
         let (decision, inner, suppress_sharing) = apply_projection_frame(
             backend,
+            cap,
             recorded_by,
             event_id_b64,
             &signed.payload,
@@ -621,7 +628,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
             ));
         }
         let Some(key_bytes) = backend.load_key_secret_bytes(recorded_by, &enc.key_event_id)? else {
-            backend.record_block(recorded_by, event_id_b64, &[])?;
+            backend.record_block(cap, recorded_by, event_id_b64, &[])?;
             return Ok((
                 ProjectionDecision::BlockOnMissingDeps {
                     missing: Vec::new(),
@@ -706,6 +713,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
         }
         let (decision, _, suppress_sharing) = apply_projection_frame(
             backend,
+            cap,
             recorded_by,
             event_id_b64,
             &plaintext,
@@ -758,12 +766,12 @@ fn apply_projection_frame<B: ProjectionBackend>(
     match decide_projection_decision_effect_plan(&projection_decision_effect_context) {
         ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands => {
             super::write_exec::assert_writes_tenant_isolated(recorded_by, &result.write_ops);
-            backend.execute_write_ops(&result.write_ops)?;
-            backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
+            backend.execute_write_ops(cap, &result.write_ops)?;
+            backend.execute_emit_commands(cap, recorded_by, &result.emit_commands)?;
         }
         ProjectionDecisionEffectPlan::EmitCommandsOnly { missing } => {
-            backend.record_block(recorded_by, event_id_b64, &missing)?;
-            backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
+            backend.record_block(cap, recorded_by, event_id_b64, &missing)?;
+            backend.execute_emit_commands(cap, recorded_by, &result.emit_commands)?;
         }
         ProjectionDecisionEffectPlan::NoEffects => {}
     }
