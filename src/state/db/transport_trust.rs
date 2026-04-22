@@ -591,44 +591,87 @@ fn is_peer_shared_spki(
     recorded_by: &str,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let matched: bool = conn.query_row(
-        "SELECT EXISTS (
-            SELECT 1 FROM peers_shared p
-            WHERE p.recorded_by = ?1
-              AND p.transport_fingerprint = ?2
-              AND NOT EXISTS (
-                SELECT 1 FROM removed_entities r
-                WHERE r.recorded_by = p.recorded_by
-                  AND r.target_event_id = p.event_id
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM removed_entities r
-                WHERE r.recorded_by = p.recorded_by
-                  AND p.user_event_id IS NOT NULL
-                  AND r.target_event_id = p.user_event_id
-                  AND r.removal_type = 'user'
-              )
-        )",
-        rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
-        |row| row.get(0),
-    )?;
-
-    // Cross-check against the Verus-verified decision core. We compute the
-    // three primitive flags independently (simpler queries) and delegate to
-    // decide_peer_shared_authz_core. If the fused CTE ever loses one of its
-    // NOT EXISTS clauses, the two computations disagree and this debug_assert
-    // fires — catching the regression before it can leak authorization.
+    // In debug builds, wrap the fused CTE and the verified cross-check in a
+    // single deferred read transaction so both see the same SQLite snapshot.
+    // Without the txn, concurrent writes on another connection could make
+    // the two queries observe different states and fire a spurious
+    // debug_assert on valid histories.
     #[cfg(debug_assertions)]
     {
-        let verified = verified_peer_shared_authz_cross_check(conn, recorded_by, spki_fingerprint)?;
-        debug_assert_eq!(
-            matched, verified,
-            "transport_trust: fused CTE and verified decision disagree for fp={:?}",
-            spki_fingerprint,
-        );
+        return run_with_consistent_read_snapshot(conn, |txn_conn| {
+            let matched: bool = txn_conn.query_row(
+                IS_PEER_SHARED_SPKI_CTE_SQL,
+                rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
+                |row| row.get(0),
+            )?;
+            let verified = verified_peer_shared_authz_cross_check(
+                txn_conn, recorded_by, spki_fingerprint,
+            )?;
+            debug_assert_eq!(
+                matched, verified,
+                "transport_trust: fused CTE and verified decision disagree for fp={:?}",
+                spki_fingerprint,
+            );
+            Ok(matched)
+        });
     }
 
-    Ok(matched)
+    #[cfg(not(debug_assertions))]
+    {
+        let matched: bool = conn.query_row(
+            IS_PEER_SHARED_SPKI_CTE_SQL,
+            rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
+            |row| row.get(0),
+        )?;
+        Ok(matched)
+    }
+}
+
+const IS_PEER_SHARED_SPKI_CTE_SQL: &str = "SELECT EXISTS (
+    SELECT 1 FROM peers_shared p
+    WHERE p.recorded_by = ?1
+      AND p.transport_fingerprint = ?2
+      AND NOT EXISTS (
+        SELECT 1 FROM removed_entities r
+        WHERE r.recorded_by = p.recorded_by
+          AND r.target_event_id = p.event_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM removed_entities r
+        WHERE r.recorded_by = p.recorded_by
+          AND p.user_event_id IS NOT NULL
+          AND r.target_event_id = p.user_event_id
+          AND r.removal_type = 'user'
+      )
+)";
+
+/// In debug builds, run the given closure inside a BEGIN DEFERRED read
+/// transaction so all SELECT statements see the same snapshot. This keeps
+/// cross-check assertions deterministic under concurrent writes on other
+/// connections. If the connection is already in a transaction, nest via
+/// a savepoint instead.
+#[cfg(debug_assertions)]
+fn run_with_consistent_read_snapshot<T, F>(
+    conn: &Connection,
+    f: F,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnOnce(&Connection) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
+{
+    let autocommit = conn.is_autocommit();
+    if autocommit {
+        conn.execute_batch("BEGIN DEFERRED;")?;
+    } else {
+        conn.execute_batch("SAVEPOINT authz_cross_check;")?;
+    }
+    let result = f(conn);
+    if autocommit {
+        // Rolling back is fine: the txn is read-only. Commit works too.
+        conn.execute_batch("COMMIT;")?;
+    } else {
+        conn.execute_batch("RELEASE authz_cross_check;")?;
+    }
+    result
 }
 
 /// Independent three-query evaluation of the peer_shared authorization
@@ -746,21 +789,13 @@ pub fn is_authorized_for_tenant(
     )?;
     let result = allowed != 0;
 
-    // Cross-check against the verified decision core — BOTH directions
-    // over the peer_shared source path. The CTE admits via union of three
-    // sources (peer_shared, invite_bootstrap_trust, pending_invite_bootstrap_trust).
-    // When a peer_shared row exists for this (tenant, fp), the peer_shared
-    // source *alone* gives us a binary answer that must match the verified
-    // decision. Asserting equality (not one-directional implication) catches
-    // drift in both directions: a CTE that becomes too strict (false negative)
-    // AND a CTE that becomes too lenient (false positive, authorizing a
-    // removed peer) — the security-critical direction.
-    //
-    // If no peer_shared row matches, the admission must come from a bootstrap
-    // source not modeled here; skip the cross-check.
+    // Cross-check against the verified decision core — BOTH directions over
+    // the peer_shared source. Wrapped in a consistent read snapshot so the
+    // fused CTE and the split queries can't observe different states under
+    // concurrent writes.
     #[cfg(debug_assertions)]
-    {
-        let peer_shared_row_exists: bool = conn.query_row(
+    run_with_consistent_read_snapshot(conn, |txn| {
+        let peer_shared_row_exists: bool = txn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM peers_shared
                  WHERE recorded_by = ?1 AND transport_fingerprint = ?2
@@ -769,13 +804,7 @@ pub fn is_authorized_for_tenant(
             |row| row.get(0),
         )?;
         if peer_shared_row_exists {
-            let verified_peer_shared = verified_peer_shared_authz_cross_check(
-                conn, tenant_id, spki_fingerprint,
-            )?;
-            // Only assert equality if the CTE decision is fully determined
-            // by peer_shared (no bootstrap row exists for the same fingerprint
-            // that could have admitted via a different source).
-            let bootstrap_row_exists: bool = conn.query_row(
+            let bootstrap_row_exists: bool = txn.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM invite_bootstrap_trust
                      WHERE recorded_by = ?1 AND bootstrap_spki_fingerprint = ?2
@@ -787,15 +816,27 @@ pub fn is_authorized_for_tenant(
                 |row| row.get(0),
             )?;
             if !bootstrap_row_exists {
+                // Re-run the outer CTE inside the same snapshot so `result`
+                // and `verified` compare on the same state.
+                let snap_result: i64 = txn.query_row(
+                    TENANT_AUTHORIZATION_EXISTS_SQL,
+                    rusqlite::params![tenant_id, spki_fingerprint.as_slice(), now],
+                    |row| row.get(0),
+                )?;
+                let snap_result_bool = snap_result != 0;
+                let verified_peer_shared = verified_peer_shared_authz_cross_check(
+                    txn, tenant_id, spki_fingerprint,
+                )?;
                 debug_assert_eq!(
-                    result, verified_peer_shared,
+                    snap_result_bool, verified_peer_shared,
                     "is_authorized_for_tenant CTE decision diverges from verified \
                      peer_shared authz for fp={:?} (CTE={}, verified={})",
-                    spki_fingerprint, result, verified_peer_shared,
+                    spki_fingerprint, snap_result_bool, verified_peer_shared,
                 );
             }
         }
-    }
+        Ok(())
+    })?;
     Ok(result)
 }
 
@@ -828,22 +869,19 @@ pub fn is_authorized_for_node(
     )?;
     let result = allowed != 0;
 
-    // Cross-check: node-scope CTE is a union across tenants. When there
-    // is at least one peer_shared row matching the fingerprint (any tenant)
-    // AND no bootstrap row matches, the CTE's admission is fully determined
-    // by the union of per-tenant verified peer_shared decisions. Assert
-    // equality, which catches drift in BOTH directions including the
-    // security-critical false-positive case (CTE re-admits a removed peer).
+    // Cross-check wrapped in a consistent read snapshot (see
+    // run_with_consistent_read_snapshot) so the fused CTE and the per-tenant
+    // verified decisions see the same state under concurrent writes.
     #[cfg(debug_assertions)]
-    {
-        let peer_shared_row_exists: bool = conn.query_row(
+    run_with_consistent_read_snapshot(conn, |txn| {
+        let peer_shared_row_exists: bool = txn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM peers_shared WHERE transport_fingerprint = ?1
              )",
             rusqlite::params![spki_fingerprint.as_slice()],
             |row| row.get(0),
         )?;
-        let bootstrap_row_exists: bool = conn.query_row(
+        let bootstrap_row_exists: bool = txn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM invite_bootstrap_trust
                  WHERE bootstrap_spki_fingerprint = ?1
@@ -855,7 +893,13 @@ pub fn is_authorized_for_node(
             |row| row.get(0),
         )?;
         if peer_shared_row_exists && !bootstrap_row_exists {
-            let mut stmt = conn.prepare(
+            let snap_result: i64 = txn.query_row(
+                NODE_AUTHORIZATION_EXISTS_SQL,
+                rusqlite::params![spki_fingerprint.as_slice(), now],
+                |row| row.get(0),
+            )?;
+            let snap_result_bool = snap_result != 0;
+            let mut stmt = txn.prepare(
                 "SELECT DISTINCT recorded_by FROM peers_shared \
                  WHERE transport_fingerprint = ?1",
             )?;
@@ -867,19 +911,20 @@ pub fn is_authorized_for_node(
                 .collect::<Result<Vec<_>, _>>()?;
             let mut any_verified = false;
             for t in &tenants {
-                if verified_peer_shared_authz_cross_check(conn, t, spki_fingerprint)? {
+                if verified_peer_shared_authz_cross_check(txn, t, spki_fingerprint)? {
                     any_verified = true;
                     break;
                 }
             }
             debug_assert_eq!(
-                result, any_verified,
+                snap_result_bool, any_verified,
                 "is_authorized_for_node CTE decision diverges from verified \
                  peer_shared authz for fp={:?} (CTE={}, verified={})",
-                spki_fingerprint, result, any_verified,
+                spki_fingerprint, snap_result_bool, any_verified,
             );
         }
-    }
+        Ok(())
+    })?;
     Ok(result)
 }
 
