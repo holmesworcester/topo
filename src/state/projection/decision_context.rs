@@ -2369,26 +2369,20 @@ impl ProjectionQueries for Connection {
             return Ok(ProjectorDecisionContext::default());
         };
 
-        let mut key_arr = [0u8; 32];
-        key_arr.copy_from_slice(&private_key_bytes);
-        let local_signing_key = SigningKey::from_bytes(&key_arr);
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes.copy_from_slice(&private_key_bytes);
 
         let sender_key = match resolve_signer_key(self, recorded_by, &current_signer_event_id)? {
             SignerResolution::Found(k) => k,
             _ => return Ok(ProjectorDecisionContext::default()),
         };
-        let sender_pub = match VerifyingKey::from_bytes(&sender_key.public_key) {
-            Ok(vk) => vk,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
 
-        let plaintext_key =
-            unwrap_key_from_sender(&local_signing_key, &sender_pub, &key_shared.wrapped_key);
-
+        // Pattern (b): surface raw material to the projector; the
+        // projector does `unwrap_key_from_sender` deterministically.
         Ok(ProjectorDecisionContext {
-            unwrapped_secret_material: Some(UnwrappedSecretMaterial {
-                key_bytes: plaintext_key,
-            }),
+            local_signing_key_bytes: Some(sk_bytes),
+            sender_verifying_key_bytes: Some(sender_key.public_key),
+            wrapped_key_bytes: Some(key_shared.wrapped_key),
             ..ProjectorDecisionContext::default()
         })
     }
@@ -2423,21 +2417,12 @@ impl ProjectionQueries for Connection {
             SignerResolution::Found(k) => k,
             _ => return Ok(ProjectorDecisionContext::default()),
         };
-        let sender_pub = match VerifyingKey::from_bytes(&sender_key.public_key) {
-            Ok(vk) => vk,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
 
-        let plaintext_key = unwrap_key_from_sender(
-            &local_signing_key,
-            &sender_pub,
-            &key_rotation.wrapped_keys[slot_index],
-        );
-
+        // Pattern (b): surface raw material; projector unwraps.
         Ok(ProjectorDecisionContext {
-            unwrapped_secret_material: Some(UnwrappedSecretMaterial {
-                key_bytes: plaintext_key,
-            }),
+            local_signing_key_bytes: Some(local_signing_key.to_bytes()),
+            sender_verifying_key_bytes: Some(sender_key.public_key),
+            wrapped_key_bytes: Some(key_rotation.wrapped_keys[slot_index]),
             ..ProjectorDecisionContext::default()
         })
     }
@@ -2464,36 +2449,18 @@ impl ProjectionQueries for Connection {
             SignerResolution::Found(k) => k,
             _ => return Ok(ProjectorDecisionContext::default()),
         };
-        let sender_pub = match VerifyingKey::from_bytes(&sender_key.public_key) {
-            Ok(vk) => vk,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
 
-        let plaintext = match decrypt_bundle_from_sender(
-            &local_signing_key,
-            &sender_pub,
-            &key_history.nonce,
-            &key_history.ciphertext,
-            &key_history.auth_tag,
-        ) {
-            Ok(plaintext) => plaintext,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
-
-        let entries = match crate::event_modules::key_history::decode_key_history_plaintext(&plaintext)
-        {
-            Ok(entries) => entries,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
-
+        // Pattern (b): surface the raw AEAD payload to the projector.
+        // The projector runs the deterministic decrypt-bundle +
+        // decode-slots walk. No crypto in the DB boundary.
         Ok(ProjectorDecisionContext {
-            unwrapped_key_history_material: entries
-                .into_iter()
-                .map(|entry| HistoricalKeyMaterial {
-                    key_event_id: entry.key_event_id,
-                    key_bytes: entry.key_bytes,
-                })
-                .collect(),
+            local_signing_key_bytes: Some(local_signing_key.to_bytes()),
+            sender_verifying_key_bytes: Some(sender_key.public_key),
+            history_payload: Some(crate::projection::projector::HistoryBundlePayload {
+                nonce: key_history.nonce.to_vec(),
+                ciphertext: key_history.ciphertext.clone(),
+                auth_tag: key_history.auth_tag,
+            }),
             ..ProjectorDecisionContext::default()
         })
     }

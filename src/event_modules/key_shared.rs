@@ -224,17 +224,28 @@ pub fn project_pure(
         ],
     }];
 
-    let material = match &ctx.unwrapped_secret_material {
-        Some(v) => v,
-        None => return ProjectorResult::valid(ops),
+    // Pattern (b): context loader surfaced raw material; do the
+    // deterministic asymmetric unwrap in the projector. Crypto is a
+    // pure function of its inputs so projection remains deterministic.
+    let (sk_bytes, vk_bytes, wrapped) = match (
+        ctx.local_signing_key_bytes,
+        ctx.sender_verifying_key_bytes,
+        ctx.wrapped_key_bytes,
+    ) {
+        (Some(sk), Some(vk), Some(w)) => (sk, vk, w),
+        _ => return ProjectorResult::valid(ops),
     };
+
+    let plaintext_key = crate::event_modules::key_broadcast::unwrap_k_bundle(
+        &sk_bytes, &vk_bytes, &wrapped,
+    );
 
     ops.push(WriteOp::InsertOrIgnore {
         table: "key_secrets",
         columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
         values: vec![
             SqlVal::Text(event_id_to_base64(&ss.key_event_id)),
-            SqlVal::Blob(material.key_bytes.to_vec()),
+            SqlVal::Blob(plaintext_key.to_vec()),
             SqlVal::Int(ss.created_at_ms as i64),
             SqlVal::Text(recorded_by.to_string()),
         ],

@@ -255,13 +255,23 @@ pub fn project_pure(
         ],
     }];
 
-    if let Some(material) = &ctx.unwrapped_secret_material {
+    // Pattern (b): context loader surfaced raw wrap material; unwrap
+    // here deterministically. Crypto is pure so projection stays
+    // replay-safe.
+    if let (Some(sk_bytes), Some(vk_bytes), Some(wrapped)) = (
+        ctx.local_signing_key_bytes,
+        ctx.sender_verifying_key_bytes,
+        ctx.wrapped_key_bytes,
+    ) {
+        let plaintext_key = crate::event_modules::key_broadcast::unwrap_k_bundle(
+            &sk_bytes, &vk_bytes, &wrapped,
+        );
         ops.push(WriteOp::InsertOrIgnore {
             table: "key_secrets",
             columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
             values: vec![
                 SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Blob(material.key_bytes.to_vec()),
+                SqlVal::Blob(plaintext_key.to_vec()),
                 SqlVal::Int(rotation.created_at_ms as i64),
                 SqlVal::Text(recorded_by.to_string()),
             ],

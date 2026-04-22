@@ -200,6 +200,45 @@ pub fn project_pure(
     if history.ciphertext.len() != KEY_HISTORY_BUNDLE_BYTES {
         return ProjectorResult::reject("ciphertext size does not match key history cap".to_string());
     }
+
+    // Pattern (b): context loader surfaced raw AEAD bundle payload.
+    // Projector runs decrypt_bundle_from_sender + decode entries +
+    // emit per-entry key_secrets writes + RetryBlockedEncryptedByKey
+    // signals. Crypto deterministic, projection stays replay-safe.
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    if let (Some(sk_bytes), Some(vk_bytes), Some(payload)) = (
+        ctx.local_signing_key_bytes,
+        ctx.sender_verifying_key_bytes,
+        ctx.history_payload.as_ref(),
+    ) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&vk_bytes) {
+            if let Ok(plaintext) = crate::shared::crypto::decrypt_bundle_from_sender(
+                &sk,
+                &vk,
+                payload
+                    .nonce
+                    .as_slice()
+                    .try_into()
+                    .unwrap_or(&[0u8; 12]),
+                &payload.ciphertext,
+                &payload.auth_tag,
+            ) {
+                if let Ok(decoded) = decode_key_history_plaintext(&plaintext) {
+                    entries = decoded
+                        .into_iter()
+                        .map(|entry| {
+                            (
+                                crate::crypto::event_id_to_base64(&entry.key_event_id),
+                                entry.key_bytes.to_vec(),
+                            )
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+
     let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "key_histories",
         columns: vec![
@@ -214,17 +253,17 @@ pub fn project_pure(
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Blob(history.recipient_public_key.to_vec()),
             SqlVal::Int(history.created_at_ms as i64),
-            SqlVal::Int(ctx.unwrapped_key_history_material.len() as i64),
+            SqlVal::Int(entries.len() as i64),
         ],
     }];
 
-    for entry in &ctx.unwrapped_key_history_material {
+    for (key_event_id_b64, key_bytes) in &entries {
         ops.push(WriteOp::InsertOrIgnore {
             table: "key_secrets",
             columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
             values: vec![
-                SqlVal::Text(crate::crypto::event_id_to_base64(&entry.key_event_id)),
-                SqlVal::Blob(entry.key_bytes.to_vec()),
+                SqlVal::Text(key_event_id_b64.clone()),
+                SqlVal::Blob(key_bytes.clone()),
                 SqlVal::Int(history.created_at_ms as i64),
                 SqlVal::Text(recorded_by.to_string()),
             ],
@@ -233,10 +272,10 @@ pub fn project_pure(
 
     ProjectorResult::valid_with_commands(
         ops,
-        ctx.unwrapped_key_history_material
-            .iter()
-            .map(|entry| EmitCommand::RetryBlockedEncryptedByKey {
-                key_event_id: crate::crypto::event_id_to_base64(&entry.key_event_id),
+        entries
+            .into_iter()
+            .map(|(key_event_id_b64, _)| EmitCommand::RetryBlockedEncryptedByKey {
+                key_event_id: key_event_id_b64,
             })
             .collect(),
     )
