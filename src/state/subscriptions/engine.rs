@@ -157,6 +157,8 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::KeyBroadcast(_) => "key_broadcast",
         ParsedEvent::KeyHistoryBundle(_) => "key_history_bundle",
         ParsedEvent::MessageKey(_) => "message_key",
+        ParsedEvent::KeyBundleRequest(_) => "key_bundle_request",
+        ParsedEvent::KeyBundleShare(_) => "key_bundle_share",
     }
 }
 

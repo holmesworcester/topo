@@ -13,6 +13,8 @@ pub mod file_slice;
 pub mod invite_accepted;
 pub mod invite_secret;
 pub mod key_broadcast;
+pub mod key_bundle_request;
+pub mod key_bundle_share;
 pub mod key_history;
 pub mod key_history_bundle;
 pub mod key_request;
@@ -73,6 +75,8 @@ pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
 pub use invite_secret::InviteSecretEvent;
 pub use key_broadcast::KeyBroadcastEvent;
+pub use key_bundle_request::KeyBundleRequestEvent;
+pub use key_bundle_share::KeyBundleShareEvent;
 pub use key_history::KeyHistoryEvent;
 pub use key_history_bundle::KeyHistoryBundleEvent;
 pub use key_request::KeyRequestEvent;
@@ -126,6 +130,8 @@ pub const EVENT_TYPE_WRAP_PUBKEY: u8 = 37;
 pub const EVENT_TYPE_KEY_BROADCAST: u8 = 38;
 pub const EVENT_TYPE_KEY_HISTORY_BUNDLE: u8 = 39;
 pub const EVENT_TYPE_MESSAGE_KEY: u8 = 40;
+pub const EVENT_TYPE_KEY_BUNDLE_REQUEST: u8 = 41;
+pub const EVENT_TYPE_KEY_BUNDLE_SHARE: u8 = 42;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -167,6 +173,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     key_broadcast::ensure_schema(conn)?;
     key_history_bundle::ensure_schema(conn)?;
     message_key::ensure_schema(conn)?;
+    key_bundle_request::ensure_schema(conn)?;
+    key_bundle_share::ensure_schema(conn)?;
     crate::state::subscriptions::ensure_schema(conn)?;
     Ok(())
 }
@@ -203,6 +211,8 @@ pub enum ParsedEvent {
     KeyBroadcast(KeyBroadcastEvent),
     KeyHistoryBundle(KeyHistoryBundleEvent),
     MessageKey(MessageKeyEvent),
+    KeyBundleRequest(KeyBundleRequestEvent),
+    KeyBundleShare(KeyBundleShareEvent),
 }
 
 impl ParsedEvent {
@@ -238,6 +248,8 @@ impl ParsedEvent {
             ParsedEvent::KeyBroadcast(k) => k.created_at_ms,
             ParsedEvent::KeyHistoryBundle(k) => k.created_at_ms,
             ParsedEvent::MessageKey(m) => m.created_at_ms,
+            ParsedEvent::KeyBundleRequest(r) => r.created_at_ms,
+            ParsedEvent::KeyBundleShare(s) => s.created_at_ms,
         }
     }
 
@@ -375,6 +387,8 @@ impl ParsedEvent {
             ParsedEvent::MessageKey(m) => {
                 vec![("owning_message_event_id", m.owning_message_event_id)]
             }
+            ParsedEvent::KeyBundleRequest(_) => vec![],
+            ParsedEvent::KeyBundleShare(_) => vec![],
         }
     }
 
@@ -410,6 +424,8 @@ impl ParsedEvent {
             ParsedEvent::KeyBroadcast(_) => EVENT_TYPE_KEY_BROADCAST,
             ParsedEvent::KeyHistoryBundle(_) => EVENT_TYPE_KEY_HISTORY_BUNDLE,
             ParsedEvent::MessageKey(_) => EVENT_TYPE_MESSAGE_KEY,
+            ParsedEvent::KeyBundleRequest(_) => EVENT_TYPE_KEY_BUNDLE_REQUEST,
+            ParsedEvent::KeyBundleShare(_) => EVENT_TYPE_KEY_BUNDLE_SHARE,
         }
     }
 
@@ -446,6 +462,8 @@ impl ParsedEvent {
             ParsedEvent::KeyBroadcast(e) => e.human_fields(),
             ParsedEvent::KeyHistoryBundle(e) => e.human_fields(),
             ParsedEvent::MessageKey(e) => e.human_fields(),
+            ParsedEvent::KeyBundleRequest(e) => e.human_fields(),
+            ParsedEvent::KeyBundleShare(e) => e.human_fields(),
         }
     }
 }
@@ -549,6 +567,8 @@ pub fn registry() -> &'static EventRegistry {
             &key_broadcast::KEY_BROADCAST_META,
             &key_history_bundle::KEY_HISTORY_BUNDLE_META,
             &message_key::MESSAGE_KEY_META,
+            &key_bundle_request::KEY_BUNDLE_REQUEST_META,
+            &key_bundle_share::KEY_BUNDLE_SHARE_META,
         ])
     })
 }
