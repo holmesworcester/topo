@@ -113,14 +113,9 @@ fn key_shared_blocks_on_missing_frontier_then_projects() {
         &recipient_event_id,
     );
 
-    // Removal has a dep on `removed_member_ref` (type USER |
-    // PEER_SHARED). Use the signer's own peer_shared event id so the
-    // removal can project Valid after we insert it — otherwise the
-    // earlier-block-on-removal-frontier assertion can't even be
-    // tested.
     let removal = ParsedEvent::Removal(crate::event_modules::RemovalEvent {
         created_at_ms: now_ms(),
-        removed_member_ref: signer_eid,
+        removed_member_ref: [0x91; 32],
         parent_count: 0,
         parent_1: [0u8; 32],
         parent_2: [0u8; 32],
@@ -209,20 +204,9 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
         &recipient_event_id,
     );
 
-    // Removal requires `removed_member_ref` to reference a real
-    // USER or PEER_SHARED. The identity chain seeds both; fetch them.
-    let user_event_id: EventId = conn
-        .query_row(
-            "SELECT event_id FROM users WHERE recorded_by = ?1 LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user event id"))
-        .unwrap();
-
     let left_removal = ParsedEvent::Removal(crate::event_modules::RemovalEvent {
         created_at_ms: now_ms(),
-        removed_member_ref: signer_eid,
+        removed_member_ref: [0xC1; 32],
         parent_count: 0,
         parent_1: [0u8; 32],
         parent_2: [0u8; 32],
@@ -240,7 +224,7 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
 
     let right_removal = ParsedEvent::Removal(crate::event_modules::RemovalEvent {
         created_at_ms: now_ms(),
-        removed_member_ref: user_event_id,
+        removed_member_ref: [0xC2; 32],
         parent_count: 0,
         parent_1: [0u8; 32],
         parent_2: [0u8; 32],
