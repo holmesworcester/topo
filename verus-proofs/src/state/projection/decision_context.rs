@@ -613,121 +613,21 @@ pub fn decide_deletion_signer_plan_core(
 
 // ═══════════════════════════════════════════════════════════════════
 // Removal authority / target kind
+//
+// The former `RemovalSignerRowsCore` / `decide_removal_signer_plan_core`
+// chain modelled an `is_admin: bool` rollup flag — a proof over an
+// opaque predicate that said nothing about HOW the runtime knew
+// admin-ness. With Removal's admin_authority_event_id now an explicit
+// dep (see runtime `dep_facts::RemovalDepFacts`), that proof surface
+// is obsolete: the positive-authority obligation is the structural
+// equality `admin.user_event_id == signer_ps.user_event_id` over two
+// parsed event types, which lifts to Verus directly once the
+// `decide_removal` pure fn is mirrored into this crate. Target-kind
+// triage (`RemovalTargetRowsCore` → `RemovalTargetPlanCore`) moved
+// into the runtime's `RemovalGuardFacts` + pure decide; it will come
+// back here as part of the DepFacts/GuardFacts mirror when signer-as
+// -dep migration lands (see plan).
 // ═══════════════════════════════════════════════════════════════════
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalSignerRowsCore {
-    MissingCurrentSigner,
-    UnsupportedSignerType,
-    PeerSharedSigner { is_admin: bool },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalSignerDecisionContextCore {
-    ReadyAdminPeerShared,
-    RejectMissingCurrentSigner,
-    RejectUnsupportedSignerType,
-    RejectNonAdminPeerShared,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalSignerPlanCore {
-    Ready,
-    RejectMissingCurrentSigner,
-    RejectUnsupportedSignerType,
-    RejectNonAdminPeerShared,
-}
-
-pub fn normalize_removal_signer_core(
-    rows: RemovalSignerRowsCore,
-) -> (context: RemovalSignerDecisionContextCore)
-    ensures
-        rows == RemovalSignerRowsCore::MissingCurrentSigner
-            ==> context == RemovalSignerDecisionContextCore::RejectMissingCurrentSigner,
-        rows == RemovalSignerRowsCore::UnsupportedSignerType
-            ==> context == RemovalSignerDecisionContextCore::RejectUnsupportedSignerType,
-        rows == (RemovalSignerRowsCore::PeerSharedSigner { is_admin: true })
-            ==> context == RemovalSignerDecisionContextCore::ReadyAdminPeerShared,
-        rows == (RemovalSignerRowsCore::PeerSharedSigner { is_admin: false })
-            ==> context == RemovalSignerDecisionContextCore::RejectNonAdminPeerShared,
-{
-    match rows {
-        RemovalSignerRowsCore::MissingCurrentSigner => {
-            RemovalSignerDecisionContextCore::RejectMissingCurrentSigner
-        }
-        RemovalSignerRowsCore::UnsupportedSignerType => {
-            RemovalSignerDecisionContextCore::RejectUnsupportedSignerType
-        }
-        RemovalSignerRowsCore::PeerSharedSigner { is_admin } => {
-            if is_admin {
-                RemovalSignerDecisionContextCore::ReadyAdminPeerShared
-            } else {
-                RemovalSignerDecisionContextCore::RejectNonAdminPeerShared
-            }
-        }
-    }
-}
-
-pub fn decide_removal_signer_plan_core(
-    context: RemovalSignerDecisionContextCore,
-) -> (plan: RemovalSignerPlanCore)
-    ensures
-        context == RemovalSignerDecisionContextCore::ReadyAdminPeerShared
-            ==> plan == RemovalSignerPlanCore::Ready,
-        context == RemovalSignerDecisionContextCore::RejectMissingCurrentSigner
-            ==> plan == RemovalSignerPlanCore::RejectMissingCurrentSigner,
-        context == RemovalSignerDecisionContextCore::RejectUnsupportedSignerType
-            ==> plan == RemovalSignerPlanCore::RejectUnsupportedSignerType,
-        context == RemovalSignerDecisionContextCore::RejectNonAdminPeerShared
-            ==> plan == RemovalSignerPlanCore::RejectNonAdminPeerShared,
-{
-    match context {
-        RemovalSignerDecisionContextCore::ReadyAdminPeerShared => RemovalSignerPlanCore::Ready,
-        RemovalSignerDecisionContextCore::RejectMissingCurrentSigner => {
-            RemovalSignerPlanCore::RejectMissingCurrentSigner
-        }
-        RemovalSignerDecisionContextCore::RejectUnsupportedSignerType => {
-            RemovalSignerPlanCore::RejectUnsupportedSignerType
-        }
-        RemovalSignerDecisionContextCore::RejectNonAdminPeerShared => {
-            RemovalSignerPlanCore::RejectNonAdminPeerShared
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalTargetRowsCore {
-    Missing,
-    User,
-    Peer,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalTargetPlanCore {
-    Missing,
-    ReadyUser,
-    ReadyPeer,
-    RejectUnsupported,
-}
-
-pub fn decide_removal_target_plan_core(
-    rows: RemovalTargetRowsCore,
-) -> (plan: RemovalTargetPlanCore)
-    ensures
-        rows == RemovalTargetRowsCore::Missing ==> plan == RemovalTargetPlanCore::Missing,
-        rows == RemovalTargetRowsCore::User ==> plan == RemovalTargetPlanCore::ReadyUser,
-        rows == RemovalTargetRowsCore::Peer ==> plan == RemovalTargetPlanCore::ReadyPeer,
-        rows == RemovalTargetRowsCore::Unsupported
-            ==> plan == RemovalTargetPlanCore::RejectUnsupported,
-{
-    match rows {
-        RemovalTargetRowsCore::Missing => RemovalTargetPlanCore::Missing,
-        RemovalTargetRowsCore::User => RemovalTargetPlanCore::ReadyUser,
-        RemovalTargetRowsCore::Peer => RemovalTargetPlanCore::ReadyPeer,
-        RemovalTargetRowsCore::Unsupported => RemovalTargetPlanCore::RejectUnsupported,
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // Semantic type
