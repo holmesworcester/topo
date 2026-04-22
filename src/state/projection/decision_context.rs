@@ -1450,6 +1450,153 @@ fn load_removal_guard_facts(
     Ok(crate::projection::dep_facts::RemovalGuardFacts { target_kind })
 }
 
+/// SQL-side dep-facts loader for File.
+///
+/// File has no dep-derived semantic gate today; this loader exists
+/// purely for uniformity with other migrated projectors. Kept as a
+/// hook for the future File-owner / message authorization migration.
+fn load_file_dep_facts(
+    _conn: &Connection,
+    _recorded_by: &str,
+    _file: &FileEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::FileDepFacts> {
+    Ok(crate::projection::dep_facts::FileDepFacts::default())
+}
+
+/// SQL-side guard-facts loader for File.
+fn load_file_guard_facts(
+    _conn: &Connection,
+    _recorded_by: &str,
+    _file: &FileEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::FileGuardFacts> {
+    Ok(crate::projection::dep_facts::FileGuardFacts::default())
+}
+
+/// SQL-side dep-facts loader for FileSlice.
+///
+/// FileSlice has no dep-derived semantic gate surfaced on DepFacts
+/// today — authorization is still dispatched from the guard-derived
+/// `file_descriptors` rollup. Present for uniformity.
+fn load_file_slice_dep_facts(
+    _conn: &Connection,
+    _recorded_by: &str,
+    _file_slice: &FileSliceEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::FileSliceDepFacts> {
+    Ok(crate::projection::dep_facts::FileSliceDepFacts::default())
+}
+
+/// SQL-side guard-facts loader for FileSlice.
+///
+/// Reads the three ambient rollups the file_slice projector needs:
+///   * owner-deleted guard, based on `frame.current_owner_event_id`,
+///   * file descriptor list for `file_id`,
+///   * existing `(file_id, slice_number)` slot, and
+///   * first descriptor whose owning message is tombstoned.
+fn load_file_slice_guard_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    file_slice: &FileSliceEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::FileSliceGuardFacts> {
+    use crate::projection::dep_facts::FileSliceGuardFacts;
+
+    let file_id_b64 = event_id_to_base64(&file_slice.file_id);
+
+    // Owner-deleted guard: treats `frame.current_owner_event_id`
+    // like ambient signer-resolution state — consulted once, surfaced
+    // verbatim. Not yet a true dep.
+    let purge_owner_event_id = if let Some(owner_event_id_b64) =
+        frame.current_owner_event_id.as_deref()
+    {
+        let owner_deleted: bool = conn.query_row(
+            "SELECT COUNT(*) > 0
+             FROM deleted_messages
+             WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, owner_event_id_b64],
+            |row| row.get(0),
+        )?;
+        if owner_deleted {
+            Some(owner_event_id_b64.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut desc_stmt = conn.prepare(
+        "SELECT event_id, message_id, signer_event_id, key_event_id, root_hash, blob_bytes, slice_bytes
+         FROM files
+         WHERE recorded_by = ?1 AND file_id = ?2
+         ORDER BY created_at ASC, event_id ASC",
+    )?;
+    let file_descriptors: Vec<FileDescriptorInfo> = desc_stmt
+        .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
+            let root_hash_blob = crate::db::sql_types::get_blob(row, 4)?;
+            let mut root_hash = [0u8; 32];
+            if root_hash_blob.len() == 32 {
+                root_hash.copy_from_slice(&root_hash_blob);
+            }
+            Ok(FileDescriptorInfo {
+                event_id: crate::db::sql_types::get_text(row, 0)?,
+                message_id: crate::db::sql_types::get_text(row, 1)?,
+                signer_event_id: crate::db::sql_types::get_text(row, 2)?,
+                key_event_id: crate::db::sql_types::get_text(row, 3)?,
+                root_hash,
+                blob_bytes: row.get::<_, i64>(5)? as u64,
+                slice_bytes: row.get::<_, i64>(6)? as u32,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Descriptor-level purge only fires when owner-purge didn't —
+    // mirroring the previous `if ctx.purge_message_event_id.is_none()`
+    // short-circuit in the loader.
+    let purge_descriptor_message_id = if purge_owner_event_id.is_none() {
+        let mut hit: Option<String> = None;
+        for descriptor in &file_descriptors {
+            let message_deleted: bool = conn.query_row(
+                "SELECT COUNT(*) > 0
+                 FROM deleted_messages
+                 WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![recorded_by, &descriptor.message_id],
+                |row| row.get(0),
+            )?;
+            if message_deleted {
+                hit = Some(descriptor.message_id.clone());
+                break;
+            }
+        }
+        hit
+    } else {
+        None
+    };
+
+    let existing_file_slice = match conn.query_row(
+        "SELECT event_id, descriptor_event_id
+         FROM file_slices
+         WHERE recorded_by = ?1 AND file_id = ?2 AND slice_number = ?3",
+        rusqlite::params![recorded_by, &file_id_b64, file_slice.slice_number as i64],
+        |row| {
+            Ok((
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_text(row, 1)?,
+            ))
+        },
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    Ok(FileSliceGuardFacts {
+        purge_owner_event_id,
+        file_descriptors,
+        existing_file_slice,
+        purge_descriptor_message_id,
+    })
+}
+
 /// Parse the admin-authority dep blob into an AdminEvent.
 fn resolve_admin_authority(
     event_id: &[u8; 32],
@@ -2286,10 +2433,15 @@ impl ProjectionQueries for Connection {
     fn load_file_context(
         &self,
         _frame: &ProjectionFrameContext,
-        _recorded_by: &str,
+        recorded_by: &str,
         _event_id_b64: &str,
-        _file: &FileEvent,
+        file: &FileEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        use crate::projection::dep_facts::{decide_file, FileDecision};
+
+        let deps = load_file_dep_facts(self, recorded_by, file)?;
+        let guards = load_file_guard_facts(self, recorded_by, file)?;
+        let FileDecision::Ready = decide_file(file, &deps, &guards);
         Ok(ProjectorDecisionContext::default())
     }
 
@@ -2300,80 +2452,22 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         file_slice: &FileSliceEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        use crate::projection::dep_facts::{decide_file_slice, FileSliceDecision};
+
+        let deps = load_file_slice_dep_facts(self, recorded_by, file_slice)?;
+        let guards = load_file_slice_guard_facts(self, frame, recorded_by, file_slice)?;
+        let decision = decide_file_slice(file_slice, &deps, &guards);
+
         let mut ctx = ProjectorDecisionContext::default();
-        let file_id_b64 = event_id_to_base64(&file_slice.file_id);
-
-        if let Some(owner_event_id_b64) = frame.current_owner_event_id.as_deref() {
-            let owner_deleted: bool = self.query_row(
-                "SELECT COUNT(*) > 0
-                 FROM deleted_messages
-                 WHERE recorded_by = ?1 AND message_id = ?2",
-                rusqlite::params![recorded_by, owner_event_id_b64],
-                |row| row.get(0),
-            )?;
-            if owner_deleted {
-                ctx.purge_message_event_id = Some(owner_event_id_b64.to_string());
+        ctx.file_descriptors = guards.file_descriptors;
+        ctx.existing_file_slice = guards.existing_file_slice;
+        match decision {
+            FileSliceDecision::Ready {
+                purge_message_event_id,
+            } => {
+                ctx.purge_message_event_id = purge_message_event_id;
             }
         }
-
-        let mut desc_stmt = self.prepare(
-            "SELECT event_id, message_id, signer_event_id, key_event_id, root_hash, blob_bytes, slice_bytes
-             FROM files
-             WHERE recorded_by = ?1 AND file_id = ?2
-             ORDER BY created_at ASC, event_id ASC",
-        )?;
-        ctx.file_descriptors = desc_stmt
-            .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
-                let root_hash_blob = crate::db::sql_types::get_blob(row, 4)?;
-                let mut root_hash = [0u8; 32];
-                if root_hash_blob.len() == 32 {
-                    root_hash.copy_from_slice(&root_hash_blob);
-                }
-                Ok(FileDescriptorInfo {
-                    event_id: crate::db::sql_types::get_text(row, 0)?,
-                    message_id: crate::db::sql_types::get_text(row, 1)?,
-                    signer_event_id: crate::db::sql_types::get_text(row, 2)?,
-                    key_event_id: crate::db::sql_types::get_text(row, 3)?,
-                    root_hash,
-                    blob_bytes: row.get::<_, i64>(5)? as u64,
-                    slice_bytes: row.get::<_, i64>(6)? as u32,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        if ctx.purge_message_event_id.is_none() {
-            for descriptor in &ctx.file_descriptors {
-                let message_deleted: bool = self.query_row(
-                    "SELECT COUNT(*) > 0
-                     FROM deleted_messages
-                     WHERE recorded_by = ?1 AND message_id = ?2",
-                    rusqlite::params![recorded_by, &descriptor.message_id],
-                    |row| row.get(0),
-                )?;
-                if message_deleted {
-                    ctx.purge_message_event_id = Some(descriptor.message_id.clone());
-                    break;
-                }
-            }
-        }
-
-        ctx.existing_file_slice = match self.query_row(
-            "SELECT event_id, descriptor_event_id
-             FROM file_slices
-             WHERE recorded_by = ?1 AND file_id = ?2 AND slice_number = ?3",
-            rusqlite::params![recorded_by, &file_id_b64, file_slice.slice_number as i64],
-            |row| {
-                Ok((
-                    crate::db::sql_types::get_text(row, 0)?,
-                    crate::db::sql_types::get_text(row, 1)?,
-                ))
-            },
-        ) {
-            Ok(v) => Some(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e.into()),
-        };
-
         Ok(ctx)
     }
 
