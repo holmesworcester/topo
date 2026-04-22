@@ -145,6 +145,12 @@ pub enum SignerResolution {
         signer_event_id: String,
         event: WorkspaceEvent,
     },
+    /// Signer resolved to an `AdminEvent`. Used by projectors that
+    /// accept admin signers directly (e.g. `MessageDeletion`).
+    Admin {
+        signer_event_id: String,
+        event: AdminEvent,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -281,6 +287,9 @@ pub fn decide_peer_shared(
                 semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
             }
         }
+        SignerResolution::Admin { .. } => PeerSharedDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_ADMIN,
+        },
         SignerResolution::DeviceInvite {
             event: device_invite,
             ..
@@ -570,6 +579,11 @@ pub fn decide_removal(
                 semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
             };
         }
+        SignerResolution::Admin { .. } => {
+            return RemovalDecision::RejectUnsupportedSignerType {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_ADMIN,
+            };
+        }
         SignerResolution::PeerShared { event, .. } => event.user_event_id,
     };
 
@@ -789,6 +803,11 @@ pub fn decide_admin(
         SignerResolution::DeviceInvite { .. } => {
             return AdminDecision::RejectUnsupportedSignerType {
                 semantic_type_code: crate::event_modules::EVENT_TYPE_DEVICE_INVITE,
+            };
+        }
+        SignerResolution::Admin { .. } => {
+            return AdminDecision::RejectUnsupportedSignerType {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_ADMIN,
             };
         }
         SignerResolution::MissingBlob { .. } | SignerResolution::Malformed { .. } => {

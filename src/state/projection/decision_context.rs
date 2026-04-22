@@ -1727,6 +1727,10 @@ pub(crate) fn resolve_signer_from_frame(
             signer_event_id: signer_b64,
             event,
         },
+        Ok(ParsedEvent::Admin(event)) => SignerResolution::Admin {
+            signer_event_id: signer_b64,
+            event,
+        },
         Ok(other) => SignerResolution::Malformed {
             signer_event_id: signer_b64.clone(),
             reason: format!(
