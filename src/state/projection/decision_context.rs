@@ -9,11 +9,10 @@ use crate::event_modules::{
 };
 use crate::projection::projector::{
     BootstrapDecisionContext, CurrentSignerInfo, DeletionIntentInfo, FileDescriptorInfo,
-    HistoricalKeyMaterial, ProjectorDecisionContext, RemovalTargetKind, UnwrappedSecretMaterial,
+    ProjectorDecisionContext, RemovalTargetKind, UnwrappedSecretMaterial,
 };
 use crate::projection::encrypted::unwrap_key_from_sender;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
-use crate::crypto::decrypt_bundle_from_sender;
 use crate::state::db::transport_creds::{peer_has_creds_with_source, CRED_SOURCE_PEER_SHARED};
 use crate::state::db::transport_trust::read_bootstrap_context;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -1477,6 +1476,135 @@ fn resolve_admin_authority(
     }
 }
 
+/// SQL-side dep-facts loader for KeyRequest.
+///
+/// KeyRequest carries no typed dep facts — the decision reads one
+/// rollup guard (was a response already projected?) and suppresses
+/// further sharing accordingly.
+fn load_key_request_dep_facts(
+    _conn: &Connection,
+    _recorded_by: &str,
+    _key_request: &KeyRequestEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::KeyRequestDepFacts> {
+    Ok(crate::projection::dep_facts::KeyRequestDepFacts::default())
+}
+
+/// SQL-side guard-facts loader for KeyRequest.
+fn load_key_request_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    key_request: &KeyRequestEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::KeyRequestGuardFacts> {
+    let delivery_target_b64 = event_id_to_base64(&key_request.delivery_target_id);
+    let has_projected_response: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM key_shared
+             WHERE recorded_by = ?1
+               AND delivery_target_id = ?2
+         )",
+        rusqlite::params![recorded_by, &delivery_target_b64],
+        |row| row.get(0),
+    )?;
+    Ok(crate::projection::dep_facts::KeyRequestGuardFacts {
+        has_projected_response,
+    })
+}
+
+/// SQL-side dep-facts loader for KeyRotation.
+fn load_key_rotation_dep_facts(
+    _conn: &Connection,
+    _recorded_by: &str,
+    _key_rotation: &KeyRotationEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::KeyRotationDepFacts> {
+    Ok(crate::projection::dep_facts::KeyRotationDepFacts::default())
+}
+
+/// SQL-side guard-facts loader for KeyRotation.
+///
+/// Gathers (a) the local peer_shared signer identity used to locate
+/// our slot + DH-unwrap, and (b) the sender's verifying key resolved
+/// off the current-signer frame. Either missing means no unwrap.
+fn load_key_rotation_guard_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::KeyRotationGuardFacts> {
+    use crate::projection::dep_facts::{KeyRotationGuardFacts, LocalPeerSigner};
+
+    let local_peer_signer = match crate::event_modules::peer_shared::load_local_peer_signer(
+        conn,
+        recorded_by,
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?
+    {
+        Some((recipient_event_id, signing_key)) => Some(LocalPeerSigner {
+            recipient_event_id,
+            signing_key,
+        }),
+        None => None,
+    };
+
+    let sender_verifying_key = load_sender_verifying_key_from_frame(conn, frame, recorded_by)?;
+
+    Ok(KeyRotationGuardFacts {
+        local_peer_signer,
+        sender_verifying_key,
+    })
+}
+
+/// SQL-side dep-facts loader for KeyHistory.
+fn load_key_history_dep_facts(
+    _conn: &Connection,
+    _recorded_by: &str,
+    _key_history: &KeyHistoryEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::KeyHistoryDepFacts> {
+    Ok(crate::projection::dep_facts::KeyHistoryDepFacts::default())
+}
+
+/// SQL-side guard-facts loader for KeyHistory.
+///
+/// Walks `invite_secrets` for a row whose verifying key equals the
+/// event's `recipient_public_key`, and resolves the current signer
+/// to a verifying key. Either absence → no unwrap.
+fn load_key_history_guard_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    key_history: &KeyHistoryEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::KeyHistoryGuardFacts> {
+    let local_recipient_signing_key =
+        load_matching_invite_secret_signing_key(conn, recorded_by, &key_history.recipient_public_key)?;
+    let sender_verifying_key = load_sender_verifying_key_from_frame(conn, frame, recorded_by)?;
+    Ok(crate::projection::dep_facts::KeyHistoryGuardFacts {
+        local_recipient_signing_key,
+        sender_verifying_key,
+    })
+}
+
+/// Shared helper: resolve the current-signer frame to a `VerifyingKey`,
+/// returning `None` for any failure mode (missing frame, unparseable
+/// id, signer not resolvable, or bad public key bytes). Mirrors the
+/// pre-migration inline behaviour in the key-rotation / key-history
+/// context loaders — all failures map to "no unwrapped material".
+fn load_sender_verifying_key_from_frame(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> ProjectionQueryResult<Option<VerifyingKey>> {
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(None);
+    };
+    let Some(current_signer_event_id) = event_id_from_base64(&current_signer.event_id) else {
+        return Ok(None);
+    };
+    let sender_key = match resolve_signer_key(conn, recorded_by, &current_signer_event_id)? {
+        SignerResolution::Found(k) => k,
+        _ => return Ok(None),
+    };
+    Ok(VerifyingKey::from_bytes(&sender_key.public_key).ok())
+}
+
 /// SQL-side dep-facts loader for PeerShared.
 ///
 /// Signer resolution goes through the shared `resolve_signer_from_frame`
@@ -2454,20 +2582,15 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         key_request: &KeyRequestEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let delivery_target_b64 = event_id_to_base64(&key_request.delivery_target_id);
-        let key_request_suppress_sharing = self.query_row(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM key_shared
-                 WHERE recorded_by = ?1
-                   AND delivery_target_id = ?2
-             )",
-            rusqlite::params![recorded_by, &delivery_target_b64],
-            |row| row.get(0),
-        )?;
+        use crate::projection::dep_facts::{decide_key_request, KeyRequestDecision};
 
+        let deps = load_key_request_dep_facts(self, recorded_by, key_request)?;
+        let guards = load_key_request_guard_facts(self, recorded_by, key_request)?;
+        let decision = decide_key_request(key_request, &deps, &guards);
+
+        let KeyRequestDecision::Ready { suppress_sharing } = decision;
         Ok(ProjectorDecisionContext {
-            key_request_suppress_sharing,
+            key_request_suppress_sharing: suppress_sharing,
             ..ProjectorDecisionContext::default()
         })
     }
@@ -2554,44 +2677,14 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         key_rotation: &KeyRotationEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let Some((local_recipient_event_id, local_signing_key)) = crate::event_modules::peer_shared::load_local_peer_signer(self, recorded_by)
-            .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?
-        else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-        let Some(slot_index) = key_rotation
-            .recipient_slots
-            .iter()
-            .position(|slot| *slot == local_recipient_event_id)
-        else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-        let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-        let Some(current_signer_event_id) = event_id_from_base64(&current_signer.event_id) else {
-            return Ok(ProjectorDecisionContext::default());
-        };
+        use crate::projection::dep_facts::decide_key_rotation;
 
-        let sender_key = match resolve_signer_key(self, recorded_by, &current_signer_event_id)? {
-            SignerResolution::Found(k) => k,
-            _ => return Ok(ProjectorDecisionContext::default()),
-        };
-        let sender_pub = match VerifyingKey::from_bytes(&sender_key.public_key) {
-            Ok(vk) => vk,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
-
-        let plaintext_key = unwrap_key_from_sender(
-            &local_signing_key,
-            &sender_pub,
-            &key_rotation.wrapped_keys[slot_index],
-        );
+        let deps = load_key_rotation_dep_facts(self, recorded_by, key_rotation)?;
+        let guards = load_key_rotation_guard_facts(self, frame, recorded_by)?;
+        let decision = decide_key_rotation(key_rotation, &deps, &guards);
 
         Ok(ProjectorDecisionContext {
-            unwrapped_secret_material: Some(UnwrappedSecretMaterial {
-                key_bytes: plaintext_key,
-            }),
+            unwrapped_secret_material: decision.unwrapped_secret_material(),
             ..ProjectorDecisionContext::default()
         })
     }
@@ -2603,51 +2696,14 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         key_history: &KeyHistoryEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let Some(local_signing_key) =
-            load_matching_invite_secret_signing_key(self, recorded_by, &key_history.recipient_public_key)?
-        else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-        let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-        let Some(current_signer_event_id) = event_id_from_base64(&current_signer.event_id) else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-        let sender_key = match resolve_signer_key(self, recorded_by, &current_signer_event_id)? {
-            SignerResolution::Found(k) => k,
-            _ => return Ok(ProjectorDecisionContext::default()),
-        };
-        let sender_pub = match VerifyingKey::from_bytes(&sender_key.public_key) {
-            Ok(vk) => vk,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
+        use crate::projection::dep_facts::decide_key_history;
 
-        let plaintext = match decrypt_bundle_from_sender(
-            &local_signing_key,
-            &sender_pub,
-            &key_history.nonce,
-            &key_history.ciphertext,
-            &key_history.auth_tag,
-        ) {
-            Ok(plaintext) => plaintext,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
-
-        let entries = match crate::event_modules::key_history::decode_key_history_plaintext(&plaintext)
-        {
-            Ok(entries) => entries,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
+        let deps = load_key_history_dep_facts(self, recorded_by, key_history)?;
+        let guards = load_key_history_guard_facts(self, frame, recorded_by, key_history)?;
+        let decision = decide_key_history(key_history, &deps, &guards);
 
         Ok(ProjectorDecisionContext {
-            unwrapped_key_history_material: entries
-                .into_iter()
-                .map(|entry| HistoricalKeyMaterial {
-                    key_event_id: entry.key_event_id,
-                    key_bytes: entry.key_bytes,
-                })
-                .collect(),
+            unwrapped_key_history_material: decision.into_material(),
             ..ProjectorDecisionContext::default()
         })
     }
