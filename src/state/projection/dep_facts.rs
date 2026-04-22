@@ -22,7 +22,7 @@
 //! a natural Verus proof target without dragging SQL into the spec.
 
 use crate::event_modules::{
-    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent,
+    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent, WorkspaceEvent,
 };
 use crate::projection::projector::{BootstrapDecisionContext, RemovalTargetKind};
 
@@ -139,6 +139,11 @@ pub enum SignerResolution {
     PeerShared {
         signer_event_id: String,
         event: PeerSharedEvent,
+    },
+    /// Signer resolved to a `WorkspaceEvent` (bootstrap-admin path).
+    Workspace {
+        signer_event_id: String,
+        event: WorkspaceEvent,
     },
 }
 
@@ -269,6 +274,11 @@ pub fn decide_peer_shared(
         SignerResolution::PeerShared { .. } => {
             PeerSharedDecision::RejectUnsupportedSignerType {
                 semantic_type_code: crate::event_modules::EVENT_TYPE_PEER_SHARED,
+            }
+        }
+        SignerResolution::Workspace { .. } => {
+            PeerSharedDecision::RejectUnsupportedSignerType {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
             }
         }
         SignerResolution::DeviceInvite {
@@ -555,6 +565,11 @@ pub fn decide_removal(
                 semantic_type_code: crate::event_modules::EVENT_TYPE_DEVICE_INVITE,
             };
         }
+        SignerResolution::Workspace { .. } => {
+            return RemovalDecision::RejectUnsupportedSignerType {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
+            };
+        }
         SignerResolution::PeerShared { event, .. } => event.user_event_id,
     };
 
@@ -582,6 +597,300 @@ pub fn decide_removal(
     match guards.target_kind {
         Some(kind) => RemovalDecision::Ready { target_kind: kind },
         None => RemovalDecision::RejectTargetUnsupported,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Admin
+//
+// An Admin event binds an admin `public_key` to a `user_event_id`.
+// Two authorization shapes are accepted:
+//
+//   - Bootstrap admin: the outer signer is the Workspace, and the
+//     admin's `authority_event_id` names that same workspace.
+//   - Promoted admin: the outer signer is a PeerShared whose user is
+//     *itself* already an admin — specifically, the admin named by
+//     `authority_event_id`. This is the "admin-promotes-admin" chain.
+//
+// In both shapes the final semantic check is: the admin `public_key`
+// equals the user's `public_key` (read from the `users` table, which
+// is populated by the User projector). Preserving the exact reject
+// strings is part of the migration contract.
+// ─────────────────────────────────────────────────────────────
+
+/// Resolution of an Admin's `authority_event_id` dep.
+///
+/// Admin's authority dep accepts `Workspace` (bootstrap) or `Admin`
+/// (promotion). Other kinds are blocked upstream by the dep
+/// type-code check; the `WrongKind` arm exists for diagnostic
+/// symmetry.
+#[derive(Debug, Clone)]
+pub enum AdminAuthorityEventResolution {
+    Workspace {
+        event_id: String,
+        event: WorkspaceEvent,
+    },
+    Admin {
+        event_id: String,
+        event: AdminEvent,
+    },
+    WrongKind {
+        event_id: String,
+        semantic_type_code: u8,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminDepFacts {
+    /// Outer signer, parsed. Admin accepts Workspace or PeerShared.
+    pub signer: SignerResolution,
+    /// Authority event named by `authority_event_id`. Resolved via the
+    /// dep system's valid_events guarantee. Carried through for
+    /// future structural refinements; the decide fn currently reads
+    /// authority identity off `event.authority_event_id` (b64) and
+    /// the SQL-derived `peer_signer_admin_match`.
+    pub authority: AdminAuthorityEventResolution,
+    /// Whether the signer peer_shared's user is an admin whose
+    /// admin-event-id equals `authority_event_id`. Carried here as a
+    /// typed bool because translating the current
+    /// peers_shared × users × admins JOIN into a purely structural
+    /// check requires tightening the user-public-key uniqueness
+    /// invariant beyond the Admin migration's scope.
+    pub peer_signer_admin_match: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdminGuardFacts {
+    /// b64 of `admin.user_event_id`, carried for reject-string parity.
+    pub user_event_id_b64: String,
+    /// Distinct `public_key` values for `users` rows keyed on
+    /// `(recorded_by, admin.user_event_id)`. LIMIT 2 — only 0 / 1 / ≥2
+    /// distinguishable. `Some(bytes)` for readable rows, `None` for
+    /// rows whose column value failed to decode as BLOB.
+    pub user_public_keys: Vec<Option<Vec<u8>>>,
+    /// True if a row in `users` had a malformed `public_key` column
+    /// (non-blob / wrong type). Rare but preserved for parity.
+    pub malformed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdminDecision {
+    Ready,
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    /// Bootstrap path: workspace signer but `authority_event_id` does
+    /// not point back at that workspace (signer.event_id ≠ authority).
+    RejectBootstrapAuthorityMismatch,
+    /// Promotion path: peer_shared signer, but the SQL chain
+    /// (peers_shared → users → admins) does not establish that the
+    /// signer's user is the admin named by `authority_event_id`.
+    RejectPeerSignerAuthorityMismatch,
+    /// `users[admin.user_event_id]` has no row. The admin cannot
+    /// certify a user whose record is not present.
+    RejectMissingUser {
+        user_event_id_b64: String,
+    },
+    /// Multiple distinct user public keys for `admin.user_event_id`.
+    /// Defensive — PRIMARY KEY prevents this in practice.
+    RejectAmbiguousUser {
+        user_event_id_b64: String,
+    },
+    /// The user row exists but the stored public_key is not a 32-byte
+    /// blob (or the column failed to decode).
+    RejectMalformedUserKey {
+        user_event_id_b64: String,
+    },
+    /// User row exists but its `public_key` does not equal
+    /// `admin.public_key` — the core "this admin is not who they
+    /// claim to be" reject.
+    RejectAdminUserKeyMismatch {
+        user_event_id_b64: String,
+    },
+}
+
+impl AdminDecision {
+    /// Compatibility shim: map decision to the pre-existing
+    /// `admin_user_key_mismatch_reason` string so existing runtime
+    /// callers (and byte-identical reject assertions) keep working.
+    pub fn mismatch_reason(&self) -> Option<String> {
+        match self {
+            Self::Ready => None,
+            Self::RejectMissingCurrentSigner => {
+                Some("admin event missing current signer envelope".to_string())
+            }
+            Self::RejectUnsupportedSignerType { semantic_type_code } => Some(format!(
+                "admin signer must be workspace or peer_shared, got semantic type {}",
+                semantic_type_code
+            )),
+            Self::RejectBootstrapAuthorityMismatch => {
+                Some("bootstrap admin must use workspace as signer and authority".to_string())
+            }
+            Self::RejectPeerSignerAuthorityMismatch => Some(
+                "peer-signed admin authority does not match signer admin identity".to_string(),
+            ),
+            Self::RejectMissingUser { user_event_id_b64 } => Some(format!(
+                "no users row for user_event_id {}",
+                user_event_id_b64
+            )),
+            Self::RejectAmbiguousUser { user_event_id_b64 } => Some(format!(
+                "ambiguous users rows for user_event_id {}",
+                user_event_id_b64
+            )),
+            Self::RejectMalformedUserKey { user_event_id_b64 } => Some(format!(
+                "user {} has invalid public_key length or type",
+                user_event_id_b64
+            )),
+            Self::RejectAdminUserKeyMismatch { user_event_id_b64 } => Some(format!(
+                "admin public_key does not match user public_key for {}",
+                user_event_id_b64
+            )),
+        }
+    }
+}
+
+/// Pure Admin decision.
+///
+/// The check order mirrors the old normalize + decide pipeline so
+/// reject strings remain byte-identical:
+///   1. Missing outer signer envelope.
+///   2. Unsupported signer kind (anything but Workspace / PeerShared).
+///   3. Malformed / missing / ambiguous `users[admin.user_event_id]`.
+///   4. Authority-match check (bootstrap vs peer-signed shape).
+///   5. `admin.public_key == users[admin.user_event_id].public_key`.
+///
+/// Signer-side authority is split by `SignerResolution` kind:
+///   - `Workspace` signer: the admin's `authority_event_id` must name
+///     that workspace (`signer_event_id == authority_event_id_b64`).
+///   - `PeerShared` signer: the signer's user must be the admin named
+///     by `authority_event_id` (currently proven by the
+///     `peer_signer_admin_match` SQL-derived bool).
+///
+/// User-side authority is a single equality:
+/// `users[admin.user_event_id].public_key == admin.public_key`. The
+/// users row is carried in `AdminGuardFacts` (raw malformed /
+/// missing / ambiguous arms preserved for parity).
+pub fn decide_admin(
+    event: &AdminEvent,
+    deps: &AdminDepFacts,
+    guards: &AdminGuardFacts,
+) -> AdminDecision {
+    // 1. Signer envelope present + kind check.
+    let signer_is_workspace_authority_match;
+    let signer_is_peer_shared_authority_match;
+    match &deps.signer {
+        SignerResolution::Missing => return AdminDecision::RejectMissingCurrentSigner,
+        SignerResolution::UnsupportedKind { semantic_type_code } => {
+            return AdminDecision::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            };
+        }
+        SignerResolution::DeviceInvite { .. } => {
+            return AdminDecision::RejectUnsupportedSignerType {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_DEVICE_INVITE,
+            };
+        }
+        SignerResolution::MissingBlob { .. } | SignerResolution::Malformed { .. } => {
+            // Old pipeline never parsed the signer blob — these arms
+            // are only reachable when the resolver loader has failed
+            // to rewrite to the Workspace / PeerShared arm (e.g.
+            // frame.current_signer missing). Treat as "no authority
+            // match" to stay parity-safe.
+            signer_is_workspace_authority_match = false;
+            signer_is_peer_shared_authority_match = false;
+        }
+        SignerResolution::Workspace {
+            signer_event_id, ..
+        } => {
+            signer_is_workspace_authority_match =
+                *signer_event_id == crate::crypto::event_id_to_base64(&event.authority_event_id);
+            signer_is_peer_shared_authority_match = false;
+        }
+        SignerResolution::PeerShared { .. } => {
+            signer_is_workspace_authority_match = false;
+            signer_is_peer_shared_authority_match = deps.peer_signer_admin_match;
+        }
+    }
+
+    // 2. User-row normalization (malformed / missing / ambiguous).
+    //    Precedence matters: in the old pipeline these fire BEFORE
+    //    authority-match rejects.
+    if guards.malformed
+        || crate::crypto::event_id_from_base64(&guards.user_event_id_b64).is_none()
+    {
+        return AdminDecision::RejectMalformedUserKey {
+            user_event_id_b64: guards.user_event_id_b64.clone(),
+        };
+    }
+    let mut keys = Vec::with_capacity(guards.user_public_keys.len());
+    for k in &guards.user_public_keys {
+        let Some(k) = k.as_ref() else {
+            return AdminDecision::RejectMalformedUserKey {
+                user_event_id_b64: guards.user_event_id_b64.clone(),
+            };
+        };
+        if k.len() != 32 {
+            return AdminDecision::RejectMalformedUserKey {
+                user_event_id_b64: guards.user_event_id_b64.clone(),
+            };
+        }
+        keys.push(k.clone());
+    }
+    keys.sort();
+    keys.dedup();
+    let unique_user_key = match keys.as_slice() {
+        [] => {
+            return AdminDecision::RejectMissingUser {
+                user_event_id_b64: guards.user_event_id_b64.clone(),
+            };
+        }
+        [user_public_key] => user_public_key.clone(),
+        _ => {
+            return AdminDecision::RejectAmbiguousUser {
+                user_event_id_b64: guards.user_event_id_b64.clone(),
+            };
+        }
+    };
+
+    // 3. Authority-match check (signer-kind dependent).
+    //
+    // Note: the authority event's *kind* is not read here — the old
+    // pipeline decided off `current_signer.semantic_type_code` and
+    // either the `signer_event_id == authority_event_id` string
+    // equality (workspace signer) or the peers_shared × users ×
+    // admins JOIN (peer-shared signer). `deps.authority` is carried
+    // through for future structural refinements but does not
+    // participate in this arm today.
+    match &deps.signer {
+        SignerResolution::Workspace { .. } => {
+            if !signer_is_workspace_authority_match {
+                return AdminDecision::RejectBootstrapAuthorityMismatch;
+            }
+        }
+        SignerResolution::PeerShared { .. } => {
+            if !signer_is_peer_shared_authority_match {
+                return AdminDecision::RejectPeerSignerAuthorityMismatch;
+            }
+        }
+        // MissingBlob / Malformed only survive here if the loader's
+        // kind-rewrite (Workspace/PeerShared) did not fire. Defensive
+        // fall-through to peer-signer mismatch.
+        SignerResolution::MissingBlob { .. } | SignerResolution::Malformed { .. } => {
+            return AdminDecision::RejectPeerSignerAuthorityMismatch;
+        }
+        // Unreachable: Missing / UnsupportedKind / DeviceInvite
+        // already returned above.
+        _ => unreachable!("earlier signer-kind check returned"),
+    }
+
+    // 4. admin.public_key must equal users[admin.user_event_id].public_key.
+    if unique_user_key.as_slice() == event.public_key.as_slice() {
+        AdminDecision::Ready
+    } else {
+        AdminDecision::RejectAdminUserKeyMismatch {
+            user_event_id_b64: guards.user_event_id_b64.clone(),
+        }
     }
 }
 
@@ -884,6 +1193,321 @@ mod tests {
             &RemovalGuardFacts { target_kind: None },
         );
         assert!(matches!(d, RemovalDecision::RejectTargetUnsupported));
+    }
+
+    // ── Admin pilot ───────────────────────────────────────────
+
+    fn admin_event_for(
+        public_key: [u8; 32],
+        authority_event_id: [u8; 32],
+        user_event_id: [u8; 32],
+    ) -> AdminEvent {
+        AdminEvent {
+            created_at_ms: 0,
+            public_key,
+            authority_event_id,
+            user_event_id,
+        }
+    }
+
+    fn workspace_signer_res(signer_event_id: &str) -> SignerResolution {
+        SignerResolution::Workspace {
+            signer_event_id: signer_event_id.to_string(),
+            event: crate::event_modules::WorkspaceEvent {
+                created_at_ms: 0,
+                public_key: [0u8; 32],
+                name: "ws".to_string(),
+            },
+        }
+    }
+
+    fn peer_shared_signer_res(user_event_id: [u8; 32]) -> SignerResolution {
+        SignerResolution::PeerShared {
+            signer_event_id: "peer-signer".into(),
+            event: PeerSharedEvent {
+                created_at_ms: 0,
+                public_key: [1u8; 32],
+                user_event_id,
+                endpoint_shared_event_id: [2u8; 32],
+                device_name: String::new(),
+            },
+        }
+    }
+
+    fn admin_authority_workspace(event_id_b64: &str) -> AdminAuthorityEventResolution {
+        AdminAuthorityEventResolution::Workspace {
+            event_id: event_id_b64.to_string(),
+            event: crate::event_modules::WorkspaceEvent {
+                created_at_ms: 0,
+                public_key: [0u8; 32],
+                name: "ws".to_string(),
+            },
+        }
+    }
+
+    fn admin_authority_admin(
+        event_id_b64: &str,
+        user_event_id: [u8; 32],
+    ) -> AdminAuthorityEventResolution {
+        AdminAuthorityEventResolution::Admin {
+            event_id: event_id_b64.to_string(),
+            event: AdminEvent {
+                created_at_ms: 0,
+                public_key: [9u8; 32],
+                authority_event_id: [0u8; 32],
+                user_event_id,
+            },
+        }
+    }
+
+    fn admin_user_key_guard(
+        user_event_id: [u8; 32],
+        keys: Vec<Option<Vec<u8>>>,
+    ) -> AdminGuardFacts {
+        AdminGuardFacts {
+            user_event_id_b64: crate::crypto::event_id_to_base64(&user_event_id),
+            user_public_keys: keys,
+            malformed: false,
+        }
+    }
+
+    #[test]
+    fn admin_ready_when_workspace_signs_itself_and_user_key_matches() {
+        let admin_public = [7u8; 32];
+        let workspace_id = [4u8; 32];
+        let user_id = [5u8; 32];
+        let authority_b64 = crate::crypto::event_id_to_base64(&workspace_id);
+        let deps = AdminDepFacts {
+            signer: workspace_signer_res(&authority_b64),
+            authority: admin_authority_workspace(&authority_b64),
+            peer_signer_admin_match: false,
+        };
+        let guards = admin_user_key_guard(user_id, vec![Some(admin_public.to_vec())]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, workspace_id, user_id),
+            &deps,
+            &guards,
+        );
+        assert!(matches!(d, AdminDecision::Ready));
+        assert!(d.mismatch_reason().is_none());
+    }
+
+    #[test]
+    fn admin_rejects_bootstrap_mismatch_when_workspace_signer_differs_from_authority() {
+        let admin_public = [7u8; 32];
+        let workspace_id = [4u8; 32];
+        let user_id = [5u8; 32];
+        let deps = AdminDepFacts {
+            signer: workspace_signer_res("other-workspace-id"),
+            authority: admin_authority_workspace(&crate::crypto::event_id_to_base64(
+                &workspace_id,
+            )),
+            peer_signer_admin_match: false,
+        };
+        let guards = admin_user_key_guard(user_id, vec![Some(admin_public.to_vec())]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, workspace_id, user_id),
+            &deps,
+            &guards,
+        );
+        assert!(matches!(d, AdminDecision::RejectBootstrapAuthorityMismatch));
+        assert_eq!(
+            d.mismatch_reason().as_deref(),
+            Some("bootstrap admin must use workspace as signer and authority"),
+        );
+    }
+
+    #[test]
+    fn admin_ready_when_peer_signer_admin_chain_matches_and_user_key_matches() {
+        let admin_public = [7u8; 32];
+        let user_id = [5u8; 32];
+        let authority_user_id = [6u8; 32];
+        let authority_admin_id = [3u8; 32];
+        let deps = AdminDepFacts {
+            signer: peer_shared_signer_res(authority_user_id),
+            authority: admin_authority_admin(
+                &crate::crypto::event_id_to_base64(&authority_admin_id),
+                authority_user_id,
+            ),
+            peer_signer_admin_match: true,
+        };
+        let guards = admin_user_key_guard(user_id, vec![Some(admin_public.to_vec())]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, authority_admin_id, user_id),
+            &deps,
+            &guards,
+        );
+        assert!(matches!(d, AdminDecision::Ready));
+    }
+
+    #[test]
+    fn admin_rejects_peer_signer_authority_mismatch_when_join_fails() {
+        let admin_public = [7u8; 32];
+        let user_id = [5u8; 32];
+        let authority_admin_id = [3u8; 32];
+        let deps = AdminDepFacts {
+            signer: peer_shared_signer_res([9u8; 32]),
+            authority: admin_authority_admin(
+                &crate::crypto::event_id_to_base64(&authority_admin_id),
+                [6u8; 32],
+            ),
+            peer_signer_admin_match: false,
+        };
+        let guards = admin_user_key_guard(user_id, vec![Some(admin_public.to_vec())]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, authority_admin_id, user_id),
+            &deps,
+            &guards,
+        );
+        assert!(matches!(d, AdminDecision::RejectPeerSignerAuthorityMismatch));
+        assert_eq!(
+            d.mismatch_reason().as_deref(),
+            Some("peer-signed admin authority does not match signer admin identity"),
+        );
+    }
+
+    #[test]
+    fn admin_rejects_missing_current_signer() {
+        let admin_public = [7u8; 32];
+        let user_id = [5u8; 32];
+        let deps = AdminDepFacts {
+            signer: SignerResolution::Missing,
+            authority: admin_authority_workspace("authority-id"),
+            peer_signer_admin_match: false,
+        };
+        let guards = admin_user_key_guard(user_id, vec![Some(admin_public.to_vec())]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, [0u8; 32], user_id),
+            &deps,
+            &guards,
+        );
+        assert!(matches!(d, AdminDecision::RejectMissingCurrentSigner));
+        assert_eq!(
+            d.mismatch_reason().as_deref(),
+            Some("admin event missing current signer envelope"),
+        );
+    }
+
+    #[test]
+    fn admin_rejects_unsupported_signer_type() {
+        let admin_public = [7u8; 32];
+        let user_id = [5u8; 32];
+        let deps = AdminDepFacts {
+            signer: SignerResolution::UnsupportedKind {
+                semantic_type_code: 99,
+            },
+            authority: admin_authority_workspace("authority-id"),
+            peer_signer_admin_match: false,
+        };
+        let guards = admin_user_key_guard(user_id, vec![Some(admin_public.to_vec())]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, [0u8; 32], user_id),
+            &deps,
+            &guards,
+        );
+        match d {
+            AdminDecision::RejectUnsupportedSignerType { semantic_type_code } => {
+                assert_eq!(semantic_type_code, 99);
+            }
+            other => panic!("expected RejectUnsupportedSignerType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn admin_rejects_user_key_mismatch_when_users_row_has_different_public_key() {
+        let admin_public = [7u8; 32];
+        let user_id = [5u8; 32];
+        let workspace_id = [4u8; 32];
+        let authority_b64 = crate::crypto::event_id_to_base64(&workspace_id);
+        let deps = AdminDepFacts {
+            signer: workspace_signer_res(&authority_b64),
+            authority: admin_authority_workspace(&authority_b64),
+            peer_signer_admin_match: false,
+        };
+        let guards = admin_user_key_guard(user_id, vec![Some(vec![0xFF; 32])]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, workspace_id, user_id),
+            &deps,
+            &guards,
+        );
+        match &d {
+            AdminDecision::RejectAdminUserKeyMismatch { user_event_id_b64 } => {
+                assert_eq!(
+                    user_event_id_b64,
+                    &crate::crypto::event_id_to_base64(&user_id)
+                );
+            }
+            other => panic!("expected RejectAdminUserKeyMismatch, got {:?}", other),
+        }
+        let reason = d.mismatch_reason().unwrap();
+        assert!(reason.starts_with("admin public_key does not match user public_key for "));
+    }
+
+    #[test]
+    fn admin_rejects_missing_user_row() {
+        let admin_public = [7u8; 32];
+        let user_id = [5u8; 32];
+        let workspace_id = [4u8; 32];
+        let authority_b64 = crate::crypto::event_id_to_base64(&workspace_id);
+        let deps = AdminDepFacts {
+            signer: workspace_signer_res(&authority_b64),
+            authority: admin_authority_workspace(&authority_b64),
+            peer_signer_admin_match: false,
+        };
+        let guards = admin_user_key_guard(user_id, Vec::new());
+        let d = decide_admin(
+            &admin_event_for(admin_public, workspace_id, user_id),
+            &deps,
+            &guards,
+        );
+        assert!(matches!(d, AdminDecision::RejectMissingUser { .. }));
+        let reason = d.mismatch_reason().unwrap();
+        assert!(reason.starts_with("no users row for user_event_id "));
+    }
+
+    #[test]
+    fn admin_rejects_malformed_user_key_when_length_wrong() {
+        let admin_public = [7u8; 32];
+        let user_id = [5u8; 32];
+        let workspace_id = [4u8; 32];
+        let authority_b64 = crate::crypto::event_id_to_base64(&workspace_id);
+        let deps = AdminDepFacts {
+            signer: workspace_signer_res(&authority_b64),
+            authority: admin_authority_workspace(&authority_b64),
+            peer_signer_admin_match: false,
+        };
+        let guards = admin_user_key_guard(user_id, vec![Some(vec![1u8; 16])]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, workspace_id, user_id),
+            &deps,
+            &guards,
+        );
+        assert!(matches!(d, AdminDecision::RejectMalformedUserKey { .. }));
+        let reason = d.mismatch_reason().unwrap();
+        assert!(reason.ends_with(" has invalid public_key length or type"));
+    }
+
+    #[test]
+    fn admin_rejects_ambiguous_user_when_two_keys() {
+        let admin_public = [7u8; 32];
+        let user_id = [5u8; 32];
+        let workspace_id = [4u8; 32];
+        let authority_b64 = crate::crypto::event_id_to_base64(&workspace_id);
+        let deps = AdminDepFacts {
+            signer: workspace_signer_res(&authority_b64),
+            authority: admin_authority_workspace(&authority_b64),
+            peer_signer_admin_match: false,
+        };
+        let guards =
+            admin_user_key_guard(user_id, vec![Some(vec![1u8; 32]), Some(vec![2u8; 32])]);
+        let d = decide_admin(
+            &admin_event_for(admin_public, workspace_id, user_id),
+            &deps,
+            &guards,
+        );
+        assert!(matches!(d, AdminDecision::RejectAmbiguousUser { .. }));
+        let reason = d.mismatch_reason().unwrap();
+        assert!(reason.starts_with("ambiguous users rows for user_event_id "));
     }
 
     // ── Guard passthrough ─────────────────────────────────────

@@ -1477,6 +1477,175 @@ fn resolve_admin_authority(
     }
 }
 
+/// Parse the admin's `authority_event_id` dep blob into the typed
+/// `AdminAuthorityEventResolution` bundle (Workspace | Admin | WrongKind).
+fn resolve_admin_authority_event(
+    event_id_b64: String,
+    blob: &[u8],
+) -> crate::projection::dep_facts::AdminAuthorityEventResolution {
+    use crate::projection::dep_facts::AdminAuthorityEventResolution;
+
+    let inner = match parse_event(blob) {
+        Ok(ParsedEvent::Signed(signed)) => parse_event(&signed.payload),
+        other => other,
+    };
+    match inner {
+        Ok(ParsedEvent::Workspace(event)) => AdminAuthorityEventResolution::Workspace {
+            event_id: event_id_b64,
+            event,
+        },
+        Ok(ParsedEvent::Admin(event)) => AdminAuthorityEventResolution::Admin {
+            event_id: event_id_b64,
+            event,
+        },
+        Ok(other) => AdminAuthorityEventResolution::WrongKind {
+            event_id: event_id_b64,
+            semantic_type_code: other.event_type_code(),
+        },
+        Err(_) => AdminAuthorityEventResolution::WrongKind {
+            event_id: event_id_b64,
+            semantic_type_code: 0,
+        },
+    }
+}
+
+/// SQL-side dep-facts loader for Admin.
+///
+/// Signer parsing goes through the shared `resolve_signer_from_frame`
+/// helper (accepting Workspace or PeerShared). The authority dep is
+/// parsed from its blob into an `AdminAuthorityEventResolution`.
+/// For the peer-signed path we preserve the old
+/// peers_shared × users × admins JOIN as a typed bool on DepFacts —
+/// moving that predicate to a purely structural field-equality is a
+/// follow-up (requires tightening the user public_key uniqueness
+/// invariant).
+///
+/// Parity note: the old pipeline decided the signer kind off
+/// `CurrentSignerInfo.semantic_type_code` alone (no blob parse), so
+/// when the dep helper surfaces `MissingBlob` / `Malformed` we fall
+/// back to a kind-only `Workspace` / `PeerShared` arm (with a zero
+/// parsed payload) so `decide_admin` does not gain new rejects for
+/// the degenerate state where `valid_events` and `events` have
+/// drifted.
+fn load_admin_dep_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    admin: &AdminEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::AdminDepFacts> {
+    use crate::projection::dep_facts::{
+        AdminAuthorityEventResolution, AdminDepFacts, SignerResolution,
+    };
+
+    let mut signer = resolve_signer_from_frame(
+        conn,
+        recorded_by,
+        frame,
+        SignerKindExpectation::AnyOf(&[EVENT_TYPE_WORKSPACE, EVENT_TYPE_PEER_SHARED]),
+    )?;
+
+    if matches!(
+        signer,
+        SignerResolution::MissingBlob { .. } | SignerResolution::Malformed { .. }
+    ) {
+        if let Some(cs) = frame.current_signer.as_ref() {
+            signer = match cs.semantic_type_code {
+                EVENT_TYPE_WORKSPACE => SignerResolution::Workspace {
+                    signer_event_id: cs.event_id.clone(),
+                    event: crate::event_modules::WorkspaceEvent {
+                        created_at_ms: 0,
+                        public_key: [0u8; 32],
+                        name: String::new(),
+                    },
+                },
+                EVENT_TYPE_PEER_SHARED => SignerResolution::PeerShared {
+                    signer_event_id: cs.event_id.clone(),
+                    event: crate::event_modules::PeerSharedEvent {
+                        created_at_ms: 0,
+                        public_key: [0u8; 32],
+                        user_event_id: [0u8; 32],
+                        endpoint_shared_event_id: [0u8; 32],
+                        device_name: String::new(),
+                    },
+                },
+                _ => signer,
+            };
+        }
+    }
+
+    let authority_event_id_b64 = event_id_to_base64(&admin.authority_event_id);
+    let authority = match load_valid_event_blob(conn, recorded_by, &authority_event_id_b64)? {
+        None => AdminAuthorityEventResolution::WrongKind {
+            event_id: authority_event_id_b64.clone(),
+            semantic_type_code: 0,
+        },
+        Some(blob) => resolve_admin_authority_event(authority_event_id_b64.clone(), &blob),
+    };
+
+    // Old behaviour: only the peer-signed path runs the JOIN. Workspace
+    // signer uses pure event-id equality, so no JOIN result is needed.
+    let peer_signer_admin_match = match frame.current_signer.as_ref() {
+        Some(cs) if cs.semantic_type_code == EVENT_TYPE_PEER_SHARED => conn.query_row(
+            "SELECT EXISTS(
+                     SELECT 1
+                     FROM peers_shared ps
+                     JOIN users u
+                       ON u.recorded_by = ps.recorded_by
+                      AND u.event_id = ps.user_event_id
+                     JOIN admins a
+                       ON a.recorded_by = u.recorded_by
+                      AND a.public_key = u.public_key
+                     WHERE ps.recorded_by = ?1
+                       AND ps.event_id = ?2
+                       AND a.event_id = ?3
+                 )",
+            rusqlite::params![recorded_by, &cs.event_id, &authority_event_id_b64],
+            |row| row.get(0),
+        )?,
+        _ => false,
+    };
+
+    Ok(AdminDepFacts {
+        signer,
+        authority,
+        peer_signer_admin_match,
+    })
+}
+
+/// SQL-side guard-facts loader for Admin.
+///
+/// Reads the narrow `users` slice Admin's pure decision fn consults:
+/// distinct `public_key` values for `(recorded_by, admin.user_event_id)`,
+/// up to LIMIT 2 so the decide fn can distinguish 0 / 1 / ≥2.
+fn load_admin_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    admin: &AdminEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::AdminGuardFacts> {
+    let user_event_id_b64 = event_id_to_base64(&admin.user_event_id);
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT public_key
+         FROM users
+         WHERE recorded_by = ?1 AND event_id = ?2
+         ORDER BY public_key
+         LIMIT 2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![recorded_by, &user_event_id_b64])?;
+    let mut user_public_keys = Vec::new();
+    let mut malformed = false;
+    while let Some(row) = rows.next()? {
+        match crate::db::sql_types::get_blob(row, 0) {
+            Ok(public_key) => user_public_keys.push(Some(public_key)),
+            Err(_) => malformed = true,
+        }
+    }
+    Ok(crate::projection::dep_facts::AdminGuardFacts {
+        user_event_id_b64,
+        user_public_keys,
+        malformed,
+    })
+}
+
 /// SQL-side dep-facts loader for PeerShared.
 ///
 /// Signer resolution goes through the shared `resolve_signer_from_frame`
@@ -1554,6 +1723,10 @@ pub(crate) fn resolve_signer_from_frame(
             signer_event_id: signer_b64,
             event,
         },
+        Ok(ParsedEvent::Workspace(event)) => SignerResolution::Workspace {
+            signer_event_id: signer_b64,
+            event,
+        },
         Ok(other) => SignerResolution::Malformed {
             signer_event_id: signer_b64.clone(),
             reason: format!(
@@ -1574,12 +1747,15 @@ pub(crate) fn resolve_signer_from_frame(
 pub(crate) enum SignerKindExpectation {
     /// Signer must be exactly this semantic type.
     Exactly(u8),
+    /// Signer may be any of these semantic types.
+    AnyOf(&'static [u8]),
 }
 
 impl SignerKindExpectation {
     fn accepts(self, code: u8) -> bool {
         match self {
             Self::Exactly(expected) => expected == code,
+            Self::AnyOf(allowed) => allowed.contains(&code),
         }
     }
 }
@@ -2063,12 +2239,14 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         admin: &AdminEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let raw_rows = load_admin_authority_raw_rows(self, frame, recorded_by, admin)?;
-        let context = normalize_admin_authority(&raw_rows, &admin.public_key);
+        use crate::projection::dep_facts::decide_admin;
+
+        let deps = load_admin_dep_facts(self, frame, recorded_by, admin)?;
+        let guards = load_admin_guard_facts(self, recorded_by, admin)?;
+        let decision = decide_admin(admin, &deps, &guards);
+
         Ok(ProjectorDecisionContext {
-            admin_user_key_mismatch_reason: admin_authority_plan_to_mismatch_reason(
-                decide_admin_authority_plan(&context),
-            ),
+            admin_user_key_mismatch_reason: decision.mismatch_reason(),
             ..ProjectorDecisionContext::default()
         })
     }
