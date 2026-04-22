@@ -129,7 +129,10 @@ pub fn project_pure(
     }];
 
     // Pattern (b): same deterministic unwrap as key_broadcast; the
-    // local KeySecret(K_bundle) event id must match across producers.
+    // resulting KeySecret(K_bundle) event is emitted through the
+    // normal pipeline so its Valid transition cascades to blocked
+    // message_key rows.
+    let mut emit_commands = Vec::new();
     if let (Some(sk_bytes), Some(vk_bytes), Some(wrapped)) = (
         ctx.local_signing_key_bytes,
         ctx.sender_verifying_key_bytes,
@@ -138,12 +141,11 @@ pub fn project_pure(
         let k_bundle = crate::event_modules::key_broadcast::unwrap_k_bundle(
             &sk_bytes, &vk_bytes, &wrapped,
         );
-        ops.extend(crate::event_modules::key_broadcast::emit_local_key_secret(
-            recorded_by,
-            &k_bundle,
-        ));
+        emit_commands.push(
+            crate::event_modules::key_broadcast::emit_deterministic_key_secret_command(&k_bundle),
+        );
     }
-    ProjectorResult::valid(ops)
+    ProjectorResult::valid_with_commands(ops, emit_commands)
 }
 
 crate::projection::decision_context::define_query_context_loader!(

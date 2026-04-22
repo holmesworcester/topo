@@ -200,20 +200,23 @@ pub fn project_pure(
     }];
 
     // Pattern (b): context loader surfaced raw wrap material; do the
-    // deterministic asymmetric unwrap here and emit a deterministic
-    // local KeySecret(K_bundle) write. All three producers
-    // (key_broadcast, key_history_bundle, key_bundle_share) emit the
-    // same local event_id for the same K_bundle bytes — standard
-    // cascade unblocks message_key rows uniformly.
+    // deterministic asymmetric unwrap here and emit a canonical
+    // KeySecret(K_bundle) event via the normal event pipeline.
+    // All three producers (key_broadcast, key_history_bundle,
+    // key_bundle_share) emit the same deterministic KeySecret event
+    // id for identical K_bundle bytes — standard cascade unblocks
+    // every message_key blocked on that id uniformly regardless of
+    // which producer delivered K_bundle.
+    let mut emit_commands = Vec::new();
     if let (Some(sk_bytes), Some(vk_bytes), Some(wrapped)) = (
         ctx.local_signing_key_bytes,
         ctx.sender_verifying_key_bytes,
         ctx.wrapped_key_bytes,
     ) {
         let k_bundle = unwrap_k_bundle(&sk_bytes, &vk_bytes, &wrapped);
-        ops.extend(emit_local_key_secret(recorded_by, &k_bundle));
+        emit_commands.push(emit_deterministic_key_secret_command(&k_bundle));
     }
-    ProjectorResult::valid(ops)
+    ProjectorResult::valid_with_commands(ops, emit_commands)
 }
 
 /// Deterministic asymmetric unwrap of a recipient-wrap slot. Mirrors
@@ -238,22 +241,27 @@ pub fn unwrap_k_bundle(
     crate::shared::crypto::unwrap_key_from_sender(&sk, &vk, wrapped)
 }
 
-/// Emit the deterministic local `KeySecret(K_bundle)` write that
-/// all three producer paths converge on.
-pub fn emit_local_key_secret(recorded_by: &str, k_bundle: &[u8; 32]) -> Vec<WriteOp> {
-    let local_event_id = crate::event_modules::key_secret::deterministic_key_secret_event_id(k_bundle);
-    let local_event_b64 = crate::crypto::event_id_to_base64(&local_event_id);
-    let created_at = crate::event_modules::key_secret::deterministic_key_secret_created_at_ms(k_bundle);
-    vec![WriteOp::InsertOrIgnore {
-        table: "key_secrets",
-        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-        values: vec![
-            SqlVal::Text(local_event_b64),
-            SqlVal::Blob(k_bundle.to_vec()),
-            SqlVal::Int(created_at as i64),
-            SqlVal::Text(recorded_by.to_string()),
-        ],
-    }]
+/// Build the `EmitCommand::EmitDeterministicBlob` that carries a
+/// canonical `KeySecret(K_bundle)` event through the normal pipeline:
+/// the command handler inserts it into `events` + `recorded_events`,
+/// then projects it. KeySecret's projector (`key_secret.rs`) inserts
+/// the key bytes into `key_secrets`. Cascade fires on the KeySecret
+/// event's `Valid` transition → unblocks every `message_key` that
+/// named `deterministic_key_secret_event_id(K_bundle)` as its dep.
+///
+/// Replaces the earlier direct-table-insert path so the cascade
+/// actually wakes, not just the projection-state row update.
+/// Shared helper across key_broadcast / key_history_bundle /
+/// key_bundle_share so the three paths emit identical event blobs
+/// for identical K_bundle bytes.
+pub fn emit_deterministic_key_secret_command(
+    k_bundle: &[u8; 32],
+) -> crate::projection::projector::EmitCommand {
+    let event =
+        crate::event_modules::key_secret::deterministic_key_secret_event(*k_bundle);
+    let blob = crate::event_modules::encode_event(&event)
+        .expect("deterministic KeySecret encoding is infallible for 32-byte key");
+    crate::projection::projector::EmitCommand::EmitDeterministicBlob { blob }
 }
 
 crate::projection::decision_context::define_query_context_loader!(
