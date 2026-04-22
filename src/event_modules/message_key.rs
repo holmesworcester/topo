@@ -31,13 +31,15 @@ use super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE_KEY};
 pub const MESSAGE_KEY_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("bundle_id"),
+    FieldSpec::EventId("k_bundle_local_event_id"),
     FieldSpec::EventId("owning_message_event_id"),
     FieldSpec::FixedBytes("nonce", 12),
     FieldSpec::FixedBytes("wrapped_k_m", 48),
 ];
 
 /// message_key wire size: type(1) + created_at(8) + bundle_id(32)
-///   + owning_message(32) + nonce(12) + wrapped_k_m(48) = 133 bytes.
+///   + k_bundle_local_event_id(32) + owning_message(32) + nonce(12)
+///   + wrapped_k_m(48) = 165 bytes.
 pub const MESSAGE_KEY_WIRE_SIZE: usize = wire_size_for_fields(MESSAGE_KEY_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,12 @@ pub struct MessageKeyEvent {
     /// The K_bundle used to wrap K_m. Sender device's current bundle
     /// at send time.
     pub bundle_id: [u8; 32],
+    /// Deterministic local `KeySecret(K_bundle)` event id
+    /// (= `deterministic_key_secret_event_id(K_bundle_bytes)`).
+    /// This is the blocking dep: stable regardless of which producer
+    /// (`key_broadcast`, `key_history_bundle`, `key_bundle_share`)
+    /// delivers K_bundle.
+    pub k_bundle_local_event_id: [u8; 32],
     /// The `message` event this key is for. Self-drop check uses this.
     pub owning_message_event_id: [u8; 32],
     /// AEAD nonce (12 bytes).
@@ -68,13 +76,13 @@ impl super::Describe for MessageKeyEvent {
 
 pub fn parse_message_key(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let values = decode_fields(EVENT_TYPE_MESSAGE_KEY, MESSAGE_KEY_FIELDS, blob)?;
-    let nonce_bytes = values[3]
+    let nonce_bytes = values[4]
         .clone()
         .into_fixed_bytes()
         .ok_or(EventError::WrongVariant)?;
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&nonce_bytes);
-    let wrapped_bytes = values[4]
+    let wrapped_bytes = values[5]
         .clone()
         .into_fixed_bytes()
         .ok_or(EventError::WrongVariant)?;
@@ -83,7 +91,8 @@ pub fn parse_message_key(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     Ok(ParsedEvent::MessageKey(MessageKeyEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         bundle_id: values[1].as_event_id().unwrap(),
-        owning_message_event_id: values[2].as_event_id().unwrap(),
+        k_bundle_local_event_id: values[2].as_event_id().unwrap(),
+        owning_message_event_id: values[3].as_event_id().unwrap(),
         nonce,
         wrapped_k_m,
     }))
@@ -97,6 +106,7 @@ pub fn encode_message_key(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let values = vec![
         FieldValue::Timestamp(mk.created_at_ms),
         FieldValue::EventId(mk.bundle_id),
+        FieldValue::EventId(mk.k_bundle_local_event_id),
         FieldValue::EventId(mk.owning_message_event_id),
         FieldValue::FixedBytes(mk.nonce.to_vec()),
         FieldValue::FixedBytes(mk.wrapped_k_m.to_vec()),
@@ -220,8 +230,12 @@ pub static MESSAGE_KEY_META: EventTypeMeta = crate::event_modules::registry::eve
     type_name: "message_key",
     projection_table: "message_keys",
     share_scope: ShareScope::Shared,
-    dep_fields: &["owning_message_event_id"],
-    dep_field_type_codes: &[&[]],
+    // Blocking dep: the local deterministic KeySecret(K_bundle). Any
+    // of the three producers (key_broadcast, key_history_bundle,
+    // key_bundle_share) materializes this identically, so cascade
+    // unblocks uniformly.
+    dep_fields: &["k_bundle_local_event_id"],
+    dep_field_type_codes: &[&[crate::event_modules::EVENT_TYPE_KEY_SECRET]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
@@ -236,9 +250,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wire_size_is_133_bytes() {
-        // type(1) + created_at(8) + bundle(32) + owning(32) + nonce(12) + wrap(48) = 133
-        assert_eq!(MESSAGE_KEY_WIRE_SIZE, 133);
+    fn wire_size_is_165_bytes() {
+        // type(1) + created_at(8) + bundle(32) + k_bundle_local(32)
+        //   + owning(32) + nonce(12) + wrap(48) = 165
+        assert_eq!(MESSAGE_KEY_WIRE_SIZE, 165);
     }
 
     #[test]
@@ -246,6 +261,7 @@ mod tests {
         let original = ParsedEvent::MessageKey(MessageKeyEvent {
             created_at_ms: 1_700_000_000_000,
             bundle_id: [1u8; 32],
+            k_bundle_local_event_id: [9u8; 32],
             owning_message_event_id: [2u8; 32],
             nonce: [3u8; 12],
             wrapped_k_m: [4u8; 48],

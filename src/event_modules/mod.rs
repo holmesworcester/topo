@@ -385,7 +385,10 @@ impl ParsedEvent {
             ParsedEvent::KeyBroadcast(_) => vec![],
             ParsedEvent::KeyHistoryBundle(_) => vec![],
             ParsedEvent::MessageKey(m) => {
-                vec![("owning_message_event_id", m.owning_message_event_id)]
+                vec![
+                    ("k_bundle_local_event_id", m.k_bundle_local_event_id),
+                    ("owning_message_event_id", m.owning_message_event_id),
+                ]
             }
             ParsedEvent::KeyBundleRequest(_) => vec![],
             ParsedEvent::KeyBundleShare(_) => vec![],
