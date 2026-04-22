@@ -144,6 +144,26 @@ fn collect_projection_dependents(
         }
     }
 
+    // Per-Message FS: enumerate message_key rows pointing at this
+    // message, adding them to the purge manifest so the cascade
+    // removes the per-message K_m wrap alongside the message blob.
+    // The K_m row in key_secrets is keyed by the message_key's own
+    // event id, so cascade-purging the message_key row covers
+    // matching K_m state via the event_id deletion path.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT event_id
+             FROM message_keys
+             WHERE recorded_by = ?1 AND owning_message_event_id = ?2",
+        )?;
+        let rows = stmt.query_map(params![recorded_by, root_message_event_id], |row| {
+            crate::db::sql_types::get_text(row, 0)
+        })?;
+        for event_id in rows {
+            changed |= manifest.add_event_id(event_id?);
+        }
+    }
+
     {
         let mut stmt = conn.prepare(
             "SELECT event_id, file_id
@@ -397,6 +417,19 @@ fn delete_tenant_scoped_rows(
         conn.execute(
             "DELETE FROM files
              WHERE recorded_by = ?1 AND (event_id = ?2 OR message_id = ?2)",
+            params![recorded_by, event_id],
+        )?;
+        // Per-Message FS: a tombstoned message_key drops the K_m row
+        // from key_secrets (keyed by the message_key's own event id)
+        // and the message_keys index row.
+        conn.execute(
+            "DELETE FROM message_keys
+             WHERE recorded_by = ?1 AND (event_id = ?2 OR owning_message_event_id = ?2)",
+            params![recorded_by, event_id],
+        )?;
+        conn.execute(
+            "DELETE FROM key_secrets
+             WHERE recorded_by = ?1 AND event_id = ?2",
             params![recorded_by, event_id],
         )?;
     }
