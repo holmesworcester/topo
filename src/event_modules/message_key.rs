@@ -191,15 +191,22 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// event's own event_id so the standard Encrypted hot path finds
 /// it on cascade retry.
 ///
-/// Late-arrival defense: under Option C, there is no
-/// owning_message_event_id to pre-check against `deleted_messages`
-/// here. Instead, if a message_key's owning message has already
-/// been tombstoned + hard-purged, the Encrypted event that would
-/// have used this K_m is gone — the K_m row produced here is an
-/// orphan that occupies local state but cannot decrypt anything
-/// (no ciphertext exists for it). Orphan GC for such rows is a
-/// periodic sweep in the heal loop (see
-/// PHASE_8_PENDING_SIM_TESTS.md).
+/// Late-arrival note: under Option C, message_key does not carry
+/// `owning_message_event_id`, so this projector cannot pre-check
+/// `deleted_messages` for its owning message. Linkage lives in
+/// `messages_to_message_keys`, written when the Encrypted projects —
+/// at which point the stages.rs Encrypted path *synchronously* runs
+/// a defensive `HardPurgeMessageGraph` + direct DELETE on any K_m /
+/// message_keys row if the owning message was already tombstoned
+/// before the Encrypted arrived (see `stages.rs` Option C gate). No
+/// background GC sweep exists or is required: the moment any side
+/// can prove an orphan relationship, it is purged in the same
+/// transaction.
+///
+/// A K_m row that sits without a ciphertext to decrypt (because the
+/// Encrypted never arrived) is not FS-sensitive — there is nothing
+/// for it to decrypt — so no immediate action is required or
+/// possible at the message_key projector level.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,

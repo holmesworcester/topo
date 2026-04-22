@@ -334,6 +334,17 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
         sub_event: &ParsedEvent,
         suppress_sharing: bool,
     ) -> ProjectionApplyResult<()>;
+
+    /// True if a durable `deleted_messages` tombstone row exists for
+    /// the given message event_id. Used by the Encrypted path to
+    /// avoid populating the `messages_to_message_keys` reverse index
+    /// for a message that has already self-tombstoned via a prior
+    /// `deletion_intent` + `HardPurgeMessageGraph` cascade.
+    fn message_is_tombstoned(
+        &self,
+        recorded_by: &str,
+        message_event_id_b64: &str,
+    ) -> ProjectionApplyResult<bool>;
 }
 
 impl ProjectionBackend for Connection {
@@ -501,6 +512,20 @@ impl ProjectionBackend for Connection {
             }
         }
     }
+
+    fn message_is_tombstoned(
+        &self,
+        recorded_by: &str,
+        message_event_id_b64: &str,
+    ) -> ProjectionApplyResult<bool> {
+        let row: bool = self.query_row(
+            "SELECT COUNT(*) > 0 FROM deleted_messages
+             WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, message_event_id_b64],
+            |row| row.get(0),
+        )?;
+        Ok(row)
+    }
 }
 
 #[cfg(test)]
@@ -657,6 +682,14 @@ mod tests {
                 .borrow_mut()
                 .push(event_id_b64.to_string());
             Ok(())
+        }
+
+        fn message_is_tombstoned(
+            &self,
+            _recorded_by: &str,
+            _message_event_id_b64: &str,
+        ) -> ProjectionApplyResult<bool> {
+            Ok(false)
         }
     }
 

@@ -730,10 +730,25 @@ fn apply_projection_frame<B: ProjectionBackend>(
         // the correct message_key row to purge without needing the
         // owning_message_event_id in the message_key wire.
         //
-        // Gate on the key event's own type being `message_key` by
-        // inspecting the first byte of its stored blob (type code).
-        // Legacy PSK flows reference a direct KeySecret instead and
-        // should not populate the reverse index.
+        // Gates (ALL must hold; any deferral to GC is unacceptable):
+        //
+        // 1. Inner message projection was Valid.
+        // 2. Inner is a Message (MessageDeletion projects under
+        //    Encrypted too; it has no K_m to link).
+        // 3. `enc.key_event_id` points at a genuine `message_key`
+        //    event (first blob byte = EVENT_TYPE_MESSAGE_KEY). Legacy
+        //    direct-KeySecret wraps must not populate the reverse
+        //    index — their key rows are shared across many messages
+        //    and would be wrongly enumerated by the delete cascade.
+        // 4. The message is NOT already tombstoned in
+        //    `deleted_messages`. If the inner projector self-
+        //    tombstoned via delete-before-create, its
+        //    `HardPurgeMessageGraph` cascade has already run by the
+        //    time we reach this point (emit commands execute inside
+        //    `apply_projection_frame`). Writing the reverse-index
+        //    row after that purge would leave an orphan pointer that
+        //    never gets cleaned up — exactly the GC pattern we're
+        //    forbidding.
         if matches!(decision, ProjectionDecision::Valid)
             && matches!(inner_parsed, ParsedEvent::Message(_))
         {
@@ -742,7 +757,8 @@ fn apply_projection_frame<B: ProjectionBackend>(
                 .as_deref()
                 .and_then(|blob| blob.first().copied())
                 == Some(crate::event_modules::EVENT_TYPE_MESSAGE_KEY);
-            if key_is_message_key {
+            let tombstoned = backend.message_is_tombstoned(recorded_by, event_id_b64)?;
+            if key_is_message_key && !tombstoned {
                 backend.execute_write_ops(&[WriteOp::InsertOrIgnore {
                     table: "messages_to_message_keys",
                     columns: vec![
@@ -756,6 +772,40 @@ fn apply_projection_frame<B: ProjectionBackend>(
                         SqlVal::Text(recorded_by.to_string()),
                     ],
                 }])?;
+            } else if key_is_message_key && tombstoned {
+                // Defensive immediate purge: the inner
+                // HardPurgeMessageGraph cascade ran before we knew
+                // the mkey linkage. Enumerate the mkey now and tack
+                // it onto the same cascade so no orphan K_m row
+                // survives. Synchronous — no GC.
+                backend.execute_emit_commands(
+                    recorded_by,
+                    &[EmitCommand::HardPurgeMessageGraph {
+                        message_event_id: event_id_b64.to_string(),
+                    }],
+                )?;
+                backend.execute_write_ops(&[
+                    WriteOp::Delete {
+                        table: "message_keys",
+                        where_clause: vec![
+                            ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                            (
+                                "event_id",
+                                SqlVal::Text(transport_key_event_id_b64.clone()),
+                            ),
+                        ],
+                    },
+                    WriteOp::Delete {
+                        table: "key_secrets",
+                        where_clause: vec![
+                            ("recorded_by", SqlVal::Text(recorded_by.to_string())),
+                            (
+                                "event_id",
+                                SqlVal::Text(transport_key_event_id_b64.clone()),
+                            ),
+                        ],
+                    },
+                ])?;
             }
         }
 
