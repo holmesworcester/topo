@@ -1511,6 +1511,139 @@ fn load_peer_shared_dep_facts(
     })
 }
 
+/// SQL-side dep-facts loader for Message.
+///
+/// Signer is resolved via the shared helper; Message only accepts a
+/// peer_shared signer. The signer's `user_event_id` is read off the
+/// parsed PeerSharedEvent directly by `decide_message` — no
+/// `peers_shared` rollup JOIN needed.
+fn load_message_dep_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::MessageDepFacts> {
+    use crate::projection::dep_facts::MessageDepFacts;
+
+    let signer = resolve_signer_from_frame(
+        conn,
+        recorded_by,
+        frame,
+        SignerKindExpectation::Exactly(EVENT_TYPE_PEER_SHARED),
+    )?;
+    Ok(MessageDepFacts { signer })
+}
+
+/// SQL-side guard-facts loader for Message.
+///
+/// Reads pre-existing deletion intents for this message's event_id.
+/// The projector consumes these to tombstone on first materialization.
+fn load_message_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::MessageGuardFacts> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT deletion_event_id, author_id, authorized_by_admin, created_at
+         FROM deletion_intents
+         WHERE recorded_by = ?1
+           AND target_id = ?2
+         ORDER BY deletion_event_id",
+    )?;
+    let deletion_intents = stmt
+        .query_map(rusqlite::params![recorded_by, event_id_b64], |row| {
+            Ok(DeletionIntentInfo {
+                deletion_event_id: crate::db::sql_types::get_text(row, 0)?,
+                author_id: crate::db::sql_types::get_text(row, 1)?,
+                authorized_by_admin: row.get::<_, i64>(2)? != 0,
+                created_at: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::projection::dep_facts::MessageGuardFacts { deletion_intents })
+}
+
+/// SQL-side dep-facts loader for Reaction. Same signer expectation
+/// and rollup shape as Message — see `load_message_dep_facts`.
+fn load_reaction_dep_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::ReactionDepFacts> {
+    use crate::projection::dep_facts::ReactionDepFacts;
+
+    let signer = resolve_signer_from_frame(
+        conn,
+        recorded_by,
+        frame,
+        SignerKindExpectation::Exactly(EVENT_TYPE_PEER_SHARED),
+    )?;
+    Ok(ReactionDepFacts { signer })
+}
+
+/// SQL-side dep-facts loader for MessageDeletion. Accepts both
+/// `admin` and `peer_shared` outer signers.
+fn load_message_deletion_dep_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::MessageDeletionDepFacts> {
+    use crate::projection::dep_facts::MessageDeletionDepFacts;
+
+    let signer = resolve_signer_from_frame(
+        conn,
+        recorded_by,
+        frame,
+        SignerKindExpectation::AnyOf(&[EVENT_TYPE_PEER_SHARED, EVENT_TYPE_ADMIN]),
+    )?;
+    Ok(MessageDeletionDepFacts { signer })
+}
+
+/// SQL-side guard-facts loader for MessageDeletion.
+///
+/// Target-message state comes from `messages`, `deleted_messages`, and
+/// `valid_events` tables — materialized guards the projector consults
+/// to decide the delete path.
+fn load_message_deletion_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    message_deletion: &MessageDeletionEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::MessageDeletionGuardFacts> {
+    let target_b64 = event_id_to_base64(&message_deletion.target_event_id);
+
+    let target_tombstone_author: Option<String> = conn
+        .query_row(
+            "SELECT author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &target_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()?;
+
+    let target_message_author: Option<String> = conn
+        .query_row(
+            "SELECT author_id FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &target_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()?;
+
+    let target_is_non_message =
+        if target_message_author.is_none() && target_tombstone_author.is_none() {
+            conn.query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &target_b64],
+                |row| row.get(0),
+            )?
+        } else {
+            false
+        };
+
+    Ok(crate::projection::dep_facts::MessageDeletionGuardFacts {
+        target_message_author,
+        target_tombstone_author,
+        target_is_non_message,
+    })
+}
+
 /// Resolve the outer signer to a parsed event, stripping any outer
 /// `Signed` envelope. Shared between all signed-event projectors —
 /// the `expected_kind` mask controls which `SignerResolution` arm
@@ -1554,6 +1687,10 @@ pub(crate) fn resolve_signer_from_frame(
             signer_event_id: signer_b64,
             event,
         },
+        Ok(ParsedEvent::Admin(event)) => SignerResolution::Admin {
+            signer_event_id: signer_b64,
+            event,
+        },
         Ok(other) => SignerResolution::Malformed {
             signer_event_id: signer_b64.clone(),
             reason: format!(
@@ -1574,12 +1711,15 @@ pub(crate) fn resolve_signer_from_frame(
 pub(crate) enum SignerKindExpectation {
     /// Signer must be exactly this semantic type.
     Exactly(u8),
+    /// Signer may be any of these semantic types.
+    AnyOf(&'static [u8]),
 }
 
 impl SignerKindExpectation {
     fn accepts(self, code: u8) -> bool {
         match self {
             Self::Exactly(expected) => expected == code,
+            Self::AnyOf(allowed) => allowed.contains(&code),
         }
     }
 }
@@ -2197,30 +2337,15 @@ impl ProjectionQueries for Connection {
         event_id_b64: &str,
         message: &MessageEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let signer_user_mismatch_reason =
-            signer_user_mismatch_reason(self, frame, recorded_by, &message.author_id)?;
+        use crate::projection::dep_facts::decide_message;
 
-        let mut stmt = self.prepare_cached(
-            "SELECT deletion_event_id, author_id, authorized_by_admin, created_at
-             FROM deletion_intents
-             WHERE recorded_by = ?1
-               AND target_id = ?2
-             ORDER BY deletion_event_id",
-        )?;
-        let deletion_intents = stmt
-            .query_map(rusqlite::params![recorded_by, event_id_b64], |row| {
-                Ok(DeletionIntentInfo {
-                    deletion_event_id: crate::db::sql_types::get_text(row, 0)?,
-                    author_id: crate::db::sql_types::get_text(row, 1)?,
-                    authorized_by_admin: row.get::<_, i64>(2)? != 0,
-                    created_at: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let deps = load_message_dep_facts(self, frame, recorded_by)?;
+        let guards = load_message_guard_facts(self, recorded_by, event_id_b64)?;
+        let decision = decide_message(message, &deps, &guards);
 
         Ok(ProjectorDecisionContext {
-            signer_user_mismatch_reason,
-            deletion_intents,
+            signer_user_mismatch_reason: decision.signer_user_mismatch_reason(),
+            deletion_intents: guards.deletion_intents,
             ..ProjectorDecisionContext::default()
         })
     }
@@ -2232,39 +2357,24 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         message_deletion: &MessageDeletionEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let mut ctx = ProjectorDecisionContext::default();
+        use crate::projection::dep_facts::decide_message_deletion;
+
+        let deps = load_message_deletion_dep_facts(self, frame, recorded_by)?;
+        let guards = load_message_deletion_guard_facts(self, recorded_by, message_deletion)?;
+        let decision = decide_message_deletion(message_deletion, &deps, &guards);
+
         let (deletion_signer_user_id, deletion_signer_is_admin, deletion_signer_reject_reason) =
-            deletion_signer_context(self, frame, recorded_by)?;
-        ctx.deletion_signer_user_id = deletion_signer_user_id;
-        ctx.deletion_signer_is_admin = deletion_signer_is_admin;
-        ctx.deletion_signer_reject_reason = deletion_signer_reject_reason;
+            decision.context_fields();
 
-        let target_b64 = event_id_to_base64(&message_deletion.target_event_id);
-        ctx.target_tombstone_author = self
-            .query_row(
-                "SELECT author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
-                rusqlite::params![recorded_by, &target_b64],
-                |row| crate::db::sql_types::get_text(row, 0),
-            )
-            .optional()?;
-
-        ctx.target_message_author = self
-            .query_row(
-                "SELECT author_id FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
-                rusqlite::params![recorded_by, &target_b64],
-                |row| crate::db::sql_types::get_text(row, 0),
-            )
-            .optional()?;
-
-        if ctx.target_message_author.is_none() && ctx.target_tombstone_author.is_none() {
-            ctx.target_is_non_message = self.query_row(
-                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![recorded_by, &target_b64],
-                |row| row.get(0),
-            )?;
-        }
-
-        Ok(ctx)
+        Ok(ProjectorDecisionContext {
+            deletion_signer_user_id,
+            deletion_signer_is_admin,
+            deletion_signer_reject_reason,
+            target_message_author: guards.target_message_author,
+            target_tombstone_author: guards.target_tombstone_author,
+            target_is_non_message: guards.target_is_non_message,
+            ..ProjectorDecisionContext::default()
+        })
     }
 
     fn load_reaction_context(
@@ -2274,11 +2384,14 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         reaction: &ReactionEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let signer_user_mismatch_reason =
-            signer_user_mismatch_reason(self, frame, recorded_by, &reaction.author_id)?;
+        use crate::projection::dep_facts::decide_reaction;
+
+        let deps = load_reaction_dep_facts(self, frame, recorded_by)?;
+        let guards = crate::projection::dep_facts::ReactionGuardFacts::default();
+        let decision = decide_reaction(reaction, &deps, &guards);
 
         Ok(ProjectorDecisionContext {
-            signer_user_mismatch_reason,
+            signer_user_mismatch_reason: decision.signer_user_mismatch_reason(),
             ..ProjectorDecisionContext::default()
         })
     }
