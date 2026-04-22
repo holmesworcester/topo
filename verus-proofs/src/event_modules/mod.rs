@@ -1,4 +1,5 @@
 pub mod encrypted;
+pub mod key_shared;
 pub mod layout;
 pub mod registry;
 pub mod roundtrip;

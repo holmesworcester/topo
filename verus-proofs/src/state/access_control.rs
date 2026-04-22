@@ -1,6 +1,26 @@
 //! System-level invariant: a peer that has not been invited to a workspace
 //! cannot decrypt messages belonging to that workspace.
 //!
+//! **Status (2026-04-22): operational correctness, not the canonical
+//! security claim.** The theorem here proves the runtime's projector
+//! refuses to *finalize Valid* on an encrypted event whose deps fail.
+//! Per `docs/planning/ACCESS_CONTROL_PROOF_RETARGETING.md`, that is
+//! not the property that protects users — a peer holding the key
+//! decrypts with any AES-GCM library regardless of our projector.
+//!
+//! The canonical security claim lives in
+//! `crate::event_modules::key_shared::valid_key_shared_has_invited_recipient`:
+//! a structural theorem that Valid KeyShared events only address
+//! admin-chained (invited) recipients. Combined with the trusted
+//! cryptographic primitive "only the recipient's private key can
+//! unwrap the wrapped_key", this implies content-key material
+//! reaches only invited peers — the actual confidentiality property.
+//!
+//! This module stays in-tree because operational correctness is
+//! still useful (the runtime doesn't hand out garbage plaintext to
+//! the caller), but the composition to a security guarantee routes
+//! through `valid_key_shared_has_invited_recipient`, not here.
+//!
 //! All four projector lemmas are now **SMT-proven** (not axiomatized). The
 //! proofs rest on a single `engine_invariant` — a per-event structural
 //! condition stating that every Valid event has its signer-chain dependency
