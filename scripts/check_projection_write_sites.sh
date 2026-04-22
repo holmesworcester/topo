@@ -163,12 +163,21 @@ for root, dirs, files in os.walk(src_dir):
                         )
 
 # Second pass: forbid DSL-level key_secrets construction via the generic
-# `WriteOp::InsertOrIgnore { table: "key_secrets"` pattern. The typed
-# variant `WriteOp::InsertKeySecret(KeySecretsRow)` is the sole legitimate
-# construction path.
+# `WriteOp::InsertOrIgnore { ... table: "key_secrets", ... }` pattern. The
+# typed variant `WriteOp::InsertKeySecret(KeySecretsRow)` is the sole
+# legitimate construction path.
+#
+# Uses DOTALL so the regex spans newlines: real code puts "WriteOp::InsertOrIgnore {"
+# on one line and `table: "key_secrets",` on a subsequent line. The `[^}]*?`
+# non-greedy body match stays within a single struct literal so a later
+# WriteOp construction in the same file doesn't spuriously match across
+# struct boundaries.
 dsl_pattern = re.compile(
-    r'WriteOp::InsertOrIgnore\s*\{\s*table\s*:\s*"key_secrets"',
+    r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*"key_secrets"',
+    re.DOTALL,
 )
+# Anchor line number by matching the start of `WriteOp::InsertOrIgnore`.
+writeop_start = re.compile(r"WriteOp::InsertOrIgnore")
 for root, dirs, files in os.walk(src_dir):
     dirs[:] = [d for d in dirs if d not in ("target", "vendor")]
     for fname in files:
@@ -180,12 +189,29 @@ for root, dirs, files in os.walk(src_dir):
             continue
         with open(fpath, encoding="utf-8", errors="replace") as f:
             text = f.read()
-        # Skip cfg(test) blocks (reuse the per-line logic above by re-scanning).
-        lines = text.splitlines()
+        # Build a per-byte-offset map to line numbers so matches in the
+        # multiline regex can be attributed to a specific source line.
+        line_starts = [0]
+        for i, c in enumerate(text):
+            if c == "\n":
+                line_starts.append(i + 1)
+        def offset_to_line(off):
+            # Binary search for the line.
+            lo, hi = 0, len(line_starts) - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if line_starts[mid] <= off:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo + 1
+        # Build a "is this byte inside a #[cfg(test)] block" mask using the
+        # same brace-depth approach as the first pass.
+        cfg_test_range = set()
         in_test_block = False
         test_brace_depth = 0
         cfg_test_pending = False
-        for lineno, line in enumerate(lines, 1):
+        for lineno, line in enumerate(text.splitlines(keepends=True), 1):
             stripped = line.strip()
             if "#[cfg(test)]" in stripped:
                 cfg_test_pending = True
@@ -205,15 +231,24 @@ for root, dirs, files in os.walk(src_dir):
                 continue
             if in_test_block:
                 test_brace_depth += stripped.count("{") - stripped.count("}")
+                cfg_test_range.add(lineno)
                 if test_brace_depth <= 0:
                     in_test_block = False
                     test_brace_depth = 0
                 continue
-            if dsl_pattern.search(line):
-                errors.append(
-                    f"ERROR: DSL-level key_secrets construction via WriteOp::InsertOrIgnore "
-                    f"at {rel}:{lineno}: {line.rstrip()}"
-                )
+        for m in dsl_pattern.finditer(text):
+            # Attribute the match to the line where `WriteOp::InsertOrIgnore` starts.
+            start_line = offset_to_line(m.start())
+            if start_line in cfg_test_range:
+                continue
+            # Reconstruct a short snippet for the error message.
+            snippet = text[m.start():m.end()].replace("\n", " \\n ")
+            if len(snippet) > 160:
+                snippet = snippet[:160] + "..."
+            errors.append(
+                f"ERROR: DSL-level key_secrets construction via WriteOp::InsertOrIgnore "
+                f"at {rel}:{start_line}: {snippet}"
+            )
 
 if errors:
     print()

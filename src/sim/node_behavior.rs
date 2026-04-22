@@ -2001,7 +2001,17 @@ impl ProjectionBackend for NodeBehaviorEngine {
                         BehaviorValue::Text(r.recorded_by.clone()));
                     let row = BehaviorRow { values: row_values };
                     let rows = state.tables.entry(table.to_string()).or_default();
-                    if !rows.iter().any(|existing| existing == &row) {
+                    // SQLite executes this as `INSERT OR IGNORE INTO key_secrets`
+                    // which conflicts on the primary key (recorded_by, event_id).
+                    // Match that semantics in the sim: reject a duplicate based on
+                    // primary key, regardless of whether non-key columns differ.
+                    let primary_key_exists = rows.iter().any(|existing| {
+                        existing.values.get(columns[0])
+                            == Some(&BehaviorValue::Text(r.event_id_b64.clone()))
+                            && existing.values.get(columns[3])
+                                == Some(&BehaviorValue::Text(r.recorded_by.clone()))
+                    });
+                    if !primary_key_exists {
                         rows.push(row);
                         rows.sort();
                     }

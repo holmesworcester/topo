@@ -288,13 +288,22 @@ pub mod fixtures {
         }
     }
 
-    /// Assert that write_ops contain an InsertOrIgnore to the given table.
+    /// Does this WriteOp target the given table? Covers all variants.
+    fn writeop_targets_table(op: &WriteOp, table: &str) -> bool {
+        match op {
+            WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
+            WriteOp::Delete { table: t, .. } => *t == table,
+            WriteOp::InsertKeySecret(_) => {
+                table == topo::event_modules::key_shared::KEY_SECRETS_TABLE
+            }
+        }
+    }
+
+    /// Assert that write_ops contain a write to the given table.
     pub fn assert_writes_to_table(result: &ProjectorResult, table: &str) {
         assert!(
-            result.write_ops.iter().any(|op| matches!(
-                op, WriteOp::InsertOrIgnore { table: t, .. } if *t == table
-            )),
-            "expected InsertOrIgnore to table '{}', ops: {:?}",
+            result.write_ops.iter().any(|op| writeop_targets_table(op, table)),
+            "expected write to table '{}', ops: {:?}",
             table,
             result.write_ops
         );
@@ -303,10 +312,7 @@ pub mod fixtures {
     /// Assert that no write_ops target the given table.
     pub fn assert_no_write_to_table(result: &ProjectorResult, table: &str) {
         assert!(
-            !result.write_ops.iter().any(|op| match op {
-                WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
-                WriteOp::Delete { table: t, .. } => *t == table,
-            }),
+            !result.write_ops.iter().any(|op| writeop_targets_table(op, table)),
             "expected no write to table '{}', but found one",
             table
         );

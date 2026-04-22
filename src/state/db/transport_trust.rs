@@ -641,49 +641,63 @@ fn verified_peer_shared_authz_cross_check(
     recorded_by: &str,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let matching_row: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT p.event_id, p.user_event_id
-             FROM peers_shared p
-             WHERE p.recorded_by = ?1 AND p.transport_fingerprint = ?2
-             LIMIT 1",
+    // Authorization is ANY-match: the fingerprint is authorized if at
+    // least one peers_shared row with this fingerprint survives the
+    // removal filters. Two peer_shared events can legitimately share a
+    // transport_fingerprint; one being removed doesn't de-authorize the
+    // other. Aggregate over ALL matching rows and compute the verified
+    // decision per row; take the disjunction.
+    let mut stmt = conn.prepare(
+        "SELECT p.event_id, p.user_event_id
+         FROM peers_shared p
+         WHERE p.recorded_by = ?1 AND p.transport_fingerprint = ?2",
+    )?;
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map(
             rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let has_matching_row = matching_row.is_some();
-    let (peer_in_removed, user_in_removed_as_user) = match matching_row {
-        Some((peer_event_id, user_event_id)) => {
-            let peer_removed: bool = conn.query_row(
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if rows.is_empty() {
+        return Ok(topo_verus_proofs::state::db::transport_trust::decide_peer_shared_authz_core(
+            false, false, false,
+        ));
+    }
+
+    for (peer_event_id, user_event_id) in &rows {
+        let peer_removed: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM removed_entities
+                 WHERE recorded_by = ?1 AND target_event_id = ?2
+             )",
+            rusqlite::params![recorded_by, peer_event_id],
+            |row| row.get(0),
+        )?;
+        let user_removed: bool = match user_event_id {
+            Some(ueid) => conn.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM removed_entities
-                     WHERE recorded_by = ?1 AND target_event_id = ?2
+                     WHERE recorded_by = ?1
+                       AND target_event_id = ?2
+                       AND removal_type = 'user'
                  )",
-                rusqlite::params![recorded_by, &peer_event_id],
+                rusqlite::params![recorded_by, ueid],
                 |row| row.get(0),
-            )?;
-            let user_removed: bool = match user_event_id {
-                Some(ueid) => conn.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM removed_entities
-                         WHERE recorded_by = ?1
-                           AND target_event_id = ?2
-                           AND removal_type = 'user'
-                     )",
-                    rusqlite::params![recorded_by, &ueid],
-                    |row| row.get(0),
-                )?,
-                None => false,
-            };
-            (peer_removed, user_removed)
+            )?,
+            None => false,
+        };
+        let authorized =
+            topo_verus_proofs::state::db::transport_trust::decide_peer_shared_authz_core(
+                true,
+                peer_removed,
+                user_removed,
+            );
+        if authorized {
+            return Ok(true);
         }
-        None => (false, false),
-    };
-    Ok(topo_verus_proofs::state::db::transport_trust::decide_peer_shared_authz_core(
-        has_matching_row,
-        peer_in_removed,
-        user_in_removed_as_user,
-    ))
+    }
+    Ok(false)
 }
 
 /// Check whether a peer fingerprint is backed by projected PeerShared state for

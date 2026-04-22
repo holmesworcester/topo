@@ -219,16 +219,19 @@ pub fn project_pure(
     }];
 
     for entry in &ctx.unwrapped_key_history_material {
-        ops.push(WriteOp::InsertOrIgnore {
-            table: "key_secrets",
-            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(crate::crypto::event_id_to_base64(&entry.key_event_id)),
-                SqlVal::Blob(entry.key_bytes.to_vec()),
-                SqlVal::Int(history.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        });
+        // Unwrap-gated (same access-control structure as KeyShared): a
+        // history entry is only materialized when THIS peer successfully
+        // unwrapped that entry's wrapped_key. Routed through the typed
+        // row constructor so the CI gate stays closed.
+        ops.push(
+            super::key_shared::KeySecretsRow::new(
+                crate::crypto::event_id_to_base64(&entry.key_event_id),
+                entry.key_bytes,
+                history.created_at_ms as i64,
+                recorded_by.to_string(),
+            )
+            .to_write_op(),
+        );
     }
 
     ProjectorResult::valid_with_commands(
