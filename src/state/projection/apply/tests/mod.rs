@@ -545,6 +545,21 @@ pub(super) fn build_identity_chain_deferred(
     let ub_blob = sign_blob(&invite_key, &uib_eid, &ub_event);
     let ub_eid = hash_event(&ub_blob);
 
+    // 5b. Admin (bootstrap grant for the chain's user, signed by
+    // workspace_key). Mirrors real bootstrap in
+    // `workspace/commands.rs::create_workspace`. Needed so removal /
+    // admin-gated projectors can authorize removals signed by the
+    // chain's peer_shared: removal's projector checks
+    // users → admins (by public_key) for the current signer.
+    let admin_event = ParsedEvent::Admin(crate::event_modules::AdminEvent {
+        created_at_ms: now_ms(),
+        public_key: user_pub,
+        authority_event_id: net_eid,
+        user_event_id: ub_eid,
+    });
+    let admin_blob = sign_blob(&workspace_key, &net_eid, &admin_event);
+    let admin_eid = hash_event(&admin_blob);
+
     // 6. DeviceInvite (signed by user key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let device_invite_pub = device_invite_key.verifying_key().to_bytes();
@@ -596,6 +611,7 @@ pub(super) fn build_identity_chain_deferred(
         (_recorded_by.to_string(), net_eid, net_blob),
         (_recorded_by.to_string(), uib_eid, uib_blob),
         (_recorded_by.to_string(), ub_eid, ub_blob),
+        (_recorded_by.to_string(), admin_eid, admin_blob),
         (_recorded_by.to_string(), dif_eid, dif_blob),
         (endpoint_recorded_by, endpoint_eid, endpoint_blob),
         (_recorded_by.to_string(), psf_eid, psf_blob),
