@@ -227,10 +227,17 @@ fn fs_preserved_for_deleted_message() {
         !message_keys_row_exists(&conn, m1_message_key_event_id_b64),
         "message_keys index row must be purged"
     );
-    // K_bundle survives (other messages may use it).
+    // Strong FS (delete-triggered bundle purge): K_bundle's plaintext
+    // row in `key_secrets` is shredded on the first-deletion-in-bundle
+    // cascade, on every honest peer. Retained `key_broadcast` wire
+    // events become inert (they cannot be unwrapped without the
+    // WrapPrivkey, purged on its own schedule). K_m rows for
+    // un-deleted messages remain in `key_secrets` keyed by their
+    // message_key_event_id, so un-deleted messages stay decryptable.
     assert!(
-        key_secrets_row_exists(&conn, &k_bundle_id_b64),
-        "K_bundle row persists — other messages still need it"
+        !key_secrets_row_exists(&conn, &k_bundle_id_b64),
+        "K_bundle row must be purged — relay-retention attacks on \
+         the deleted message's retained wire become inert"
     );
     // Durable tombstone persists (defends against late-replay re-
     // materialization of K_m when the message_key arrives again).
@@ -349,8 +356,10 @@ fn history_preserved_after_deletion() {
         "m3 message_keys index must be preserved"
     );
 
-    // K_bundle persists (m1, m3 still need it).
-    assert!(key_secrets_row_exists(&conn, &k_bundle_id_b64));
+    // Strong FS: K_bundle is purged on first-delete-in-bundle.
+    // Un-deleted messages still decryptable via their K_m rows
+    // (keyed by the message_key event id, not by K_bundle id).
+    assert!(!key_secrets_row_exists(&conn, &k_bundle_id_b64));
 }
 
 /// Compound property: run multiple deletes sequentially. Each delete
@@ -404,6 +413,8 @@ fn sequential_deletes_preserve_non_target_history() {
     assert!(events_row_exists(&conn, sm4_msg.as_str()));
     assert!(key_secrets_row_exists(&conn, sm4_mkey.as_str()));
 
-    // K_bundle still persists — shared across m2 and m4.
-    assert!(key_secrets_row_exists(&conn, &k_bundle_id_b64));
+    // Strong FS: K_bundle is purged on first-delete-in-bundle.
+    // Un-deleted m2 and m4 still decryptable via their K_m rows
+    // (keyed by message_key event id, not by K_bundle id).
+    assert!(!key_secrets_row_exists(&conn, &k_bundle_id_b64));
 }

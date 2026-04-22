@@ -447,10 +447,21 @@ fn latest_materialized_key_for_peer(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
+    // Only consider rows whose `key_secrets` entry is a K_bundle
+    // (has a matching `key_rotations` row). Per-message K_m rows
+    // live in `key_secrets` too — keyed by `message_key.event_id` —
+    // but they're not valid inputs for creating a new K_bundle:
+    // reusing a K_m as a K_bundle would produce duplicate key
+    // material across two different cryptographic roles and defeat
+    // strong FS's "K_bundle shredded on deletion" invariant on the
+    // originating message's rotation.
     let existing: Option<String> = conn
         .query_row(
             "SELECT ks.event_id
              FROM key_secrets ks
+             JOIN key_rotations kr
+               ON kr.recorded_by = ks.recorded_by
+              AND kr.event_id = ks.event_id
              JOIN events e
                ON e.event_id = ks.event_id
              WHERE ks.recorded_by = ?1
@@ -588,18 +599,27 @@ fn existing_rotation_for_frontier(
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
     let slots = slotted_frontier_refs(frontier_refs)?;
     let frontier_hash = frontier_hash_from_refs(frontier_refs);
+    // Strong-FS (delete-triggered bundle purge): a KeyRotation row
+    // may outlive its `key_secrets` plaintext row (the latter gets
+    // shredded on first-delete-in-bundle). Only consider a rotation
+    // "existing" if its plaintext is still materialized locally —
+    // otherwise the caller should rotate to a fresh K_bundle. This
+    // mirrors the INNER JOIN in `latest_content_key_for_frontier`.
     conn
         .query_row(
-            "SELECT event_id
-             FROM key_rotations
-             WHERE recorded_by = ?1
-               AND frontier_hash = ?2
-               AND frontier_count = ?3
-               AND frontier_ref_1 = ?4
-               AND frontier_ref_2 = ?5
-               AND frontier_ref_3 = ?6
-               AND frontier_ref_4 = ?7
-             ORDER BY rowid DESC
+            "SELECT kr.event_id
+             FROM key_rotations kr
+             JOIN key_secrets ks
+               ON ks.recorded_by = kr.recorded_by
+              AND ks.event_id = kr.event_id
+             WHERE kr.recorded_by = ?1
+               AND kr.frontier_hash = ?2
+               AND kr.frontier_count = ?3
+               AND kr.frontier_ref_1 = ?4
+               AND kr.frontier_ref_2 = ?5
+               AND kr.frontier_ref_3 = ?6
+               AND kr.frontier_ref_4 = ?7
+             ORDER BY kr.rowid DESC
              LIMIT 1",
             rusqlite::params![
                 recorded_by,

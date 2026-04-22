@@ -11,6 +11,18 @@ use crate::crypto::{event_id_from_base64, EventId};
 struct PurgeManifest {
     event_ids: BTreeSet<String>,
     file_ids: BTreeSet<String>,
+    /// Strong-FS phase A: K_bundle event ids (KeyRotation / key_broadcast
+    /// event ids) whose `key_secrets` row must be shredded from this
+    /// tenant's local state on deletion. These are NOT full manifest
+    /// events — we DO NOT delete them from `events`, `valid_events`,
+    /// `recorded_events`, etc. The KeyRotation stays live on the wire
+    /// and in other tables; only the plaintext K_bundle bytes in
+    /// `key_secrets` go away. This is the core of the delete-triggered
+    /// strong-FS lever: retained wire `key_broadcast` blobs become
+    /// inert on every honest peer once the bundle's `key_secrets` row
+    /// is shredded, because there is no way to re-derive it from the
+    /// asymmetric wrap without the corresponding WrapPrivkey.
+    bundle_key_secret_event_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +53,10 @@ impl PurgeManifest {
 
     fn add_file_id(&mut self, file_id: impl Into<String>) -> bool {
         self.file_ids.insert(file_id.into())
+    }
+
+    fn add_bundle_key_secret_event_id(&mut self, event_id: impl Into<String>) -> bool {
+        self.bundle_key_secret_event_ids.insert(event_id.into())
     }
 }
 
@@ -150,6 +166,21 @@ fn collect_projection_dependents(
     // event_id to the manifest so the cascade removes the
     // per-message K_m wrap (and its K_m row in key_secrets keyed by
     // the same event_id) alongside the message blob.
+    //
+    // Strong FS (delete-triggered bundle purge): at the same time,
+    // walk one hop further — from each message_key to its
+    // `k_bundle_local_event_id` — and add those K_bundle event ids
+    // to `bundle_key_secret_event_ids`. That bucket receives a
+    // narrow `DELETE FROM key_secrets` treatment only (not the full
+    // manifest cascade), since the KeyRotation / key_broadcast event
+    // itself must stay live on the wire for other peers' projection.
+    // This is the core of the strong-FS design: shredding the
+    // plaintext K_bundle on every honest peer at first-delete-in-
+    // bundle makes retained wire `message_key` events unrecoverable,
+    // because the asymmetric wrap in the retained `key_broadcast`
+    // requires a WrapPrivkey that may have been purged on its own
+    // schedule.
+    let mut mkey_event_ids: Vec<String> = Vec::new();
     {
         let mut stmt = conn.prepare(
             "SELECT message_key_event_id
@@ -160,7 +191,23 @@ fn collect_projection_dependents(
             crate::db::sql_types::get_text(row, 0)
         })?;
         for event_id in rows {
-            changed |= manifest.add_event_id(event_id?);
+            let eid = event_id?;
+            changed |= manifest.add_event_id(eid.clone());
+            mkey_event_ids.push(eid);
+        }
+    }
+    for mkey_eid in &mkey_event_ids {
+        let bundle_event_id: Option<String> = conn
+            .query_row(
+                "SELECT k_bundle_local_event_id
+                 FROM message_keys
+                 WHERE recorded_by = ?1 AND event_id = ?2",
+                params![recorded_by, mkey_eid],
+                |row| crate::db::sql_types::get_text(row, 0),
+            )
+            .ok();
+        if let Some(bundle_eid) = bundle_event_id {
+            changed |= manifest.add_bundle_key_secret_event_id(bundle_eid);
         }
     }
 
@@ -461,6 +508,26 @@ fn delete_tenant_scoped_rows(
         )?;
     }
 
+    // Strong FS (delete-triggered bundle purge): shred the plaintext
+    // K_bundle row from this tenant's `key_secrets`. This is the
+    // primary FS lever — retained `key_broadcast` wire events become
+    // inert on every honest peer once this row is gone (there is no
+    // mechanism to re-derive K_bundle bytes from the asymmetric wrap
+    // without the corresponding WrapPrivkey). We deliberately do NOT
+    // touch the KeyRotation's rows in `events`, `valid_events`,
+    // `recorded_events`, etc. — the rotation event itself stays live
+    // on the wire so sync integrity holds; only its plaintext output
+    // in this tenant's `key_secrets` disappears. K_m rows keyed by
+    // the per-message `message_key` event ids are already handled by
+    // the main manifest loop above and survive this step.
+    for bundle_event_id in &manifest.bundle_key_secret_event_ids {
+        conn.execute(
+            "DELETE FROM key_secrets
+             WHERE recorded_by = ?1 AND event_id = ?2",
+            params![recorded_by, bundle_event_id],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -714,6 +781,7 @@ mod tests {
                 manifest: PurgeManifest {
                     event_ids: BTreeSet::from(["message".to_string()]),
                     file_ids: BTreeSet::new(),
+                    bundle_key_secret_event_ids: BTreeSet::new(),
                 },
             }
         );
