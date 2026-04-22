@@ -279,7 +279,17 @@ pub static MESSAGE_KEY_META: EventTypeMeta = crate::event_modules::registry::eve
     // key_bundle_share) materializes this identically, so cascade
     // unblocks uniformly.
     dep_fields: &["k_bundle_local_event_id"],
-    dep_field_type_codes: &[&[crate::event_modules::EVENT_TYPE_KEY_SECRET]],
+    // Accepts any event type whose projection populates `key_secrets`
+    // with the K_bundle bytes — in practice either a canonical
+    // `KeySecret` (new per-message-FS producers via
+    // `EmitDeterministicBlob`) or a legacy `KeyRotation` (whose
+    // projector inserts K_epoch into `key_secrets` keyed by its own
+    // event id). Message sends through `create_encrypted_event_with_
+    // message_key_via_rotation` use the rotation's event id.
+    dep_field_type_codes: &[&[
+        crate::event_modules::EVENT_TYPE_KEY_SECRET,
+        crate::event_modules::EVENT_TYPE_KEY_ROTATION,
+    ]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,

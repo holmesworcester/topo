@@ -11,7 +11,8 @@ use crate::event_modules::file_slice::{
     BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES, MAX_FILE_BYTES,
 };
 use crate::projection::create::{
-    create_encrypted_event, create_encrypted_event_with_owner,
+    create_encrypted_event, create_encrypted_event_with_message_key_via_rotation,
+    create_encrypted_event_with_owner,
 };
 use crate::service::open_db_for_peer;
 use crate::state::db::queue::current_timestamp_ms_u64;
@@ -245,10 +246,14 @@ pub fn create(
         content: cmd.content,
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
-    let eid = create_encrypted_event(
+    // Per-Message FS (Option C): emit a fresh `message_key` wrapping a
+    // random K_m under the current bundle, and encrypt the message
+    // under K_m. Delete then purges K_m as well as the ciphertext.
+    let eid = create_encrypted_event_with_message_key_via_rotation(
         db,
         recorded_by,
         &key_event_id,
+        None,
         &msg,
         Some((signer_eid, signing_key)),
     )?;

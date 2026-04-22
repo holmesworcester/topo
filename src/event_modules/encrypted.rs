@@ -194,7 +194,11 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     projection_table: "",
     share_scope: ShareScope::Shared,
     dep_fields: &["key_event_id", "owner_event_id"],
-    dep_field_type_codes: &[&[32], &[1]],
+    // Option C: `key_event_id` may reference either a legacy
+    // KeyRotation (32) or a per-message `message_key` (40). Both
+    // materialize a K_m into `key_secrets` keyed by the same event_id
+    // used here — Encrypted's decrypt path resolves it uniformly.
+    dep_field_type_codes: &[&[32, 40], &[1]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,

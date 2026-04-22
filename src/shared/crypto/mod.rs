@@ -83,6 +83,27 @@ pub fn encrypt_event_blob(
     Ok((nonce_bytes, ciphertext, auth_tag))
 }
 
+/// Encrypt with a caller-supplied nonce (AES-256-GCM). Used for
+/// deterministic wraps (e.g. K_m wrapped under K_bundle at send time)
+/// where the nonce is derived from stable inputs so content-addressed
+/// dedupe works across re-emits.
+pub fn encrypt_event_blob_with_nonce(
+    key: &[u8; 32],
+    nonce_bytes: &[u8; 12],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, [u8; 16]), Box<dyn std::error::Error>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("aes-gcm key init: {}", e))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let ciphertext_with_tag = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| format!("aes-gcm encrypt: {}", e))?;
+    let tag_start = ciphertext_with_tag.len() - 16;
+    let ciphertext = ciphertext_with_tag[..tag_start].to_vec();
+    let mut auth_tag = [0u8; 16];
+    auth_tag.copy_from_slice(&ciphertext_with_tag[tag_start..]);
+    Ok((ciphertext, auth_tag))
+}
+
 /// Decrypt an AES-256-GCM encrypted blob represented as nonce + ciphertext + auth_tag.
 pub fn decrypt_event_blob(
     key: &[u8; 32],

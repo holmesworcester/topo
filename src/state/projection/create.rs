@@ -533,6 +533,160 @@ pub fn create_encrypted_event_with_owner(
     }
 }
 
+/// Convenience: send a message under Per-Message FS given a legacy
+/// content-key event id (as returned by `ensure_content_key_for_peer`).
+/// Loads K_epoch bytes from the existing `key_secrets` row keyed by
+/// the rotation event id, then delegates to
+/// `create_encrypted_event_with_message_key` using the rotation event
+/// id as both `bundle_id` and `k_bundle_local_event_id`.
+///
+/// Using the rotation event id (rather than a freshly-derived
+/// deterministic id) keeps the `message_key` dep pointing at the same
+/// `key_secrets` row that receivers already materialize through the
+/// legacy KeyRotation projector path — no new cascade plumbing
+/// required on the receive side, and device-link content-key replay
+/// (which inserts directly into `key_secrets`) continues to unblock
+/// `message_key` uniformly.
+pub fn create_encrypted_event_with_message_key_via_rotation(
+    conn: &Connection,
+    recorded_by: &str,
+    content_key_event_id: &EventId,
+    owner_event_id: Option<&EventId>,
+    inner_event: &ParsedEvent,
+    signer: Option<(&EventId, &SigningKey)>,
+) -> Result<EventId, CreateEventError> {
+    let key_b64 = event_id_to_base64(content_key_event_id);
+    let key_bytes_vec: Vec<u8> = conn
+        .query_row(
+            "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_b64],
+            |row| crate::db::sql_types::get_blob(row, 0),
+        )
+        .map_err(|e| CreateEventError::DbError(format!("key lookup: {}", e)))?;
+    if key_bytes_vec.len() != 32 {
+        return Err(CreateEventError::EncodeError(format!(
+            "secret key wrong length: {}",
+            key_bytes_vec.len()
+        )));
+    }
+    let mut k_bundle_bytes = [0u8; 32];
+    k_bundle_bytes.copy_from_slice(&key_bytes_vec);
+
+    create_encrypted_event_with_message_key(
+        conn,
+        recorded_by,
+        content_key_event_id,
+        content_key_event_id,
+        &k_bundle_bytes,
+        owner_event_id,
+        inner_event,
+        signer,
+    )
+}
+
+/// Option C: per-message FS send path. Generates a fresh random K_m,
+/// emits a `message_key` event carrying `AEAD(K_bundle, K_m)`, then
+/// encrypts the inner event under K_m and builds an Encrypted wrapper
+/// whose `key_event_id` is the message_key event id.
+///
+/// The caller supplies the K_bundle bytes and a stable
+/// `k_bundle_local_event_id` (the deterministic local KeySecret id
+/// for those bundle bytes). Projection of the `message_key` event
+/// inserts K_m into `key_secrets` keyed by the mkey's own event_id,
+/// which unblocks the Encrypted message via the standard cascade.
+pub fn create_encrypted_event_with_message_key(
+    conn: &Connection,
+    recorded_by: &str,
+    bundle_id: &EventId,
+    k_bundle_local_event_id: &EventId,
+    k_bundle_bytes: &[u8; 32],
+    owner_event_id: Option<&EventId>,
+    inner_event: &ParsedEvent,
+    signer: Option<(&EventId, &SigningKey)>,
+) -> Result<EventId, CreateEventError> {
+    use crate::event_modules::message_key::{
+        deterministic_message_key_created_at_ms, deterministic_message_key_nonce,
+        MessageKeyEvent,
+    };
+    use rand::RngCore;
+
+    let inner_meta = events::registry()
+        .lookup(inner_event.event_type_code())
+        .ok_or_else(|| CreateEventError::EncodeError("unknown event type".to_string()))?;
+    if !inner_meta.encryptable {
+        return Err(CreateEventError::EncodeError(format!(
+            "{} events cannot be encrypted",
+            inner_meta.type_name
+        )));
+    }
+    if inner_meta.transport_privacy() == TransportPrivacy::PlaintextOnly {
+        return Err(CreateEventError::EncodeError(format!(
+            "{} events may not be carried inside encrypted wrappers",
+            inner_meta.type_name
+        )));
+    }
+
+    // 1. Fresh random K_m for this message.
+    let mut k_m = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut k_m);
+
+    // 2. Wrap K_m under K_bundle with a deterministic nonce so
+    //    content-addressed dedupe works if a peer re-emits the same
+    //    (bundle, K_m) — though in practice K_m is fresh per send.
+    let wrap_nonce = deterministic_message_key_nonce(k_bundle_local_event_id, &k_m);
+    let (wrap_ct, wrap_tag) =
+        crate::shared::crypto::encrypt_event_blob_with_nonce(k_bundle_bytes, &wrap_nonce, &k_m)
+            .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let mut wrapped_k_m = [0u8; 48];
+    wrapped_k_m[..32].copy_from_slice(&wrap_ct);
+    wrapped_k_m[32..].copy_from_slice(&wrap_tag);
+
+    // 3. Build + emit the message_key event (deterministic, unsigned,
+    //    content-addressed).
+    let created_at_ms = deterministic_message_key_created_at_ms(
+        bundle_id,
+        k_bundle_local_event_id,
+        &wrapped_k_m,
+    );
+    let mkey = ParsedEvent::MessageKey(MessageKeyEvent {
+        created_at_ms,
+        bundle_id: *bundle_id,
+        k_bundle_local_event_id: *k_bundle_local_event_id,
+        nonce: wrap_nonce,
+        wrapped_k_m,
+    });
+    let mkey_evid = create_event(conn, recorded_by, &mkey)?;
+
+    // 4. Encrypt inner under K_m with a random nonce (message body
+    //    nonce is independent from the wrap nonce).
+    let inner_blob = events::encode_event(inner_event)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&k_m, &inner_blob)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+
+    // 5. Build Encrypted wrapper keyed by the message_key event id.
+    let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
+        created_at_ms: inner_event.created_at_ms(),
+        key_event_id: mkey_evid,
+        owner_event_id: owner_event_id.copied().unwrap_or(NO_OWNER_EVENT_ID),
+        inner_type_code: inner_event.event_type_code(),
+        nonce,
+        ciphertext,
+        auth_tag,
+    });
+
+    match signer {
+        Some((signer_event_id, signing_key)) => create_signed_event(
+            conn,
+            recorded_by,
+            signer_event_id,
+            &wrapper,
+            signing_key,
+        ),
+        None => create_event(conn, recorded_by, &wrapper),
+    }
+}
+
 /// Staged encrypted create: persist and enqueue an encrypted event even if its
 /// inner event is Blocked. Returns the outer wrapper event_id on both Valid and
 /// Blocked outcomes.

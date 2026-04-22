@@ -70,6 +70,69 @@ fn delete_message_by_index(db: &str, index: usize) {
     );
 }
 
+/// Send-time emission proof: `topo send` must produce one
+/// `message_key` event per message (Option C Per-Message FS). Also
+/// proves delete-cascade removes the per-message K_m row in addition
+/// to the ciphertext blob: the message_key row + its K_m row in
+/// key_secrets + the messages_to_message_keys reverse index row all
+/// disappear via the purge.
+#[test]
+fn cli_send_emits_message_key_and_delete_purges_it() {
+    let _lock = hold_network_test_lock_for_binary();
+    let (_tmpdir_guard, db_path) = temp_db();
+    create_workspace(&db_path);
+    let mut daemon = start_daemon(&db_path);
+    wait_for_daemon_ready(&db_path, Duration::from_secs(10));
+
+    // Baseline: no message_key events before any sends.
+    assert_eq!(
+        count_rows(&db_path, "message_keys"),
+        0,
+        "no message_keys before any sends"
+    );
+
+    // Send three messages.
+    send_message(&db_path, "alpha");
+    send_message(&db_path, "bravo");
+    send_message(&db_path, "charlie");
+    assert_eventually(&db_path, "message_count == 3", 10_000);
+
+    // Every send emits exactly one message_key event (content-addressed
+    // dedupe means repeated K_m would collapse; random K_m per send
+    // guarantees distinct rows).
+    assert_eq!(
+        count_rows(&db_path, "message_keys"),
+        3,
+        "each send must emit a distinct message_key"
+    );
+
+    // Reverse index must have a row per message.
+    assert_eq!(
+        count_rows(&db_path, "messages_to_message_keys"),
+        3,
+        "reverse index populated by Encrypted-projection on each send"
+    );
+
+    // Delete message 2 (bravo).
+    delete_message_by_index(&db_path, 2);
+    assert_eventually(&db_path, "message_count == 2", 10_000);
+
+    // The deleted message's K_m row is gone (down to 2), and the
+    // reverse-index row for it is gone too.
+    assert_eq!(
+        count_rows(&db_path, "message_keys"),
+        2,
+        "per-message K_m for the deleted message must be purged"
+    );
+    assert_eq!(
+        count_rows(&db_path, "messages_to_message_keys"),
+        2,
+        "reverse-index row for the deleted message must be purged"
+    );
+
+    daemon.stop();
+}
+
 /// Test 1: delete one of three messages. Observe via CLI that the
 /// deleted message no longer lists, surviving messages do. K_m count
 /// in content-keys decreases by 1 for a per-message-key system; at
