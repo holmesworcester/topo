@@ -1535,10 +1535,12 @@ fn load_message_dep_facts(
 
 /// SQL-side guard-facts loader for Message.
 ///
-/// Reads pre-existing deletion intents for this message's event_id.
-/// The projector consumes these to tombstone on first materialization.
+/// Reads pre-existing deletion intents for this message's event_id
+/// and the materialized `peers_shared` rollup for the outer signer
+/// (the DB-consistency guard for content-authority rejects).
 fn load_message_guard_facts(
     conn: &Connection,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     event_id_b64: &str,
 ) -> ProjectionQueryResult<crate::projection::dep_facts::MessageGuardFacts> {
@@ -1559,7 +1561,58 @@ fn load_message_guard_facts(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(crate::projection::dep_facts::MessageGuardFacts { deletion_intents })
+    let signer_rollup = load_peer_shared_signer_rollup(conn, frame, recorded_by)?;
+    Ok(crate::projection::dep_facts::MessageGuardFacts {
+        deletion_intents,
+        signer_rollup,
+    })
+}
+
+/// SQL-side guard-facts loader for Reaction. Reads just the
+/// materialized `peers_shared` rollup for the outer signer.
+fn load_reaction_guard_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::ReactionGuardFacts> {
+    let signer_rollup = load_peer_shared_signer_rollup(conn, frame, recorded_by)?;
+    Ok(crate::projection::dep_facts::ReactionGuardFacts { signer_rollup })
+}
+
+/// Read the materialized `peers_shared` rollup (user_event_ids) for
+/// the current outer signer. Empty rollup when no signer or the
+/// signer is not a peer_shared kind.
+fn load_peer_shared_signer_rollup(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::SignerPeerSharedRollup> {
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(crate::projection::dep_facts::SignerPeerSharedRollup::default());
+    };
+    if current_signer.semantic_type_code != EVENT_TYPE_PEER_SHARED {
+        return Ok(crate::projection::dep_facts::SignerPeerSharedRollup::default());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT user_event_id
+         FROM peers_shared
+         WHERE recorded_by = ?1 AND event_id = ?2
+         ORDER BY user_event_id
+         LIMIT 2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![recorded_by, &current_signer.event_id])?;
+    let mut signer_user_ids = Vec::new();
+    let mut malformed = false;
+    while let Some(row) = rows.next()? {
+        match crate::db::sql_types::get_opt_text(row, 0) {
+            Ok(user_id) => signer_user_ids.push(user_id),
+            Err(_) => malformed = true,
+        }
+    }
+    Ok(crate::projection::dep_facts::SignerPeerSharedRollup {
+        signer_user_ids,
+        malformed,
+    })
 }
 
 /// SQL-side dep-facts loader for Reaction. Same signer expectation
@@ -1602,9 +1655,11 @@ fn load_message_deletion_dep_facts(
 ///
 /// Target-message state comes from `messages`, `deleted_messages`, and
 /// `valid_events` tables — materialized guards the projector consults
-/// to decide the delete path.
+/// to decide the delete path. The `peers_shared` rollup is loaded for
+/// peer_shared outer signers (DB-consistency guard).
 fn load_message_deletion_guard_facts(
     conn: &Connection,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     message_deletion: &MessageDeletionEvent,
 ) -> ProjectionQueryResult<crate::projection::dep_facts::MessageDeletionGuardFacts> {
@@ -1637,10 +1692,13 @@ fn load_message_deletion_guard_facts(
             false
         };
 
+    let signer_rollup = load_peer_shared_signer_rollup(conn, frame, recorded_by)?;
+
     Ok(crate::projection::dep_facts::MessageDeletionGuardFacts {
         target_message_author,
         target_tombstone_author,
         target_is_non_message,
+        signer_rollup,
     })
 }
 
@@ -2340,7 +2398,7 @@ impl ProjectionQueries for Connection {
         use crate::projection::dep_facts::decide_message;
 
         let deps = load_message_dep_facts(self, frame, recorded_by)?;
-        let guards = load_message_guard_facts(self, recorded_by, event_id_b64)?;
+        let guards = load_message_guard_facts(self, frame, recorded_by, event_id_b64)?;
         let decision = decide_message(message, &deps, &guards);
 
         Ok(ProjectorDecisionContext {
@@ -2360,7 +2418,8 @@ impl ProjectionQueries for Connection {
         use crate::projection::dep_facts::decide_message_deletion;
 
         let deps = load_message_deletion_dep_facts(self, frame, recorded_by)?;
-        let guards = load_message_deletion_guard_facts(self, recorded_by, message_deletion)?;
+        let guards =
+            load_message_deletion_guard_facts(self, frame, recorded_by, message_deletion)?;
         let decision = decide_message_deletion(message_deletion, &deps, &guards);
 
         let (deletion_signer_user_id, deletion_signer_is_admin, deletion_signer_reject_reason) =
@@ -2387,7 +2446,7 @@ impl ProjectionQueries for Connection {
         use crate::projection::dep_facts::decide_reaction;
 
         let deps = load_reaction_dep_facts(self, frame, recorded_by)?;
-        let guards = crate::projection::dep_facts::ReactionGuardFacts::default();
+        let guards = load_reaction_guard_facts(self, frame, recorded_by)?;
         let decision = decide_reaction(reaction, &deps, &guards);
 
         Ok(ProjectorDecisionContext {
