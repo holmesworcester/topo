@@ -1371,6 +1371,115 @@ fn deleted_message_purges_dep(
     Ok(deleted.then(|| dep_b64.to_string()))
 }
 
+/// SQL-side guard-facts loader for Workspace.
+fn load_workspace_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::WorkspaceGuardFacts> {
+    let raw = load_workspace_accepted_raw_rows(conn, recorded_by)?;
+    Ok(crate::projection::dep_facts::WorkspaceGuardFacts {
+        accepted_workspace_ids: raw.workspace_ids,
+        malformed: raw.malformed,
+    })
+}
+
+/// SQL-side dep-facts loader for PeerShared.
+///
+/// Resolves the outer signer to a parsed `DeviceInviteEvent` (stripping
+/// any outer `Signed` envelope) and looks up the referenced
+/// endpoint_shared projection row. Both are immediate event deps of
+/// PeerShared — this is the dep-bundle the pure decide fn consumes.
+fn load_peer_shared_dep_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    peer_shared: &PeerSharedEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::PeerSharedDepFacts> {
+    use crate::projection::dep_facts::{PeerSharedDepFacts, SignerResolution};
+
+    let signer = match frame.current_signer.as_ref() {
+        None => SignerResolution::Missing,
+        Some(current_signer) if current_signer.semantic_type_code != EVENT_TYPE_DEVICE_INVITE => {
+            SignerResolution::UnsupportedKind {
+                semantic_type_code: current_signer.semantic_type_code,
+            }
+        }
+        Some(current_signer) => {
+            let signer_b64 = current_signer.event_id.clone();
+            match load_valid_event_blob(conn, recorded_by, &signer_b64)? {
+                None => SignerResolution::MissingBlob {
+                    signer_event_id: signer_b64,
+                },
+                Some(blob) => resolve_device_invite_signer(&signer_b64, &blob),
+            }
+        }
+    };
+
+    let endpoint_shared_event_id_b64 =
+        event_id_to_base64(&peer_shared.endpoint_shared_event_id);
+    let endpoint_shared_endpoint_id =
+        load_endpoint_shared_by_event_id(conn, &endpoint_shared_event_id_b64)
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?
+            .map(|row| row.endpoint_id);
+
+    Ok(PeerSharedDepFacts {
+        signer,
+        endpoint_shared_endpoint_id,
+    })
+}
+
+/// Parse a signer blob as a DeviceInvite (stripping any Signed wrapper)
+/// and return a matching `SignerResolution` variant.
+fn resolve_device_invite_signer(
+    signer_event_id: &str,
+    blob: &[u8],
+) -> crate::projection::dep_facts::SignerResolution {
+    use crate::projection::dep_facts::SignerResolution;
+
+    match parse_event(blob) {
+        Ok(ParsedEvent::DeviceInvite(event)) => SignerResolution::DeviceInvite {
+            signer_event_id: signer_event_id.to_string(),
+            event,
+        },
+        Ok(ParsedEvent::Signed(signed)) => match parse_event(&signed.payload) {
+            Ok(ParsedEvent::DeviceInvite(event)) => SignerResolution::DeviceInvite {
+                signer_event_id: signer_event_id.to_string(),
+                event,
+            },
+            Ok(other) => SignerResolution::Malformed {
+                signer_event_id: signer_event_id.to_string(),
+                reason: format!(
+                    "peer_shared signer {} resolved to unexpected event type {}",
+                    signer_event_id,
+                    other.event_type_code()
+                ),
+            },
+            Err(err) => SignerResolution::Malformed {
+                signer_event_id: signer_event_id.to_string(),
+                reason: format!(
+                    "failed to parse signed device_invite signer {}: {}",
+                    signer_event_id, err
+                ),
+            },
+        },
+        Ok(other) => SignerResolution::Malformed {
+            signer_event_id: signer_event_id.to_string(),
+            reason: format!(
+                "peer_shared signer {} resolved to unexpected event type {}",
+                signer_event_id,
+                other.event_type_code()
+            ),
+        },
+        Err(err) => SignerResolution::Malformed {
+            signer_event_id: signer_event_id.to_string(),
+            reason: format!(
+                "failed to parse device_invite signer {}: {}",
+                signer_event_id, err
+            ),
+        },
+    }
+}
+
 /// SQL-side guard-facts loader for InviteAccepted.
 ///
 /// Reads the narrow slice of ambient state that InviteAccepted's pure
@@ -1818,8 +1927,19 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         _workspace: &WorkspaceEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let context = load_workspace_decision_context_from_db(self, recorded_by)?;
-        Ok(build_workspace_projector_decision_context(&context))
+        use crate::projection::dep_facts::{
+            decide_workspace, WorkspaceDecision, WorkspaceDepFacts,
+        };
+
+        let deps = WorkspaceDepFacts::default();
+        let guards = load_workspace_guard_facts(self, recorded_by)?;
+        let decision = decide_workspace(&deps, &guards);
+
+        let mut ctx = ProjectorDecisionContext::default();
+        if let WorkspaceDecision::UniqueAcceptedWorkspace { workspace_id } = decision {
+            ctx.accepted_workspace_id = Some(workspace_id);
+        }
+        Ok(ctx)
     }
 
     fn load_workspace_decision_context(
@@ -1856,32 +1976,26 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         peer_shared: &PeerSharedEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let raw_rows = load_peer_shared_authority_raw_rows(self, frame, recorded_by)?;
-        let claimed_user_id = event_id_to_base64(&peer_shared.user_event_id);
-        let authority_context = normalize_peer_shared_authority(&raw_rows, &claimed_user_id);
+        use crate::projection::dep_facts::{
+            decide_peer_shared, PeerSharedDecision, PeerSharedGuardFacts,
+        };
 
-        let endpoint_shared_event_id_b64 =
-            event_id_to_base64(&peer_shared.endpoint_shared_event_id);
-        let endpoint_shared_row =
-            load_endpoint_shared_by_event_id(self, &endpoint_shared_event_id_b64)
-                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+        let deps = load_peer_shared_dep_facts(self, frame, recorded_by, peer_shared)?;
+        let guards = PeerSharedGuardFacts::default();
+        let decision = decide_peer_shared(peer_shared, &deps, &guards);
 
-        Ok(ProjectorDecisionContext {
-            peer_shared_user_mismatch_reason: peer_shared_authority_plan_to_mismatch_reason(
-                decide_peer_shared_authority_plan(&authority_context),
-            ),
-            peer_shared_endpoint_id: endpoint_shared_row
-                .as_ref()
-                .map(|row| row.endpoint_id.clone()),
-            peer_shared_endpoint_binding_reason: match endpoint_shared_row {
-                Some(_) => None,
-                None => Some(format!(
-                    "no projected endpoint_shared row for {}",
-                    endpoint_shared_event_id_b64
-                )),
-            },
-            ..ProjectorDecisionContext::default()
-        })
+        let mut ctx = ProjectorDecisionContext::default();
+        ctx.peer_shared_user_mismatch_reason = decision.user_mismatch_reason();
+        ctx.peer_shared_endpoint_binding_reason = decision.endpoint_binding_reason();
+        // Keep the already-projected endpoint_id visible to the
+        // projector even when a non-endpoint reject fires — callers
+        // rely on it purely for diagnostics, and it mirrors the
+        // previous behaviour.
+        ctx.peer_shared_endpoint_id = match &decision {
+            PeerSharedDecision::Ready { endpoint_id } => Some(endpoint_id.clone()),
+            _ => deps.endpoint_shared_endpoint_id.clone(),
+        };
+        Ok(ctx)
     }
 
     fn load_user_invite_context(
