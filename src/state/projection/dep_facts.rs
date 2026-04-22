@@ -745,6 +745,147 @@ mod tests {
         ));
     }
 
+    // ── Removal pilot ─────────────────────────────────────────
+
+    fn removal_event() -> crate::event_modules::RemovalEvent {
+        crate::event_modules::RemovalEvent {
+            created_at_ms: 0,
+            removed_member_ref: [0xAA; 32],
+            parent_count: 0,
+            parent_1: [0u8; 32],
+            parent_2: [0u8; 32],
+            parent_3: [0u8; 32],
+            parent_4: [0u8; 32],
+            frontier_hash: [0u8; 32],
+            removed_by: [0xBB; 32],
+            admin_authority_event_id: [0xCC; 32],
+        }
+    }
+
+    fn peer_shared_signer(user_event_id: [u8; 32]) -> SignerResolution {
+        SignerResolution::PeerShared {
+            signer_event_id: "ps".into(),
+            event: PeerSharedEvent {
+                created_at_ms: 0,
+                public_key: [1u8; 32],
+                user_event_id,
+                endpoint_shared_event_id: [2u8; 32],
+                device_name: String::new(),
+            },
+        }
+    }
+
+    fn admin_resolution(user_event_id: [u8; 32]) -> AdminResolution {
+        AdminResolution::Valid {
+            event_id: [0xCC; 32],
+            event: AdminEvent {
+                created_at_ms: 0,
+                public_key: [3u8; 32],
+                authority_event_id: [0u8; 32],
+                user_event_id,
+            },
+        }
+    }
+
+    #[test]
+    fn removal_ready_when_admin_user_matches_signer_user_and_target_is_user() {
+        let user = [42u8; 32];
+        let deps = RemovalDepFacts {
+            signer: peer_shared_signer(user),
+            admin_authority: admin_resolution(user),
+        };
+        let guards = RemovalGuardFacts {
+            target_kind: Some(RemovalTargetKind::User),
+        };
+        let d = decide_removal(&removal_event(), &deps, &guards);
+        assert!(matches!(
+            d,
+            RemovalDecision::Ready {
+                target_kind: RemovalTargetKind::User
+            }
+        ));
+    }
+
+    #[test]
+    fn removal_rejects_when_admin_user_differs_from_signer_user() {
+        let deps = RemovalDepFacts {
+            signer: peer_shared_signer([1u8; 32]),
+            admin_authority: admin_resolution([2u8; 32]),
+        };
+        let guards = RemovalGuardFacts {
+            target_kind: Some(RemovalTargetKind::User),
+        };
+        let d = decide_removal(&removal_event(), &deps, &guards);
+        match d {
+            RemovalDecision::RejectAdminUserMismatch {
+                admin_user,
+                signer_user,
+            } => {
+                assert_eq!(admin_user, [2u8; 32]);
+                assert_eq!(signer_user, [1u8; 32]);
+            }
+            other => panic!("expected RejectAdminUserMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn removal_rejects_missing_signer() {
+        let deps = RemovalDepFacts {
+            signer: SignerResolution::Missing,
+            admin_authority: admin_resolution([1u8; 32]),
+        };
+        let d = decide_removal(
+            &removal_event(),
+            &deps,
+            &RemovalGuardFacts {
+                target_kind: Some(RemovalTargetKind::User),
+            },
+        );
+        assert!(matches!(d, RemovalDecision::RejectMissingCurrentSigner));
+    }
+
+    #[test]
+    fn removal_rejects_unsupported_signer_kind() {
+        let deps = RemovalDepFacts {
+            signer: SignerResolution::DeviceInvite {
+                signer_event_id: "ps".into(),
+                event: DeviceInviteEvent {
+                    created_at_ms: 0,
+                    public_key: [1u8; 32],
+                    authority_event_id: [2u8; 32],
+                    key_history_event_id: [3u8; 32],
+                },
+            },
+            admin_authority: admin_resolution([1u8; 32]),
+        };
+        let d = decide_removal(
+            &removal_event(),
+            &deps,
+            &RemovalGuardFacts {
+                target_kind: Some(RemovalTargetKind::User),
+            },
+        );
+        assert!(matches!(
+            d,
+            RemovalDecision::RejectUnsupportedSignerType { .. }
+        ));
+    }
+
+    #[test]
+    fn removal_rejects_target_unsupported_when_target_kind_missing() {
+        let user = [1u8; 32];
+        let deps = RemovalDepFacts {
+            signer: peer_shared_signer(user),
+            admin_authority: admin_resolution(user),
+        };
+        let d = decide_removal(
+            &removal_event(),
+            &deps,
+            &RemovalGuardFacts { target_kind: None },
+        );
+        assert!(matches!(d, RemovalDecision::RejectTargetUnsupported));
+    }
+
     // ── Guard passthrough ─────────────────────────────────────
 
     #[test]
