@@ -127,12 +127,27 @@ pub fn build_projector_context(
     };
 
     let ctx = queries.load_invite_accepted_context(frame, recorded_by, event_id_b64, ia)?;
-    if let Some(reason) = &ctx.invite_accepted_link_workspace_mismatch_reason {
-        return Ok(crate::projection::decision_context::ContextLoadResult::reject(
-            reason.clone(),
-        ));
+
+    // Delegate the accept/reject decision to the Verus-verified core.
+    use topo_verus_proofs::event_modules::invite_accepted::{
+        decide_invite_accepted_acceptance_core, InviteAcceptedAcceptanceCore,
+        InviteAcceptedAcceptanceFlags,
+    };
+    let flags = InviteAcceptedAcceptanceFlags {
+        link_workspace_match_ok: ctx.invite_accepted_link_workspace_mismatch_reason.is_none(),
+    };
+    match decide_invite_accepted_acceptance_core(flags) {
+        InviteAcceptedAcceptanceCore::RejectLinkWorkspaceMismatch => {
+            let reason = ctx
+                .invite_accepted_link_workspace_mismatch_reason
+                .clone()
+                .expect("verified LinkWorkspaceMismatch requires reason to be present");
+            Ok(crate::projection::decision_context::ContextLoadResult::reject(reason))
+        }
+        InviteAcceptedAcceptanceCore::Valid => {
+            Ok(crate::projection::decision_context::ContextLoadResult::ready(ctx))
+        }
     }
-    Ok(crate::projection::decision_context::ContextLoadResult::ready(ctx))
 }
 
 /// Pure projector: InviteAccepted — local trust-anchor binding.

@@ -150,41 +150,78 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
+    use topo_verus_proofs::event_modules::key_shared::{
+        decide_key_shared_acceptance_core, KeySharedAcceptanceCore, KeySharedAcceptanceFlags,
+    };
     let ss = match parsed {
         ParsedEvent::KeyShared(s) => s,
         _ => return ProjectorResult::reject("not a key_shared event".to_string()),
     };
 
+    // Extract the four primitive flags. Each Result/bool is computed from
+    // real input state; the outcome enum is checked against the verified
+    // decision. Reject strings are rehydrated from the Err values so we
+    // don't lose the specific frontier-refs-from-slots failure messages.
     let slots = [
         ss.frontier_ref_1,
         ss.frontier_ref_2,
         ss.frontier_ref_3,
         ss.frontier_ref_4,
     ];
-    let refs = match frontier_refs_from_slots(ss.frontier_count, &slots) {
-        Ok(refs) => refs,
-        Err(reason) => return ProjectorResult::reject(reason),
-    };
-    if let Err(reason) = validate_canonical_frontier_refs(&refs) {
-        return ProjectorResult::reject(reason);
-    }
-    let expected_frontier_hash = frontier_hash_from_refs(&refs);
-    if ss.frontier_hash != expected_frontier_hash {
-        return ProjectorResult::reject(
-            "frontier_hash does not match key_shared frontier".to_string(),
-        );
-    }
-
+    let refs_result = frontier_refs_from_slots(ss.frontier_count, &slots);
+    let frontier_refs_well_formed = refs_result.is_ok();
+    let canonical_result = refs_result
+        .as_ref()
+        .ok()
+        .map(|r| validate_canonical_frontier_refs(r));
+    let frontier_refs_canonical = matches!(&canonical_result, Some(Ok(())));
+    let frontier_hash_matches = refs_result
+        .as_ref()
+        .ok()
+        .map(|r| ss.frontier_hash == frontier_hash_from_refs(r))
+        .unwrap_or(false);
     let expected_delivery_target_id = delivery_target_id(
         &ss.key_event_id,
         &ss.frontier_hash,
         &ss.recipient_event_id,
         &ss.unwrap_key_event_id,
     );
-    if ss.delivery_target_id != expected_delivery_target_id {
-        return ProjectorResult::reject(
-            "delivery_target_id does not match key_shared target".to_string(),
-        );
+    let delivery_target_matches = ss.delivery_target_id == expected_delivery_target_id;
+
+    let flags = KeySharedAcceptanceFlags {
+        frontier_refs_well_formed,
+        frontier_refs_canonical,
+        frontier_hash_matches,
+        delivery_target_matches,
+    };
+    match decide_key_shared_acceptance_core(flags) {
+        KeySharedAcceptanceCore::RejectFrontierRefsMalformed => {
+            return ProjectorResult::reject(
+                refs_result
+                    .err()
+                    .expect("verified FrontierRefsMalformed requires refs_result Err"),
+            );
+        }
+        KeySharedAcceptanceCore::RejectFrontierRefsNotCanonical => {
+            let reason = match canonical_result {
+                Some(Err(reason)) => reason,
+                _ => unreachable!(
+                    "verified FrontierRefsNotCanonical requires Some(Err)"
+                ),
+            };
+            return ProjectorResult::reject(reason);
+        }
+        KeySharedAcceptanceCore::RejectFrontierHashMismatch => {
+            return ProjectorResult::reject(
+                "frontier_hash does not match key_shared frontier".to_string(),
+            );
+        }
+        KeySharedAcceptanceCore::RejectDeliveryTargetMismatch => {
+            return ProjectorResult::reject(
+                "delivery_target_id does not match key_shared target".to_string(),
+            );
+        }
+        KeySharedAcceptanceCore::Valid => {}
     }
 
     let key_b64 = event_id_to_base64(&ss.key_event_id);
@@ -224,10 +261,24 @@ pub fn project_pure(
         ],
     }];
 
-    let material = match &ctx.unwrapped_secret_material {
-        Some(v) => v,
-        None => return ProjectorResult::valid(ops),
+    // Access-control gate: delegate the "emit key_secrets row?" decision
+    // to the Verus-verified core. The runtime's primitive flag is "did
+    // THIS peer's unwrap key decrypt the wrapped_key" — encoded by the
+    // context loader as `unwrapped_secret_material.is_some()`.
+    use topo_verus_proofs::event_modules::key_shared::{
+        decide_key_secrets_materialization_core, KeySecretsMaterializationCore,
     };
+    let unwrap_successful_for_this_peer = ctx.unwrapped_secret_material.is_some();
+    match decide_key_secrets_materialization_core(unwrap_successful_for_this_peer) {
+        KeySecretsMaterializationCore::SkipKeySecretsRow => {
+            return ProjectorResult::valid(ops);
+        }
+        KeySecretsMaterializationCore::EmitKeySecretsRow => {}
+    }
+    let material = ctx
+        .unwrapped_secret_material
+        .as_ref()
+        .expect("verified EmitKeySecretsRow requires material to be Some");
 
     ops.push(WriteOp::InsertOrIgnore {
         table: "key_secrets",

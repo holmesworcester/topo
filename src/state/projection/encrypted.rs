@@ -25,40 +25,85 @@ pub fn project_encrypted(
     event_id_b64: &str,
     enc: &EncryptedEvent,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
-    // 1. Resolve key from key_secrets table
-    let key_bytes: Vec<u8> = match conn.query_row(
+    use topo_verus_proofs::state::projection::encrypted::{
+        decide_encrypted_decryption_core, EncryptedDecryptionCore, EncryptedDecryptionFlags,
+    };
+
+    // --- Extract every primitive flag the verified decision depends on.
+    // This runs every upstream query/operation, captures the outcomes, and
+    // then hands the booleans to the verified decider. Real state in; real
+    // outcomes observed; verified decision binds which action the runtime
+    // takes.
+    let key_bytes_opt: Option<Vec<u8>> = match conn.query_row(
         "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
         rusqlite::params![recorded_by, event_id_to_base64(&enc.key_event_id)],
         |row| crate::db::sql_types::get_blob(row, 0),
     ) {
-        Ok(k) => k,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
+        Ok(k) => Some(k),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let key_bytes_present = key_bytes_opt.is_some();
+    let key_bytes_length_valid = key_bytes_opt.as_ref().map(|k| k.len() == 32).unwrap_or(false);
+
+    // Decryption only runs if key present and right length. We eagerly run
+    // it so we can fill the corresponding flag; if the verified decision
+    // says Block, the plaintext is never used.
+    let (decryption_succeeded, plaintext_opt) = if key_bytes_present && key_bytes_length_valid {
+        let key_bytes = key_bytes_opt.as_ref().expect("checked above");
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(key_bytes);
+        match decrypt_event_blob(&key_arr, &enc.nonce, &enc.ciphertext, &enc.auth_tag) {
+            Ok(pt) => (true, Some(pt)),
+            Err(_) => (false, None),
+        }
+    } else {
+        (false, None)
+    };
+
+    let inner_parsed_opt = plaintext_opt
+        .as_ref()
+        .and_then(|pt| events::parse_event(pt).ok());
+    let inner_parse_succeeded = inner_parsed_opt.is_some();
+    let inner_type_matches_outer_claim = inner_parsed_opt
+        .as_ref()
+        .map(|p| p.event_type_code() == enc.inner_type_code)
+        .unwrap_or(false);
+    let inner_type_not_encrypted = enc.inner_type_code != EVENT_TYPE_ENCRYPTED;
+    let inner_type_is_encryptable = inner_parsed_opt
+        .as_ref()
+        .and_then(|p| events::registry().lookup(p.event_type_code()))
+        .map(|m| m.encryptable)
+        .unwrap_or(false);
+
+    let flags = EncryptedDecryptionFlags {
+        key_bytes_present,
+        key_bytes_length_valid,
+        decryption_succeeded,
+        inner_parse_succeeded,
+        inner_type_matches_outer_claim,
+        inner_type_not_encrypted,
+        inner_type_is_encryptable,
+    };
+
+    // --- Delegate the decision to the verified core.
+    match decide_encrypted_decryption_core(flags) {
+        EncryptedDecryptionCore::BlockOnMissingKeySecret => {
             return Ok((
-                ProjectionDecision::BlockOnMissingDeps {
-                    missing: Vec::new(),
+                ProjectionDecision::BlockOnMissingDeps { missing: Vec::new() },
+                None,
+            ));
+        }
+        EncryptedDecryptionCore::RejectKeyWrongLength => {
+            let len = key_bytes_opt.as_ref().map(|k| k.len()).unwrap_or(0);
+            return Ok((
+                ProjectionDecision::Reject {
+                    reason: format!("secret key has wrong length: {}", len),
                 },
                 None,
             ));
         }
-        Err(e) => return Err(e.into()),
-    };
-
-    if key_bytes.len() != 32 {
-        return Ok((
-            ProjectionDecision::Reject {
-                reason: format!("secret key has wrong length: {}", key_bytes.len()),
-            },
-            None,
-        ));
-    }
-
-    let mut key_arr = [0u8; 32];
-    key_arr.copy_from_slice(&key_bytes);
-
-    // 2. Decrypt
-    let plaintext = match decrypt_event_blob(&key_arr, &enc.nonce, &enc.ciphertext, &enc.auth_tag) {
-        Ok(pt) => pt,
-        Err(_) => {
+        EncryptedDecryptionCore::RejectDecryptionFailed => {
             return Ok((
                 ProjectionDecision::Reject {
                     reason: "decryption failed (wrong key or corrupted)".to_string(),
@@ -66,62 +111,62 @@ pub fn project_encrypted(
                 None,
             ));
         }
-    };
-
-    // 3. Parse inner event
-    let inner_parsed = match events::parse_event(&plaintext) {
-        Ok(p) => p,
-        Err(e) => {
+        EncryptedDecryptionCore::RejectInnerParseFailed => {
+            // Re-run parse to get the specific error message (the flag was
+            // computed with the same input, so this will fail identically).
+            let err = plaintext_opt
+                .as_ref()
+                .and_then(|pt| events::parse_event(pt).err())
+                .map(|e| format!("{}", e))
+                .unwrap_or_else(|| "unknown parse error".to_string());
             return Ok((
                 ProjectionDecision::Reject {
-                    reason: format!("inner event parse error: {}", e),
+                    reason: format!("inner event parse error: {}", err),
                 },
                 None,
             ));
         }
-    };
-
-    // 4. Verify inner type matches inner_type_code
-    if inner_parsed.event_type_code() != enc.inner_type_code {
-        return Ok((
-            ProjectionDecision::Reject {
-                reason: format!(
-                    "inner type mismatch: outer declares {}, inner is {}",
-                    enc.inner_type_code,
-                    inner_parsed.event_type_code()
-                ),
-            },
-            None,
-        ));
-    }
-
-    // 5. Reject nested encryption
-    if enc.inner_type_code == EVENT_TYPE_ENCRYPTED {
-        return Ok((
-            ProjectionDecision::Reject {
-                reason: "nested encryption not allowed".to_string(),
-            },
-            None,
-        ));
-    }
-
-    // 6. Reject disallowed inner families via registry metadata
-    let inner_code = inner_parsed.event_type_code();
-    let inner_meta = events::registry().lookup(inner_code);
-    match inner_meta {
-        Some(m) if m.encryptable => {}
-        _ => {
+        EncryptedDecryptionCore::RejectInnerTypeMismatch => {
+            let actual = inner_parsed_opt.as_ref().map(|p| p.event_type_code()).unwrap_or(0);
             return Ok((
                 ProjectionDecision::Reject {
                     reason: format!(
-                        "event type {} is not admissible inside encrypted wrappers",
-                        inner_code
+                        "inner type mismatch: outer declares {}, inner is {}",
+                        enc.inner_type_code, actual,
                     ),
                 },
                 None,
             ));
         }
+        EncryptedDecryptionCore::RejectNestedEncryption => {
+            return Ok((
+                ProjectionDecision::Reject {
+                    reason: "nested encryption not allowed".to_string(),
+                },
+                None,
+            ));
+        }
+        EncryptedDecryptionCore::RejectInnerNotEncryptable => {
+            let code = inner_parsed_opt
+                .as_ref()
+                .map(|p| p.event_type_code())
+                .unwrap_or(0);
+            return Ok((
+                ProjectionDecision::Reject {
+                    reason: format!(
+                        "event type {} is not admissible inside encrypted wrappers",
+                        code,
+                    ),
+                },
+                None,
+            ));
+        }
+        EncryptedDecryptionCore::ProceedToDecryptAndProject => {}
     }
+
+    // --- Verified Proceed: all gates passed. Unwrap the computed values.
+    let plaintext = plaintext_opt.expect("verified Proceed requires plaintext");
+    let inner_parsed = inner_parsed_opt.expect("verified Proceed requires parsed inner");
 
     // Shared dep/signer/projection stages (outer event_id anchors block/reject rows).
     // Dep type checking now uses tenant-scoped valid_events.semantic_type_code,
