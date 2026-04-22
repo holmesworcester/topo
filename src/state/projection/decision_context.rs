@@ -1511,6 +1511,114 @@ fn load_peer_shared_dep_facts(
     })
 }
 
+/// SQL-side dep-facts loader for UserInvite.
+///
+/// The signer is resolved via the shared helper (peer_shared only —
+/// workspace signers short-circuit to `UnsupportedKind` and the
+/// decide fn treats that as "no peer-signed authority opinion"). When
+/// a peer_shared signer is present, we additionally load the
+/// `authority_event_id` dep blob and parse it as an AdminEvent; the
+/// decide fn uses this to compute `authority_matches_signer`.
+fn load_user_invite_dep_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    user_invite: &UserInviteEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::UserInviteDepFacts> {
+    use crate::projection::dep_facts::{SignerResolution, UserInviteDepFacts};
+
+    let signer = resolve_signer_from_frame(
+        conn,
+        recorded_by,
+        frame,
+        SignerKindExpectation::Exactly(EVENT_TYPE_PEER_SHARED),
+    )?;
+
+    let admin_authority = match &signer {
+        SignerResolution::PeerShared { .. } => {
+            let authority_b64 = event_id_to_base64(&user_invite.authority_event_id);
+            match load_valid_event_blob(conn, recorded_by, &authority_b64)? {
+                Some(blob) => {
+                    Some(resolve_admin_authority(&user_invite.authority_event_id, &blob))
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+
+    Ok(UserInviteDepFacts {
+        signer,
+        admin_authority,
+    })
+}
+
+/// SQL-side guard-facts loader for UserInvite.
+fn load_user_invite_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::UserInviteGuardFacts> {
+    let is_local_create = match conn.query_row(
+        "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+        |row| crate::db::sql_types::get_text(row, 0),
+    ) {
+        Ok(source) => source == "local" || source == "local_create",
+        Err(_) => false,
+    };
+    let bootstrap_context = load_bootstrap_decision_context(conn, recorded_by, event_id_b64)?;
+    Ok(crate::projection::dep_facts::UserInviteGuardFacts {
+        is_local_create,
+        bootstrap_context,
+    })
+}
+
+/// SQL-side dep-facts loader for DeviceInvite.
+///
+/// Same shape as UserInvite, minus the admin blob: DeviceInvite's
+/// authority-match check is a direct equality between the signer
+/// peer_shared's `user_event_id` and the event's `authority_event_id`
+/// (itself a user event_id, per `dep_field_type_codes`).
+fn load_device_invite_dep_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    _device_invite: &DeviceInviteEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::DeviceInviteDepFacts> {
+    use crate::projection::dep_facts::DeviceInviteDepFacts;
+
+    let signer = resolve_signer_from_frame(
+        conn,
+        recorded_by,
+        frame,
+        SignerKindExpectation::Exactly(EVENT_TYPE_PEER_SHARED),
+    )?;
+
+    Ok(DeviceInviteDepFacts { signer })
+}
+
+/// SQL-side guard-facts loader for DeviceInvite.
+fn load_device_invite_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> ProjectionQueryResult<crate::projection::dep_facts::DeviceInviteGuardFacts> {
+    let is_local_create = match conn.query_row(
+        "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+        |row| crate::db::sql_types::get_text(row, 0),
+    ) {
+        Ok(source) => source == "local" || source == "local_create",
+        Err(_) => false,
+    };
+    let bootstrap_context = load_bootstrap_decision_context(conn, recorded_by, event_id_b64)?;
+    Ok(crate::projection::dep_facts::DeviceInviteGuardFacts {
+        is_local_create,
+        bootstrap_context,
+    })
+}
+
 /// Resolve the outer signer to a parsed event, stripping any outer
 /// `Signed` envelope. Shared between all signed-event projectors —
 /// the `expected_kind` mask controls which `SignerResolution` arm
@@ -2107,45 +2215,23 @@ impl ProjectionQueries for Connection {
         frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
-        _user_invite: &UserInviteEvent,
+        user_invite: &UserInviteEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        use crate::projection::dep_facts::{decide_user_invite, UserInviteDecision};
+
+        let deps = load_user_invite_dep_facts(self, frame, recorded_by, user_invite)?;
+        let guards = load_user_invite_guard_facts(self, recorded_by, event_id_b64)?;
+        let decision = decide_user_invite(user_invite, &deps, &guards);
+
         let mut ctx = ProjectorDecisionContext::default();
-
-        ctx.is_local_create = match self.query_row(
-            "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-            |row| crate::db::sql_types::get_text(row, 0),
-        ) {
-            Ok(source) => source == "local" || source == "local_create",
-            Err(_) => false,
-        };
-
-        if let Some(current_signer) = frame.current_signer.as_ref() {
-            if current_signer.semantic_type_code == EVENT_TYPE_PEER_SHARED {
-                let signer_b64 = current_signer.event_id.clone();
-                let authority_b64 = event_id_to_base64(&_user_invite.authority_event_id);
-                let authority_matches_signer: bool = self.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1
-                         FROM peers_shared ps
-                         JOIN users u
-                           ON u.recorded_by = ps.recorded_by
-                          AND u.event_id = ps.user_event_id
-                         JOIN admins a
-                           ON a.recorded_by = u.recorded_by
-                          AND a.public_key = u.public_key
-                         WHERE ps.recorded_by = ?1
-                           AND ps.event_id = ?2
-                           AND a.event_id = ?3
-                     )",
-                    rusqlite::params![recorded_by, signer_b64, authority_b64],
-                    |row| row.get(0),
-                )?;
-                ctx.invite_authority_matches_signer = Some(authority_matches_signer);
-            }
-        }
-
-        ctx.bootstrap_context = load_bootstrap_decision_context(self, recorded_by, event_id_b64)?;
+        let UserInviteDecision::Ready {
+            authority_matches_signer,
+            is_local_create,
+            bootstrap_context,
+        } = decision;
+        ctx.is_local_create = is_local_create;
+        ctx.invite_authority_matches_signer = authority_matches_signer;
+        ctx.bootstrap_context = bootstrap_context;
         Ok(ctx)
     }
 
@@ -2156,37 +2242,21 @@ impl ProjectionQueries for Connection {
         event_id_b64: &str,
         device_invite: &DeviceInviteEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        use crate::projection::dep_facts::{decide_device_invite, DeviceInviteDecision};
+
+        let deps = load_device_invite_dep_facts(self, frame, recorded_by, device_invite)?;
+        let guards = load_device_invite_guard_facts(self, recorded_by, event_id_b64)?;
+        let decision = decide_device_invite(device_invite, &deps, &guards);
+
         let mut ctx = ProjectorDecisionContext::default();
-
-        ctx.is_local_create = match self.query_row(
-            "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-            |row| crate::db::sql_types::get_text(row, 0),
-        ) {
-            Ok(source) => source == "local" || source == "local_create",
-            Err(_) => false,
-        };
-
-        if let Some(current_signer) = frame.current_signer.as_ref() {
-            if current_signer.semantic_type_code == EVENT_TYPE_PEER_SHARED {
-                let signer_b64 = current_signer.event_id.clone();
-                let authority_b64 = event_id_to_base64(&device_invite.authority_event_id);
-                let authority_matches_signer: bool = self.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1
-                         FROM peers_shared
-                         WHERE recorded_by = ?1
-                           AND event_id = ?2
-                           AND user_event_id = ?3
-                     )",
-                    rusqlite::params![recorded_by, signer_b64, authority_b64],
-                    |row| row.get(0),
-                )?;
-                ctx.invite_authority_matches_signer = Some(authority_matches_signer);
-            }
-        }
-
-        ctx.bootstrap_context = load_bootstrap_decision_context(self, recorded_by, event_id_b64)?;
+        let DeviceInviteDecision::Ready {
+            authority_matches_signer,
+            is_local_create,
+            bootstrap_context,
+        } = decision;
+        ctx.is_local_create = is_local_create;
+        ctx.invite_authority_matches_signer = authority_matches_signer;
+        ctx.bootstrap_context = bootstrap_context;
         Ok(ctx)
     }
 

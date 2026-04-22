@@ -22,7 +22,7 @@
 //! a natural Verus proof target without dragging SQL into the spec.
 
 use crate::event_modules::{
-    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent,
+    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent, UserInviteEvent,
 };
 use crate::projection::projector::{BootstrapDecisionContext, RemovalTargetKind};
 
@@ -585,10 +585,153 @@ pub fn decide_removal(
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// UserInvite
+//
+// UserInvite's outer signer may be a Workspace (bootstrap path) or
+// a PeerShared (ongoing path). The context loader here does not gate
+// rejection on signer kind — that check lives in the projector's
+// `build_projector_context`. This loader only answers:
+//   "when signed by a peer_shared, does the named admin authority
+//    authorize that signer's user?"
+// Expressed as an Option<bool>: None for the workspace path, Some(..)
+// for peer-signed.
+//
+// Authority resolution: `user_invite.authority_event_id` may resolve
+// to an AdminEvent (ongoing) or a Workspace (bootstrap). For the
+// peer-signed match we only care about the Admin case; Workspace (or
+// any other kind) collapses to `authority_matches_signer = false`.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct UserInviteDepFacts {
+    /// Outer signer, parsed. The UserInvite projector accepts only a
+    /// `peer_shared` or a workspace signer at the outer-dispatch layer;
+    /// this loader treats everything except `PeerShared` as "not a
+    /// peer-signed UserInvite" (no authority-match opinion).
+    pub signer: SignerResolution,
+    /// Admin event named by `authority_event_id`, when the signer is
+    /// a peer_shared and the authority blob parses as an Admin. `None`
+    /// otherwise (workspace-signed path, or authority event is not an
+    /// Admin — e.g. a Workspace on the bootstrap path).
+    pub admin_authority: Option<AdminResolution>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UserInviteGuardFacts {
+    /// True when this event was created locally on this peer — drives
+    /// the projector's `pending_invite_bootstrap_trust` write.
+    pub is_local_create: bool,
+    /// Locally-recorded invite-link binding (workspace id, bootstrap
+    /// addrs, bootstrap SPKI), when present.
+    pub bootstrap_context: Option<BootstrapDecisionContext>,
+}
+
+/// Pure UserInvite decision.
+///
+/// There is no reject arm here: the loader's job is to surface the
+/// Option<bool> authority-match signal the projector's dispatch layer
+/// consumes. Rejection (workspace-signer mismatch, peer-signed
+/// authority mismatch, unsupported signer) happens in the projector's
+/// `build_projector_context`, which reads the Option<bool> this
+/// decision carries.
+#[derive(Debug, Clone)]
+pub enum UserInviteDecision {
+    Ready {
+        /// None when signer isn't a peer_shared. Some(true) when the
+        /// admin_authority's user_event_id matches the signer peer_shared's
+        /// user_event_id. Some(false) otherwise (admin kind mismatch,
+        /// admin missing, or user-event ids differ).
+        authority_matches_signer: Option<bool>,
+        is_local_create: bool,
+        bootstrap_context: Option<BootstrapDecisionContext>,
+    },
+}
+
+pub fn decide_user_invite(
+    _event: &UserInviteEvent,
+    deps: &UserInviteDepFacts,
+    guards: &UserInviteGuardFacts,
+) -> UserInviteDecision {
+    let authority_matches_signer = match &deps.signer {
+        SignerResolution::PeerShared { event: ps, .. } => {
+            let matches = match &deps.admin_authority {
+                Some(AdminResolution::Valid { event: admin, .. }) => {
+                    admin.user_event_id == ps.user_event_id
+                }
+                _ => false,
+            };
+            Some(matches)
+        }
+        _ => None,
+    };
+    UserInviteDecision::Ready {
+        authority_matches_signer,
+        is_local_create: guards.is_local_create,
+        bootstrap_context: guards.bootstrap_context.clone(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DeviceInvite
+//
+// DeviceInvite's outer signer may be a User (bootstrap path) or a
+// PeerShared (ongoing path). Same shape as UserInvite: the loader
+// answers the peer-signed authority match question, the projector's
+// dispatch layer handles signer-kind gating and rejection.
+//
+// Authority: `device_invite.authority_event_id` is a user event_id.
+// For the peer-signed match, the signer peer_shared's user_event_id
+// must equal `authority_event_id`. No blob load is needed — the
+// equality is over event_ids, and the dep system has already
+// validated that `authority_event_id` is a User (type 14).
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct DeviceInviteDepFacts {
+    /// Outer signer, parsed.
+    pub signer: SignerResolution,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeviceInviteGuardFacts {
+    pub is_local_create: bool,
+    pub bootstrap_context: Option<BootstrapDecisionContext>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeviceInviteDecision {
+    Ready {
+        authority_matches_signer: Option<bool>,
+        is_local_create: bool,
+        bootstrap_context: Option<BootstrapDecisionContext>,
+    },
+}
+
+pub fn decide_device_invite(
+    event: &DeviceInviteEvent,
+    deps: &DeviceInviteDepFacts,
+    guards: &DeviceInviteGuardFacts,
+) -> DeviceInviteDecision {
+    let authority_matches_signer = match &deps.signer {
+        SignerResolution::PeerShared { event: ps, .. } => {
+            Some(ps.user_event_id == event.authority_event_id)
+        }
+        _ => None,
+    };
+    DeviceInviteDecision::Ready {
+        authority_matches_signer,
+        is_local_create: guards.is_local_create,
+        bootstrap_context: guards.bootstrap_context.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_modules::{DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent};
+    use crate::event_modules::{
+        DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent, UserInviteEvent,
+    };
 
     fn ev(invite_eq_workspace: bool) -> InviteAcceptedEvent {
         let invite = [7u8; 32];
@@ -884,6 +1027,232 @@ mod tests {
             &RemovalGuardFacts { target_kind: None },
         );
         assert!(matches!(d, RemovalDecision::RejectTargetUnsupported));
+    }
+
+    // ── UserInvite pilot ──────────────────────────────────────
+
+    fn user_invite_event(authority: [u8; 32], workspace: [u8; 32]) -> UserInviteEvent {
+        UserInviteEvent {
+            created_at_ms: 0,
+            public_key: [1u8; 32],
+            workspace_id: workspace,
+            authority_event_id: authority,
+            key_history_event_id: [2u8; 32],
+        }
+    }
+
+    fn admin_event_with_user(user: [u8; 32]) -> AdminResolution {
+        AdminResolution::Valid {
+            event_id: [0xAB; 32],
+            event: AdminEvent {
+                created_at_ms: 0,
+                public_key: [3u8; 32],
+                authority_event_id: [0u8; 32],
+                user_event_id: user,
+            },
+        }
+    }
+
+    #[test]
+    fn user_invite_ready_with_no_peer_signer_leaves_match_none() {
+        let event = user_invite_event([1u8; 32], [2u8; 32]);
+        let deps = UserInviteDepFacts {
+            signer: SignerResolution::UnsupportedKind {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
+            },
+            admin_authority: None,
+        };
+        let d = decide_user_invite(&event, &deps, &UserInviteGuardFacts::default());
+        match d {
+            UserInviteDecision::Ready {
+                authority_matches_signer,
+                ..
+            } => assert_eq!(authority_matches_signer, None),
+        }
+    }
+
+    #[test]
+    fn user_invite_ready_peer_signed_match_true_when_admin_user_equals_signer_user() {
+        let user = [42u8; 32];
+        let event = user_invite_event([0xAB; 32], [7u8; 32]);
+        let deps = UserInviteDepFacts {
+            signer: peer_shared_signer(user),
+            admin_authority: Some(admin_event_with_user(user)),
+        };
+        let d = decide_user_invite(&event, &deps, &UserInviteGuardFacts::default());
+        match d {
+            UserInviteDecision::Ready {
+                authority_matches_signer,
+                ..
+            } => assert_eq!(authority_matches_signer, Some(true)),
+        }
+    }
+
+    #[test]
+    fn user_invite_ready_peer_signed_match_false_when_admin_user_differs() {
+        let event = user_invite_event([0xAB; 32], [7u8; 32]);
+        let deps = UserInviteDepFacts {
+            signer: peer_shared_signer([1u8; 32]),
+            admin_authority: Some(admin_event_with_user([2u8; 32])),
+        };
+        let d = decide_user_invite(&event, &deps, &UserInviteGuardFacts::default());
+        match d {
+            UserInviteDecision::Ready {
+                authority_matches_signer,
+                ..
+            } => assert_eq!(authority_matches_signer, Some(false)),
+        }
+    }
+
+    #[test]
+    fn user_invite_ready_peer_signed_match_false_when_admin_missing() {
+        let event = user_invite_event([0xAB; 32], [7u8; 32]);
+        let deps = UserInviteDepFacts {
+            signer: peer_shared_signer([42u8; 32]),
+            admin_authority: None,
+        };
+        let d = decide_user_invite(&event, &deps, &UserInviteGuardFacts::default());
+        match d {
+            UserInviteDecision::Ready {
+                authority_matches_signer,
+                ..
+            } => assert_eq!(authority_matches_signer, Some(false)),
+        }
+    }
+
+    #[test]
+    fn user_invite_ready_peer_signed_match_false_when_authority_wrong_kind() {
+        let event = user_invite_event([0xAB; 32], [7u8; 32]);
+        let deps = UserInviteDepFacts {
+            signer: peer_shared_signer([42u8; 32]),
+            admin_authority: Some(AdminResolution::WrongKind {
+                event_id: [0xAB; 32],
+                semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
+            }),
+        };
+        let d = decide_user_invite(&event, &deps, &UserInviteGuardFacts::default());
+        match d {
+            UserInviteDecision::Ready {
+                authority_matches_signer,
+                ..
+            } => assert_eq!(authority_matches_signer, Some(false)),
+        }
+    }
+
+    #[test]
+    fn user_invite_carries_guard_flags_through() {
+        let event = user_invite_event([1u8; 32], [2u8; 32]);
+        let guards = UserInviteGuardFacts {
+            is_local_create: true,
+            bootstrap_context: Some(BootstrapDecisionContext {
+                workspace_id: "ws".into(),
+                bootstrap_addrs: vec!["127.0.0.1:1".into()],
+                bootstrap_spki_fingerprint: [0u8; 32],
+            }),
+        };
+        let deps = UserInviteDepFacts {
+            signer: SignerResolution::Missing,
+            admin_authority: None,
+        };
+        let d = decide_user_invite(&event, &deps, &guards);
+        match d {
+            UserInviteDecision::Ready {
+                is_local_create,
+                bootstrap_context,
+                authority_matches_signer,
+            } => {
+                assert!(is_local_create);
+                assert!(bootstrap_context.is_some());
+                assert_eq!(authority_matches_signer, None);
+            }
+        }
+    }
+
+    // ── DeviceInvite pilot ────────────────────────────────────
+
+    fn device_invite_event(authority: [u8; 32]) -> DeviceInviteEvent {
+        DeviceInviteEvent {
+            created_at_ms: 0,
+            public_key: [1u8; 32],
+            authority_event_id: authority,
+            key_history_event_id: [2u8; 32],
+        }
+    }
+
+    #[test]
+    fn device_invite_ready_with_no_peer_signer_leaves_match_none() {
+        let event = device_invite_event([5u8; 32]);
+        let deps = DeviceInviteDepFacts {
+            signer: SignerResolution::UnsupportedKind {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_USER,
+            },
+        };
+        let d = decide_device_invite(&event, &deps, &DeviceInviteGuardFacts::default());
+        match d {
+            DeviceInviteDecision::Ready {
+                authority_matches_signer,
+                ..
+            } => assert_eq!(authority_matches_signer, None),
+        }
+    }
+
+    #[test]
+    fn device_invite_ready_peer_signed_match_true_when_signer_user_equals_authority() {
+        let user = [42u8; 32];
+        let event = device_invite_event(user);
+        let deps = DeviceInviteDepFacts {
+            signer: peer_shared_signer(user),
+        };
+        let d = decide_device_invite(&event, &deps, &DeviceInviteGuardFacts::default());
+        match d {
+            DeviceInviteDecision::Ready {
+                authority_matches_signer,
+                ..
+            } => assert_eq!(authority_matches_signer, Some(true)),
+        }
+    }
+
+    #[test]
+    fn device_invite_ready_peer_signed_match_false_when_signer_user_differs() {
+        let event = device_invite_event([1u8; 32]);
+        let deps = DeviceInviteDepFacts {
+            signer: peer_shared_signer([2u8; 32]),
+        };
+        let d = decide_device_invite(&event, &deps, &DeviceInviteGuardFacts::default());
+        match d {
+            DeviceInviteDecision::Ready {
+                authority_matches_signer,
+                ..
+            } => assert_eq!(authority_matches_signer, Some(false)),
+        }
+    }
+
+    #[test]
+    fn device_invite_carries_guard_flags_through() {
+        let event = device_invite_event([1u8; 32]);
+        let guards = DeviceInviteGuardFacts {
+            is_local_create: true,
+            bootstrap_context: Some(BootstrapDecisionContext {
+                workspace_id: "ws".into(),
+                bootstrap_addrs: vec!["127.0.0.1:1".into()],
+                bootstrap_spki_fingerprint: [0u8; 32],
+            }),
+        };
+        let deps = DeviceInviteDepFacts {
+            signer: SignerResolution::Missing,
+        };
+        let d = decide_device_invite(&event, &deps, &guards);
+        match d {
+            DeviceInviteDecision::Ready {
+                is_local_create,
+                bootstrap_context,
+                authority_matches_signer,
+            } => {
+                assert!(is_local_create);
+                assert!(bootstrap_context.is_some());
+                assert_eq!(authority_matches_signer, None);
+            }
+        }
     }
 
     // ── Guard passthrough ─────────────────────────────────────
