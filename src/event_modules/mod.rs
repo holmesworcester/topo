@@ -14,6 +14,7 @@ pub mod invite_accepted;
 pub mod invite_secret;
 pub mod key_broadcast;
 pub mod key_history;
+pub mod key_history_bundle;
 pub mod key_request;
 pub mod key_rotation;
 pub mod key_secret;
@@ -72,6 +73,7 @@ pub use invite_accepted::InviteAcceptedEvent;
 pub use invite_secret::InviteSecretEvent;
 pub use key_broadcast::KeyBroadcastEvent;
 pub use key_history::KeyHistoryEvent;
+pub use key_history_bundle::KeyHistoryBundleEvent;
 pub use key_request::KeyRequestEvent;
 pub use key_rotation::KeyRotationEvent;
 pub use key_secret::KeySecretEvent;
@@ -120,6 +122,7 @@ pub const EVENT_TYPE_SIGNED: u8 = 35;
 pub const EVENT_TYPE_KEY_HISTORY: u8 = 36;
 pub const EVENT_TYPE_WRAP_PUBKEY: u8 = 37;
 pub const EVENT_TYPE_KEY_BROADCAST: u8 = 38;
+pub const EVENT_TYPE_KEY_HISTORY_BUNDLE: u8 = 39;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -159,6 +162,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     endpoint_shared::ensure_schema(conn)?;
     wrap_pubkey::ensure_schema(conn)?;
     key_broadcast::ensure_schema(conn)?;
+    key_history_bundle::ensure_schema(conn)?;
     crate::state::subscriptions::ensure_schema(conn)?;
     Ok(())
 }
@@ -193,6 +197,7 @@ pub enum ParsedEvent {
     EndpointShared(EndpointSharedEvent),
     WrapPubkey(WrapPubkeyEvent),
     KeyBroadcast(KeyBroadcastEvent),
+    KeyHistoryBundle(KeyHistoryBundleEvent),
 }
 
 impl ParsedEvent {
@@ -226,6 +231,7 @@ impl ParsedEvent {
             ParsedEvent::EndpointShared(e) => e.created_at_ms,
             ParsedEvent::WrapPubkey(w) => w.created_at_ms,
             ParsedEvent::KeyBroadcast(k) => k.created_at_ms,
+            ParsedEvent::KeyHistoryBundle(k) => k.created_at_ms,
         }
     }
 
@@ -359,6 +365,7 @@ impl ParsedEvent {
             ParsedEvent::EndpointShared(_) => vec![],
             ParsedEvent::WrapPubkey(_) => vec![],
             ParsedEvent::KeyBroadcast(_) => vec![],
+            ParsedEvent::KeyHistoryBundle(_) => vec![],
         }
     }
 
@@ -392,6 +399,7 @@ impl ParsedEvent {
             ParsedEvent::EndpointShared(_) => EVENT_TYPE_ENDPOINT_SHARED,
             ParsedEvent::WrapPubkey(_) => EVENT_TYPE_WRAP_PUBKEY,
             ParsedEvent::KeyBroadcast(_) => EVENT_TYPE_KEY_BROADCAST,
+            ParsedEvent::KeyHistoryBundle(_) => EVENT_TYPE_KEY_HISTORY_BUNDLE,
         }
     }
 
@@ -426,6 +434,7 @@ impl ParsedEvent {
             ParsedEvent::EndpointShared(e) => e.human_fields(),
             ParsedEvent::WrapPubkey(e) => e.human_fields(),
             ParsedEvent::KeyBroadcast(e) => e.human_fields(),
+            ParsedEvent::KeyHistoryBundle(e) => e.human_fields(),
         }
     }
 }
@@ -527,6 +536,7 @@ pub fn registry() -> &'static EventRegistry {
             &endpoint_shared::ENDPOINT_SHARED_META,
             &wrap_pubkey::WRAP_PUBKEY_META,
             &key_broadcast::KEY_BROADCAST_META,
+            &key_history_bundle::KEY_HISTORY_BUNDLE_META,
         ])
     })
 }
