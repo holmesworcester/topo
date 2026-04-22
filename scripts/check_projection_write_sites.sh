@@ -209,34 +209,49 @@ for root, dirs, files in os.walk(src_dir):
 # non-greedy body match stays within a single struct literal so a later
 # WriteOp construction in the same file doesn't spuriously match across
 # struct boundaries.
-def build_dsl_variants(table_name):
+def build_dsl_variants(table_name, constant_refs):
     """Return regexes for BOTH InsertOrIgnore and Delete targeting this table.
     Deletes are banned identically: no production projector should construct a
-    Delete on access-control-critical tables outside the allow-list."""
+    Delete on access-control-critical tables outside the allow-list.
+
+    `constant_refs` is a list of identifiers whose values resolve to the
+    target table at runtime (e.g. `KEY_SECRETS_TABLE`). The regex matches
+    either the string literal OR any of the listed constants — so a bypass
+    like `WriteOp::InsertOrIgnore { table: KEY_SECRETS_TABLE, ... }` is
+    caught as well as `table: "key_secrets"`.
+    """
+    # Build alternation group: "table_name" | CONST1 | CONST2 | ...
+    # Each const is matched as an identifier with optional path qualifiers
+    # (e.g., `key_shared::KEY_SECRETS_TABLE` or just `KEY_SECRETS_TABLE`).
+    alternatives = [r'"' + table_name + r'"']
+    for c in constant_refs:
+        alternatives.append(r'(?:[A-Za-z_][A-Za-z0-9_]*::)*' + re.escape(c))
+    table_group = r'(?:' + r'|'.join(alternatives) + r')'
     return [
         re.compile(
-            r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*"' + table_name + r'"',
+            r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*' + table_group,
             re.DOTALL,
         ),
         re.compile(
-            r'WriteOp::Delete\s*\{[^}]*?table\s*:\s*"' + table_name + r'"',
+            r'WriteOp::Delete\s*\{[^}]*?table\s*:\s*' + table_group,
             re.DOTALL,
         ),
     ]
 
 dsl_patterns = {
     "key_secrets": (
-        build_dsl_variants("key_secrets"),
+        # KEY_SECRETS_TABLE is a constant in key_shared.rs; match it as an
+        # alternative so a `table: KEY_SECRETS_TABLE` bypass is caught.
+        build_dsl_variants("key_secrets", ["KEY_SECRETS_TABLE"]),
         # Empty allow set: untyped key_secrets DSL ops (insert OR delete) are
         # categorically forbidden; the typed variant is the only construction path.
         set(),
     ),
     "peers_shared": (
-        build_dsl_variants("peers_shared"),
+        # No known public constant for peers_shared yet; if one is added,
+        # extend this list.
+        build_dsl_variants("peers_shared", []),
         {
-            # The sole production writer of peers_shared (InsertOrIgnore).
-            # No production path deletes from peers_shared (removals are
-            # implemented via removed_entities rows, not peers_shared deletes).
             "src/event_modules/peer_shared/projector.rs",
         },
     ),
@@ -351,12 +366,14 @@ VARIANT_ALLOW = {
     },
 }
 for method, allowed in VARIANT_ALLOW.items():
-    # For method chains, require a leading ".". For variant constructors,
-    # require the full prefix and a trailing "(" to distinguish from matches.
+    # Use DOTALL so `\s*` spans newlines: a call split across lines like
+    #   WriteOp::InsertKeySecretFromUnwrap
+    #   (todo!())
+    # is still matched.
     if method.startswith("WriteOp::"):
-        pattern = re.compile(r"\b" + re.escape(method) + r"\s*\(")
+        pattern = re.compile(r"\b" + re.escape(method) + r"\s*\(", re.DOTALL)
     else:
-        pattern = re.compile(r"\." + re.escape(method) + r"\s*\(")
+        pattern = re.compile(r"\." + re.escape(method) + r"\s*\(", re.DOTALL)
     for root, dirs, files in os.walk(src_dir):
         dirs[:] = [d for d in dirs if d not in ("target", "vendor")]
         for fname in files:
@@ -368,8 +385,23 @@ for method, allowed in VARIANT_ALLOW.items():
                 continue
             with open(fpath, encoding="utf-8", errors="replace") as f:
                 text = f.read()
-            # Also skip cfg(test) mod tests { ... } regions via a quick line check.
-            lines = text.splitlines(keepends=False)
+            lines = text.splitlines()
+            # Byte-offset → line mapping for whole-file scan.
+            line_starts = [0]
+            running = 0
+            for l in text.splitlines(keepends=True):
+                running += len(l)
+                line_starts.append(running)
+            def offset_to_line(off, _ls=line_starts):
+                lo, hi = 0, len(_ls) - 1
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if _ls[mid] <= off:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                return lo + 1
+            # cfg(test) lineset.
             cfg_test_lines = set()
             in_test_block = False
             test_brace_depth = 0
@@ -399,34 +431,37 @@ for method, allowed in VARIANT_ALLOW.items():
                         in_test_block = False
                         test_brace_depth = 0
                     continue
-            for lineno, line in enumerate(lines, 1):
+            # Whole-file scan with DOTALL patterns.
+            for m in pattern.finditer(text):
+                lineno = offset_to_line(m.start())
                 if lineno in cfg_test_lines:
                     continue
-                m = pattern.search(line)
-                if not m:
-                    continue
                 # Skip matches inside line comments.
-                pre = line[: m.start()]
-                if "//" in pre:
+                ls_prev = line_starts[lineno - 1]
+                # Check for a `//` earlier on the same line.
+                pre_on_line = text[ls_prev:m.start()]
+                if "//" in pre_on_line:
                     continue
-                # Skip pattern-match arms: `WriteOp::InsertX(row) => ...`
-                # and or-patterns like `WriteOp::InsertX(r) | WriteOp::InsertY(r) => ...`.
-                # These are destructuring, not construction.
-                post = line[m.start():]
-                if " => " in post or post.rstrip().endswith("=>"):
-                    continue
-                # Skip an or-pattern continuation where the arrow is on the
-                # next line or two — find the match arm by looking ahead
-                # a few lines. Conservative: if any of the next 2 non-comment
-                # lines contains ` => `, treat as pattern match.
-                ahead_hits_arrow = False
-                for ahead in lines[lineno : min(lineno + 2, len(lines))]:
-                    if "//" in ahead.strip()[:2]:
-                        continue
-                    if " => " in ahead:
-                        ahead_hits_arrow = True
-                        break
-                if ahead_hits_arrow:
+                # Skip pattern-match arms. Look ahead a small window after
+                # the match for ` => ` (which destructuring match arms use);
+                # scan the next ~5 lines worth of text (enough to cover
+                # multi-line or-patterns in the apply executor).
+                ahead_end = min(m.end() + 400, len(text))
+                ahead_window = text[m.end():ahead_end]
+                if " => " in ahead_window.split("\n", 6)[0:6].__str__():
+                    # Check if any of the next ~6 lines has an arrow before
+                    # a `;` or block close. Safer than a substring check.
+                    pass
+                # Simpler: count arrow vs semicolon positions in the ahead
+                # window. If arrow appears before any `;`, treat as pattern.
+                arrow_pos = ahead_window.find("=>")
+                semi_pos = ahead_window.find(";")
+                brace_close_pos = ahead_window.find("}")
+                # Earliest terminator.
+                terminator = min(
+                    p for p in [semi_pos, brace_close_pos] if p != -1
+                ) if (semi_pos != -1 or brace_close_pos != -1) else len(ahead_window)
+                if arrow_pos != -1 and arrow_pos < terminator:
                     continue
                 if rel not in allowed:
                     errors.append(
