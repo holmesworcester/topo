@@ -209,23 +209,30 @@ for root, dirs, files in os.walk(src_dir):
 # non-greedy body match stays within a single struct literal so a later
 # WriteOp construction in the same file doesn't spuriously match across
 # struct boundaries.
-def build_dsl_variants(table_name, constant_refs):
+def build_dsl_variants(table_name, constant_refs, helper_calls):
     """Return regexes for BOTH InsertOrIgnore and Delete targeting this table.
     Deletes are banned identically: no production projector should construct a
     Delete on access-control-critical tables outside the allow-list.
 
     `constant_refs` is a list of identifiers whose values resolve to the
-    target table at runtime (e.g. `KEY_SECRETS_TABLE`). The regex matches
-    either the string literal OR any of the listed constants — so a bypass
-    like `WriteOp::InsertOrIgnore { table: KEY_SECRETS_TABLE, ... }` is
-    caught as well as `table: "key_secrets"`.
+    target table at runtime (e.g. `KEY_SECRETS_TABLE`).
+
+    `helper_calls` is a list of function names that return the target table's
+    name at runtime (e.g. `required_valid_table_name`). These are matched as
+    function-call expressions — a bypass like
+    `WriteOp::InsertOrIgnore { table: required_valid_table_name(), ... }` is
+    caught the same way as the string literal.
     """
-    # Build alternation group: "table_name" | CONST1 | CONST2 | ...
-    # Each const is matched as an identifier with optional path qualifiers
-    # (e.g., `key_shared::KEY_SECRETS_TABLE` or just `KEY_SECRETS_TABLE`).
+    # Build alternation group: "table_name" | CONST | helper() | ...
+    # Each const/call is matched with optional `::`-qualified path prefixes
+    # (e.g., `key_shared::KEY_SECRETS_TABLE`, `some::path::helper()`).
     alternatives = [r'"' + table_name + r'"']
     for c in constant_refs:
         alternatives.append(r'(?:[A-Za-z_][A-Za-z0-9_]*::)*' + re.escape(c))
+    for h in helper_calls:
+        alternatives.append(
+            r'(?:[A-Za-z_][A-Za-z0-9_]*::)*' + re.escape(h) + r'\s*\('
+        )
     table_group = r'(?:' + r'|'.join(alternatives) + r')'
     return [
         re.compile(
@@ -242,15 +249,25 @@ dsl_patterns = {
     "key_secrets": (
         # KEY_SECRETS_TABLE is a constant in key_shared.rs; match it as an
         # alternative so a `table: KEY_SECRETS_TABLE` bypass is caught.
-        build_dsl_variants("key_secrets", ["KEY_SECRETS_TABLE"]),
-        # Empty allow set: untyped key_secrets DSL ops (insert OR delete) are
-        # categorically forbidden; the typed variant is the only construction path.
+        # No helper call currently returns this table name; if one is added,
+        # extend the third argument.
+        build_dsl_variants(
+            "key_secrets",
+            ["KEY_SECRETS_TABLE"],
+            [],
+        ),
         set(),
     ),
     "peers_shared": (
-        # No known public constant for peers_shared yet; if one is added,
-        # extend this list.
-        build_dsl_variants("peers_shared", []),
+        # `required_valid_table_name()` in verus-proofs (via the peer_shared
+        # seam) returns "peers_shared"; the peer_shared projector already
+        # uses this helper. Any OTHER file calling it inside a WriteOp
+        # construction would be a bypass, caught here.
+        build_dsl_variants(
+            "peers_shared",
+            [],
+            ["required_valid_table_name"],
+        ),
         {
             "src/event_modules/peer_shared/projector.rs",
         },
