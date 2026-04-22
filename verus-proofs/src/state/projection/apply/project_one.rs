@@ -144,4 +144,23 @@ pub fn project_one_with_cascade(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Note: `WriteCapability` is a Rust-type-system gate, not an SMT
+// invariant.
+//
+// The runtime's `ProjectionBackend` trait requires `&WriteCapability`
+// on every mutating method (`execute_write_ops`, `execute_emit_commands`,
+// `record_rejection`, `record_block`, `mark_guard_blocked`,
+// `finalize_valid_projection`). The token's constructor is
+// `pub(in crate::state::projection::apply)` — only the apply module
+// can mint one. Consequently, no call site outside the apply module
+// can drive a mutating backend method; the sole-writer property is
+// enforced at compile time by Rust's visibility system.
+//
+// No Verus mirror is required because the obligation is discharged
+// entirely by the type declarations. This note documents the trust
+// boundary at the expected location (apply/project_one is where the
+// gate is minted and threaded); no proof fn is added because there
+// is no structural property to SMT-check.
+
 } // verus!

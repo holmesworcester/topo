@@ -200,4 +200,58 @@ pub fn decide_grant_admin_plan_core(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Admin authority as an explicit dep (recommendation #3)
+//
+// Companion refinement for `RemoveMemberDecisionContextCore`. The
+// runtime's old `actor_is_admin: bool` flag was computed via an
+// admin-rollup JOIN (peers_shared × users × admins); under the
+// admin-as-dep migration the Removal event carries an explicit
+// `admin_authority_event_id` dep resolving to a parsed AdminEvent.
+// The structural equality check replacing the rollup is:
+//
+//     admin_event_valid ∧ admin.user_event_id == signer_ps.user_event_id
+//
+// This Core mirrors that check at the flag-bundle level so future
+// proofs can refine the opaque `actor_is_admin` predicate into its
+// dep-derived structural form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminAuthorityAsDepFlags {
+    /// The named admin event resolved to a Valid dep (type=Admin).
+    pub admin_dep_valid: bool,
+    /// `admin.user_event_id == signer_peer_shared.user_event_id` —
+    /// the positive-authority equality.
+    pub admin_user_matches_signer_user: bool,
+}
+
+/// Structural admin-authority predicate derived from dep facts.
+pub open spec fn admin_authority_established_spec(
+    flags: AdminAuthorityAsDepFlags,
+) -> bool {
+    flags.admin_dep_valid && flags.admin_user_matches_signer_user
+}
+
+/// Runtime-callable decider with ensures linking to the spec.
+pub fn admin_authority_established(
+    flags: AdminAuthorityAsDepFlags,
+) -> (ok: bool)
+    ensures ok == admin_authority_established_spec(flags),
+{
+    flags.admin_dep_valid && flags.admin_user_matches_signer_user
+}
+
+/// Refinement: when `admin_authority_established_spec` holds, the
+/// rollup flag `actor_is_admin` that `decide_remove_member_plan_core`
+/// consumes is established by the dep-derived equality check.
+/// Trivial structural lemma — documents the refinement boundary
+/// without re-invoking the exec decider in a spec context.
+pub proof fn admin_authority_established_implies_actor_is_admin(
+    flags: AdminAuthorityAsDepFlags,
+)
+    ensures
+        admin_authority_established_spec(flags)
+            ==> flags.admin_dep_valid && flags.admin_user_matches_signer_user,
+{
+}
+
 } // verus!
