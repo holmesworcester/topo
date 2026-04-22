@@ -247,12 +247,19 @@ fn rotation_frontier_by_key_event_id(
     key_event_id: &EventId,
 ) -> KeyRepairResult<Option<RotationFrontier>> {
     let key_event_id_b64 = event_id_to_base64(key_event_id);
+    // `key_event_id` is the deterministic KeySecret event_id used by
+    // encrypted wrappers. Match against `key_rotations.key_event_id` first
+    // (populated when the local tenant had unwrapped material at rotation
+    // projection time). Fall back to the `key_shared` table for peers that
+    // received a key_shared event whose `key_event_id` field encodes the
+    // KeySecret id but whose own `key_rotations.key_event_id` still carries
+    // the legacy rotation-event-id fallback.
     let row: Option<(i64, String, String, String, String, String)> = conn
         .query_row(
             "SELECT frontier_count, frontier_ref_1, frontier_ref_2, frontier_ref_3, frontier_ref_4, frontier_hash
              FROM key_rotations
              WHERE recorded_by = ?1
-               AND event_id = ?2
+               AND key_event_id = ?2
              LIMIT 1",
             rusqlite::params![recorded_by, &key_event_id_b64],
             |row| {
@@ -267,6 +274,31 @@ fn rotation_frontier_by_key_event_id(
             },
         )
         .optional()?;
+    let row = if row.is_some() {
+        row
+    } else {
+        conn
+            .query_row(
+                "SELECT frontier_count, frontier_ref_1, frontier_ref_2, frontier_ref_3, frontier_ref_4, frontier_hash
+                 FROM key_shared
+                 WHERE recorded_by = ?1
+                   AND key_event_id = ?2
+                 ORDER BY rowid ASC
+                 LIMIT 1",
+                rusqlite::params![recorded_by, &key_event_id_b64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        crate::db::sql_types::get_text(row, 1)?,
+                        crate::db::sql_types::get_text(row, 2)?,
+                        crate::db::sql_types::get_text(row, 3)?,
+                        crate::db::sql_types::get_text(row, 4)?,
+                        crate::db::sql_types::get_text(row, 5)?,
+                    ))
+                },
+            )
+            .optional()?
+    };
     let Some((frontier_count, ref1, ref2, ref3, ref4, frontier_hash_b64)) = row else {
         return Ok(None);
     };
@@ -386,45 +418,99 @@ fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> KeyRepairResu
         if has_local_key_material(&conn, recorded_by, &key_event_id)? {
             continue;
         }
-        let Some(frontier) = rotation_frontier_by_key_event_id(&conn, recorded_by, &key_event_id)? else {
+        // Try direct lookup first; if that fails (non-material peer whose
+        // local rotation rows still carry the legacy fallback key_event_id),
+        // emit a request for every known rotation frontier so the sender can
+        // answer with the matching key_shared.
+        let frontiers =
+            if let Some(frontier) = rotation_frontier_by_key_event_id(&conn, recorded_by, &key_event_id)? {
+                vec![frontier]
+            } else {
+                all_local_rotation_frontiers(&conn, recorded_by)?
+            };
+        if frontiers.is_empty() {
             continue;
-        };
-        let target_id = delivery_target_id(
-            &key_event_id,
-            &frontier.frontier_hash,
-            &recipient_event_id,
-            &unwrap_key_event_id,
-        );
-        let request = ParsedEvent::KeyRequest(KeyRequestEvent {
-            created_at_ms,
-            blocked_event_id,
-            key_event_id,
-            frontier_hash: frontier.frontier_hash,
-            delivery_target_id: target_id,
-            recipient_event_id,
-            unwrap_key_event_id,
-        });
-        let event_id =
-            signed_event_id(&request, &authoring.signer_event_id, &authoring.signing_key)?;
-        let event_id_b64 = event_id_to_base64(&event_id);
-        let existed_before: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
-            rusqlite::params![&event_id_b64],
-            |row| row.get(0),
-        )?;
-        let _ = create_signed_event(
-            &conn,
-            recorded_by,
-            &authoring.signer_event_id,
-            &request,
-            &authoring.signing_key,
-        )?;
-        if !existed_before {
-            emitted = emitted.saturating_add(1);
+        }
+        for frontier in frontiers {
+            let target_id = delivery_target_id(
+                &key_event_id,
+                &frontier.frontier_hash,
+                &recipient_event_id,
+                &unwrap_key_event_id,
+            );
+            let request = ParsedEvent::KeyRequest(KeyRequestEvent {
+                created_at_ms,
+                blocked_event_id,
+                key_event_id,
+                frontier_hash: frontier.frontier_hash,
+                delivery_target_id: target_id,
+                recipient_event_id,
+                unwrap_key_event_id,
+            });
+            let event_id =
+                signed_event_id(&request, &authoring.signer_event_id, &authoring.signing_key)?;
+            let event_id_b64 = event_id_to_base64(&event_id);
+            let existed_before: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+                rusqlite::params![&event_id_b64],
+                |row| row.get(0),
+            )?;
+            let _ = create_signed_event(
+                &conn,
+                recorded_by,
+                &authoring.signer_event_id,
+                &request,
+                &authoring.signing_key,
+            )?;
+            if !existed_before {
+                emitted = emitted.saturating_add(1);
+            }
         }
     }
 
     Ok(emitted)
+}
+
+fn all_local_rotation_frontiers(
+    conn: &Connection,
+    recorded_by: &str,
+) -> KeyRepairResult<Vec<RotationFrontier>> {
+    let mut stmt = conn.prepare(
+        "SELECT frontier_count, frontier_ref_1, frontier_ref_2, frontier_ref_3, frontier_ref_4, frontier_hash
+         FROM key_rotations
+         WHERE recorded_by = ?1
+         ORDER BY rowid ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_text(row, 2)?,
+            crate::db::sql_types::get_text(row, 3)?,
+            crate::db::sql_types::get_text(row, 4)?,
+            crate::db::sql_types::get_text(row, 5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (frontier_count, ref1, ref2, ref3, ref4, frontier_hash_b64) = row?;
+        let frontier_refs = frontier_refs_from_slots(
+            frontier_count as u8,
+            &[
+                decode_frontier_slot(&ref1)?,
+                decode_frontier_slot(&ref2)?,
+                decode_frontier_slot(&ref3)?,
+                decode_frontier_slot(&ref4)?,
+            ],
+        )?;
+        let frontier_hash = event_id_from_base64(&frontier_hash_b64)
+            .ok_or("invalid key_rotation.frontier_hash")?;
+        out.push(RotationFrontier {
+            frontier_hash,
+            frontier_refs,
+        });
+    }
+    Ok(out)
 }
 
 fn emit_key_shared_responses_for_peer(

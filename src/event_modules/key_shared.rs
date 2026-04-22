@@ -229,22 +229,23 @@ pub fn project_pure(
         None => return ProjectorResult::valid(ops),
     };
 
-    ops.push(WriteOp::InsertOrIgnore {
-        table: "key_secrets",
-        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-        values: vec![
-            SqlVal::Text(event_id_to_base64(&ss.key_event_id)),
-            SqlVal::Blob(material.key_bytes.to_vec()),
-            SqlVal::Int(ss.created_at_ms as i64),
-            SqlVal::Text(recorded_by.to_string()),
-        ],
-    });
-
+    // Emit the deterministic KeySecret blob through the normal event
+    // pipeline. The KeySecret projector writes `key_secrets` and the
+    // encrypted wrapper dep resolves on the KeySecret event_id.
+    let sk_event = crate::event_modules::key_secret::deterministic_key_secret_event(
+        material.key_bytes,
+    );
+    let sk_blob = match crate::event_modules::encode_event(&sk_event) {
+        Ok(blob) => blob,
+        Err(err) => {
+            return ProjectorResult::reject(format!(
+                "failed to encode deterministic key_secret: {err}"
+            ));
+        }
+    };
     ProjectorResult::valid_with_commands(
         ops,
-        vec![EmitCommand::RetryBlockedEncryptedByKey {
-            key_event_id: event_id_to_base64(&ss.key_event_id),
-        }],
+        vec![EmitCommand::EmitDeterministicBlob { blob: sk_blob }],
     )
 }
 
