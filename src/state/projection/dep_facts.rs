@@ -1458,6 +1458,126 @@ pub fn decide_message_deletion(
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// File
+//
+// File projection currently has no dep-derived semantic gate and
+// no ambient-state guard: the context loader is a pass-through.
+// The empty DepFacts/GuardFacts pair is here for *uniformity* with
+// the other migrated projectors so call sites look identical.
+// Future work may migrate the File-owner / message authorization
+// checks into these bundles.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct FileDepFacts {}
+
+#[derive(Debug, Clone, Default)]
+pub struct FileGuardFacts {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileDecision {
+    /// Projection proceeds with the default (empty) context. File's
+    /// pure decision today has no reject arms at the context-load
+    /// layer — downstream projector dispatch handles semantics.
+    Ready,
+}
+
+pub fn decide_file(
+    _event: &crate::event_modules::FileEvent,
+    _deps: &FileDepFacts,
+    _guards: &FileGuardFacts,
+) -> FileDecision {
+    FileDecision::Ready
+}
+
+// ─────────────────────────────────────────────────────────────
+// FileSlice
+//
+// FileSlice authorization reads three ambient rollups (all over
+// already-projected tables):
+//
+//   * `files` rows for the slice's `file_id`          — the set of
+//     file descriptors carrying the authorizing signer / key / bao
+//     root hash / slice size. The file_slice projector fans out
+//     authorization across these descriptors.
+//
+//   * `file_slices` row for `(file_id, slice_number)` — the
+//     existing slice at the slot, if any, for idempotent re-project
+//     / conflict diagnostics.
+//
+//   * `deleted_messages` join     — if the enclosing encrypted
+//     wrapper's owner message is tombstoned, or any descriptor's
+//     owning message is tombstoned, the slice must be purged rather
+//     than stored.
+//
+// The encrypted-wrapper owner lives on `frame.current_owner_event_id`
+// (same ambient-frame pattern as `resolve_signer_from_frame`). For
+// now the owner is surfaced on GuardFacts verbatim — full dep-ification
+// is a later migration.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct FileSliceDepFacts {}
+
+/// Ambient-state guard bundle for FileSlice projection.
+///
+/// All three fields are rollups over previously-projected tables.
+/// `purge_owner_event_id` captures the owner-deleted guard (before
+/// any descriptor-deleted sweep); `purge_message_event_id` in the
+/// materialized `ProjectorDecisionContext` is the *winner* of the
+/// owner/descriptor race, chosen by `decide_file_slice`.
+#[derive(Debug, Clone, Default)]
+pub struct FileSliceGuardFacts {
+    /// Outer encrypted-wrapper owner event_id (from `frame.current_owner_event_id`),
+    /// if present and currently tombstoned in `deleted_messages`.
+    ///
+    /// Carrying the owner id verbatim (not the full frame field) keeps
+    /// `decide_file_slice` decoupled from the frame structure while
+    /// preserving the owner-wins purge order.
+    pub purge_owner_event_id: Option<String>,
+    /// File descriptor rollup for `file_id`, ordered by created_at ASC
+    /// then event_id ASC (matches previous SQL).
+    pub file_descriptors: Vec<crate::projection::projector::FileDescriptorInfo>,
+    /// `(event_id, descriptor_event_id)` for a previously projected
+    /// slice occupying this `(file_id, slice_number)` slot, if any.
+    pub existing_file_slice: Option<(String, String)>,
+    /// First descriptor whose `message_id` is tombstoned in
+    /// `deleted_messages`, if any — ordered the same way as
+    /// `file_descriptors` so the "first hit" is deterministic.
+    pub purge_descriptor_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileSliceDecision {
+    Ready {
+        purge_message_event_id: Option<String>,
+    },
+}
+
+/// Pure FileSlice decision.
+///
+/// Today the decision's only output is *which* purge id (owner vs.
+/// descriptor-owning message) to surface, if any. The chosen order
+/// matches the previous SQL: owner-deleted wins over descriptor-
+/// deleted, and the first descriptor hit is chosen in iteration
+/// order. Everything else — authorization against `file_descriptors`,
+/// existing-slice conflict handling — is performed by the projector
+/// dispatch layer off the materialized `ProjectorDecisionContext`.
+pub fn decide_file_slice(
+    _event: &crate::event_modules::FileSliceEvent,
+    _deps: &FileSliceDepFacts,
+    guards: &FileSliceGuardFacts,
+) -> FileSliceDecision {
+    let purge_message_event_id = guards
+        .purge_owner_event_id
+        .clone()
+        .or_else(|| guards.purge_descriptor_message_id.clone());
+    FileSliceDecision::Ready {
+        purge_message_event_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2416,6 +2536,89 @@ mod tests {
                 assert!(bootstrap_context.is_none());
             }
             other => panic!("expected Ready, got {:?}", other),
+        }
+    }
+
+    // ── File pilot ────────────────────────────────────────────
+
+    fn file_event() -> crate::event_modules::FileEvent {
+        crate::event_modules::FileEvent {
+            created_at_ms: 0,
+            message_id: [1u8; 32],
+            file_id: [2u8; 32],
+            blob_bytes: 1024,
+            total_slices: 1,
+            slice_bytes: 1024,
+            root_hash: [3u8; 32],
+            key_event_id: [4u8; 32],
+            filename: "test.bin".into(),
+            mime_type: "application/octet-stream".into(),
+        }
+    }
+
+    #[test]
+    fn file_ready_always() {
+        let d = decide_file(&file_event(), &FileDepFacts::default(), &FileGuardFacts::default());
+        assert!(matches!(d, FileDecision::Ready));
+    }
+
+    // ── FileSlice pilot ───────────────────────────────────────
+
+    fn file_slice_event() -> crate::event_modules::FileSliceEvent {
+        crate::event_modules::FileSliceEvent {
+            created_at_ms: 0,
+            file_id: [2u8; 32],
+            slice_number: 0,
+            ciphertext: vec![0u8; 32],
+        }
+    }
+
+    #[test]
+    fn file_slice_ready_no_purge_when_nothing_deleted() {
+        let d = decide_file_slice(
+            &file_slice_event(),
+            &FileSliceDepFacts::default(),
+            &FileSliceGuardFacts::default(),
+        );
+        assert!(matches!(
+            d,
+            FileSliceDecision::Ready {
+                purge_message_event_id: None
+            }
+        ));
+    }
+
+    #[test]
+    fn file_slice_owner_purge_wins_over_descriptor_purge() {
+        let guards = FileSliceGuardFacts {
+            purge_owner_event_id: Some("owner-msg".into()),
+            purge_descriptor_message_id: Some("desc-msg".into()),
+            ..Default::default()
+        };
+        let d = decide_file_slice(&file_slice_event(), &FileSliceDepFacts::default(), &guards);
+        match d {
+            FileSliceDecision::Ready {
+                purge_message_event_id,
+            } => {
+                assert_eq!(purge_message_event_id.as_deref(), Some("owner-msg"));
+            }
+        }
+    }
+
+    #[test]
+    fn file_slice_descriptor_purge_used_when_owner_absent() {
+        let guards = FileSliceGuardFacts {
+            purge_owner_event_id: None,
+            purge_descriptor_message_id: Some("desc-msg".into()),
+            ..Default::default()
+        };
+        let d = decide_file_slice(&file_slice_event(), &FileSliceDepFacts::default(), &guards);
+        match d {
+            FileSliceDecision::Ready {
+                purge_message_event_id,
+            } => {
+                assert_eq!(purge_message_event_id.as_deref(), Some("desc-msg"));
+            }
         }
     }
 }
