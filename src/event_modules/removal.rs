@@ -298,45 +298,75 @@ pub fn project_pure(
         .removal_target_kind
         .expect("verified Valid requires removal_target_kind to be Some");
     let removed_member_ref_b64 = event_id_to_base64(&removal.removed_member_ref);
-    ProjectorResult::valid(vec![
-        WriteOp::InsertOrIgnore {
-            table: "removals",
-            columns: vec![
-                "recorded_by",
-                "event_id",
-                "removed_member_ref",
-                "frontier_hash",
-                "parent_count",
-                "parent_1",
-                "parent_2",
-                "parent_3",
-                "parent_4",
-                "remover_signer_event_id",
-            ],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(removed_member_ref_b64.clone()),
-                SqlVal::Text(event_id_to_base64(&removal.frontier_hash)),
-                SqlVal::Int(removal.parent_count as i64),
-                SqlVal::Text(event_id_to_base64(&removal.parent_1)),
-                SqlVal::Text(event_id_to_base64(&removal.parent_2)),
-                SqlVal::Text(event_id_to_base64(&removal.parent_3)),
-                SqlVal::Text(event_id_to_base64(&removal.parent_4)),
-                SqlVal::Text(current_signer.event_id.clone()),
-            ],
-        },
-        WriteOp::InsertOrIgnore {
-            table: "removed_entities",
-            columns: vec!["recorded_by", "event_id", "target_event_id", "removal_type"],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(removed_member_ref_b64),
-                SqlVal::Text(target_kind.as_str().to_string()),
-            ],
-        },
-    ])
+
+    // --- Build write ops; assert structure against the Verus-verified constants
+    // --- so a schema drift (e.g. dropping a column, renaming a table, emitting
+    // --- the wrong number of ops) fails compilation of the debug tests.
+    use topo_verus_proofs::event_modules::removal::{
+        required_removal_op_column_count, required_removal_op_table,
+        required_valid_write_op_count,
+    };
+    let removals_write = WriteOp::InsertOrIgnore {
+        table: required_removal_op_table(0),
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "removed_member_ref",
+            "frontier_hash",
+            "parent_count",
+            "parent_1",
+            "parent_2",
+            "parent_3",
+            "parent_4",
+            "remover_signer_event_id",
+        ],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(removed_member_ref_b64.clone()),
+            SqlVal::Text(event_id_to_base64(&removal.frontier_hash)),
+            SqlVal::Int(removal.parent_count as i64),
+            SqlVal::Text(event_id_to_base64(&removal.parent_1)),
+            SqlVal::Text(event_id_to_base64(&removal.parent_2)),
+            SqlVal::Text(event_id_to_base64(&removal.parent_3)),
+            SqlVal::Text(event_id_to_base64(&removal.parent_4)),
+            SqlVal::Text(current_signer.event_id.clone()),
+        ],
+    };
+    let removed_entities_write = WriteOp::InsertOrIgnore {
+        table: required_removal_op_table(1),
+        columns: vec!["recorded_by", "event_id", "target_event_id", "removal_type"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(removed_member_ref_b64),
+            SqlVal::Text(target_kind.as_str().to_string()),
+        ],
+    };
+    debug_assert_eq!(
+        write_op_column_len(&removals_write) as u8,
+        required_removal_op_column_count(0),
+        "removal op 0: column count drift",
+    );
+    debug_assert_eq!(
+        write_op_column_len(&removed_entities_write) as u8,
+        required_removal_op_column_count(1),
+        "removal op 1: column count drift",
+    );
+    let ops = vec![removals_write, removed_entities_write];
+    debug_assert_eq!(
+        ops.len() as u8,
+        required_valid_write_op_count(RemovalDecisionCore::Valid),
+        "removal Valid must emit exactly 2 write ops",
+    );
+    ProjectorResult::valid(ops)
+}
+
+fn write_op_column_len(op: &WriteOp) -> usize {
+    match op {
+        WriteOp::InsertOrIgnore { columns, .. } => columns.len(),
+        _ => 0,
+    }
 }
 
 define_query_context_loader!(build_projector_context, Removal, load_removal_context, "removal");

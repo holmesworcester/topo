@@ -130,6 +130,69 @@ pub proof fn any_false_flag_rejects(inputs: RemovalAcceptanceInputs)
 {
 }
 
+// ---------------------------------------------------------------------------
+// Step 2: write-op structural invariant.
+//
+// When acceptance is Valid, the runtime emits exactly TWO write ops:
+// one to `removals`, one to `removed_entities`. The table names and column
+// counts are pinned below; the verified count function `required_valid_write_op_count`
+// enforces "exactly 2" at the verified boundary, and `required_removal_op_tables`
+// pins the table names.
+
+/// Count of write ops produced for a Valid removal.
+pub open spec fn required_valid_write_op_count_spec(decision: RemovalDecisionCore) -> nat {
+    if decision == RemovalDecisionCore::Valid { 2 } else { 0 }
+}
+
+pub fn required_valid_write_op_count(decision: RemovalDecisionCore) -> (n: u8)
+    ensures
+        n as nat == required_valid_write_op_count_spec(decision),
+        decision == RemovalDecisionCore::Valid ==> n == 2,
+        decision != RemovalDecisionCore::Valid ==> n == 0,
+{
+    match decision {
+        RemovalDecisionCore::Valid => 2,
+        _ => 0,
+    }
+}
+
+/// Pinned table names for the two Valid write ops, in order.
+/// Index 0 = `removals`, index 1 = `removed_entities`.
+pub open spec fn required_removal_op_table_spec(index: u8) -> &'static str {
+    if index == 0 { "removals" }
+    else if index == 1 { "removed_entities" }
+    else { "" }
+}
+
+pub fn required_removal_op_table(index: u8) -> (name: &'static str)
+    ensures name == required_removal_op_table_spec(index),
+{
+    match index {
+        0 => "removals",
+        1 => "removed_entities",
+        _ => "",
+    }
+}
+
+/// Pinned column count per Valid write op. The `removals` write has 10
+/// columns; the `removed_entities` write has 4. Enforces schema stability
+/// at the verified boundary.
+pub open spec fn required_removal_op_column_count_spec(index: u8) -> nat {
+    if index == 0 { 10 }
+    else if index == 1 { 4 }
+    else { 0 }
+}
+
+pub fn required_removal_op_column_count(index: u8) -> (n: u8)
+    ensures n as nat == required_removal_op_column_count_spec(index),
+{
+    match index {
+        0 => 10,
+        1 => 4,
+        _ => 0,
+    }
+}
+
 /// Reject reason precedence matches the runtime's early-return structure:
 /// the first-false flag determines the reject variant. Locks the reason
 /// ordering into the proof, so reordering runtime checks without updating
