@@ -79,19 +79,21 @@ def is_test_only_file(rel_path: str) -> bool:
         return True
     return False
 
-# Regexes. Each captures the table name in group 2.
+# Regexes with DOTALL so multiline SQL literals are caught.
+# `\s+` in Python regex already matches newlines, but we use re.DOTALL
+# to make `.` span newlines if it appears. Each captures the table name.
 patterns = {
     "INSERT": re.compile(
         r"\bINSERT\s+(?:OR\s+(?:IGNORE|REPLACE|ROLLBACK|ABORT|FAIL)\s+)?INTO\s+(" + "|".join(sorted(TABLES)) + r")\b",
-        re.IGNORECASE,
+        re.IGNORECASE | re.DOTALL,
     ),
     "UPDATE": re.compile(
         r"\bUPDATE\s+(" + "|".join(sorted(TABLES)) + r")\b",
-        re.IGNORECASE,
+        re.IGNORECASE | re.DOTALL,
     ),
     "DELETE": re.compile(
         r"\bDELETE\s+FROM\s+(" + "|".join(sorted(TABLES)) + r")\b",
-        re.IGNORECASE,
+        re.IGNORECASE | re.DOTALL,
     ),
 }
 
@@ -113,20 +115,43 @@ for root, dirs, files in os.walk(src_dir):
             continue
 
         with open(fpath, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+            text = f.read()
 
-        # Brace-depth #[cfg(test)] skipping.
+        # Build a (byte-offset-start, byte-offset-end-exclusive) set for
+        # cfg(test) regions so multiline matches can be filtered.
+        lines = text.splitlines(keepends=True)
+        line_starts = [0]
+        running = 0
+        for l in lines:
+            running += len(l)
+            line_starts.append(running)
+
+        def line_to_offset_range(lineno):
+            # lineno is 1-based; returns (start, end) byte range for that line.
+            i = lineno - 1
+            if i < 0 or i >= len(lines):
+                return (0, 0)
+            return (line_starts[i], line_starts[i + 1])
+
+        def offset_to_line(off):
+            lo, hi = 0, len(line_starts) - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if line_starts[mid] <= off:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo + 1
+
+        cfg_test_lineset = set()
         in_test_block = False
         test_brace_depth = 0
         cfg_test_pending = False
-
         for lineno, line in enumerate(lines, 1):
             stripped = line.strip()
-
             if "#[cfg(test)]" in stripped:
                 cfg_test_pending = True
                 continue
-
             if cfg_test_pending and "{" in stripped and (
                 stripped.startswith("mod ")
                 or stripped.startswith("fn ")
@@ -142,25 +167,32 @@ for root, dirs, files in os.walk(src_dir):
                     in_test_block = False
                     test_brace_depth = 0
                 continue
-
             if in_test_block:
                 test_brace_depth += stripped.count("{") - stripped.count("}")
+                cfg_test_lineset.add(lineno)
                 if test_brace_depth <= 0:
                     in_test_block = False
                     test_brace_depth = 0
-                continue
 
-            for op, pat in patterns.items():
-                m = pat.search(line)
-                if m:
-                    table = m.group(1).lower()
-                    if rel in ALLOWED_WRITERS:
-                        ok_count += 1
-                        print(f"OK: {op} {table} at {rel}:{lineno}")
-                    else:
-                        errors.append(
-                            f"ERROR: {op} on projection-tracked table '{table}' at {rel}:{lineno}: {line.rstrip()}"
-                        )
+        # Scan the WHOLE FILE with DOTALL-aware patterns, so multiline
+        # SQL literals (e.g., split across string concatenation or raw
+        # string literals) don't slip past.
+        for op, pat in patterns.items():
+            for m in pat.finditer(text):
+                lineno = offset_to_line(m.start())
+                if lineno in cfg_test_lineset:
+                    continue
+                table = m.group(1).lower()
+                snippet = text[m.start():m.end()].replace("\n", " \\n ")
+                if len(snippet) > 160:
+                    snippet = snippet[:160] + "..."
+                if rel in ALLOWED_WRITERS:
+                    ok_count += 1
+                    print(f"OK: {op} {table} at {rel}:{lineno}")
+                else:
+                    errors.append(
+                        f"ERROR: {op} on projection-tracked table '{table}' at {rel}:{lineno}: {snippet}"
+                    )
 
 # Second pass: forbid DSL-level access-control-critical table writes
 # through the generic `WriteOp::InsertOrIgnore { ... table: "<table>", ... }`
@@ -177,23 +209,34 @@ for root, dirs, files in os.walk(src_dir):
 # non-greedy body match stays within a single struct literal so a later
 # WriteOp construction in the same file doesn't spuriously match across
 # struct boundaries.
-dsl_patterns = {
-    "key_secrets": (
+def build_dsl_variants(table_name):
+    """Return regexes for BOTH InsertOrIgnore and Delete targeting this table.
+    Deletes are banned identically: no production projector should construct a
+    Delete on access-control-critical tables outside the allow-list."""
+    return [
         re.compile(
-            r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*"key_secrets"',
+            r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*"' + table_name + r'"',
             re.DOTALL,
         ),
-        # Empty allow set: untyped key_secrets writes are categorically
-        # forbidden; the typed variant is the only path.
+        re.compile(
+            r'WriteOp::Delete\s*\{[^}]*?table\s*:\s*"' + table_name + r'"',
+            re.DOTALL,
+        ),
+    ]
+
+dsl_patterns = {
+    "key_secrets": (
+        build_dsl_variants("key_secrets"),
+        # Empty allow set: untyped key_secrets DSL ops (insert OR delete) are
+        # categorically forbidden; the typed variant is the only construction path.
         set(),
     ),
     "peers_shared": (
-        re.compile(
-            r'WriteOp::InsertOrIgnore\s*\{[^}]*?table\s*:\s*"peers_shared"',
-            re.DOTALL,
-        ),
+        build_dsl_variants("peers_shared"),
         {
-            # The sole production writer of peers_shared.
+            # The sole production writer of peers_shared (InsertOrIgnore).
+            # No production path deletes from peers_shared (removals are
+            # implemented via removed_entities rows, not peers_shared deletes).
             "src/event_modules/peer_shared/projector.rs",
         },
     ),
@@ -258,20 +301,21 @@ for root, dirs, files in os.walk(src_dir):
                     in_test_block = False
                     test_brace_depth = 0
                 continue
-        for table_name, (pat, allowed_writers) in dsl_patterns.items():
-            for m in pat.finditer(text):
-                start_line = offset_to_line(m.start())
-                if start_line in cfg_test_range:
-                    continue
-                if rel in allowed_writers:
-                    continue
-                snippet = text[m.start():m.end()].replace("\n", " \\n ")
-                if len(snippet) > 160:
-                    snippet = snippet[:160] + "..."
-                errors.append(
-                    f"ERROR: DSL-level {table_name} construction via WriteOp::InsertOrIgnore "
-                    f"at {rel}:{start_line}: {snippet}"
-                )
+        for table_name, (pats, allowed_writers) in dsl_patterns.items():
+            for pat in pats:
+                for m in pat.finditer(text):
+                    start_line = offset_to_line(m.start())
+                    if start_line in cfg_test_range:
+                        continue
+                    if rel in allowed_writers:
+                        continue
+                    snippet = text[m.start():m.end()].replace("\n", " \\n ")
+                    if len(snippet) > 160:
+                        snippet = snippet[:160] + "..."
+                    errors.append(
+                        f"ERROR: DSL-level {table_name} mutation (InsertOrIgnore or Delete) "
+                        f"at {rel}:{start_line}: {snippet}"
+                    )
 
 # Third pass: enforce per-variant constructor scope.
 #   - InsertKeySecretFromUnwrap: only emitted by unwrap-gated projectors.
