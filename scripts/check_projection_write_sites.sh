@@ -276,10 +276,14 @@ for root, dirs, files in os.walk(src_dir):
 # Third pass: enforce per-variant constructor scope.
 #   - InsertKeySecretFromUnwrap: only emitted by unwrap-gated projectors.
 #   - InsertKeySecretLocal: only emitted by the local-peer key_secret projector.
-# Any other file constructing these variants directly is a rule violation:
-# the variant's access-control semantics is determined by the emitting file,
-# so we pin which file is allowed to use which constructor method.
+# Any other file constructing these variants is a rule violation.
+# Two construction routes are checked:
+#   (a) The typed method chain: `KeySecretsRow::new(...).to_write_op_*()`.
+#   (b) Direct variant construction: `WriteOp::InsertKeySecret*(...)`.
+# Both must be restricted to the allow-list; otherwise a rogue module could
+# call the tuple variant constructor directly and bypass the method gate.
 VARIANT_ALLOW = {
+    # Method-chain constructors.
     "to_write_op_from_unwrap": {
         "src/event_modules/key_shared.rs",
         "src/event_modules/key_rotation.rs",
@@ -288,9 +292,27 @@ VARIANT_ALLOW = {
     "to_write_op_local": {
         "src/event_modules/key_secret.rs",
     },
+    # Direct variant constructors. These are public enum variants so the
+    # type system can't hide them; the gate has to.
+    "WriteOp::InsertKeySecretFromUnwrap": {
+        # The typed method chain lives here and uses direct construction.
+        "src/event_modules/key_shared.rs",
+        # The apply executor matches on the variant but never constructs.
+        # The projector.rs file has it in the enum definition; we skip
+        # comment-lines via the `//` check below so the variant declaration
+        # doesn't self-flag.
+    },
+    "WriteOp::InsertKeySecretLocal": {
+        "src/event_modules/key_shared.rs",
+    },
 }
 for method, allowed in VARIANT_ALLOW.items():
-    pattern = re.compile(r"\." + re.escape(method) + r"\s*\(")
+    # For method chains, require a leading ".". For variant constructors,
+    # require the full prefix and a trailing "(" to distinguish from matches.
+    if method.startswith("WriteOp::"):
+        pattern = re.compile(r"\b" + re.escape(method) + r"\s*\(")
+    else:
+        pattern = re.compile(r"\." + re.escape(method) + r"\s*\(")
     for root, dirs, files in os.walk(src_dir):
         dirs[:] = [d for d in dirs if d not in ("target", "vendor")]
         for fname in files:
@@ -342,6 +364,25 @@ for method, allowed in VARIANT_ALLOW.items():
                 # Skip matches inside line comments.
                 pre = line[: m.start()]
                 if "//" in pre:
+                    continue
+                # Skip pattern-match arms: `WriteOp::InsertX(row) => ...`
+                # and or-patterns like `WriteOp::InsertX(r) | WriteOp::InsertY(r) => ...`.
+                # These are destructuring, not construction.
+                post = line[m.start():]
+                if " => " in post or post.rstrip().endswith("=>"):
+                    continue
+                # Skip an or-pattern continuation where the arrow is on the
+                # next line or two — find the match arm by looking ahead
+                # a few lines. Conservative: if any of the next 2 non-comment
+                # lines contains ` => `, treat as pattern match.
+                ahead_hits_arrow = False
+                for ahead in lines[lineno : min(lineno + 2, len(lines))]:
+                    if "//" in ahead.strip()[:2]:
+                        continue
+                    if " => " in ahead:
+                        ahead_hits_arrow = True
+                        break
+                if ahead_hits_arrow:
                     continue
                 if rel not in allowed:
                     errors.append(
