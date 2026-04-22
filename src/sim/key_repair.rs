@@ -68,7 +68,29 @@ pub fn seed_deterministic_key_secret(
         recorded_by,
     )?
     .0;
-    seed_key_rotation_for_recipients(db_path, recorded_by, &[local_recipient_event_id], key_bytes)
+    let _rotation_event_id = seed_key_rotation_for_recipients(
+        db_path,
+        recorded_by,
+        &[local_recipient_event_id],
+        key_bytes,
+    )?;
+    // Encrypted wrappers depend on a KeySecret (type 6), not the rotation.
+    // Locally emit the deterministic KeySecret so the wrapper's key_event_id
+    // dep resolves in valid_events.
+    let conn = open_connection(db_path)?;
+    let sk_event = crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes);
+    let expected =
+        crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
+    let created = crate::projection::create::event_id_or_blocked(
+        crate::projection::create::create_event(&conn, recorded_by, &sk_event),
+    )
+    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
+    if created != expected {
+        return Err(
+            "seed_deterministic_key_secret: key_secret event_id mismatch".into(),
+        );
+    }
+    Ok(created)
 }
 
 pub fn seed_key_rotation_for_recipients(

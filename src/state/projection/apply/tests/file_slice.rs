@@ -343,9 +343,10 @@ fn test_attachment_cascade_unblock() {
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "hello cascade");
     let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
-    let (_sk, sk_blob) =
-        make_self_key_rotation_blob(&conn, &signer_eid, &signing_key, [0xBB; 32]);
-    let sk_eid = crate::crypto::hash_event(&sk_blob);
+    // Post-migration: file descriptors + encrypted wrappers depend on a
+    // KeySecret (type 6), not a KeyRotation. Use the deterministic KeySecret
+    // event_id for this key_bytes.
+    let (sk_eid, sk_blob) = make_deterministic_key_secret_blob([0xBB; 32]);
 
     // Insert attachment first (both deps missing → blocks)
     let (_att, att_blob) = make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &sk_eid);

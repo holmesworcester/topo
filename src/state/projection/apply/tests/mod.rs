@@ -81,19 +81,13 @@ pub(super) fn test_content_key_bytes() -> [u8; 32] {
 
 fn test_content_key_blob() -> &'static Vec<u8> {
     static BLOB: OnceLock<Vec<u8>> = OnceLock::new();
+    // Deterministic KeySecret blob for the fixed test key bytes. Encrypted
+    // dep checks now require the wrapper `key_event_id` to resolve to a
+    // KeySecret event (type 6), not a KeyRotation.
     BLOB.get_or_init(|| {
-        let event = ParsedEvent::KeyRotation(KeyRotationEvent {
-            created_at_ms: TEST_CONTENT_KEY_CREATED_AT_MS,
-            frontier_count: 0,
-            frontier_ref_1: [0u8; 32],
-            frontier_ref_2: [0u8; 32],
-            frontier_ref_3: [0u8; 32],
-            frontier_ref_4: [0u8; 32],
-            frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
-            rotated_by: [0u8; 32],
-            recipient_slots: vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP],
-            wrapped_keys: vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP],
-        });
+        let event = crate::event_modules::key_secret::deterministic_key_secret_event(
+            test_content_key_bytes(),
+        );
         events::encode_event(&event).unwrap()
     })
 }
@@ -140,20 +134,11 @@ pub(super) fn ensure_test_content_key(conn: &Connection, recorded_by: &str) -> E
     insert_event(
         conn,
         &key_event_id,
-        "key_rotation",
+        "key_secret",
         key_blob,
-        crate::event_modules::ShareScope::Shared,
+        crate::event_modules::ShareScope::Local,
         TEST_CONTENT_KEY_CREATED_AT_MS as i64,
         ts,
-    )
-    .unwrap();
-    insert_shared_event_index_entry_if_shared(
-        conn,
-        crate::event_modules::ShareScope::Shared,
-        TEST_CONTENT_KEY_CREATED_AT_MS as i64,
-        &key_event_id,
-        "",
-        key_blob,
     )
     .unwrap();
     insert_recorded_event(conn, recorded_by, &key_event_id, ts, "test").unwrap();
@@ -161,28 +146,8 @@ pub(super) fn ensure_test_content_key(conn: &Connection, recorded_by: &str) -> E
         conn,
         recorded_by,
         &key_event_id,
-        crate::event_modules::EVENT_TYPE_KEY_ROTATION,
+        crate::event_modules::EVENT_TYPE_KEY_SECRET,
     );
-    let key_event_id_b64 = event_id_to_base64(&key_event_id);
-    let frontier_hash_b64 =
-        event_id_to_base64(&crate::event_modules::removal::frontier_hash_from_refs(&[]));
-    let zero_b64 = event_id_to_base64(&[0u8; 32]);
-    conn.execute(
-        "INSERT OR IGNORE INTO key_rotations (
-             recorded_by,
-             event_id,
-             key_event_id,
-             frontier_hash,
-             frontier_count,
-             frontier_ref_1,
-             frontier_ref_2,
-             frontier_ref_3,
-             frontier_ref_4,
-             rotator_signer_event_id
-         ) VALUES (?1, ?2, ?2, ?3, 0, ?4, ?4, ?4, ?4, ?4)",
-        rusqlite::params![recorded_by, &key_event_id_b64, &frontier_hash_b64, &zero_b64],
-    )
-    .unwrap();
     conn.execute(
         "INSERT OR IGNORE INTO key_secrets (event_id, key_bytes, created_at, recorded_by)
          VALUES (?1, ?2, ?3, ?4)",
@@ -816,6 +781,16 @@ pub(super) fn make_key_secret(key_bytes: [u8; 32]) -> (ParsedEvent, Vec<u8>) {
     (sk, blob)
 }
 
+/// Deterministic KeySecret blob (stable event_id per `key_bytes`). Use when
+/// tests need to reference the KeySecret event_id before inserting the blob
+/// (e.g. cascade tests that insert and project in staged order).
+pub(super) fn make_deterministic_key_secret_blob(key_bytes: [u8; 32]) -> (EventId, Vec<u8>) {
+    let event = crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes);
+    let blob = events::encode_event(&event).unwrap();
+    let eid = crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
+    (eid, blob)
+}
+
 pub(super) fn make_self_key_rotation_blob(
     conn: &Connection,
     signer_event_id: &EventId,
@@ -857,7 +832,43 @@ pub(super) fn insert_and_project_self_key_rotation(
     key_bytes: [u8; 32],
 ) -> EventId {
     let (_event, blob) = make_self_key_rotation_blob(conn, signer_event_id, signing_key, key_bytes);
-    let event_id = insert_event_raw(conn, recorded_by, &blob);
+    let rotation_event_id = insert_event_raw(conn, recorded_by, &blob);
+    let decision = project_one(conn, recorded_by, &rotation_event_id).unwrap();
+    assert_eq!(decision, ProjectionDecision::Valid);
+    // Post-migration: encrypted events depend on a KeySecret (type 6), not a
+    // KeyRotation. Emit and project the deterministic KeySecret whose event_id
+    // callers use as the wrapper `key_event_id`.
+    let sk_blob = events::encode_event(
+        &crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes),
+    )
+    .unwrap();
+    let key_secret_event_id =
+        crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
+    sk_evt_from_blob(conn, recorded_by, &sk_blob, &key_secret_event_id)
+}
+
+fn sk_evt_from_blob(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+    expected_eid: &EventId,
+) -> EventId {
+    use rusqlite::OptionalExtension;
+    let eid_b64 = event_id_to_base64(expected_eid);
+    let already: Option<String> = conn
+        .query_row(
+            "SELECT event_id FROM events WHERE event_id = ?1",
+            rusqlite::params![&eid_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .optional()
+        .unwrap();
+    if already.is_some() {
+        let _ = project_one(conn, recorded_by, expected_eid).unwrap();
+        return *expected_eid;
+    }
+    let event_id = insert_event_raw(conn, recorded_by, blob);
+    assert_eq!(event_id, *expected_eid);
     let decision = project_one(conn, recorded_by, &event_id).unwrap();
     assert_eq!(decision, ProjectionDecision::Valid);
     event_id

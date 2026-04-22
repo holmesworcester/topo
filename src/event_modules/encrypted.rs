@@ -2,7 +2,7 @@ use super::layout::common::{
     encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_AUTH_TAG_BYTES,
 };
 use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_ENCRYPTED};
+use super::{EventError, ParsedEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_KEY_SECRET, EVENT_TYPE_MESSAGE};
 
 // ─── Layout (owned by this module) ───
 
@@ -194,7 +194,7 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     projection_table: "",
     share_scope: ShareScope::Shared,
     dep_fields: &["key_event_id", "owner_event_id"],
-    dep_field_type_codes: &[&[32], &[1]],
+    dep_field_type_codes: &[&[EVENT_TYPE_KEY_SECRET], &[EVENT_TYPE_MESSAGE]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
