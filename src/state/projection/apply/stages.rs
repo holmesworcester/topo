@@ -6,7 +6,7 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
-use crate::projection::projector::EmitCommand;
+use crate::projection::projector::{EmitCommand, SqlVal, WriteOp};
 use crate::projection::decision_context::{
     decide_semantic_type_plan, normalize_semantic_type, ContextLoadResult, DepLoadResult,
     ProjectionFrameContext, SemanticTypePlan,
@@ -722,6 +722,43 @@ fn apply_projection_frame<B: ProjectionBackend>(
             next_frame,
             envelope_depth + 1,
         )?;
+
+        // Option C: when an Encrypted message projects Valid via a
+        // per-message `message_key` (NOT a legacy direct KeySecret
+        // wrap), record (message_event_id, message_key_event_id) in
+        // the reverse index so MessageDeletion cascade can enumerate
+        // the correct message_key row to purge without needing the
+        // owning_message_event_id in the message_key wire.
+        //
+        // Gate on the key event's own type being `message_key` by
+        // inspecting the first byte of its stored blob (type code).
+        // Legacy PSK flows reference a direct KeySecret instead and
+        // should not populate the reverse index.
+        if matches!(decision, ProjectionDecision::Valid)
+            && matches!(inner_parsed, ParsedEvent::Message(_))
+        {
+            let key_is_message_key = backend
+                .load_blob(&transport_key_event_id_b64)?
+                .as_deref()
+                .and_then(|blob| blob.first().copied())
+                == Some(crate::event_modules::EVENT_TYPE_MESSAGE_KEY);
+            if key_is_message_key {
+                backend.execute_write_ops(&[WriteOp::InsertOrIgnore {
+                    table: "messages_to_message_keys",
+                    columns: vec![
+                        "message_event_id",
+                        "message_key_event_id",
+                        "recorded_by",
+                    ],
+                    values: vec![
+                        SqlVal::Text(event_id_b64.to_string()),
+                        SqlVal::Text(transport_key_event_id_b64.clone()),
+                        SqlVal::Text(recorded_by.to_string()),
+                    ],
+                }])?;
+            }
+        }
+
         let inner = matches!(decision, ProjectionDecision::Valid).then_some(inner_parsed);
         return Ok((decision, inner, suppress_sharing));
     }

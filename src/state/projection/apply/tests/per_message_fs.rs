@@ -90,8 +90,9 @@ fn insert_k_m(conn: &Connection, message_key_event_id_b64: &str, k_m: &[u8; 32])
     .expect("insert K_m");
 }
 
-/// Helper: place a `message_keys` index row so purge's reverse-lookup
-/// finds the message_key bound to a given owning message.
+/// Helper: place a `message_keys` index row + the `messages_to_
+/// message_keys` reverse-index row so purge's enumeration finds the
+/// message_key bound to a given owning message (Option C shape).
 fn insert_message_key_index(
     conn: &Connection,
     message_key_event_id_b64: &str,
@@ -100,17 +101,28 @@ fn insert_message_key_index(
 ) {
     conn.execute(
         "INSERT OR IGNORE INTO message_keys
-             (event_id, bundle_id, owning_message_event_id, created_at_ms, recorded_by)
+             (event_id, bundle_id, k_bundle_local_event_id, created_at_ms, recorded_by)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             message_key_event_id_b64,
             bundle_id_b64,
-            owning_message_event_id_b64,
+            bundle_id_b64,
             0_i64,
             "peer-test",
         ],
     )
     .expect("insert message_keys row");
+    conn.execute(
+        "INSERT OR IGNORE INTO messages_to_message_keys
+             (message_event_id, message_key_event_id, recorded_by)
+         VALUES (?1, ?2, ?3)",
+        params![
+            owning_message_event_id_b64,
+            message_key_event_id_b64,
+            "peer-test",
+        ],
+    )
+    .expect("insert messages_to_message_keys row");
 }
 
 /// Helper: insert a `deleted_messages` durable tombstone so

@@ -108,11 +108,18 @@ fn populate_message(
     .expect("record message");
     conn.execute(
         "INSERT OR IGNORE INTO message_keys
-             (event_id, bundle_id, owning_message_event_id, created_at_ms, recorded_by)
+             (event_id, bundle_id, k_bundle_local_event_id, created_at_ms, recorded_by)
          VALUES (?1, ?2, ?3, 0, ?4)",
-        params![message_key_event_id_b64, bundle_id_b64, message_event_id_b64, peer],
+        params![message_key_event_id_b64, bundle_id_b64, bundle_id_b64, peer],
     )
     .expect("insert message_keys row");
+    conn.execute(
+        "INSERT OR IGNORE INTO messages_to_message_keys
+             (message_event_id, message_key_event_id, recorded_by)
+         VALUES (?1, ?2, ?3)",
+        params![message_event_id_b64, message_key_event_id_b64, peer],
+    )
+    .expect("insert messages_to_message_keys row");
     conn.execute(
         "INSERT OR IGNORE INTO key_secrets (event_id, key_bytes, created_at, recorded_by)
          VALUES (?1, ?2, 0, ?3)",

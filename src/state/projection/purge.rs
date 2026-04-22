@@ -144,17 +144,17 @@ fn collect_projection_dependents(
         }
     }
 
-    // Per-Message FS: enumerate message_key rows pointing at this
-    // message, adding them to the purge manifest so the cascade
-    // removes the per-message K_m wrap alongside the message blob.
-    // The K_m row in key_secrets is keyed by the message_key's own
-    // event id, so cascade-purging the message_key row covers
-    // matching K_m state via the event_id deletion path.
+    // Per-Message FS (Option C): enumerate the message_key row bound
+    // to this message via the `messages_to_message_keys` reverse
+    // index, populated at Encrypted-projection time. Adds the mkey's
+    // event_id to the manifest so the cascade removes the
+    // per-message K_m wrap (and its K_m row in key_secrets keyed by
+    // the same event_id) alongside the message blob.
     {
         let mut stmt = conn.prepare(
-            "SELECT event_id
-             FROM message_keys
-             WHERE recorded_by = ?1 AND owning_message_event_id = ?2",
+            "SELECT message_key_event_id
+             FROM messages_to_message_keys
+             WHERE recorded_by = ?1 AND message_event_id = ?2",
         )?;
         let rows = stmt.query_map(params![recorded_by, root_message_event_id], |row| {
             crate::db::sql_types::get_text(row, 0)
@@ -419,12 +419,21 @@ fn delete_tenant_scoped_rows(
              WHERE recorded_by = ?1 AND (event_id = ?2 OR message_id = ?2)",
             params![recorded_by, event_id],
         )?;
-        // Per-Message FS: a tombstoned message_key drops the K_m row
-        // from key_secrets (keyed by the message_key's own event id)
-        // and the message_keys index row.
+        // Per-Message FS (Option C): a tombstoned message_key drops
+        // the K_m row from key_secrets (keyed by the message_key's
+        // own event id) and the message_keys index row. The
+        // enumeration pass (collect_projection_dependents) has
+        // already added message_key event_ids to the manifest via
+        // the messages_to_message_keys reverse index, so this is a
+        // straight DELETE-by-event_id path.
         conn.execute(
             "DELETE FROM message_keys
-             WHERE recorded_by = ?1 AND (event_id = ?2 OR owning_message_event_id = ?2)",
+             WHERE recorded_by = ?1 AND event_id = ?2",
+            params![recorded_by, event_id],
+        )?;
+        conn.execute(
+            "DELETE FROM messages_to_message_keys
+             WHERE recorded_by = ?1 AND (message_event_id = ?2 OR message_key_event_id = ?2)",
             params![recorded_by, event_id],
         )?;
         conn.execute(

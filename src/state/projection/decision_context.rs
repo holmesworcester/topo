@@ -2467,22 +2467,15 @@ impl ProjectionQueries for Connection {
 
     // ── Per-Message FS context loaders ────────────────────────────
 
-    /// Pre-check for `message_key` projection: is the owning message
-    /// durably tombstoned (`deleted_messages` row present)? If yes,
-    /// the projector will self-drop without materializing K_m.
+    /// Option C: `message_key` carries no `owning_message_event_id`
+    /// in its wire (to avoid the chicken-and-egg with content-
+    /// addressed outer ids). Tombstone enforcement is handled by the
+    /// purge cascade consulting the `messages_to_message_keys`
+    /// reverse index written at Encrypted projection time.
     ///
-    /// Deliberately checks `deleted_messages` only, not
-    /// `deletion_intents` — non-authorized intents are not terminal
-    /// and would produce false-positive drops. (Authorization for
-    /// admin-authored pre-create deletions is a follow-up enhancement
-    /// that requires resolving the intent's signer authority here.)
-    ///
-    /// The K_m materialization path (query `key_secrets` for
-    /// `k_bundle_local_event_id`, AEAD-decrypt `wrapped_k_m` under
-    /// K_bundle) is intentionally deferred to the next pass — the
-    /// crypto wiring requires surfacing AES-GCM decrypt against the
-    /// event's nonce, which belongs alongside the producer-unwrap
-    /// work below.
+    /// This loader only surfaces the K_bundle bytes so the projector
+    /// can AEAD-decrypt `wrapped_k_m` and emit a canonical KeySecret
+    /// event for K_m.
     fn load_message_key_context(
         &self,
         _frame: &ProjectionFrameContext,
@@ -2490,24 +2483,10 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         message_key: &crate::event_modules::MessageKeyEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let owning_b64 = event_id_to_base64(&message_key.owning_message_event_id);
-        let tombstoned: bool = self
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM deleted_messages
-                 WHERE recorded_by = ?1 AND message_id = ?2",
-                rusqlite::params![recorded_by, owning_b64],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        // Look up the local deterministic KeySecret(K_bundle) row; if
-        // present, surface K_bundle bytes so the projector can AEAD-
-        // decrypt wrapped_k_m and emit KeySecret(K_m).
         let k_bundle = self
             .load_key_secret_bytes(recorded_by, &message_key.k_bundle_local_event_id)?;
 
         Ok(ProjectorDecisionContext {
-            owning_message_tombstoned: Some(tombstoned),
             unwrapped_k_bundle: k_bundle,
             ..ProjectorDecisionContext::default()
         })

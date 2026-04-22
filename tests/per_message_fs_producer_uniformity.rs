@@ -60,28 +60,26 @@ fn message_key_event_id_determinism_across_emitters() {
     };
 
     let bundle_id = [0x01u8; 32];
-    let owning_message = [0x02u8; 32];
+    let k_bundle_local = [0x05u8; 32];
     let wrapped_k_m = [0x03u8; 48];
     let nonce = [0x04u8; 12];
 
     let created_at_a = deterministic_message_key_created_at_ms(
         &bundle_id,
-        &owning_message,
+        &k_bundle_local,
         &wrapped_k_m,
     );
     let created_at_b = deterministic_message_key_created_at_ms(
         &bundle_id,
-        &owning_message,
+        &k_bundle_local,
         &wrapped_k_m,
     );
     assert_eq!(created_at_a, created_at_b);
 
-    let k_bundle_local = [0x05u8; 32];
     let evt_a = ParsedEvent::MessageKey(MessageKeyEvent {
         created_at_ms: created_at_a,
         bundle_id,
         k_bundle_local_event_id: k_bundle_local,
-        owning_message_event_id: owning_message,
         nonce,
         wrapped_k_m,
     });
@@ -89,7 +87,6 @@ fn message_key_event_id_determinism_across_emitters() {
         created_at_ms: created_at_b,
         bundle_id,
         k_bundle_local_event_id: k_bundle_local,
-        owning_message_event_id: owning_message,
         nonce,
         wrapped_k_m,
     });
@@ -111,7 +108,10 @@ fn wire_sizes_follow_plan_targets() {
     // Small events: WrapPubkey, message_key, key_bundle_request,
     // key_bundle_share all stay well under master's 524 KB-class.
     assert_eq!(WRAP_PUBKEY_WIRE_SIZE, 49);
-    assert_eq!(MESSAGE_KEY_WIRE_SIZE, 165);
+    // Option C: owning_message_event_id dropped from wire
+    // (133 = 1 type + 8 created_at + 32 bundle_id +
+    //  32 k_bundle_local_event_id + 12 nonce + 48 wrapped_k_m).
+    assert_eq!(MESSAGE_KEY_WIRE_SIZE, 133);
     assert_eq!(KEY_BUNDLE_REQUEST_WIRE_SIZE, 73);
     assert_eq!(KEY_BUNDLE_SHARE_WIRE_SIZE, 105);
 
