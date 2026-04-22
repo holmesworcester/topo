@@ -22,9 +22,13 @@
 //! a natural Verus proof target without dragging SQL into the spec.
 
 use crate::event_modules::{
-    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent,
+    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, KeyHistoryEvent, KeyRequestEvent,
+    KeyRotationEvent, PeerSharedEvent,
 };
-use crate::projection::projector::{BootstrapDecisionContext, RemovalTargetKind};
+use crate::projection::projector::{
+    BootstrapDecisionContext, HistoricalKeyMaterial, RemovalTargetKind, UnwrappedSecretMaterial,
+};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 
 /// Typed summaries of immediate valid event dependencies.
 ///
@@ -585,6 +589,223 @@ pub fn decide_removal(
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// KeyRequest
+//
+// Trivial shape: projection reads a single rollup flag that says
+// "has a key_shared response for this delivery_target already been
+// projected?" — used to suppress duplicate sharing. No rejects.
+// Kept as typed Decision for uniformity with the rest of the
+// DepFacts/GuardFacts migration.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct KeyRequestDepFacts {}
+
+#[derive(Debug, Clone, Default)]
+pub struct KeyRequestGuardFacts {
+    /// True when a `key_shared` row already exists for this
+    /// `delivery_target_id` under this tenant — later sharing
+    /// should be suppressed.
+    pub has_projected_response: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyRequestDecision {
+    Ready { suppress_sharing: bool },
+}
+
+pub fn decide_key_request(
+    _event: &KeyRequestEvent,
+    _deps: &KeyRequestDepFacts,
+    guards: &KeyRequestGuardFacts,
+) -> KeyRequestDecision {
+    KeyRequestDecision::Ready {
+        suppress_sharing: guards.has_projected_response,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// KeyRotation
+//
+// Projection may unwrap the caller's slot when:
+//   - a local peer_shared signing key exists (the recipient),
+//   - that recipient's event_id appears in `recipient_slots`,
+//   - the outer signer resolves to a sender with a usable Ed25519
+//     verifying key.
+// All three are guard-shaped (ambient local state / frame signer).
+// No rejects — missing guards just produce `NoUnwrap`, matching
+// the pre-migration behaviour of returning a default
+// `ProjectorDecisionContext` with no `unwrapped_secret_material`.
+// ─────────────────────────────────────────────────────────────
+
+/// Local peer-shared signer data (recipient identity) used to
+/// DH-unwrap a KeyRotation slot.
+#[derive(Debug, Clone)]
+pub struct LocalPeerSigner {
+    /// The local peer_shared event_id — matched against
+    /// `KeyRotationEvent::recipient_slots` to find our slot.
+    pub recipient_event_id: [u8; 32],
+    /// The local signing key corresponding to `recipient_event_id`.
+    pub signing_key: SigningKey,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KeyRotationDepFacts {}
+
+#[derive(Debug, Clone, Default)]
+pub struct KeyRotationGuardFacts {
+    /// Local peer_shared signer, when present. `None` means the
+    /// tenant has no active peer_shared identity — nothing to
+    /// unwrap.
+    pub local_peer_signer: Option<LocalPeerSigner>,
+    /// Sender's verifying key, looked up off the current signer
+    /// frame. `None` means the signer could not be resolved or
+    /// the key failed to parse.
+    pub sender_verifying_key: Option<VerifyingKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyRotationDecision {
+    /// Either the local signer is absent, our recipient slot is
+    /// not in the rotation, or the sender signer did not resolve.
+    /// In all cases: emit no unwrapped material.
+    NoUnwrap,
+    /// Unwrapped key material for our slot, ready to install.
+    Ready {
+        unwrapped_key: [u8; 32],
+    },
+}
+
+impl KeyRotationDecision {
+    pub fn unwrapped_secret_material(&self) -> Option<UnwrappedSecretMaterial> {
+        match self {
+            Self::NoUnwrap => None,
+            Self::Ready { unwrapped_key } => Some(UnwrappedSecretMaterial {
+                key_bytes: *unwrapped_key,
+            }),
+        }
+    }
+}
+
+/// Pure KeyRotation decision.
+///
+/// Finds the local recipient's slot (if any) and XORs the
+/// sender-derived wrap-key against the wrapped slot bytes.
+pub fn decide_key_rotation(
+    event: &KeyRotationEvent,
+    _deps: &KeyRotationDepFacts,
+    guards: &KeyRotationGuardFacts,
+) -> KeyRotationDecision {
+    let Some(local) = guards.local_peer_signer.as_ref() else {
+        return KeyRotationDecision::NoUnwrap;
+    };
+    let Some(slot_index) = event
+        .recipient_slots
+        .iter()
+        .position(|slot| *slot == local.recipient_event_id)
+    else {
+        return KeyRotationDecision::NoUnwrap;
+    };
+    let Some(sender_pub) = guards.sender_verifying_key.as_ref() else {
+        return KeyRotationDecision::NoUnwrap;
+    };
+    if slot_index >= event.wrapped_keys.len() {
+        return KeyRotationDecision::NoUnwrap;
+    }
+    let unwrapped = crate::crypto::unwrap_key_from_sender(
+        &local.signing_key,
+        sender_pub,
+        &event.wrapped_keys[slot_index],
+    );
+    KeyRotationDecision::Ready {
+        unwrapped_key: unwrapped,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// KeyHistory
+//
+// Guard-only: projection decrypts the history bundle with a local
+// invite_secret signing key (matched by recipient_public_key) and
+// the sender's verifying key (off the signer frame). On any
+// missing input or decrypt/decode failure: no unwrapped material
+// (matches pre-migration default-ctx return).
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct KeyHistoryDepFacts {}
+
+#[derive(Debug, Clone, Default)]
+pub struct KeyHistoryGuardFacts {
+    /// Local invite_secret signing key whose verifying key equals
+    /// `KeyHistoryEvent::recipient_public_key`. `None` means no
+    /// such secret exists for this tenant.
+    pub local_recipient_signing_key: Option<SigningKey>,
+    /// Sender's verifying key from the current signer frame.
+    pub sender_verifying_key: Option<VerifyingKey>,
+}
+
+#[derive(Debug, Clone)]
+pub enum KeyHistoryDecision {
+    /// No local recipient secret, no signer, decrypt failure, or
+    /// decode failure. Emit empty history material.
+    NoUnwrap,
+    /// Decoded historical key material, ready to install.
+    Ready { entries: Vec<HistoricalKeyMaterial> },
+}
+
+impl KeyHistoryDecision {
+    pub fn into_material(self) -> Vec<HistoricalKeyMaterial> {
+        match self {
+            Self::NoUnwrap => Vec::new(),
+            Self::Ready { entries } => entries,
+        }
+    }
+}
+
+/// Pure KeyHistory decision.
+///
+/// Decrypts the bundle with (local signing key, sender pub key,
+/// nonce, ciphertext, auth_tag). On decrypt or decode failure the
+/// decision is `NoUnwrap` — matching the pre-migration default.
+pub fn decide_key_history(
+    event: &KeyHistoryEvent,
+    _deps: &KeyHistoryDepFacts,
+    guards: &KeyHistoryGuardFacts,
+) -> KeyHistoryDecision {
+    let Some(local_signing_key) = guards.local_recipient_signing_key.as_ref() else {
+        return KeyHistoryDecision::NoUnwrap;
+    };
+    let Some(sender_pub) = guards.sender_verifying_key.as_ref() else {
+        return KeyHistoryDecision::NoUnwrap;
+    };
+    let plaintext = match crate::crypto::decrypt_bundle_from_sender(
+        local_signing_key,
+        sender_pub,
+        &event.nonce,
+        &event.ciphertext,
+        &event.auth_tag,
+    ) {
+        Ok(p) => p,
+        Err(_) => return KeyHistoryDecision::NoUnwrap,
+    };
+    let entries =
+        match crate::event_modules::key_history::decode_key_history_plaintext(&plaintext) {
+            Ok(e) => e,
+            Err(_) => return KeyHistoryDecision::NoUnwrap,
+        };
+    KeyHistoryDecision::Ready {
+        entries: entries
+            .into_iter()
+            .map(|entry| HistoricalKeyMaterial {
+                key_event_id: entry.key_event_id,
+                key_bytes: entry.key_bytes,
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +1133,204 @@ mod tests {
             }
             other => panic!("expected Ready, got {:?}", other),
         }
+    }
+
+    // ── KeyRequest pilot ──────────────────────────────────────
+
+    fn kr_event() -> KeyRequestEvent {
+        KeyRequestEvent {
+            created_at_ms: 0,
+            blocked_event_id: [1u8; 32],
+            key_event_id: [2u8; 32],
+            frontier_hash: [3u8; 32],
+            delivery_target_id: [4u8; 32],
+            recipient_event_id: [5u8; 32],
+            unwrap_key_event_id: [6u8; 32],
+        }
+    }
+
+    #[test]
+    fn key_request_ready_passes_through_suppress_flag() {
+        let d = decide_key_request(
+            &kr_event(),
+            &KeyRequestDepFacts::default(),
+            &KeyRequestGuardFacts {
+                has_projected_response: true,
+            },
+        );
+        assert!(matches!(
+            d,
+            KeyRequestDecision::Ready {
+                suppress_sharing: true
+            }
+        ));
+    }
+
+    #[test]
+    fn key_request_ready_when_no_existing_response() {
+        let d = decide_key_request(
+            &kr_event(),
+            &KeyRequestDepFacts::default(),
+            &KeyRequestGuardFacts::default(),
+        );
+        assert!(matches!(
+            d,
+            KeyRequestDecision::Ready {
+                suppress_sharing: false
+            }
+        ));
+    }
+
+    // ── KeyRotation pilot ─────────────────────────────────────
+
+    fn key_rotation_event(
+        recipient_slots: Vec<[u8; 32]>,
+        wrapped_keys: Vec<[u8; 32]>,
+    ) -> KeyRotationEvent {
+        KeyRotationEvent {
+            created_at_ms: 0,
+            frontier_count: 0,
+            frontier_ref_1: [0u8; 32],
+            frontier_ref_2: [0u8; 32],
+            frontier_ref_3: [0u8; 32],
+            frontier_ref_4: [0u8; 32],
+            frontier_hash: [0u8; 32],
+            rotated_by: [0u8; 32],
+            recipient_slots,
+            wrapped_keys,
+        }
+    }
+
+    fn test_signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn key_rotation_no_unwrap_when_no_local_signer() {
+        let event = key_rotation_event(vec![[7u8; 32]], vec![[0u8; 32]]);
+        let d = decide_key_rotation(
+            &event,
+            &KeyRotationDepFacts::default(),
+            &KeyRotationGuardFacts::default(),
+        );
+        assert!(matches!(d, KeyRotationDecision::NoUnwrap));
+        assert!(d.unwrapped_secret_material().is_none());
+    }
+
+    #[test]
+    fn key_rotation_no_unwrap_when_slot_absent() {
+        let signing = test_signing_key(9);
+        let sender = test_signing_key(11);
+        let event = key_rotation_event(vec![[7u8; 32]], vec![[0u8; 32]]);
+        let guards = KeyRotationGuardFacts {
+            local_peer_signer: Some(LocalPeerSigner {
+                recipient_event_id: [42u8; 32],
+                signing_key: signing,
+            }),
+            sender_verifying_key: Some(sender.verifying_key()),
+        };
+        let d = decide_key_rotation(&event, &KeyRotationDepFacts::default(), &guards);
+        assert!(matches!(d, KeyRotationDecision::NoUnwrap));
+    }
+
+    #[test]
+    fn key_rotation_no_unwrap_when_sender_missing() {
+        let signing = test_signing_key(9);
+        let recipient_id = [7u8; 32];
+        let event = key_rotation_event(vec![recipient_id], vec![[0u8; 32]]);
+        let guards = KeyRotationGuardFacts {
+            local_peer_signer: Some(LocalPeerSigner {
+                recipient_event_id: recipient_id,
+                signing_key: signing,
+            }),
+            sender_verifying_key: None,
+        };
+        let d = decide_key_rotation(&event, &KeyRotationDepFacts::default(), &guards);
+        assert!(matches!(d, KeyRotationDecision::NoUnwrap));
+    }
+
+    #[test]
+    fn key_rotation_ready_unwraps_slot() {
+        // Round-trip: since unwrap_key_from_sender is a symmetric XOR
+        // against the derived wrap-key, wrap(plain) ≡ unwrap(plain). We
+        // use that property to produce a wrapped slot and verify decide
+        // recovers the plaintext.
+        let recipient_sk = test_signing_key(3);
+        let sender_sk = test_signing_key(5);
+        let plaintext = [0x5Au8; 32];
+        let recipient_id = [7u8; 32];
+
+        let wrapped = crate::crypto::unwrap_key_from_sender(
+            &recipient_sk,
+            &sender_sk.verifying_key(),
+            &plaintext,
+        );
+
+        let event = key_rotation_event(vec![recipient_id], vec![wrapped]);
+        let guards = KeyRotationGuardFacts {
+            local_peer_signer: Some(LocalPeerSigner {
+                recipient_event_id: recipient_id,
+                signing_key: recipient_sk,
+            }),
+            sender_verifying_key: Some(sender_sk.verifying_key()),
+        };
+        let d = decide_key_rotation(&event, &KeyRotationDepFacts::default(), &guards);
+        match &d {
+            KeyRotationDecision::Ready { unwrapped_key } => {
+                assert_eq!(*unwrapped_key, plaintext);
+            }
+            other => panic!("expected Ready, got {:?}", other),
+        }
+        assert_eq!(
+            d.unwrapped_secret_material().map(|m| m.key_bytes),
+            Some(plaintext)
+        );
+    }
+
+    // ── KeyHistory pilot ──────────────────────────────────────
+
+    fn empty_key_history_event() -> KeyHistoryEvent {
+        KeyHistoryEvent {
+            created_at_ms: 0,
+            recipient_public_key: [0u8; 32],
+            nonce: [0u8; 12],
+            ciphertext: vec![0u8; crate::event_modules::key_history::KEY_HISTORY_BUNDLE_BYTES],
+            auth_tag: [0u8; 16],
+        }
+    }
+
+    #[test]
+    fn key_history_no_unwrap_when_no_local_key() {
+        let event = empty_key_history_event();
+        let d = decide_key_history(
+            &event,
+            &KeyHistoryDepFacts::default(),
+            &KeyHistoryGuardFacts::default(),
+        );
+        assert!(matches!(d, KeyHistoryDecision::NoUnwrap));
+        assert!(d.into_material().is_empty());
+    }
+
+    #[test]
+    fn key_history_no_unwrap_when_sender_missing() {
+        let event = empty_key_history_event();
+        let guards = KeyHistoryGuardFacts {
+            local_recipient_signing_key: Some(test_signing_key(1)),
+            sender_verifying_key: None,
+        };
+        let d = decide_key_history(&event, &KeyHistoryDepFacts::default(), &guards);
+        assert!(matches!(d, KeyHistoryDecision::NoUnwrap));
+    }
+
+    #[test]
+    fn key_history_no_unwrap_on_decrypt_failure() {
+        // Provide both keys but a bogus ciphertext/auth_tag so decrypt fails.
+        let event = empty_key_history_event();
+        let guards = KeyHistoryGuardFacts {
+            local_recipient_signing_key: Some(test_signing_key(1)),
+            sender_verifying_key: Some(test_signing_key(2).verifying_key()),
+        };
+        let d = decide_key_history(&event, &KeyHistoryDepFacts::default(), &guards);
+        assert!(matches!(d, KeyHistoryDecision::NoUnwrap));
     }
 }
