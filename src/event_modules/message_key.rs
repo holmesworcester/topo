@@ -207,20 +207,35 @@ pub fn project_pure(
         ],
     }];
 
-    // If K_bundle was locally materialized and the context loaded the
-    // decrypted K_m, insert into key_secrets keyed by this event's
-    // own id. Cascade unblocks the owning Encrypted message.
-    if let Some(k_m) = ctx.decrypted_k_m_bytes {
-        ops.push(WriteOp::InsertOrIgnore {
-            table: "key_secrets",
-            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Blob(k_m.to_vec()),
-                SqlVal::Int(mk.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        });
+    // Pattern (b): if K_bundle is locally materialized, do the AEAD
+    // decrypt here in the projector (pure, deterministic) to recover
+    // K_m. wrapped_k_m is 48 bytes = 32-byte ciphertext + 16-byte
+    // GCM tag. Emit K_m into key_secrets keyed by this message_key's
+    // own event_id so the owning Encrypted message's cascade finds
+    // it via the standard key_secrets lookup path.
+    if let Some(k_bundle) = ctx.unwrapped_k_bundle {
+        let ciphertext = &mk.wrapped_k_m[0..32];
+        let mut auth_tag = [0u8; 16];
+        auth_tag.copy_from_slice(&mk.wrapped_k_m[32..48]);
+        if let Ok(plaintext) = crate::projection::encrypted::decrypt_event_blob(
+            &k_bundle,
+            &mk.nonce,
+            ciphertext,
+            &auth_tag,
+        ) {
+            if plaintext.len() == 32 {
+                ops.push(WriteOp::InsertOrIgnore {
+                    table: "key_secrets",
+                    columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+                    values: vec![
+                        SqlVal::Text(event_id_b64.to_string()),
+                        SqlVal::Blob(plaintext),
+                        SqlVal::Int(mk.created_at_ms as i64),
+                        SqlVal::Text(recorded_by.to_string()),
+                    ],
+                });
+            }
+        }
     }
     ProjectorResult::valid(ops)
 }

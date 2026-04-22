@@ -128,26 +128,20 @@ pub fn project_pure(
         ],
     }];
 
-    // If the context loader successfully unwrapped K_bundle (recipient
-    // is local and their wrap_privkey matched), emit a deterministic
-    // local KeySecret(K_bundle) write so cascade unblocks every
-    // message_key waiting on this bundle.
-    if let Some(k_bundle) = ctx.unwrapped_k_bundle {
-        let local_secret_id_bytes =
-            crate::event_modules::key_secret::deterministic_key_secret_event_id(&k_bundle);
-        let local_secret_id_b64 = crate::crypto::event_id_to_base64(&local_secret_id_bytes);
-        let created_at =
-            crate::event_modules::key_secret::deterministic_key_secret_created_at_ms(&k_bundle);
-        ops.push(WriteOp::InsertOrIgnore {
-            table: "key_secrets",
-            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(local_secret_id_b64),
-                SqlVal::Blob(k_bundle.to_vec()),
-                SqlVal::Int(created_at as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        });
+    // Pattern (b): same deterministic unwrap as key_broadcast; the
+    // local KeySecret(K_bundle) event id must match across producers.
+    if let (Some(sk_bytes), Some(vk_bytes), Some(wrapped)) = (
+        ctx.local_signing_key_bytes,
+        ctx.sender_verifying_key_bytes,
+        ctx.wrapped_key_bytes,
+    ) {
+        let k_bundle = crate::event_modules::key_broadcast::unwrap_k_bundle(
+            &sk_bytes, &vk_bytes, &wrapped,
+        );
+        ops.extend(crate::event_modules::key_broadcast::emit_local_key_secret(
+            recorded_by,
+            &k_bundle,
+        ));
     }
     ProjectorResult::valid(ops)
 }

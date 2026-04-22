@@ -2532,66 +2532,158 @@ impl ProjectionQueries for Connection {
                 |row| row.get(0),
             )
             .unwrap_or(false);
+
+        // Look up the local deterministic KeySecret(K_bundle) row; if
+        // present, surface K_bundle bytes so the projector can AEAD-
+        // decrypt wrapped_k_m and emit KeySecret(K_m).
+        let k_bundle = self
+            .load_key_secret_bytes(recorded_by, &message_key.k_bundle_local_event_id)?;
+
         Ok(ProjectorDecisionContext {
             owning_message_tombstoned: Some(tombstoned),
+            unwrapped_k_bundle: k_bundle,
             ..ProjectorDecisionContext::default()
         })
     }
 
-    /// Scans a `key_broadcast`'s recipient slots against local
-    /// `wrap_privkeys` for a match. On successful asymmetric-unwrap,
-    /// populates `unwrapped_k_bundle` so the projector emits a
-    /// deterministic local `KeySecret(K_bundle)` write.
-    ///
-    /// Currently a stub: the production crypto wiring
-    /// (`unwrap_key_from_sender` with the broadcast emitter's
-    /// verifying key resolved via `resolve_signer_key`) lands in a
-    /// follow-up. Projector falls back to header-only recording in
-    /// the meantime.
+    /// Pattern (b): scan `wrap_privkeys` for a row whose pubkey
+    /// event id matches one of the broadcast's recipient slots.
+    /// If found, surface the RAW local signing key + sender's
+    /// verifying key + wrapped slot bytes to the projector. The
+    /// projector runs `unwrap_key_from_sender` (deterministic, pure).
     fn load_key_broadcast_context(
         &self,
-        _frame: &ProjectionFrameContext,
-        _recorded_by: &str,
+        frame: &ProjectionFrameContext,
+        recorded_by: &str,
         _event_id_b64: &str,
-        _key_broadcast: &crate::event_modules::KeyBroadcastEvent,
+        key_broadcast: &crate::event_modules::KeyBroadcastEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        // TODO: query wrap_privkeys for local recipient entries; for
-        // each matching slot run unwrap_key_from_sender against the
-        // signer's peer_shared pubkey to recover K_bundle; populate
-        // ctx.unwrapped_k_bundle.
-        Ok(ProjectorDecisionContext::default())
+        resolve_raw_wrap_material(
+            self,
+            frame,
+            recorded_by,
+            &key_broadcast.recipient_pubkey_slots,
+            &key_broadcast.wrapped_bundle_slots,
+        )
     }
 
-    /// Same pattern as `load_key_broadcast_context` — unwrap the
-    /// anchor K_bundle, then AEAD-decrypt each populated historical
-    /// slot. Emits one deterministic `KeySecret(historical_K_bundle)`
-    /// per decoded slot.
-    ///
-    /// TODO: full crypto wiring lands with key_broadcast above.
+    /// Pattern (b): same shape as `load_key_broadcast_context`, but
+    /// the bundle has a single recipient slot + N historical slots.
+    /// Populates raw unwrap material for the anchor; the projector
+    /// decrypts each historical slot AEAD-style under the recovered
+    /// anchor K_bundle.
     fn load_key_history_bundle_context(
         &self,
-        _frame: &ProjectionFrameContext,
-        _recorded_by: &str,
+        frame: &ProjectionFrameContext,
+        recorded_by: &str,
         _event_id_b64: &str,
-        _key_history_bundle: &crate::event_modules::KeyHistoryBundleEvent,
+        key_history_bundle: &crate::event_modules::KeyHistoryBundleEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        Ok(ProjectorDecisionContext::default())
+        let recipient_slots = vec![key_history_bundle.recipient_wrappubkey_event_id];
+        let wrapped_slots = vec![key_history_bundle.wrapped_anchor_bundle];
+        let mut ctx = resolve_raw_wrap_material(
+            self,
+            frame,
+            recorded_by,
+            &recipient_slots,
+            &wrapped_slots,
+        )?;
+        ctx.history_payload = Some(crate::projection::projector::HistoryBundlePayload {
+            nonce: key_history_bundle.nonce.to_vec(),
+            ciphertext: key_history_bundle.historical_slots.clone(),
+            auth_tag: [0u8; 16], // AEAD tag is trailing 16 bytes of ciphertext
+        });
+        Ok(ctx)
     }
 
-    /// Targeted heal: the wire carries one recipient slot + one
-    /// wrapped K_bundle. Same unwrap path as `key_broadcast`, just
-    /// single-slot.
-    ///
-    /// TODO: full crypto wiring lands with key_broadcast above.
+    /// Pattern (b): targeted 1×1 heal — one recipient slot, one
+    /// wrapped K_bundle. Resolves raw wrap material; projector
+    /// runs `unwrap_key_from_sender`.
     fn load_key_bundle_share_context(
         &self,
-        _frame: &ProjectionFrameContext,
-        _recorded_by: &str,
+        frame: &ProjectionFrameContext,
+        recorded_by: &str,
         _event_id_b64: &str,
-        _key_bundle_share: &crate::event_modules::KeyBundleShareEvent,
+        key_bundle_share: &crate::event_modules::KeyBundleShareEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        Ok(ProjectorDecisionContext::default())
+        let recipient_slots = vec![key_bundle_share.recipient_wrappubkey_event_id];
+        let wrapped_slots = vec![key_bundle_share.wrapped_k_bundle];
+        resolve_raw_wrap_material(
+            self,
+            frame,
+            recorded_by,
+            &recipient_slots,
+            &wrapped_slots,
+        )
     }
+}
+
+/// Pattern-(b) helper: given parallel arrays of recipient pubkey
+/// event ids + wrapped-key slots, find the slot that targets a
+/// locally-held privkey (`wrap_privkeys`), resolve the sender's
+/// verifying key via `resolve_signer_key(frame.current_signer)`,
+/// and return a `ProjectorDecisionContext` carrying the RAW bytes
+/// for `unwrap_key_from_sender`. The projector does the crypto.
+fn resolve_raw_wrap_material(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    recipient_pubkey_slots: &[[u8; 32]],
+    wrapped_slots: &[[u8; 32]],
+) -> ProjectionQueryResult<ProjectorDecisionContext> {
+    if recipient_pubkey_slots.len() != wrapped_slots.len() {
+        return Ok(ProjectorDecisionContext::default());
+    }
+
+    // Scan recipient slots against our locally-emitted WrapPubkeys.
+    // `wrap_privkeys` is local-only; each row is
+    // (pubkey_event_id, privkey, valid_until_ms, created_at_ms).
+    let mut matched: Option<(Vec<u8>, [u8; 32])> = None;
+    for (slot_idx, recipient_event_id) in recipient_pubkey_slots.iter().enumerate() {
+        if *recipient_event_id == [0u8; 32] {
+            continue;
+        }
+        let recipient_b64 = event_id_to_base64(recipient_event_id);
+        let privkey: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT privkey FROM wrap_privkeys WHERE pubkey_event_id = ?1",
+                rusqlite::params![recipient_b64],
+                |row| crate::db::sql_types::get_blob(row, 0),
+            )
+            .optional()?;
+        if let Some(privkey_bytes) = privkey {
+            if privkey_bytes.len() == 32 {
+                matched = Some((privkey_bytes, wrapped_slots[slot_idx]));
+                break;
+            }
+        }
+    }
+
+    let (privkey_bytes, wrapped_slot) = match matched {
+        Some(v) => v,
+        None => return Ok(ProjectorDecisionContext::default()),
+    };
+
+    let mut local_sk = [0u8; 32];
+    local_sk.copy_from_slice(&privkey_bytes);
+
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(ProjectorDecisionContext::default());
+    };
+    let Some(current_signer_event_id) = event_id_from_base64(&current_signer.event_id) else {
+        return Ok(ProjectorDecisionContext::default());
+    };
+    let sender_key = match resolve_signer_key(conn, recorded_by, &current_signer_event_id)? {
+        SignerResolution::Found(k) => k,
+        _ => return Ok(ProjectorDecisionContext::default()),
+    };
+
+    Ok(ProjectorDecisionContext {
+        local_signing_key_bytes: Some(local_sk),
+        sender_verifying_key_bytes: Some(sender_key.public_key),
+        wrapped_key_bytes: Some(wrapped_slot),
+        ..ProjectorDecisionContext::default()
+    })
 }
 
 #[cfg(test)]

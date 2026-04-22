@@ -147,7 +147,7 @@ pub fn project_pure(
         .as_ref()
         .map(|s| s.event_id.clone())
         .unwrap_or_default();
-    let ops = vec![WriteOp::InsertOrIgnore {
+    let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "key_history_bundles",
         columns: vec![
             "event_id",
@@ -168,6 +168,53 @@ pub fn project_pure(
             SqlVal::Text(recorded_by.to_string()),
         ],
     }];
+
+    // Pattern (b): if the loader matched our WrapPubkey, unwrap the
+    // anchor K_bundle and emit its deterministic local KeySecret.
+    if let (Some(sk_bytes), Some(vk_bytes), Some(wrapped)) = (
+        ctx.local_signing_key_bytes,
+        ctx.sender_verifying_key_bytes,
+        ctx.wrapped_key_bytes,
+    ) {
+        let anchor_k_bundle = crate::event_modules::key_broadcast::unwrap_k_bundle(
+            &sk_bytes, &vk_bytes, &wrapped,
+        );
+        ops.extend(crate::event_modules::key_broadcast::emit_local_key_secret(
+            recorded_by,
+            &anchor_k_bundle,
+        ));
+
+        // Walk historical_slots (80 bytes each: 32B bundle_id + 48B
+        // AEAD ciphertext under anchor K_bundle). For each populated
+        // slot, decrypt and emit the deterministic local
+        // KeySecret(historical_K_bundle) row.
+        for chunk in kh.historical_slots.chunks_exact(HISTORICAL_SLOT_BYTES) {
+            if chunk.iter().all(|b| *b == 0) {
+                continue; // unused slot
+            }
+            let mut historical_bundle_id = [0u8; 32];
+            historical_bundle_id.copy_from_slice(&chunk[0..32]);
+            // 48-byte AEAD = 32-byte ciphertext + 16-byte tag.
+            let ciphertext = &chunk[32..64];
+            let mut auth_tag = [0u8; 16];
+            auth_tag.copy_from_slice(&chunk[64..80]);
+            if let Ok(plaintext) = crate::projection::encrypted::decrypt_event_blob(
+                &anchor_k_bundle,
+                &kh.nonce,
+                ciphertext,
+                &auth_tag,
+            ) {
+                if plaintext.len() == 32 {
+                    let mut k_bytes = [0u8; 32];
+                    k_bytes.copy_from_slice(&plaintext);
+                    ops.extend(crate::event_modules::key_broadcast::emit_local_key_secret(
+                        recorded_by,
+                        &k_bytes,
+                    ));
+                }
+            }
+        }
+    }
     ProjectorResult::valid(ops)
 }
 

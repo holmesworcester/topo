@@ -181,7 +181,7 @@ pub fn project_pure(
         .as_ref()
         .map(|s| s.event_id.clone())
         .unwrap_or_default();
-    let ops = vec![WriteOp::InsertOrIgnore {
+    let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "key_broadcasts",
         columns: vec![
             "event_id",
@@ -198,7 +198,62 @@ pub fn project_pure(
             SqlVal::Text(recorded_by.to_string()),
         ],
     }];
+
+    // Pattern (b): context loader surfaced raw wrap material; do the
+    // deterministic asymmetric unwrap here and emit a deterministic
+    // local KeySecret(K_bundle) write. All three producers
+    // (key_broadcast, key_history_bundle, key_bundle_share) emit the
+    // same local event_id for the same K_bundle bytes — standard
+    // cascade unblocks message_key rows uniformly.
+    if let (Some(sk_bytes), Some(vk_bytes), Some(wrapped)) = (
+        ctx.local_signing_key_bytes,
+        ctx.sender_verifying_key_bytes,
+        ctx.wrapped_key_bytes,
+    ) {
+        let k_bundle = unwrap_k_bundle(&sk_bytes, &vk_bytes, &wrapped);
+        ops.extend(emit_local_key_secret(recorded_by, &k_bundle));
+    }
     ProjectorResult::valid(ops)
+}
+
+/// Deterministic asymmetric unwrap of a recipient-wrap slot. Mirrors
+/// `unwrap_key_from_sender` in `src/shared/crypto/mod.rs:178` and is
+/// identical across all three producer paths so the resulting K_bundle
+/// bytes are stable and cascade materializes the same local event id.
+///
+/// Shared with `key_history_bundle::project_pure` and
+/// `key_bundle_share::project_pure` so the three paths emit identical
+/// deterministic local KeySecret(K_bundle) rows.
+pub fn unwrap_k_bundle(
+    local_sk_bytes: &[u8; 32],
+    sender_vk_bytes: &[u8; 32],
+    wrapped: &[u8; 32],
+) -> [u8; 32] {
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    let sk = SigningKey::from_bytes(local_sk_bytes);
+    // Safe: caller only surfaces vk bytes recovered from an existing
+    // peer_shared row, which was validated at projection of that
+    // peer_shared event.
+    let vk = VerifyingKey::from_bytes(sender_vk_bytes).expect("valid sender vk");
+    crate::shared::crypto::unwrap_key_from_sender(&sk, &vk, wrapped)
+}
+
+/// Emit the deterministic local `KeySecret(K_bundle)` write that
+/// all three producer paths converge on.
+pub fn emit_local_key_secret(recorded_by: &str, k_bundle: &[u8; 32]) -> Vec<WriteOp> {
+    let local_event_id = crate::event_modules::key_secret::deterministic_key_secret_event_id(k_bundle);
+    let local_event_b64 = crate::crypto::event_id_to_base64(&local_event_id);
+    let created_at = crate::event_modules::key_secret::deterministic_key_secret_created_at_ms(k_bundle);
+    vec![WriteOp::InsertOrIgnore {
+        table: "key_secrets",
+        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+        values: vec![
+            SqlVal::Text(local_event_b64),
+            SqlVal::Blob(k_bundle.to_vec()),
+            SqlVal::Int(created_at as i64),
+            SqlVal::Text(recorded_by.to_string()),
+        ],
+    }]
 }
 
 crate::projection::decision_context::define_query_context_loader!(
