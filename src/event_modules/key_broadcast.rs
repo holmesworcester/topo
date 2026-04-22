@@ -201,6 +201,13 @@ pub fn project_pure(
     ProjectorResult::valid(ops)
 }
 
+crate::projection::decision_context::define_query_context_loader!(
+    build_projector_context,
+    KeyBroadcast,
+    load_key_broadcast_context,
+    "key_broadcast"
+);
+
 pub static KEY_BROADCAST_META: EventTypeMeta =
     crate::event_modules::registry::event_type_meta! {
         type_code: EVENT_TYPE_KEY_BROADCAST,
@@ -215,7 +222,7 @@ pub static KEY_BROADCAST_META: EventTypeMeta =
         parse: parse_key_broadcast,
         encode: encode_key_broadcast,
         projector: project_pure,
-        context_loader: crate::event_modules::registry::load_empty_context,
+        context_loader: build_projector_context,
     };
 
 #[cfg(test)]

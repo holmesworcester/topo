@@ -225,6 +225,13 @@ pub fn project_pure(
     ProjectorResult::valid(ops)
 }
 
+crate::projection::decision_context::define_query_context_loader!(
+    build_projector_context,
+    MessageKey,
+    load_message_key_context,
+    "message_key"
+);
+
 pub static MESSAGE_KEY_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_MESSAGE_KEY,
     type_name: "message_key",
@@ -242,7 +249,7 @@ pub static MESSAGE_KEY_META: EventTypeMeta = crate::event_modules::registry::eve
     parse: parse_message_key,
     encode: encode_message_key,
     projector: project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: build_projector_context,
 };
 
 #[cfg(test)]

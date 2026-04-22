@@ -1205,6 +1205,51 @@ pub trait ProjectionQueries {
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
         Ok(ProjectorDecisionContext::default())
     }
+
+    // Per-Message FS producer/consumer context loaders. Default impls
+    // return an empty context so test doubles and simulation backends
+    // don't need to implement them right away. The real Connection
+    // impl below performs the actual tombstone + privkey queries.
+
+    fn load_message_key_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        _recorded_by: &str,
+        _event_id_b64: &str,
+        _message_key: &crate::event_modules::MessageKeyEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        Ok(ProjectorDecisionContext::default())
+    }
+
+    fn load_key_broadcast_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        _recorded_by: &str,
+        _event_id_b64: &str,
+        _key_broadcast: &crate::event_modules::KeyBroadcastEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        Ok(ProjectorDecisionContext::default())
+    }
+
+    fn load_key_history_bundle_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        _recorded_by: &str,
+        _event_id_b64: &str,
+        _key_history_bundle: &crate::event_modules::KeyHistoryBundleEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        Ok(ProjectorDecisionContext::default())
+    }
+
+    fn load_key_bundle_share_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        _recorded_by: &str,
+        _event_id_b64: &str,
+        _key_bundle_share: &crate::event_modules::KeyBundleShareEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        Ok(ProjectorDecisionContext::default())
+    }
 }
 
 /// Declare a projector-local context loader that downcasts ParsedEvent to the
@@ -2451,6 +2496,101 @@ impl ProjectionQueries for Connection {
                 .collect(),
             ..ProjectorDecisionContext::default()
         })
+    }
+
+    // ── Per-Message FS context loaders ────────────────────────────
+
+    /// Pre-check for `message_key` projection: is the owning message
+    /// durably tombstoned (`deleted_messages` row present)? If yes,
+    /// the projector will self-drop without materializing K_m.
+    ///
+    /// Deliberately checks `deleted_messages` only, not
+    /// `deletion_intents` — non-authorized intents are not terminal
+    /// and would produce false-positive drops. (Authorization for
+    /// admin-authored pre-create deletions is a follow-up enhancement
+    /// that requires resolving the intent's signer authority here.)
+    ///
+    /// The K_m materialization path (query `key_secrets` for
+    /// `k_bundle_local_event_id`, AEAD-decrypt `wrapped_k_m` under
+    /// K_bundle) is intentionally deferred to the next pass — the
+    /// crypto wiring requires surfacing AES-GCM decrypt against the
+    /// event's nonce, which belongs alongside the producer-unwrap
+    /// work below.
+    fn load_message_key_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        recorded_by: &str,
+        _event_id_b64: &str,
+        message_key: &crate::event_modules::MessageKeyEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        let owning_b64 = event_id_to_base64(&message_key.owning_message_event_id);
+        let tombstoned: bool = self
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM deleted_messages
+                 WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![recorded_by, owning_b64],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        Ok(ProjectorDecisionContext {
+            owning_message_tombstoned: Some(tombstoned),
+            ..ProjectorDecisionContext::default()
+        })
+    }
+
+    /// Scans a `key_broadcast`'s recipient slots against local
+    /// `wrap_privkeys` for a match. On successful asymmetric-unwrap,
+    /// populates `unwrapped_k_bundle` so the projector emits a
+    /// deterministic local `KeySecret(K_bundle)` write.
+    ///
+    /// Currently a stub: the production crypto wiring
+    /// (`unwrap_key_from_sender` with the broadcast emitter's
+    /// verifying key resolved via `resolve_signer_key`) lands in a
+    /// follow-up. Projector falls back to header-only recording in
+    /// the meantime.
+    fn load_key_broadcast_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        _recorded_by: &str,
+        _event_id_b64: &str,
+        _key_broadcast: &crate::event_modules::KeyBroadcastEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        // TODO: query wrap_privkeys for local recipient entries; for
+        // each matching slot run unwrap_key_from_sender against the
+        // signer's peer_shared pubkey to recover K_bundle; populate
+        // ctx.unwrapped_k_bundle.
+        Ok(ProjectorDecisionContext::default())
+    }
+
+    /// Same pattern as `load_key_broadcast_context` — unwrap the
+    /// anchor K_bundle, then AEAD-decrypt each populated historical
+    /// slot. Emits one deterministic `KeySecret(historical_K_bundle)`
+    /// per decoded slot.
+    ///
+    /// TODO: full crypto wiring lands with key_broadcast above.
+    fn load_key_history_bundle_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        _recorded_by: &str,
+        _event_id_b64: &str,
+        _key_history_bundle: &crate::event_modules::KeyHistoryBundleEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        Ok(ProjectorDecisionContext::default())
+    }
+
+    /// Targeted heal: the wire carries one recipient slot + one
+    /// wrapped K_bundle. Same unwrap path as `key_broadcast`, just
+    /// single-slot.
+    ///
+    /// TODO: full crypto wiring lands with key_broadcast above.
+    fn load_key_bundle_share_context(
+        &self,
+        _frame: &ProjectionFrameContext,
+        _recorded_by: &str,
+        _event_id_b64: &str,
+        _key_bundle_share: &crate::event_modules::KeyBundleShareEvent,
+    ) -> ProjectionQueryResult<ProjectorDecisionContext> {
+        Ok(ProjectorDecisionContext::default())
     }
 }
 

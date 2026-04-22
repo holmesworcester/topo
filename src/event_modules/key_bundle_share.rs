@@ -152,6 +152,13 @@ pub fn project_pure(
     ProjectorResult::valid(ops)
 }
 
+crate::projection::decision_context::define_query_context_loader!(
+    build_projector_context,
+    KeyBundleShare,
+    load_key_bundle_share_context,
+    "key_bundle_share"
+);
+
 pub static KEY_BUNDLE_SHARE_META: EventTypeMeta =
     crate::event_modules::registry::event_type_meta! {
         type_code: EVENT_TYPE_KEY_BUNDLE_SHARE,
@@ -166,7 +173,7 @@ pub static KEY_BUNDLE_SHARE_META: EventTypeMeta =
         parse: parse_key_bundle_share,
         encode: encode_key_bundle_share,
         projector: project_pure,
-        context_loader: crate::event_modules::registry::load_empty_context,
+        context_loader: build_projector_context,
     };
 
 #[cfg(test)]

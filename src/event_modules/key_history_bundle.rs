@@ -171,6 +171,13 @@ pub fn project_pure(
     ProjectorResult::valid(ops)
 }
 
+crate::projection::decision_context::define_query_context_loader!(
+    build_projector_context,
+    KeyHistoryBundle,
+    load_key_history_bundle_context,
+    "key_history_bundle"
+);
+
 pub static KEY_HISTORY_BUNDLE_META: EventTypeMeta =
     crate::event_modules::registry::event_type_meta! {
         type_code: EVENT_TYPE_KEY_HISTORY_BUNDLE,
@@ -185,7 +192,7 @@ pub static KEY_HISTORY_BUNDLE_META: EventTypeMeta =
         parse: parse_key_history_bundle,
         encode: encode_key_history_bundle,
         projector: project_pure,
-        context_loader: crate::event_modules::registry::load_empty_context,
+        context_loader: build_projector_context,
     };
 
 #[cfg(test)]
