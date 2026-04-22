@@ -299,6 +299,36 @@ pub struct ProjectorDecisionContext {
     /// when this is `Some`.
     pub unwrapped_k_bundle: Option<[u8; 32]>,
 
+    // ── Raw cryptographic inputs for pattern-(b) projectors ──
+    // Context loaders populate these directly from DB rows; the
+    // projector performs the deterministic crypto (asymmetric
+    // unwrap, AEAD decrypt) and emits writes. Keeps DB I/O in the
+    // context loader and pure transforms in the projector.
+
+    /// Recipient's ed25519 signing key bytes, recovered from
+    /// `wrap_privkeys` / `peer_secrets` / `invite_secrets` by the
+    /// context loader. Combined with `sender_verifying_key_bytes`
+    /// inside the projector for `unwrap_key_from_sender`.
+    pub local_signing_key_bytes: Option<[u8; 32]>,
+
+    /// Broadcast / rotation / bundle emitter's ed25519 verifying key
+    /// bytes, resolved via `resolve_signer_key(current_signer)` by
+    /// the context loader. Combined with `local_signing_key_bytes`
+    /// in the projector for `unwrap_key_from_sender`.
+    pub sender_verifying_key_bytes: Option<[u8; 32]>,
+
+    /// For producer events (`key_broadcast`, `key_history_bundle`,
+    /// `key_bundle_share`, `key_shared`, `key_rotation`): the raw
+    /// 32-byte wrapped key slot that targets this peer. Projector
+    /// runs `unwrap_key_from_sender` to recover K_bundle.
+    pub wrapped_key_bytes: Option<[u8; 32]>,
+
+    /// For `key_history` / `key_history_bundle`: the raw AEAD bundle
+    /// payload (nonce, ciphertext, auth_tag) plus the anchor wrap so
+    /// the projector can decrypt per-slot historical keys. Empty
+    /// vec when no bundle to decode.
+    pub history_payload: Option<HistoryBundlePayload>,
+
     /// Whether this event was locally created (source = 'local' in recorded_events).
     /// Used to gate pending bootstrap trust writes: only locally-created invite
     /// events should write pending trust rows. Synced invite events on the
@@ -332,6 +362,16 @@ pub struct UnwrappedSecretMaterial {
 pub struct HistoricalKeyMaterial {
     pub key_event_id: [u8; 32],
     pub key_bytes: [u8; 32],
+}
+
+/// Raw AEAD bundle material surfaced by a context loader for the
+/// projector to decrypt. Used by `key_history` / `key_history_bundle`
+/// so the deterministic bundle decrypt happens inside `project_pure`.
+#[derive(Debug, Clone)]
+pub struct HistoryBundlePayload {
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub auth_tag: [u8; 16],
 }
 
 /// Bootstrap context read from the `bootstrap_context` table, passed to
