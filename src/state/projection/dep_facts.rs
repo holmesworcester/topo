@@ -22,9 +22,12 @@
 //! a natural Verus proof target without dragging SQL into the spec.
 
 use crate::event_modules::{
-    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent, WorkspaceEvent,
+    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, MessageDeletionEvent, MessageEvent,
+    PeerSharedEvent, ReactionEvent, WorkspaceEvent,
 };
-use crate::projection::projector::{BootstrapDecisionContext, RemovalTargetKind};
+use crate::projection::projector::{
+    BootstrapDecisionContext, DeletionIntentInfo, RemovalTargetKind,
+};
 
 /// Typed summaries of immediate valid event dependencies.
 ///
@@ -913,6 +916,548 @@ pub fn decide_admin(
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Message
+//
+// Message's only semantic gate is content-authority: the outer
+// signer (a peer_shared) must authorize the `author_id` claimed by
+// the event. Positive authority is the signer dep; the
+// materialized `peers_shared` rollup is kept as a guard fact so
+// DB-level corruption (malformed/ambiguous/missing row) is still
+// detected — preserving existing defence-in-depth reject strings.
+//
+// Deletion intents (pre-existing `deletion_intents` rows keyed on
+// the message's own event_id) are a local materialized guard: they
+// govern whether the projector immediately tombstones on first
+// projection. Surfaced as guard facts.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MessageDepFacts {
+    /// Outer signer, parsed. Message requires a peer_shared signer.
+    pub signer: SignerResolution,
+}
+
+/// Materialized `peers_shared` rollup for the current signer_event_id.
+/// Carries the user_event_ids (0, 1, or >1 — the decision only
+/// distinguishes those cardinalities) and a `malformed` flag that
+/// surfaces DB corruption.
+#[derive(Debug, Clone, Default)]
+pub struct SignerPeerSharedRollup {
+    pub signer_user_ids: Vec<Option<String>>,
+    pub malformed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MessageGuardFacts {
+    /// Pre-existing deletion intents for this message_id. Consumed
+    /// by the projector to tombstone on first materialization.
+    pub deletion_intents: Vec<DeletionIntentInfo>,
+    /// Materialized `peers_shared` rollup for the outer signer. Only
+    /// populated when the dep-derived signer is `PeerShared`; for
+    /// other signer arms the dep decision is taken before the rollup
+    /// is consulted.
+    pub signer_rollup: SignerPeerSharedRollup,
+}
+
+#[derive(Debug, Clone)]
+pub enum MessageDecision {
+    Ready,
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    RejectMissingSignerBlob {
+        signer_event_id: String,
+    },
+    RejectMalformedSigner {
+        signer_event_id: String,
+        reason: String,
+    },
+    /// Materialized rollup missing (no `peers_shared` row for signer).
+    RejectNoPeersSharedRow { signer_event_id: String },
+    /// Materialized rollup carries >1 distinct user_event_id.
+    RejectAmbiguousPeersSharedRow { signer_event_id: String },
+    /// Materialized rollup user_event_id is not a valid base64 EventId.
+    RejectMalformedPeersSharedRow { signer_event_id: String },
+    /// Signer's peers_shared user_event_id differs from claimed author.
+    RejectAuthorMismatch {
+        signer_event_id: String,
+        signer_user_id: String,
+        claimed_author_id: String,
+    },
+}
+
+impl MessageDecision {
+    /// Compat shim: map decision to the pre-existing
+    /// `signer_user_mismatch_reason` string so existing runtime
+    /// tests and callers continue to see byte-identical reject text.
+    pub fn signer_user_mismatch_reason(&self) -> Option<String> {
+        match self {
+            Self::Ready => None,
+            Self::RejectMissingCurrentSigner => {
+                Some("missing current signer envelope".to_string())
+            }
+            Self::RejectUnsupportedSignerType { semantic_type_code } => Some(format!(
+                "content signer must be peer_shared, got semantic type {}",
+                semantic_type_code
+            )),
+            Self::RejectMissingSignerBlob { signer_event_id }
+            | Self::RejectNoPeersSharedRow { signer_event_id } => Some(format!(
+                "no peers_shared entry for signer {}",
+                signer_event_id
+            )),
+            Self::RejectAmbiguousPeersSharedRow { signer_event_id } => Some(format!(
+                "ambiguous peers_shared user binding for signer {}",
+                signer_event_id
+            )),
+            Self::RejectMalformedSigner { signer_event_id, .. }
+            | Self::RejectMalformedPeersSharedRow { signer_event_id } => Some(format!(
+                "malformed peers_shared user binding for signer {}",
+                signer_event_id
+            )),
+            Self::RejectAuthorMismatch {
+                signer_event_id,
+                signer_user_id,
+                claimed_author_id,
+            } => Some(format!(
+                "signer {} belongs to user {} but author_id claims {}",
+                signer_event_id, signer_user_id, claimed_author_id
+            )),
+        }
+    }
+}
+
+/// Normalise a `SignerPeerSharedRollup` into `(signer_user_id_opt, err)`
+/// where err carries a typed rollup-level reject (missing / ambiguous /
+/// malformed). Single source of truth for rollup sanity — shared
+/// between Message, Reaction, and MessageDeletion decisions.
+fn resolve_peers_shared_rollup(
+    signer_event_id: &str,
+    rollup: &SignerPeerSharedRollup,
+) -> Result<String, PeersSharedRollupError> {
+    if rollup.malformed || crate::crypto::event_id_from_base64(signer_event_id).is_none() {
+        return Err(PeersSharedRollupError::Malformed);
+    }
+    let mut user_ids = Vec::with_capacity(rollup.signer_user_ids.len());
+    for user_id in &rollup.signer_user_ids {
+        let Some(user_id) = user_id.as_ref() else {
+            return Err(PeersSharedRollupError::Malformed);
+        };
+        if user_id.is_empty() || crate::crypto::event_id_from_base64(user_id).is_none() {
+            return Err(PeersSharedRollupError::Malformed);
+        }
+        user_ids.push(user_id.clone());
+    }
+    user_ids.sort();
+    user_ids.dedup();
+    match user_ids.as_slice() {
+        [] => Err(PeersSharedRollupError::Missing),
+        [user_id] => Ok(user_id.clone()),
+        _ => Err(PeersSharedRollupError::Ambiguous),
+    }
+}
+
+enum PeersSharedRollupError {
+    Missing,
+    Ambiguous,
+    Malformed,
+}
+
+/// Pure Message decision.
+///
+/// Authority: outer signer must resolve (via `SignerResolution`) to a
+/// PeerShared *and* the materialized `peers_shared` rollup must agree
+/// with the event's `author_id`. The rollup-level checks preserve
+/// defence-in-depth against DB corruption.
+pub fn decide_message(
+    event: &MessageEvent,
+    deps: &MessageDepFacts,
+    guards: &MessageGuardFacts,
+) -> MessageDecision {
+    match &deps.signer {
+        SignerResolution::Missing => MessageDecision::RejectMissingCurrentSigner,
+        SignerResolution::UnsupportedKind { semantic_type_code } => {
+            MessageDecision::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            }
+        }
+        SignerResolution::MissingBlob { signer_event_id } => {
+            MessageDecision::RejectMissingSignerBlob {
+                signer_event_id: signer_event_id.clone(),
+            }
+        }
+        SignerResolution::Malformed {
+            signer_event_id,
+            reason,
+        } => MessageDecision::RejectMalformedSigner {
+            signer_event_id: signer_event_id.clone(),
+            reason: reason.clone(),
+        },
+        SignerResolution::DeviceInvite { .. } => MessageDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_DEVICE_INVITE,
+        },
+        SignerResolution::Admin { .. } => MessageDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_ADMIN,
+        },
+        SignerResolution::Workspace { .. } => MessageDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
+        },
+        SignerResolution::PeerShared { signer_event_id, .. } => {
+            let author_b64 = crate::crypto::event_id_to_base64(&event.author_id);
+            match resolve_peers_shared_rollup(signer_event_id, &guards.signer_rollup) {
+                Err(PeersSharedRollupError::Missing) => MessageDecision::RejectNoPeersSharedRow {
+                    signer_event_id: signer_event_id.clone(),
+                },
+                Err(PeersSharedRollupError::Ambiguous) => {
+                    MessageDecision::RejectAmbiguousPeersSharedRow {
+                        signer_event_id: signer_event_id.clone(),
+                    }
+                }
+                Err(PeersSharedRollupError::Malformed) => {
+                    MessageDecision::RejectMalformedPeersSharedRow {
+                        signer_event_id: signer_event_id.clone(),
+                    }
+                }
+                Ok(signer_user_id) => {
+                    if signer_user_id == author_b64 {
+                        MessageDecision::Ready
+                    } else {
+                        MessageDecision::RejectAuthorMismatch {
+                            signer_event_id: signer_event_id.clone(),
+                            signer_user_id,
+                            claimed_author_id: author_b64,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Reaction
+//
+// Reaction's semantic gate mirrors Message's: signer peer_shared
+// must authorize the claimed `author_id`, with the materialized
+// `peers_shared` rollup acting as a DB-consistency guard.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ReactionDepFacts {
+    pub signer: SignerResolution,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReactionGuardFacts {
+    pub signer_rollup: SignerPeerSharedRollup,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReactionDecision {
+    Ready,
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    RejectMissingSignerBlob {
+        signer_event_id: String,
+    },
+    RejectMalformedSigner {
+        signer_event_id: String,
+        reason: String,
+    },
+    RejectNoPeersSharedRow { signer_event_id: String },
+    RejectAmbiguousPeersSharedRow { signer_event_id: String },
+    RejectMalformedPeersSharedRow { signer_event_id: String },
+    RejectAuthorMismatch {
+        signer_event_id: String,
+        signer_user_id: String,
+        claimed_author_id: String,
+    },
+}
+
+impl ReactionDecision {
+    pub fn signer_user_mismatch_reason(&self) -> Option<String> {
+        match self {
+            Self::Ready => None,
+            Self::RejectMissingCurrentSigner => {
+                Some("missing current signer envelope".to_string())
+            }
+            Self::RejectUnsupportedSignerType { semantic_type_code } => Some(format!(
+                "content signer must be peer_shared, got semantic type {}",
+                semantic_type_code
+            )),
+            Self::RejectMissingSignerBlob { signer_event_id }
+            | Self::RejectNoPeersSharedRow { signer_event_id } => Some(format!(
+                "no peers_shared entry for signer {}",
+                signer_event_id
+            )),
+            Self::RejectAmbiguousPeersSharedRow { signer_event_id } => Some(format!(
+                "ambiguous peers_shared user binding for signer {}",
+                signer_event_id
+            )),
+            Self::RejectMalformedSigner { signer_event_id, .. }
+            | Self::RejectMalformedPeersSharedRow { signer_event_id } => Some(format!(
+                "malformed peers_shared user binding for signer {}",
+                signer_event_id
+            )),
+            Self::RejectAuthorMismatch {
+                signer_event_id,
+                signer_user_id,
+                claimed_author_id,
+            } => Some(format!(
+                "signer {} belongs to user {} but author_id claims {}",
+                signer_event_id, signer_user_id, claimed_author_id
+            )),
+        }
+    }
+}
+
+pub fn decide_reaction(
+    event: &ReactionEvent,
+    deps: &ReactionDepFacts,
+    guards: &ReactionGuardFacts,
+) -> ReactionDecision {
+    match &deps.signer {
+        SignerResolution::Missing => ReactionDecision::RejectMissingCurrentSigner,
+        SignerResolution::UnsupportedKind { semantic_type_code } => {
+            ReactionDecision::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            }
+        }
+        SignerResolution::MissingBlob { signer_event_id } => {
+            ReactionDecision::RejectMissingSignerBlob {
+                signer_event_id: signer_event_id.clone(),
+            }
+        }
+        SignerResolution::Malformed {
+            signer_event_id,
+            reason,
+        } => ReactionDecision::RejectMalformedSigner {
+            signer_event_id: signer_event_id.clone(),
+            reason: reason.clone(),
+        },
+        SignerResolution::DeviceInvite { .. } => ReactionDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_DEVICE_INVITE,
+        },
+        SignerResolution::Admin { .. } => ReactionDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_ADMIN,
+        },
+        SignerResolution::Workspace { .. } => ReactionDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
+        },
+        SignerResolution::PeerShared { signer_event_id, .. } => {
+            let author_b64 = crate::crypto::event_id_to_base64(&event.author_id);
+            match resolve_peers_shared_rollup(signer_event_id, &guards.signer_rollup) {
+                Err(PeersSharedRollupError::Missing) => {
+                    ReactionDecision::RejectNoPeersSharedRow {
+                        signer_event_id: signer_event_id.clone(),
+                    }
+                }
+                Err(PeersSharedRollupError::Ambiguous) => {
+                    ReactionDecision::RejectAmbiguousPeersSharedRow {
+                        signer_event_id: signer_event_id.clone(),
+                    }
+                }
+                Err(PeersSharedRollupError::Malformed) => {
+                    ReactionDecision::RejectMalformedPeersSharedRow {
+                        signer_event_id: signer_event_id.clone(),
+                    }
+                }
+                Ok(signer_user_id) => {
+                    if signer_user_id == author_b64 {
+                        ReactionDecision::Ready
+                    } else {
+                        ReactionDecision::RejectAuthorMismatch {
+                            signer_event_id: signer_event_id.clone(),
+                            signer_user_id,
+                            claimed_author_id: author_b64,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// MessageDeletion
+//
+// MessageDeletion accepts two signer kinds:
+//   - Admin → projector treats as authorized for any message
+//     (authorized_by_admin = true).
+//   - PeerShared → signer's user_event_id is the deletion author
+//     and must match the target message's author_id at write time.
+//
+// Target-message guard state comes from materialized `messages` and
+// `deleted_messages` rows. Both may be absent (intent-only path).
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MessageDeletionDepFacts {
+    pub signer: SignerResolution,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MessageDeletionGuardFacts {
+    /// author_id from `messages` row for the target, if present.
+    pub target_message_author: Option<String>,
+    /// author_id from `deleted_messages` tombstone for the target, if present.
+    pub target_tombstone_author: Option<String>,
+    /// True when the target event_id is in valid_events but is NOT a
+    /// message (no row in messages or deleted_messages). Only
+    /// populated when both message/tombstone author are absent.
+    pub target_is_non_message: bool,
+    /// Materialized `peers_shared` rollup for a peer_shared outer
+    /// signer; unused for admin signers.
+    pub signer_rollup: SignerPeerSharedRollup,
+}
+
+/// Result of resolving the MessageDeletion signer to its (user_id, is_admin, reject_reason)
+/// triple — the exact shape the projector's decision context expects.
+#[derive(Debug, Clone)]
+pub enum MessageDeletionDecision {
+    /// Admin signer: authorized for any message.
+    ReadyAdmin,
+    /// PeerShared signer: deletion carries the signer's user_event_id.
+    ReadyPeerSharedUser { signer_user_id: String },
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    RejectMissingSignerBlob {
+        signer_event_id: String,
+    },
+    RejectMalformedSigner {
+        signer_event_id: String,
+        reason: String,
+    },
+    RejectNoPeersSharedRow { signer_event_id: String },
+    RejectAmbiguousPeersSharedRow { signer_event_id: String },
+    RejectMalformedPeersSharedRow { signer_event_id: String },
+}
+
+impl MessageDeletionDecision {
+    /// Compat shim: fold into the three legacy context fields
+    /// `(deletion_signer_user_id, deletion_signer_is_admin, deletion_signer_reject_reason)`.
+    pub fn context_fields(&self) -> (Option<String>, bool, Option<String>) {
+        match self {
+            Self::ReadyAdmin => (None, true, None),
+            Self::ReadyPeerSharedUser { signer_user_id } => {
+                (Some(signer_user_id.clone()), false, None)
+            }
+            Self::RejectMissingCurrentSigner => (
+                None,
+                false,
+                Some("missing current signer envelope".to_string()),
+            ),
+            Self::RejectUnsupportedSignerType { semantic_type_code } => (
+                None,
+                false,
+                Some(format!(
+                    "message_deletion signer must be peer_shared or admin, got semantic type {}",
+                    semantic_type_code
+                )),
+            ),
+            Self::RejectMissingSignerBlob { signer_event_id }
+            | Self::RejectNoPeersSharedRow { signer_event_id } => (
+                None,
+                false,
+                Some(format!(
+                    "no peers_shared entry for signer {}",
+                    signer_event_id
+                )),
+            ),
+            Self::RejectAmbiguousPeersSharedRow { signer_event_id } => (
+                None,
+                false,
+                Some(format!(
+                    "ambiguous peers_shared user binding for message_deletion signer {}",
+                    signer_event_id
+                )),
+            ),
+            Self::RejectMalformedSigner {
+                signer_event_id, ..
+            }
+            | Self::RejectMalformedPeersSharedRow { signer_event_id } => (
+                None,
+                false,
+                Some(format!(
+                    "malformed peers_shared user binding for message_deletion signer {}",
+                    signer_event_id
+                )),
+            ),
+        }
+    }
+}
+
+/// Pure MessageDeletion signer decision.
+///
+/// Admin signers are authorized directly; peer_shared signers route
+/// through the materialized `peers_shared` rollup (DB-consistency
+/// guard) to produce the deletion author. The target-message author
+/// match is applied *inside* the projector at emit time.
+pub fn decide_message_deletion(
+    _event: &MessageDeletionEvent,
+    deps: &MessageDeletionDepFacts,
+    guards: &MessageDeletionGuardFacts,
+) -> MessageDeletionDecision {
+    match &deps.signer {
+        SignerResolution::Missing => MessageDeletionDecision::RejectMissingCurrentSigner,
+        SignerResolution::UnsupportedKind { semantic_type_code } => {
+            MessageDeletionDecision::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            }
+        }
+        SignerResolution::MissingBlob { signer_event_id } => {
+            MessageDeletionDecision::RejectMissingSignerBlob {
+                signer_event_id: signer_event_id.clone(),
+            }
+        }
+        SignerResolution::Malformed {
+            signer_event_id,
+            reason,
+        } => MessageDeletionDecision::RejectMalformedSigner {
+            signer_event_id: signer_event_id.clone(),
+            reason: reason.clone(),
+        },
+        SignerResolution::DeviceInvite { .. } => {
+            MessageDeletionDecision::RejectUnsupportedSignerType {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_DEVICE_INVITE,
+            }
+        }
+        SignerResolution::Admin { .. } => MessageDeletionDecision::ReadyAdmin,
+        SignerResolution::Workspace { .. } => {
+            MessageDeletionDecision::RejectUnsupportedSignerType {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
+            }
+        }
+        SignerResolution::PeerShared { signer_event_id, .. } => {
+            match resolve_peers_shared_rollup(signer_event_id, &guards.signer_rollup) {
+                Err(PeersSharedRollupError::Missing) => {
+                    MessageDeletionDecision::RejectNoPeersSharedRow {
+                        signer_event_id: signer_event_id.clone(),
+                    }
+                }
+                Err(PeersSharedRollupError::Ambiguous) => {
+                    MessageDeletionDecision::RejectAmbiguousPeersSharedRow {
+                        signer_event_id: signer_event_id.clone(),
+                    }
+                }
+                Err(PeersSharedRollupError::Malformed) => {
+                    MessageDeletionDecision::RejectMalformedPeersSharedRow {
+                        signer_event_id: signer_event_id.clone(),
+                    }
+                }
+                Ok(signer_user_id) => {
+                    MessageDeletionDecision::ReadyPeerSharedUser { signer_user_id }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1531,6 +2076,323 @@ mod tests {
 
     // ── Guard passthrough ─────────────────────────────────────
 
+    fn msg_event(author: [u8; 32]) -> MessageEvent {
+        MessageEvent {
+            created_at_ms: 0,
+            workspace_id: [9u8; 32],
+            author_id: author,
+            content: "hello".to_string(),
+        }
+    }
+
+    fn peer_shared_signer_with(user: [u8; 32]) -> SignerResolution {
+        SignerResolution::PeerShared {
+            signer_event_id: "sig".into(),
+            event: PeerSharedEvent {
+                created_at_ms: 0,
+                public_key: [1u8; 32],
+                user_event_id: user,
+                endpoint_shared_event_id: [2u8; 32],
+                device_name: String::new(),
+            },
+        }
+    }
+
+    fn ps_signer_id_b64() -> String {
+        // Matches `peer_shared_signer_with`: any valid 32-byte b64 works.
+        crate::crypto::event_id_to_base64(&[0xFFu8; 32])
+    }
+
+    fn peer_shared_signer_full(signer_id: &str, user: [u8; 32]) -> SignerResolution {
+        SignerResolution::PeerShared {
+            signer_event_id: signer_id.to_string(),
+            event: PeerSharedEvent {
+                created_at_ms: 0,
+                public_key: [1u8; 32],
+                user_event_id: user,
+                endpoint_shared_event_id: [2u8; 32],
+                device_name: String::new(),
+            },
+        }
+    }
+
+    fn rollup_single_user(user: [u8; 32]) -> SignerPeerSharedRollup {
+        SignerPeerSharedRollup {
+            signer_user_ids: vec![Some(crate::crypto::event_id_to_base64(&user))],
+            malformed: false,
+        }
+    }
+
+    #[test]
+    fn message_ready_when_signer_user_matches_author_id() {
+        let user = [10u8; 32];
+        let signer_id = ps_signer_id_b64();
+        let deps = MessageDepFacts {
+            signer: peer_shared_signer_full(&signer_id, user),
+        };
+        let guards = MessageGuardFacts {
+            signer_rollup: rollup_single_user(user),
+            ..Default::default()
+        };
+        let d = decide_message(&msg_event(user), &deps, &guards);
+        assert!(matches!(d, MessageDecision::Ready));
+        assert!(d.signer_user_mismatch_reason().is_none());
+    }
+
+    #[test]
+    fn message_rejects_when_signer_user_differs_from_author() {
+        let signer_id = ps_signer_id_b64();
+        let deps = MessageDepFacts {
+            signer: peer_shared_signer_full(&signer_id, [1u8; 32]),
+        };
+        let guards = MessageGuardFacts {
+            signer_rollup: rollup_single_user([1u8; 32]),
+            ..Default::default()
+        };
+        let d = decide_message(&msg_event([2u8; 32]), &deps, &guards);
+        assert!(matches!(d, MessageDecision::RejectAuthorMismatch { .. }));
+        let reason = d.signer_user_mismatch_reason().expect("reason");
+        assert!(reason.contains("author_id claims"));
+    }
+
+    #[test]
+    fn message_rejects_missing_signer() {
+        let deps = MessageDepFacts {
+            signer: SignerResolution::Missing,
+        };
+        let d = decide_message(&msg_event([0u8; 32]), &deps, &MessageGuardFacts::default());
+        assert!(matches!(d, MessageDecision::RejectMissingCurrentSigner));
+        assert_eq!(
+            d.signer_user_mismatch_reason().as_deref(),
+            Some("missing current signer envelope")
+        );
+    }
+
+    #[test]
+    fn message_rejects_unsupported_signer_kind() {
+        let deps = MessageDepFacts {
+            signer: SignerResolution::DeviceInvite {
+                signer_event_id: "sig".into(),
+                event: DeviceInviteEvent {
+                    created_at_ms: 0,
+                    public_key: [1u8; 32],
+                    authority_event_id: [2u8; 32],
+                    key_history_event_id: [3u8; 32],
+                },
+            },
+        };
+        let d = decide_message(&msg_event([0u8; 32]), &deps, &MessageGuardFacts::default());
+        assert!(matches!(
+            d,
+            MessageDecision::RejectUnsupportedSignerType { .. }
+        ));
+    }
+
+    #[test]
+    fn message_rejects_malformed_peers_shared_rollup() {
+        let signer_id = ps_signer_id_b64();
+        let user = [10u8; 32];
+        let deps = MessageDepFacts {
+            signer: peer_shared_signer_full(&signer_id, user),
+        };
+        let guards = MessageGuardFacts {
+            signer_rollup: SignerPeerSharedRollup {
+                signer_user_ids: vec![Some("not-base64".to_string())],
+                malformed: false,
+            },
+            ..Default::default()
+        };
+        let d = decide_message(&msg_event(user), &deps, &guards);
+        assert!(matches!(
+            d,
+            MessageDecision::RejectMalformedPeersSharedRow { .. }
+        ));
+        assert!(d.signer_user_mismatch_reason().unwrap().contains("malformed"));
+    }
+
+    // ── Reaction pilot ────────────────────────────────────────
+
+    fn rxn_event(author: [u8; 32]) -> ReactionEvent {
+        ReactionEvent {
+            created_at_ms: 0,
+            target_event_id: [9u8; 32],
+            author_id: author,
+            emoji: "👍".to_string(),
+        }
+    }
+
+    #[test]
+    fn reaction_ready_when_signer_user_matches_author_id() {
+        let user = [10u8; 32];
+        let signer_id = ps_signer_id_b64();
+        let deps = ReactionDepFacts {
+            signer: peer_shared_signer_full(&signer_id, user),
+        };
+        let guards = ReactionGuardFacts {
+            signer_rollup: rollup_single_user(user),
+        };
+        let d = decide_reaction(&rxn_event(user), &deps, &guards);
+        assert!(matches!(d, ReactionDecision::Ready));
+        assert!(d.signer_user_mismatch_reason().is_none());
+    }
+
+    #[test]
+    fn reaction_rejects_when_signer_user_differs_from_author() {
+        let signer_id = ps_signer_id_b64();
+        let deps = ReactionDepFacts {
+            signer: peer_shared_signer_full(&signer_id, [1u8; 32]),
+        };
+        let guards = ReactionGuardFacts {
+            signer_rollup: rollup_single_user([1u8; 32]),
+        };
+        let d = decide_reaction(&rxn_event([2u8; 32]), &deps, &guards);
+        assert!(matches!(d, ReactionDecision::RejectAuthorMismatch { .. }));
+        assert!(d.signer_user_mismatch_reason().is_some());
+    }
+
+    #[test]
+    fn reaction_rejects_missing_signer() {
+        let deps = ReactionDepFacts {
+            signer: SignerResolution::Missing,
+        };
+        let d = decide_reaction(&rxn_event([0u8; 32]), &deps, &ReactionGuardFacts::default());
+        assert!(matches!(d, ReactionDecision::RejectMissingCurrentSigner));
+    }
+
+    // ── MessageDeletion pilot ─────────────────────────────────
+
+    fn del_event() -> MessageDeletionEvent {
+        MessageDeletionEvent {
+            created_at_ms: 0,
+            target_event_id: [0xAB; 32],
+        }
+    }
+
+    fn admin_signer(user: [u8; 32]) -> SignerResolution {
+        SignerResolution::Admin {
+            signer_event_id: "admin-sig".into(),
+            event: AdminEvent {
+                created_at_ms: 0,
+                public_key: [5u8; 32],
+                authority_event_id: [0u8; 32],
+                user_event_id: user,
+            },
+        }
+    }
+
+    #[test]
+    fn message_deletion_ready_admin_when_signer_is_admin() {
+        let deps = MessageDeletionDepFacts {
+            signer: admin_signer([1u8; 32]),
+        };
+        let d = decide_message_deletion(
+            &del_event(),
+            &deps,
+            &MessageDeletionGuardFacts::default(),
+        );
+        assert!(matches!(d, MessageDeletionDecision::ReadyAdmin));
+        let (user, is_admin, reject) = d.context_fields();
+        assert!(user.is_none());
+        assert!(is_admin);
+        assert!(reject.is_none());
+    }
+
+    #[test]
+    fn message_deletion_ready_peer_shared_user_carries_user_event_id() {
+        let user = [42u8; 32];
+        let signer_id = ps_signer_id_b64();
+        let deps = MessageDeletionDepFacts {
+            signer: peer_shared_signer_full(&signer_id, user),
+        };
+        let guards = MessageDeletionGuardFacts {
+            signer_rollup: rollup_single_user(user),
+            ..Default::default()
+        };
+        let d = decide_message_deletion(&del_event(), &deps, &guards);
+        match &d {
+            MessageDeletionDecision::ReadyPeerSharedUser { signer_user_id } => {
+                assert_eq!(
+                    signer_user_id.as_str(),
+                    crate::crypto::event_id_to_base64(&user).as_str()
+                );
+            }
+            other => panic!("expected ReadyPeerSharedUser, got {:?}", other),
+        }
+        let (resolved_user, is_admin, reject) = d.context_fields();
+        assert_eq!(
+            resolved_user.as_deref(),
+            Some(crate::crypto::event_id_to_base64(&user).as_str())
+        );
+        assert!(!is_admin);
+        assert!(reject.is_none());
+    }
+
+    #[test]
+    fn message_deletion_rejects_malformed_peers_shared_rollup() {
+        let user = [42u8; 32];
+        let signer_id = ps_signer_id_b64();
+        let deps = MessageDeletionDepFacts {
+            signer: peer_shared_signer_full(&signer_id, user),
+        };
+        let guards = MessageDeletionGuardFacts {
+            signer_rollup: SignerPeerSharedRollup {
+                signer_user_ids: vec![Some("not-base64".to_string())],
+                malformed: false,
+            },
+            ..Default::default()
+        };
+        let d = decide_message_deletion(&del_event(), &deps, &guards);
+        assert!(matches!(
+            d,
+            MessageDeletionDecision::RejectMalformedPeersSharedRow { .. }
+        ));
+    }
+
+    #[test]
+    fn message_deletion_rejects_missing_signer() {
+        let deps = MessageDeletionDepFacts {
+            signer: SignerResolution::Missing,
+        };
+        let d = decide_message_deletion(
+            &del_event(),
+            &deps,
+            &MessageDeletionGuardFacts::default(),
+        );
+        assert!(matches!(
+            d,
+            MessageDeletionDecision::RejectMissingCurrentSigner
+        ));
+        let (user, is_admin, reject) = d.context_fields();
+        assert!(user.is_none());
+        assert!(!is_admin);
+        assert_eq!(reject.as_deref(), Some("missing current signer envelope"));
+    }
+
+    #[test]
+    fn message_deletion_rejects_unsupported_signer_kind() {
+        let deps = MessageDeletionDepFacts {
+            signer: SignerResolution::DeviceInvite {
+                signer_event_id: "sig".into(),
+                event: DeviceInviteEvent {
+                    created_at_ms: 0,
+                    public_key: [1u8; 32],
+                    authority_event_id: [2u8; 32],
+                    key_history_event_id: [3u8; 32],
+                },
+            },
+        };
+        let d = decide_message_deletion(
+            &del_event(),
+            &deps,
+            &MessageDeletionGuardFacts::default(),
+        );
+        assert!(matches!(
+            d,
+            MessageDeletionDecision::RejectUnsupportedSignerType { .. }
+        ));
+        let (_, _, reject) = d.context_fields();
+        assert!(reject.expect("reason").contains("peer_shared or admin"));
+    }
     #[test]
     fn ready_carries_guard_flags_through() {
         let event = ev(true);
