@@ -16,6 +16,7 @@ pub const REMOVAL_FIELDS: &[FieldSpec] = &[
     FieldSpec::EventId("parent_4"),
     FieldSpec::EventId("frontier_hash"),
     FieldSpec::EventId("removed_by"),
+    FieldSpec::EventId("admin_authority_event_id"),
 ];
 
 pub const REMOVAL_WIRE_SIZE: usize = wire_size_for_fields(REMOVAL_FIELDS);
@@ -31,6 +32,12 @@ pub struct RemovalEvent {
     pub parent_4: [u8; 32],
     pub frontier_hash: [u8; 32],
     pub removed_by: [u8; 32],
+    /// Admin event that authorizes this removal. The event graph's
+    /// dep-resolution must see this as a valid `admin` event, and its
+    /// `user_event_id` must match the signer peer_shared's user. That
+    /// equality is the positive-authority proof obligation; revocation
+    /// remains a separate guard layer.
+    pub admin_authority_event_id: [u8; 32],
 }
 
 impl super::Describe for RemovalEvent {
@@ -109,8 +116,8 @@ pub fn frontier_refs_from_slots(
 }
 
 pub fn parse_removal(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if let Some((ts, removed_member_ref, parent_count, p1, p2, p3, p4, fh, rb)) =
-        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id6(EVENT_TYPE_REMOVAL, blob)
+    if let Some((ts, removed_member_ref, parent_count, p1, p2, p3, p4, fh, rb, admin)) =
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id7(EVENT_TYPE_REMOVAL, blob)
     {
         return Ok(ParsedEvent::Removal(RemovalEvent {
             created_at_ms: ts,
@@ -122,6 +129,7 @@ pub fn parse_removal(blob: &[u8]) -> Result<ParsedEvent, EventError> {
             parent_4: p4,
             frontier_hash: fh,
             removed_by: rb,
+            admin_authority_event_id: admin,
         }));
     }
     let values = decode_fields(EVENT_TYPE_REMOVAL, REMOVAL_FIELDS, blob)?;
@@ -135,6 +143,7 @@ pub fn parse_removal(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         parent_4: values[6].as_event_id().unwrap(),
         frontier_hash: values[7].as_event_id().unwrap(),
         removed_by: values[8].as_event_id().unwrap(),
+        admin_authority_event_id: values[9].as_event_id().unwrap(),
     }))
 }
 
@@ -144,7 +153,7 @@ pub fn encode_removal(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
     Ok(
-        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u8_id6(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id_u8_id7(
             EVENT_TYPE_REMOVAL,
             r.created_at_ms,
             &r.removed_member_ref,
@@ -155,6 +164,7 @@ pub fn encode_removal(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
             &r.parent_4,
             &r.frontier_hash,
             &r.removed_by,
+            &r.admin_authority_event_id,
         ),
     )
 }
@@ -309,6 +319,7 @@ mod tests {
             parent_4: [0u8; 32],
             frontier_hash: frontier_hash_from_refs(&frontier_refs),
             removed_by: [0x44; 32],
+            admin_authority_event_id: [0x55; 32],
         });
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), REMOVAL_WIRE_SIZE);

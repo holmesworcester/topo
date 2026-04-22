@@ -30,6 +30,7 @@ mod tests {
             parent_4: [0u8; 32],
             frontier_hash,
             removed_by,
+            admin_authority_event_id: [0u8; 32],
         })
     }
 

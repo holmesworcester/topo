@@ -28,6 +28,7 @@ fn make_signed_removal(
         parent_4: slots[3],
         frontier_hash: frontier_hash_override.unwrap_or_else(|| frontier_hash_from_refs(parents)),
         removed_by: *signer_eid,
+        admin_authority_event_id: [0u8; 32],
     });
     let blob = sign_blob(signing_key, signer_eid, &event);
     let parsed = events::parse_event(&blob).unwrap();

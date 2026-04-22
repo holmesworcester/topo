@@ -240,6 +240,77 @@ pub fn parse_ts_id_u8_id6(
 }
 
 // ══════════════════════════════════════════════════════════════════
+// ts_id_u8_id7: Timestamp + EventId + U8 + 7 EventIds
+// Covers: removal (adds admin_authority_event_id as an explicit
+// dep alongside the existing 6 ids: removed_member_ref is the head,
+// parent_1..4 + frontier_hash + removed_by as id1..6, and
+// admin_authority_event_id as id7).
+//
+// Shape: type(1) + ts(8) + head_id(32) + count(1) + 7*id(224)
+// Total: 1 + 8 + 32 + 1 + 7*32 = 266
+// ══════════════════════════════════════════════════════════════════
+
+pub const TS_ID_U8_ID7_WIRE_SIZE: usize = 266;
+
+pub fn encode_ts_id_u8_id7(
+    type_byte: u8, ts: u64, head_id: &[u8; 32], count: u8,
+    id1: &[u8; 32], id2: &[u8; 32], id3: &[u8; 32],
+    id4: &[u8; 32], id5: &[u8; 32], id6: &[u8; 32],
+    id7: &[u8; 32],
+) -> (out: Vec<u8>)
+    ensures
+        out@.len() == TS_ID_U8_ID7_WIRE_SIZE,
+        out@[0] == type_byte,
+        out@.subrange(1, 9) =~= spec_u64_to_le_bytes(ts),
+        out@.subrange(9, 41) =~= head_id@,
+        out@[41] == count,
+        out@.subrange(42, 74) =~= id1@,
+        out@.subrange(74, 106) =~= id2@,
+        out@.subrange(106, 138) =~= id3@,
+        out@.subrange(138, 170) =~= id4@,
+        out@.subrange(170, 202) =~= id5@,
+        out@.subrange(202, 234) =~= id6@,
+        out@.subrange(234, 266) =~= id7@,
+{
+    let mut buf: Vec<u8> = Vec::with_capacity(TS_ID_U8_ID7_WIRE_SIZE);
+    buf.push(type_byte);
+    let ts_bytes: Vec<u8> = u64_to_le_bytes(ts);
+    buf.extend_from_slice(ts_bytes.as_slice());
+    buf.extend_from_slice(head_id);
+    buf.push(count);
+    buf.extend_from_slice(id1);
+    buf.extend_from_slice(id2);
+    buf.extend_from_slice(id3);
+    buf.extend_from_slice(id4);
+    buf.extend_from_slice(id5);
+    buf.extend_from_slice(id6);
+    buf.extend_from_slice(id7);
+    buf
+}
+
+pub fn parse_ts_id_u8_id7(
+    expected_type_byte: u8, blob: &[u8],
+) -> (out: Option<(u64, [u8; 32], u8, [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32])>)
+    ensures
+        out.is_some() <==> (blob@.len() == TS_ID_U8_ID7_WIRE_SIZE
+            && blob@[0] == expected_type_byte),
+{
+    if blob.len() != TS_ID_U8_ID7_WIRE_SIZE { return None; }
+    if blob[0] != expected_type_byte { return None; }
+    let ts = u64_from_le_bytes(vstd::slice::slice_subrange(blob, 1, 9));
+    let head = copy_32(blob, 9);
+    let count = blob[41];
+    let id1 = copy_32(blob, 42);
+    let id2 = copy_32(blob, 74);
+    let id3 = copy_32(blob, 106);
+    let id4 = copy_32(blob, 138);
+    let id5 = copy_32(blob, 170);
+    let id6 = copy_32(blob, 202);
+    let id7 = copy_32(blob, 234);
+    Some((ts, head, count, id1, id2, id3, id4, id5, id6, id7))
+}
+
+// ══════════════════════════════════════════════════════════════════
 // ts_id_u32_slice: Timestamp + EventId + U32 + variable-length slice
 // Covers: file_slice (ciphertext is a large variable payload)
 // The slice length is not fixed by the codec; the runtime supplies it.

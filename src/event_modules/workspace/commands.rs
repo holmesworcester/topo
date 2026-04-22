@@ -1001,6 +1001,8 @@ pub fn remove_member(
         parent_4: parent_slots[3],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&parent_refs),
         removed_by: authoring.signer_event_id,
+        // TODO(phase B): resolve admin-authority event for signer's user.
+        admin_authority_event_id: [0u8; 32],
     });
     let removal_event_id = event_id_or_blocked(create_signed_event(
         db,

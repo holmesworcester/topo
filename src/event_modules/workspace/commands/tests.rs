@@ -61,6 +61,7 @@ fn create_local_removal(
         parent_4: parent_slots[3],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&slots),
         removed_by: *signer_event_id,
+        admin_authority_event_id: [0u8; 32],
     });
     create_signed_event(conn, recorded_by, signer_event_id, &removal, signing_key)
         .expect("create signed removal")

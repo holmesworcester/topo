@@ -123,6 +123,7 @@ fn key_shared_blocks_on_missing_frontier_then_projects() {
         parent_4: [0u8; 32],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
         removed_by: signer_eid,
+        admin_authority_event_id: [0u8; 32],
     });
     let removal_blob = sign_blob(&signer_key, &signer_eid, &removal);
     let removal_eid = canonical_test_event_id(&conn, recorded_by, &removal_blob);
@@ -214,6 +215,7 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
         parent_4: [0u8; 32],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
         removed_by: signer_eid,
+        admin_authority_event_id: [0u8; 32],
     });
     let left_blob = sign_blob(&signer_key, &signer_eid, &left_removal);
     let left_eid = insert_event_raw(&conn, recorded_by, &left_blob);
@@ -232,6 +234,7 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
         parent_4: [0u8; 32],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
         removed_by: signer_eid,
+        admin_authority_event_id: [0u8; 32],
     });
     let right_blob = sign_blob(&signer_key, &signer_eid, &right_removal);
     let right_eid = insert_event_raw(&conn, recorded_by, &right_blob);
