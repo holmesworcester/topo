@@ -42,6 +42,7 @@ mod encryption;
 mod file_slice;
 mod identity;
 mod invite;
+mod per_message_fs;
 mod removal_rotation;
 mod tenant;
 mod verus_findings;
