@@ -2,13 +2,21 @@
 
 ## Status
 
-**Design decision point — not implemented this session.** The
-producer side of the pipeline (message_key projection, K_m
-materialization, cascade into the Encrypted lookup) is fully in
-place. The SENDER side — wiring the CLI / RPC `send` path to emit a
-message_key alongside each message and encrypt under a fresh K_m
-instead of K_epoch — has a circular-dependency issue that needs a
-deliberate design call before implementing.
+**Option C wire/projection landed** in commit `db0f7440`. The
+`owning_message_event_id` field is dropped from the `message_key`
+wire; linkage is established at Encrypted-projection time by writing
+`(message_event_id, message_key_event_id)` into a new
+`messages_to_message_keys` reverse index. Purge cascade now reads the
+reverse index to enumerate the per-message K_m row to remove.
+
+**Remaining scope** — wire the SEND path (`message::commands::create`)
+to actually emit a `message_key` alongside each outgoing message and
+encrypt under a fresh K_m instead of K_epoch. The current send flow
+still uses the legacy `KeyRotation` content key (which is why the
+existing FS CLI tests exercise blob-level purge, not K_m-level purge).
+Upgrading to per-message K_m tightens the FS granularity but does not
+add a new property — blob purge already covers the deleted message's
+ciphertext.
 
 ## Current send flow (legacy, still functional)
 
