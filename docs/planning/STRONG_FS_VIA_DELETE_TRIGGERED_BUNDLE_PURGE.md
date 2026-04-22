@@ -90,9 +90,15 @@ T_delete     Any peer emits `MessageDeletion` for some m_j in this
                   - Leaves all other K_m rows (for m1..m_N except m_j)
                     intact — undeleted messages stay decryptable.
 
-T_delete+ε   Creator observes the deletion (via normal event sync)
-             and rotates to a new K_bundle on their next send.
-             REQUIRED: see invariant 3.
+T_delete+ε   If the creator next calls `ensure_content_key_for_peer`
+             (i.e., sends another message), it sees no
+             `key_rotations JOIN key_secrets` match for the current
+             frontier (K_bundle row was purged from their own state
+             too) and rotates to a fresh K_bundle automatically. No
+             explicit "force rotate" hook needed. If the creator
+             never sends again, no rotation happens — the bundle is
+             quietly retired. Symmetric purge + existing rotation
+             logic does the whole job.
 ```
 
 At `T_delete`, on every honest peer, it becomes cryptographically
@@ -100,7 +106,9 @@ impossible to recover K_m for any message whose message_key event
 arrives after `T_delete` and references the retired K_bundle. Such
 message_key events project as blocked on a `k_bundle_local_event_id`
 that no longer exists in any honest peer's state. Those messages are
-effectively lost — which is why the creator MUST rotate.
+effectively lost — but in practice the creator's next send rotates
+to a fresh bundle before any such lost-in-flight case can occur, so
+this is a consistency property rather than a correctness hazard.
 
 ## Invariants
 
@@ -116,13 +124,22 @@ effectively lost — which is why the creator MUST rotate.
    `k_bundle_local_event_id`. The purge is a single-row delete
    (the K_bundle's row), not a cascade over all K_m's.
 
-3. **Creators MUST rotate to a new K_bundle on deletion awareness.**
-   When a creator device projects a `MessageDeletion` for one of the
-   messages it authored (or for any message in any bundle it is
-   currently using), its next send must emit a fresh K_bundle via a
-   new `key_broadcast`. Sending under a retired bundle would produce
-   `message_key` events that project as blocked on every recipient
-   (K_bundle gone) and the messages would be lost.
+3. **Rotation on next send emerges naturally — no explicit
+   "force rotate" machinery.** The K_bundle purge is symmetric: the
+   creator's own `key_secrets` row is shredded along with every
+   other honest peer's. `latest_content_key_for_frontier`
+   inner-joins `key_rotations JOIN key_secrets`, so a KeyRotation
+   row that no longer has a matching `key_secrets` row returns None,
+   and `ensure_content_key_for_peer_at` rotates automatically on
+   the creator's next send. If the creator never sends again, no
+   rotation happens — the bundle is quietly retired.
+
+   Math: rotation costs ~524 KB per `key_broadcast` emission;
+   retired-bundle cold-path history delivery (individually-wrapped
+   K_m per un-deleted message at ~200B each) is cheaper than
+   rotation for any bundle with fewer than ~2620 messages. For
+   typical chat workloads, not rotating on delete is the cheaper
+   choice.
 
 4. **Per-device K_bundle lineage.** Each sender device has its own
    K_bundle stream. Another device's deletion cascade does NOT purge
@@ -199,23 +216,12 @@ DELETE). Existing K_m deletes can optionally also use it — K_m is
 already gone-on-delete in Option C, but shredding hardens against
 SQLite page-reuse leakage.
 
-### Phase C — Creator rotation on deletion awareness
+### Phase C — (NOT NEEDED)
 
-Touch: `src/event_modules/workspace/identity_ops.rs`
-(`ensure_content_key_for_peer` / `rotate_content_key_for_peer`) and
-the send path.
-
-Track: for each sender device, the set of "dirty" K_bundles — any
-bundle for which a MessageDeletion has projected locally. On the
-next send from that device, force a rotation to a fresh K_bundle
-before proceeding.
-
-Simplest implementation: a `dirty_bundles(recorded_by, bundle_id,
-observed_at_ms)` table written by the MessageDeletion projector
-(one row per distinct bundle referenced by the deleted message's
-message_key), read by `ensure_content_key_for_peer` to decide
-"should I rotate before this send?". Once rotated, the dirty row
-can be cleared.
+No explicit code. Rotation on next-send emerges for free from the
+symmetric purge in Phase A + the existing `JOIN key_secrets` in
+`latest_content_key_for_frontier`. Briefly delayed first-send
+after a deletion is acceptable (happens serially on one device).
 
 ### Phase D — Pattern-(b) polish on heal path
 
@@ -374,8 +380,8 @@ What we do NOT claim:
        K_bundle row in `key_secrets`
 - [ ] Phase B — `secure_zero` + `secure_shred_blob` helpers for
        K_bundle rows (and optionally K_m)
-- [ ] Phase C — creator rotation-on-deletion via `dirty_bundles`
-       table + `ensure_content_key_for_peer` hook
+- [x] Phase C — dropped; natural rotation via existing
+       `ensure_content_key_for_peer` inner-join suffices
 - [ ] Phase D — pattern-(b) polish on `key_bundle_share` heal path
        and a retired-bundle joiner test
 - [ ] Phase E — WrapPrivkey hygiene (shred + grace sweep) on its
