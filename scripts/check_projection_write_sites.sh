@@ -162,6 +162,59 @@ for root, dirs, files in os.walk(src_dir):
                             f"ERROR: {op} on projection-tracked table '{table}' at {rel}:{lineno}: {line.rstrip()}"
                         )
 
+# Second pass: forbid DSL-level key_secrets construction via the generic
+# `WriteOp::InsertOrIgnore { table: "key_secrets"` pattern. The typed
+# variant `WriteOp::InsertKeySecret(KeySecretsRow)` is the sole legitimate
+# construction path.
+dsl_pattern = re.compile(
+    r'WriteOp::InsertOrIgnore\s*\{\s*table\s*:\s*"key_secrets"',
+)
+for root, dirs, files in os.walk(src_dir):
+    dirs[:] = [d for d in dirs if d not in ("target", "vendor")]
+    for fname in files:
+        if not fname.endswith(".rs"):
+            continue
+        fpath = os.path.join(root, fname)
+        rel = os.path.relpath(fpath, os.path.dirname(src_dir)).replace(os.sep, "/")
+        if is_skipped_dir(rel) or is_test_only_file(rel):
+            continue
+        with open(fpath, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        # Skip cfg(test) blocks (reuse the per-line logic above by re-scanning).
+        lines = text.splitlines()
+        in_test_block = False
+        test_brace_depth = 0
+        cfg_test_pending = False
+        for lineno, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if "#[cfg(test)]" in stripped:
+                cfg_test_pending = True
+                continue
+            if cfg_test_pending and "{" in stripped and (
+                stripped.startswith("mod ") or stripped.startswith("fn ")
+                or stripped.startswith("impl ") or stripped.startswith("pub fn ")
+                or stripped.startswith("pub(crate) fn ")
+                or stripped.startswith("pub(super) fn ")
+            ):
+                in_test_block = True
+                test_brace_depth = stripped.count("{") - stripped.count("}")
+                cfg_test_pending = False
+                if test_brace_depth <= 0:
+                    in_test_block = False
+                    test_brace_depth = 0
+                continue
+            if in_test_block:
+                test_brace_depth += stripped.count("{") - stripped.count("}")
+                if test_brace_depth <= 0:
+                    in_test_block = False
+                    test_brace_depth = 0
+                continue
+            if dsl_pattern.search(line):
+                errors.append(
+                    f"ERROR: DSL-level key_secrets construction via WriteOp::InsertOrIgnore "
+                    f"at {rel}:{lineno}: {line.rstrip()}"
+                )
+
 if errors:
     print()
     for e in errors:

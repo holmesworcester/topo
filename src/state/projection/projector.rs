@@ -27,6 +27,16 @@ pub enum WriteOp {
         table: &'static str,
         where_clause: Vec<(&'static str, SqlVal)>,
     },
+    /// Dedicated typed write variant for the `key_secrets` table.
+    ///
+    /// This variant exists so that EVERY production-path construction of a
+    /// key_secrets WriteOp must go through `KeySecretsRow`. The constructor
+    /// for the inner typed row lives in a single file (`key_shared.rs`);
+    /// the access-control chain for "user cannot read messages unless
+    /// invited" relies on `KeySecretsRow::new` being the only entry point.
+    ///
+    /// The executor substitutes canonical columns + values at apply time.
+    InsertKeySecret(crate::event_modules::key_shared::KeySecretsRow),
 }
 
 /// A follow-on command to execute after write_ops are applied.

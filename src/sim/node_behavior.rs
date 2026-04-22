@@ -1987,6 +1987,25 @@ impl ProjectionBackend for NodeBehaviorEngine {
                         });
                     }
                 }
+                WriteOp::InsertKeySecret(r) => {
+                    let table = crate::event_modules::key_shared::KEY_SECRETS_TABLE;
+                    let columns = crate::event_modules::key_shared::KEY_SECRETS_COLUMNS;
+                    let mut row_values = BTreeMap::new();
+                    row_values.insert(columns[0].to_string(),
+                        BehaviorValue::Text(r.event_id_b64.clone()));
+                    row_values.insert(columns[1].to_string(),
+                        BehaviorValue::Blob(r.key_bytes.to_vec()));
+                    row_values.insert(columns[2].to_string(),
+                        BehaviorValue::Int(r.created_at_ms));
+                    row_values.insert(columns[3].to_string(),
+                        BehaviorValue::Text(r.recorded_by.clone()));
+                    let row = BehaviorRow { values: row_values };
+                    let rows = state.tables.entry(table.to_string()).or_default();
+                    if !rows.iter().any(|existing| existing == &row) {
+                        rows.push(row);
+                        rows.sort();
+                    }
+                }
             }
         }
         Ok(())

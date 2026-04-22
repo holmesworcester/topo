@@ -25,12 +25,17 @@ verus! {
 pub enum WriteOpKind {
     InsertOrIgnore,
     Delete,
+    /// Dedicated typed variant for key_secrets writes. Replayed-safely via
+    /// INSERT OR IGNORE semantics at the executor; the variant exists only
+    /// to forbid non-typed-row construction paths.
+    InsertKeySecret,
 }
 
 pub open spec fn kind_is_idempotent_spec(kind: WriteOpKind) -> bool {
     match kind {
         WriteOpKind::InsertOrIgnore => true,
         WriteOpKind::Delete => true,
+        WriteOpKind::InsertKeySecret => true,
     }
 }
 
@@ -40,6 +45,7 @@ pub fn is_idempotent_writeop(kind: WriteOpKind) -> (ok: bool)
     match kind {
         WriteOpKind::InsertOrIgnore => true,
         WriteOpKind::Delete => true,
+        WriteOpKind::InsertKeySecret => true,
     }
 }
 

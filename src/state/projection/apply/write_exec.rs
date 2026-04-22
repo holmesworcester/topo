@@ -17,6 +17,7 @@ fn writeop_kind(op: &WriteOp) -> WriteOpKind {
     match op {
         WriteOp::InsertOrIgnore { .. } => WriteOpKind::InsertOrIgnore,
         WriteOp::Delete { .. } => WriteOpKind::Delete,
+        WriteOp::InsertKeySecret(_) => WriteOpKind::InsertKeySecret,
     }
 }
 
@@ -57,6 +58,13 @@ fn writeop_tenant_view(op: &WriteOp, executing_tenant: &str) -> WriteOpTenantVie
             WriteOpTenantView {
                 has_recorded_by: false,
                 recorded_by_matches_executing: false,
+            }
+        }
+        WriteOp::InsertKeySecret(row) => {
+            // Typed variant: recorded_by is always present as a struct field.
+            WriteOpTenantView {
+                has_recorded_by: true,
+                recorded_by_matches_executing: row.recorded_by == executing_tenant,
             }
         }
     }
@@ -119,6 +127,25 @@ pub(crate) fn execute_write_ops(
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| &**p).collect();
                 conn.execute(&sql, param_refs.as_slice())?;
+            }
+            WriteOp::InsertKeySecret(row) => {
+                // Canonical columns pinned at the typed-row constructor.
+                // Table name + column count cross-checked against verus
+                // constants in key_shared.rs unit tests.
+                let sql = format!(
+                    "INSERT OR IGNORE INTO {} ({}) VALUES (?1, ?2, ?3, ?4)",
+                    crate::event_modules::key_shared::KEY_SECRETS_TABLE,
+                    crate::event_modules::key_shared::KEY_SECRETS_COLUMNS.join(", "),
+                );
+                conn.execute(
+                    &sql,
+                    rusqlite::params![
+                        row.event_id_b64,
+                        row.key_bytes.to_vec(),
+                        row.created_at_ms,
+                        row.recorded_by,
+                    ],
+                )?;
             }
             WriteOp::Delete {
                 table,
