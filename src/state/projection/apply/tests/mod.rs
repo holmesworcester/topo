@@ -247,6 +247,69 @@ fn ensure_test_wrapper_key_for_blob(conn: &Connection, recorded_by: &str, blob: 
     }
 }
 
+/// Create a synthetic-but-parseable Admin event for the signer's user
+/// and make it visible to projection (events + valid_events + admins).
+/// Returns the admin event id so removal fixtures can name it as
+/// `admin_authority_event_id`.
+pub(super) fn seed_admin_for_signer(
+    conn: &Connection,
+    recorded_by: &str,
+    signer_eid: &EventId,
+) -> EventId {
+    use crate::event_modules::AdminEvent;
+    let signer_b64 = event_id_to_base64(signer_eid);
+    let (user_event_id_b64, public_key_vec): (String, Vec<u8>) = conn
+        .query_row(
+            "SELECT u.event_id, u.public_key
+             FROM peers_shared ps
+             JOIN users u
+               ON u.recorded_by = ps.recorded_by
+              AND u.event_id = ps.user_event_id
+             WHERE ps.recorded_by = ?1
+               AND ps.event_id = ?2",
+            rusqlite::params![recorded_by, &signer_b64],
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_blob(row, 1)?,
+                ))
+            },
+        )
+        .unwrap();
+    let user_event_id = event_id_from_base64(&user_event_id_b64).unwrap();
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&public_key_vec);
+
+    let admin = ParsedEvent::Admin(AdminEvent {
+        created_at_ms: now_ms(),
+        public_key,
+        authority_event_id: [0u8; 32],
+        user_event_id,
+    });
+    let admin_blob = events::encode_event(&admin).unwrap();
+    let admin_eid = hash_event(&admin_blob);
+    let admin_eid_b64 = event_id_to_base64(&admin_eid);
+
+    let _ = insert_event_raw(conn, recorded_by, &admin_blob);
+    conn.execute(
+        "INSERT OR IGNORE INTO valid_events (peer_id, event_id, semantic_type_code)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            recorded_by,
+            &admin_eid_b64,
+            i64::from(crate::event_modules::EVENT_TYPE_ADMIN)
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO admins (recorded_by, event_id, public_key)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![recorded_by, &admin_eid_b64, &public_key_vec],
+    )
+    .unwrap();
+    admin_eid
+}
+
 pub(super) fn canonical_test_event_id(
     conn: &Connection,
     recorded_by: &str,

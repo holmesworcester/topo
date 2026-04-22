@@ -290,8 +290,16 @@ pub static REMOVAL_META: EventTypeMeta = crate::event_modules::registry::event_t
     type_name: "removal",
     projection_table: "removals",
     share_scope: ShareScope::Shared,
-    dep_fields: &["removed_member_ref", "parent_1", "parent_2", "parent_3", "parent_4"],
-    dep_field_type_codes: &[&[super::EVENT_TYPE_USER, super::EVENT_TYPE_PEER_SHARED], &[], &[], &[], &[]],
+    dep_fields: &[
+        "removed_member_ref",
+        "parent_1", "parent_2", "parent_3", "parent_4",
+        "admin_authority_event_id",
+    ],
+    dep_field_type_codes: &[
+        &[super::EVENT_TYPE_USER, super::EVENT_TYPE_PEER_SHARED],
+        &[], &[], &[], &[],
+        &[super::EVENT_TYPE_ADMIN],
+    ],
     signer_required: true,
     signature_byte_len: 0,
     encryptable: false,

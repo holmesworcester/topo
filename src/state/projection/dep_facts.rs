@@ -21,8 +21,10 @@
 //! sense — no `Connection`, no `&dyn ProjectionQueries`. That makes them
 //! a natural Verus proof target without dragging SQL into the spec.
 
-use crate::event_modules::{DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent};
-use crate::projection::projector::BootstrapDecisionContext;
+use crate::event_modules::{
+    AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent,
+};
+use crate::projection::projector::{BootstrapDecisionContext, RemovalTargetKind};
 
 /// Typed summaries of immediate valid event dependencies.
 ///
@@ -395,6 +397,191 @@ pub fn decide_invite_accepted(
         bootstrap_spki_already_peer_shared: guards.bootstrap_spki_already_peer_shared,
         has_local_invite_secret: guards.has_local_invite_secret,
         peer_shared_transport_identity_active: guards.peer_shared_transport_identity_active,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Removal
+//
+// Positive authority is dep-derived: Removal names an explicit
+// `admin_authority_event_id` dep. When resolved, it parses to an
+// `AdminEvent` whose `user_event_id` must equal the signer
+// peer_shared's `user_event_id`. No admin-rollup JOIN, no "is this
+// signer currently an admin" guard — the event graph's dep validity
+// carries the positive authority. Revocation remains a guard layer
+// (future `RemovalGuardFacts` extension).
+// ─────────────────────────────────────────────────────────────
+
+/// Resolution of a Removal's `admin_authority_event_id` dep.
+///
+/// The dep system guarantees the named event is valid before this
+/// resolution runs — so only the happy `Valid { event }` shape and a
+/// wrong-kind arm are interesting at decide time. Other failure modes
+/// (missing blob, malformed) are absorbed by the shared dep-loading
+/// pipeline.
+#[derive(Debug, Clone)]
+pub enum AdminResolution {
+    Valid {
+        event_id: [u8; 32],
+        event: AdminEvent,
+    },
+    /// Blob was parseable but not an Admin event — the dep field
+    /// landed on a wrong-kind event. Normally precluded by
+    /// `dep_field_type_codes`, surfaced here for diagnostic symmetry.
+    WrongKind {
+        event_id: [u8; 32],
+        semantic_type_code: u8,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RemovalDepFacts {
+    /// Outer signer, parsed. Removal requires a PeerShared signer.
+    pub signer: SignerResolution,
+    /// Admin event named by `admin_authority_event_id`. The event
+    /// graph's dep validity check ensures this event has projected.
+    pub admin_authority: AdminResolution,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RemovalGuardFacts {
+    /// Semantic kind of the `removed_member_ref` target, looked up
+    /// from `valid_events`. `None` means target hasn't projected yet
+    /// (dep-blocked upstream via the target's dep field) or isn't a
+    /// removable kind.
+    pub target_kind: Option<RemovalTargetKind>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RemovalDecision {
+    Ready {
+        target_kind: RemovalTargetKind,
+    },
+    RejectMissingCurrentSigner,
+    RejectUnsupportedSignerType {
+        semantic_type_code: u8,
+    },
+    /// Signer blob resolved but the peer_shared structure was
+    /// malformed. Rare — preserved for parity with existing rejects.
+    RejectMalformedSigner {
+        signer_event_id: String,
+        reason: String,
+    },
+    /// Admin event's `user_event_id` does not equal the signer
+    /// peer_shared's `user_event_id`. This is the core positive-
+    /// authority equality check: a removal is authorized iff it
+    /// cites an admin that grants the signer's user admin status.
+    RejectAdminUserMismatch {
+        admin_user: [u8; 32],
+        signer_user: [u8; 32],
+    },
+    /// Named admin_authority dep resolved to an event of the wrong
+    /// kind. Normally the dep_field_type_codes machinery rejects
+    /// this upstream; arm exists for completeness.
+    RejectAdminAuthorityWrongKind {
+        admin_event_id: [u8; 32],
+        semantic_type_code: u8,
+    },
+    /// `removed_member_ref` target is not a user or peer_shared.
+    /// Happens when the target event kind is unsupported (e.g., a
+    /// workspace or tenant can't be "removed").
+    RejectTargetUnsupported,
+}
+
+impl RemovalDecision {
+    /// Compatibility shim: map decision to the pre-existing
+    /// `removal_signer_reject_reason` string so existing test asserts
+    /// continue to pass during the typed-reject migration. Once tests
+    /// flip to variant matching, this collapses to a `Display` impl.
+    pub fn signer_reject_reason(&self) -> Option<String> {
+        match self {
+            Self::Ready { .. } | Self::RejectTargetUnsupported => None,
+            Self::RejectMissingCurrentSigner => {
+                Some("removal missing current signer envelope".to_string())
+            }
+            Self::RejectUnsupportedSignerType { .. } => {
+                Some("removal signer must be peer_shared".to_string())
+            }
+            Self::RejectMalformedSigner { reason, .. } => Some(reason.clone()),
+            Self::RejectAdminUserMismatch { .. }
+            | Self::RejectAdminAuthorityWrongKind { .. } => {
+                Some("removal signer must be an admin peer_shared identity".to_string())
+            }
+        }
+    }
+}
+
+/// Pure Removal decision.
+///
+/// Authorization proof obligation reduces to a single structural
+/// equality: `admin.user_event_id == signer_peer_shared.user_event_id`.
+/// Both sides are fields of parsed event structs — no JOINs, no
+/// rollups, directly provable in Verus once lifted.
+pub fn decide_removal(
+    _event: &crate::event_modules::RemovalEvent,
+    deps: &RemovalDepFacts,
+    guards: &RemovalGuardFacts,
+) -> RemovalDecision {
+    // Signer authority.
+    let signer_user = match &deps.signer {
+        SignerResolution::Missing => {
+            return RemovalDecision::RejectMissingCurrentSigner;
+        }
+        SignerResolution::UnsupportedKind { semantic_type_code } => {
+            return RemovalDecision::RejectUnsupportedSignerType {
+                semantic_type_code: *semantic_type_code,
+            };
+        }
+        SignerResolution::MissingBlob { signer_event_id } => {
+            return RemovalDecision::RejectMalformedSigner {
+                signer_event_id: signer_event_id.clone(),
+                reason: format!(
+                    "removal signer {} peer_shared blob is not available",
+                    signer_event_id
+                ),
+            };
+        }
+        SignerResolution::Malformed {
+            signer_event_id,
+            reason,
+        } => {
+            return RemovalDecision::RejectMalformedSigner {
+                signer_event_id: signer_event_id.clone(),
+                reason: reason.clone(),
+            };
+        }
+        SignerResolution::DeviceInvite { .. } => {
+            return RemovalDecision::RejectUnsupportedSignerType {
+                semantic_type_code: crate::event_modules::EVENT_TYPE_DEVICE_INVITE,
+            };
+        }
+        SignerResolution::PeerShared { event, .. } => event.user_event_id,
+    };
+
+    // Admin authority, read off the parsed dep event directly.
+    let admin_user = match &deps.admin_authority {
+        AdminResolution::Valid { event, .. } => event.user_event_id,
+        AdminResolution::WrongKind {
+            event_id,
+            semantic_type_code,
+        } => {
+            return RemovalDecision::RejectAdminAuthorityWrongKind {
+                admin_event_id: *event_id,
+                semantic_type_code: *semantic_type_code,
+            };
+        }
+    };
+
+    if admin_user != signer_user {
+        return RemovalDecision::RejectAdminUserMismatch {
+            admin_user,
+            signer_user,
+        };
+    }
+
+    match guards.target_kind {
+        Some(kind) => RemovalDecision::Ready { target_kind: kind },
+        None => RemovalDecision::RejectTargetUnsupported,
     }
 }
 

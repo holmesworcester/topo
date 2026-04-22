@@ -33,6 +33,36 @@ fn record_invite_link_workspace(
     .expect("record invite-link workspace binding");
 }
 
+/// Look up the admin event id for the user of `signer_event_id`.
+/// Test helper for removal-flow fixtures — fails loudly if the setup
+/// didn't establish an admin event for the signer.
+fn test_helper_resolve_admin_for_signer(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+    signer_event_id: &EventId,
+) -> EventId {
+    let signer_b64 = event_id_to_base64(signer_event_id);
+    let admin_b64: String = conn
+        .query_row(
+            "SELECT a.event_id
+             FROM admins a
+             JOIN users u
+               ON u.recorded_by = a.recorded_by
+              AND u.public_key = a.public_key
+             JOIN peers_shared ps
+               ON ps.recorded_by = u.recorded_by
+              AND ps.user_event_id = u.event_id
+             WHERE ps.recorded_by = ?1
+               AND ps.event_id = ?2
+             ORDER BY a.event_id
+             LIMIT 1",
+            rusqlite::params![recorded_by, &signer_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .expect("removal-flow test fixture must establish an admin event for the signer");
+    crate::crypto::event_id_from_base64(&admin_b64).expect("admin event_id must be base64")
+}
+
 fn create_local_removal(
     conn: &rusqlite::Connection,
     recorded_by: &str,
@@ -51,6 +81,8 @@ fn create_local_removal(
     for (slot, event_id) in parent_slots.iter_mut().zip(slots.iter()) {
         *slot = *event_id;
     }
+    let admin_authority_event_id =
+        test_helper_resolve_admin_for_signer(conn, recorded_by, signer_event_id);
     let removal = ParsedEvent::Removal(RemovalEvent {
         created_at_ms: 9_000,
         removed_member_ref,
@@ -61,7 +93,7 @@ fn create_local_removal(
         parent_4: parent_slots[3],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&slots),
         removed_by: *signer_event_id,
-        admin_authority_event_id: [0u8; 32],
+        admin_authority_event_id,
     });
     create_signed_event(conn, recorded_by, signer_event_id, &removal, signing_key)
         .expect("create signed removal")

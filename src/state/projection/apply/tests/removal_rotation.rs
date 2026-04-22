@@ -6,6 +6,7 @@ use crate::event_modules::removal::{frontier_hash_from_refs, RemovalEvent};
 fn make_signed_removal(
     signing_key: &SigningKey,
     signer_eid: &EventId,
+    admin_eid: &EventId,
     removed_member_ref: [u8; 32],
     parents: &[[u8; 32]],
     frontier_hash_override: Option<[u8; 32]>,
@@ -28,7 +29,7 @@ fn make_signed_removal(
         parent_4: slots[3],
         frontier_hash: frontier_hash_override.unwrap_or_else(|| frontier_hash_from_refs(parents)),
         removed_by: *signer_eid,
-        admin_authority_event_id: [0u8; 32],
+        admin_authority_event_id: *admin_eid,
     });
     let blob = sign_blob(signing_key, signer_eid, &event);
     let parsed = events::parse_event(&blob).unwrap();
@@ -66,30 +67,6 @@ fn make_signed_key_rotation(
     (parsed, blob)
 }
 
-fn seed_admin_for_signer(conn: &Connection, recorded_by: &str, signer_eid: &EventId) {
-    let signer_b64 = event_id_to_base64(signer_eid);
-    let public_key: Vec<u8> = conn
-        .query_row(
-            "SELECT u.public_key
-             FROM peers_shared ps
-             JOIN users u
-               ON u.recorded_by = ps.recorded_by
-              AND u.event_id = ps.user_event_id
-             WHERE ps.recorded_by = ?1
-               AND ps.event_id = ?2",
-            rusqlite::params![recorded_by, &signer_b64],
-            |row| crate::db::sql_types::get_blob(row, 0),
-        )
-        .unwrap();
-    let admin_eid = event_id_to_base64(&hash_event(signer_b64.as_bytes()));
-    conn.execute(
-        "INSERT OR IGNORE INTO admins (recorded_by, event_id, public_key)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, &admin_eid, &public_key],
-    )
-    .unwrap();
-}
-
 fn local_user_for_signer(conn: &Connection, recorded_by: &str, signer_eid: &EventId) -> EventId {
     let signer_b64 = event_id_to_base64(signer_eid);
     let user_b64: String = conn
@@ -111,10 +88,10 @@ fn test_removal_projects_and_rejects_bad_frontier_hash() {
     let recorded_by = "peer1";
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-    seed_admin_for_signer(&conn, recorded_by, &signer_eid);
+    let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
 
     let (_valid_removal, valid_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_eid, &[], None);
     let valid_eid = insert_event_raw(&conn, recorded_by, &valid_blob);
     let result = project_one(&conn, recorded_by, &valid_eid).unwrap();
     assert_eq!(result, ProjectionDecision::Valid);
@@ -130,7 +107,7 @@ fn test_removal_projects_and_rejects_bad_frontier_hash() {
     assert!(projected, "valid removal should project");
 
     let (_bad_removal, bad_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_eid, &[], Some([0x99; 32]));
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_eid, &[], Some([0x99; 32]));
     let bad_eid = insert_event_raw(&conn, recorded_by, &bad_blob);
     let result = project_one(&conn, recorded_by, &bad_eid).unwrap();
     match result {
@@ -150,9 +127,9 @@ fn test_removal_blocks_on_missing_removed_member_ref() {
     let recorded_by = "peer1";
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-    seed_admin_for_signer(&conn, recorded_by, &signer_eid);
+    let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
 
-    let (_removal, blob) = make_signed_removal(&signing_key, &signer_eid, [0x44; 32], &[], None);
+    let (_removal, blob) = make_signed_removal(&signing_key, &signer_eid, &admin_eid, [0x44; 32], &[], None);
     let event_id = insert_event_raw(&conn, recorded_by, &blob);
     let result = project_one(&conn, recorded_by, &event_id).unwrap();
     match result {
@@ -172,7 +149,7 @@ fn test_removal_projects_removed_entities_for_user_target() {
     let recorded_by = "peer1";
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-    seed_admin_for_signer(&conn, recorded_by, &signer_eid);
+    let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
 
     let removed_user_b64: String = conn
         .query_row(
@@ -184,7 +161,7 @@ fn test_removal_projects_removed_entities_for_user_target() {
     let removed_user_eid = event_id_from_base64(&removed_user_b64).expect("user event id");
 
     let (_removal, blob) =
-        make_signed_removal(&signing_key, &signer_eid, removed_user_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, removed_user_eid, &[], None);
     let event_id = insert_event_raw(&conn, recorded_by, &blob);
     assert_eq!(
         project_one(&conn, recorded_by, &event_id).unwrap(),
@@ -216,7 +193,7 @@ fn test_key_rotation_projects_root_frontier_and_rejects_bad_hash() {
     let recorded_by = "peer1";
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-    seed_admin_for_signer(&conn, recorded_by, &signer_eid);
+    let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
 
     let (_valid_rotation, valid_blob) =
         make_signed_key_rotation(&signing_key, &signer_eid, &[], None);
@@ -255,10 +232,10 @@ fn test_key_rotation_blocks_on_missing_frontier_then_projects_and_rejects_bad_ha
     let recorded_by = "peer1";
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-    seed_admin_for_signer(&conn, recorded_by, &signer_eid);
+    let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
 
     let (_frontier_removal, frontier_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_eid, &[], None);
     let frontier_eid = canonical_test_event_id(&conn, recorded_by, &frontier_blob);
     let (_blocked_rotation, blocked_blob) =
         make_signed_key_rotation(&signing_key, &signer_eid, &[frontier_eid], None);
@@ -317,11 +294,11 @@ fn test_concurrent_multi_parent_frontier_hash_converges_despite_parent_order() {
     let recorded_by = "peer1";
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-    seed_admin_for_signer(&conn, recorded_by, &signer_eid);
+    let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
     let signer_user_eid = local_user_for_signer(&conn, recorded_by, &signer_eid);
 
     let (_left_parent, left_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_eid, &[], None);
     let left_eid = insert_event_raw(&conn, recorded_by, &left_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &left_eid).unwrap(),
@@ -329,7 +306,7 @@ fn test_concurrent_multi_parent_frontier_hash_converges_despite_parent_order() {
     );
 
     let (_right_parent, right_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_user_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_user_eid, &[], None);
     let right_eid = insert_event_raw(&conn, recorded_by, &right_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &right_eid).unwrap(),
@@ -346,6 +323,7 @@ fn test_concurrent_multi_parent_frontier_hash_converges_despite_parent_order() {
     let (_merge_left_right, merge_left_right_blob) = make_signed_removal(
         &signing_key,
         &signer_eid,
+        &admin_eid,
         signer_eid,
         &canonical_frontier,
         Some(frontier_hash),
@@ -359,6 +337,7 @@ fn test_concurrent_multi_parent_frontier_hash_converges_despite_parent_order() {
     let (_merge_right_left, merge_right_left_blob) = make_signed_removal(
         &signing_key,
         &signer_eid,
+        &admin_eid,
         signer_user_eid,
         &canonical_frontier,
         Some(frontier_hash),
@@ -398,15 +377,15 @@ fn test_key_rotation_multi_parent_frontier_blocks_until_all_frontier_deps_arrive
     let recorded_by = "peer1";
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-    seed_admin_for_signer(&conn, recorded_by, &signer_eid);
+    let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
     let signer_user_eid = local_user_for_signer(&conn, recorded_by, &signer_eid);
 
     let (_left_parent, left_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_eid, &[], None);
     let left_eid = canonical_test_event_id(&conn, recorded_by, &left_blob);
 
     let (_right_parent, right_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_user_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_user_eid, &[], None);
     let right_eid = canonical_test_event_id(&conn, recorded_by, &right_blob);
 
     let canonical_frontier = if left_eid <= right_eid {
@@ -498,11 +477,11 @@ fn test_key_rotation_rejects_unsorted_multi_parent_frontier_even_when_hash_match
     let recorded_by = "peer1";
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
-    seed_admin_for_signer(&conn, recorded_by, &signer_eid);
+    let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
     let signer_user_eid = local_user_for_signer(&conn, recorded_by, &signer_eid);
 
     let (_left_parent, left_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_eid, &[], None);
     let left_eid = insert_event_raw(&conn, recorded_by, &left_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &left_eid).unwrap(),
@@ -510,7 +489,7 @@ fn test_key_rotation_rejects_unsorted_multi_parent_frontier_even_when_hash_match
     );
 
     let (_right_parent, right_blob) =
-        make_signed_removal(&signing_key, &signer_eid, signer_user_eid, &[], None);
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_user_eid, &[], None);
     let right_eid = insert_event_raw(&conn, recorded_by, &right_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &right_eid).unwrap(),

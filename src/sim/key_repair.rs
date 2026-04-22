@@ -22,6 +22,40 @@ pub use crate::runtime::key_repair::{
 
 type SimResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Find the admin event id granting the user admin rights — sim
+/// analogue of `workspace::commands::resolve_admin_authority_for_user`.
+fn sim_resolve_admin_authority(
+    conn: &Connection,
+    recorded_by: &str,
+    user_event_id: &EventId,
+) -> SimResult<EventId> {
+    use crate::crypto::event_id_to_base64;
+    let user_b64 = event_id_to_base64(user_event_id);
+    let admin_b64: String = conn
+        .query_row(
+            "SELECT a.event_id
+             FROM admins a
+             JOIN users u
+               ON u.recorded_by = a.recorded_by
+              AND u.public_key = a.public_key
+             WHERE a.recorded_by = ?1
+               AND u.event_id = ?2
+             ORDER BY a.event_id
+             LIMIT 1",
+            rusqlite::params![recorded_by, &user_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    "no admin grant found for signer user (sim)".into()
+                }
+                other => Box::new(other),
+            }
+        })?;
+    event_id_from_base64(&admin_b64).ok_or_else(|| "admins.event_id is not valid base64".into())
+}
+
 pub fn seed_deterministic_key_secret(
     db_path: &str,
     recorded_by: &str,
@@ -101,6 +135,7 @@ pub fn create_removal(
     crate::db::schema::create_tables(&conn)?;
     let authoring = load_local_authoring_context(&conn, recorded_by)?;
     let slots = slotted_frontier_refs(parent_refs)?;
+    let admin_authority_event_id = sim_resolve_admin_authority(&conn, recorded_by, &authoring.author_id)?;
     let event = ParsedEvent::Removal(RemovalEvent {
         created_at_ms: crate::state::db::queue::current_timestamp_ms_u64(),
         removed_member_ref: *removed_member_ref,
@@ -111,8 +146,7 @@ pub fn create_removal(
         parent_4: slots[3],
         frontier_hash: frontier_hash_from_refs(parent_refs),
         removed_by: authoring.signer_event_id,
-        // TODO(phase B): resolve admin-authority event for signer's user.
-        admin_authority_event_id: [0u8; 32],
+        admin_authority_event_id,
     });
     Ok(create_signed_event(
         &conn,

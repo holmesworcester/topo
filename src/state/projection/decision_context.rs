@@ -1383,6 +1383,147 @@ fn load_workspace_guard_facts(
     })
 }
 
+/// SQL-side dep-facts loader for Removal.
+fn load_removal_dep_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    removal: &RemovalEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::RemovalDepFacts> {
+    use crate::projection::dep_facts::{AdminResolution, RemovalDepFacts, SignerResolution};
+
+    // Signer: resolve from frame to a parsed event (peer_shared expected).
+    let signer = match frame.current_signer.as_ref() {
+        None => SignerResolution::Missing,
+        Some(current_signer) if current_signer.semantic_type_code != EVENT_TYPE_PEER_SHARED => {
+            SignerResolution::UnsupportedKind {
+                semantic_type_code: current_signer.semantic_type_code,
+            }
+        }
+        Some(current_signer) => {
+            let signer_b64 = current_signer.event_id.clone();
+            match load_valid_event_blob(conn, recorded_by, &signer_b64)? {
+                None => SignerResolution::MissingBlob {
+                    signer_event_id: signer_b64,
+                },
+                Some(blob) => resolve_peer_shared_signer(&signer_b64, &blob),
+            }
+        }
+    };
+
+    // Admin authority dep: the dep system has already validated the
+    // event exists in valid_events; we parse it here to surface the
+    // AdminEvent fields to `decide_removal`.
+    let admin_event_id_b64 = event_id_to_base64(&removal.admin_authority_event_id);
+    let admin_authority =
+        match load_valid_event_blob(conn, recorded_by, &admin_event_id_b64)? {
+            None => {
+                // Dep-resolution upstream should have blocked this; if
+                // somehow we got here without the blob, surface it as
+                // a wrong-kind reject so the runtime doesn't panic.
+                AdminResolution::WrongKind {
+                    event_id: removal.admin_authority_event_id,
+                    semantic_type_code: 0,
+                }
+            }
+            Some(blob) => resolve_admin_authority(&removal.admin_authority_event_id, &blob),
+        };
+
+    Ok(RemovalDepFacts {
+        signer,
+        admin_authority,
+    })
+}
+
+/// SQL-side guard-facts loader for Removal.
+fn load_removal_guard_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    removal: &RemovalEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::RemovalGuardFacts> {
+    let target_b64 = event_id_to_base64(&removal.removed_member_ref);
+    let semantic_type_code: Option<i64> = conn
+        .query_row(
+            "SELECT semantic_type_code
+             FROM valid_events
+             WHERE peer_id = ?1 AND event_id = ?2
+             LIMIT 1",
+            rusqlite::params![recorded_by, &target_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let target_kind = match semantic_type_code {
+        Some(code) if code == i64::from(crate::event_modules::EVENT_TYPE_USER) => {
+            Some(RemovalTargetKind::User)
+        }
+        Some(code) if code == i64::from(EVENT_TYPE_PEER_SHARED) => Some(RemovalTargetKind::Peer),
+        _ => None,
+    };
+    Ok(crate::projection::dep_facts::RemovalGuardFacts { target_kind })
+}
+
+/// Parse a signer blob as a PeerShared (stripping any Signed wrapper)
+/// and return a matching `SignerResolution` variant.
+fn resolve_peer_shared_signer(
+    signer_event_id: &str,
+    blob: &[u8],
+) -> crate::projection::dep_facts::SignerResolution {
+    use crate::projection::dep_facts::SignerResolution;
+
+    let inner = match parse_event(blob) {
+        Ok(ParsedEvent::Signed(signed)) => parse_event(&signed.payload),
+        other => other,
+    };
+    match inner {
+        Ok(ParsedEvent::PeerShared(event)) => SignerResolution::PeerShared {
+            signer_event_id: signer_event_id.to_string(),
+            event,
+        },
+        Ok(other) => SignerResolution::Malformed {
+            signer_event_id: signer_event_id.to_string(),
+            reason: format!(
+                "removal signer {} resolved to unexpected event type {}",
+                signer_event_id,
+                other.event_type_code()
+            ),
+        },
+        Err(err) => SignerResolution::Malformed {
+            signer_event_id: signer_event_id.to_string(),
+            reason: format!(
+                "failed to parse peer_shared signer {}: {}",
+                signer_event_id, err
+            ),
+        },
+    }
+}
+
+/// Parse the admin-authority dep blob into an AdminEvent.
+fn resolve_admin_authority(
+    event_id: &[u8; 32],
+    blob: &[u8],
+) -> crate::projection::dep_facts::AdminResolution {
+    use crate::projection::dep_facts::AdminResolution;
+
+    let inner = match parse_event(blob) {
+        Ok(ParsedEvent::Signed(signed)) => parse_event(&signed.payload),
+        other => other,
+    };
+    match inner {
+        Ok(ParsedEvent::Admin(event)) => AdminResolution::Valid {
+            event_id: *event_id,
+            event,
+        },
+        Ok(other) => AdminResolution::WrongKind {
+            event_id: *event_id,
+            semantic_type_code: other.event_type_code(),
+        },
+        Err(_) => AdminResolution::WrongKind {
+            event_id: *event_id,
+            semantic_type_code: 0,
+        },
+    }
+}
+
 /// SQL-side dep-facts loader for PeerShared.
 ///
 /// Resolves the outer signer to a parsed `DeviceInviteEvent` (stripping
@@ -2324,81 +2465,22 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         removal: &RemovalEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        use topo_verus_proofs::state::projection::decision_context::{
-            decide_removal_signer_plan_core, decide_removal_target_plan_core,
-            normalize_removal_signer_core, RemovalSignerPlanCore, RemovalSignerRowsCore,
-            RemovalTargetPlanCore, RemovalTargetRowsCore,
-        };
+        use crate::projection::dep_facts::{decide_removal, RemovalDecision};
+
+        let deps = load_removal_dep_facts(self, frame, recorded_by, removal)?;
+        let guards = load_removal_guard_facts(self, recorded_by, removal)?;
+        let decision = decide_removal(removal, &deps, &guards);
 
         let mut ctx = ProjectorDecisionContext::default();
-
-        let signer_rows = match frame.current_signer.as_ref() {
-            Some(current_signer) if current_signer.semantic_type_code == EVENT_TYPE_PEER_SHARED => {
-                let signer_b64 = current_signer.event_id.clone();
-                let is_admin: bool = self.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1
-                         FROM peers_shared ps
-                         JOIN users u
-                           ON u.recorded_by = ps.recorded_by
-                          AND u.event_id = ps.user_event_id
-                         JOIN admins a
-                           ON a.recorded_by = u.recorded_by
-                          AND a.public_key = u.public_key
-                         WHERE ps.recorded_by = ?1
-                           AND ps.event_id = ?2
-                     )",
-                    rusqlite::params![recorded_by, signer_b64],
-                    |row| row.get(0),
-                )?;
-                RemovalSignerRowsCore::PeerSharedSigner { is_admin }
-            }
-            Some(_) => RemovalSignerRowsCore::UnsupportedSignerType,
-            None => RemovalSignerRowsCore::MissingCurrentSigner,
-        };
-        ctx.removal_signer_reject_reason = match decide_removal_signer_plan_core(
-            normalize_removal_signer_core(signer_rows),
-        ) {
-            RemovalSignerPlanCore::Ready => None,
-            RemovalSignerPlanCore::RejectMissingCurrentSigner => {
-                Some("removal missing current signer envelope".to_string())
-            }
-            RemovalSignerPlanCore::RejectUnsupportedSignerType => {
-                Some("removal signer must be peer_shared".to_string())
-            }
-            RemovalSignerPlanCore::RejectNonAdminPeerShared => {
-                Some("removal signer must be an admin peer_shared identity".to_string())
-            }
-        };
-
-        let target_b64 = event_id_to_base64(&removal.removed_member_ref);
-        let semantic_type_code: Option<i64> = self
-            .query_row(
-                "SELECT semantic_type_code
-                 FROM valid_events
-                 WHERE peer_id = ?1
-                   AND event_id = ?2
-                 LIMIT 1",
-                rusqlite::params![recorded_by, &target_b64],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let target_rows = match semantic_type_code {
-            Some(code) if code == i64::from(crate::event_modules::EVENT_TYPE_USER) => {
-                RemovalTargetRowsCore::User
-            }
-            Some(code) if code == i64::from(EVENT_TYPE_PEER_SHARED) => {
-                RemovalTargetRowsCore::Peer
-            }
-            Some(_) => RemovalTargetRowsCore::Unsupported,
-            None => RemovalTargetRowsCore::Missing,
-        };
-        ctx.removal_target_kind = match decide_removal_target_plan_core(target_rows) {
-            RemovalTargetPlanCore::ReadyUser => Some(RemovalTargetKind::User),
-            RemovalTargetPlanCore::ReadyPeer => Some(RemovalTargetKind::Peer),
-            RemovalTargetPlanCore::Missing | RemovalTargetPlanCore::RejectUnsupported => None,
-        };
-
+        ctx.removal_signer_reject_reason = decision.signer_reject_reason();
+        if let RemovalDecision::Ready { target_kind } = &decision {
+            ctx.removal_target_kind = Some(*target_kind);
+        } else {
+            // Non-admin reject paths still want target_kind populated
+            // for the projector's "target must exist" diagnostic —
+            // mirror the previous behaviour.
+            ctx.removal_target_kind = guards.target_kind;
+        }
         Ok(ctx)
     }
 

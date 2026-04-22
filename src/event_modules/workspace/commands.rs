@@ -969,6 +969,44 @@ pub fn create_device_link_invite(
     })
 }
 
+/// Find the admin event that grants the signer's user admin rights.
+///
+/// The `admins` projection table keys on `public_key`; we look up the
+/// user's public key in `users`, then find the admin row whose
+/// public_key matches. That admin's event_id is the authority the
+/// Removal event will name as a dep (letting projection prove admin
+/// authority via dep-resolution instead of a runtime JOIN).
+fn resolve_admin_authority_for_user(
+    db: &Connection,
+    recorded_by: &str,
+    user_event_id: &EventId,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let user_b64 = event_id_to_base64(user_event_id);
+    let admin_b64: String = db.query_row(
+        "SELECT a.event_id
+         FROM admins a
+         JOIN users u
+           ON u.recorded_by = a.recorded_by
+          AND u.public_key = a.public_key
+         WHERE a.recorded_by = ?1
+           AND u.event_id = ?2
+         ORDER BY a.event_id
+         LIMIT 1",
+        rusqlite::params![recorded_by, &user_b64],
+        |row| crate::db::sql_types::get_text(row, 0),
+    ).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                "no admin grant found for signer user — signer is not authorized to remove"
+                    .into()
+            }
+            other => Box::new(other),
+        }
+    })?;
+    event_id_from_base64(&admin_b64)
+        .ok_or_else(|| "admins.event_id is not valid base64".into())
+}
+
 pub fn remove_member(
     db: &Connection,
     recorded_by: &str,
@@ -991,6 +1029,8 @@ pub fn remove_member(
     for (slot, parent_ref) in parent_slots.iter_mut().zip(parent_refs.iter()) {
         *slot = *parent_ref;
     }
+    let admin_authority_event_id =
+        resolve_admin_authority_for_user(db, recorded_by, &authoring.author_id)?;
     let removal = ParsedEvent::Removal(crate::event_modules::RemovalEvent {
         created_at_ms: current_timestamp_ms_u64(),
         removed_member_ref: *removed_member_ref,
@@ -1001,8 +1041,7 @@ pub fn remove_member(
         parent_4: parent_slots[3],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&parent_refs),
         removed_by: authoring.signer_event_id,
-        // TODO(phase B): resolve admin-authority event for signer's user.
-        admin_authority_event_id: [0u8; 32],
+        admin_authority_event_id,
     });
     let removal_event_id = event_id_or_blocked(create_signed_event(
         db,
