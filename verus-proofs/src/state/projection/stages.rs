@@ -13,6 +13,17 @@
 //! Runtime now uses the same stage dispatcher when direct `key_rotation` /
 //! `key_history` materialization unblocks encrypted content, so the verified Block /
 //! Reject / Valid effect split continues to cover the key-repair path.
+//!
+//! Apply-only-writer capability. The runtime's `execute_write_ops` /
+//! `execute_emit_commands` trait methods now take a `WriteCapability` token
+//! whose constructor is `pub(in crate::state::projection::apply)`. This
+//! makes the apply module the sole possible caller of those methods at the
+//! Rust-visibility level — no code outside `src/state/projection/apply/**`
+//! can mint the token, so no other code can drive a write through the
+//! ProjectionBackend trait. The verified Block/Reject/Valid effect split
+//! here continues to govern WHICH ops apply runs given a decision; the
+//! capability governs WHO may run them. The two checks compose: the
+//! decision pins the ops, the capability pins the caller.
 
 use vstd::prelude::*;
 

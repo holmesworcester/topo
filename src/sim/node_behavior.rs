@@ -1950,7 +1950,11 @@ impl ProjectionBackend for NodeBehaviorEngine {
         resolve_signer_key_behavior(&self.state.borrow(), recorded_by, signer_event_id)
     }
 
-    fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {
+    fn execute_write_ops(
+        &self,
+        _cap: &crate::state::projection::apply::backend::WriteCapability,
+        ops: &[WriteOp],
+    ) -> ProjectionApplyResult<()> {
         let mut state = self.state.borrow_mut();
         for op in ops {
             match op {
@@ -2023,6 +2027,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
 
     fn execute_emit_commands(
         &self,
+        _cap: &crate::state::projection::apply::backend::WriteCapability,
         _recorded_by: &str,
         commands: &[EmitCommand],
     ) -> ProjectionApplyResult<()> {

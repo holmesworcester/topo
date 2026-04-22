@@ -288,6 +288,32 @@ fn suppress_matching_key_requests_for_key_shared(
 
 pub(crate) type ProjectionApplyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// Zero-sized capability token for executing `WriteOp`s.
+///
+/// Only the apply module can construct a `WriteCapability`. Any trait method
+/// that mutates persistent projection-tracked state takes this as a
+/// parameter, so no code outside apply can drive a mutation even if it
+/// happens to hold a `&dyn ProjectionBackend` (e.g. via the sim).
+///
+/// This is the Rust-type-system analog of the CI write-site gate: the gate
+/// scans source code for forbidden constructor patterns, this makes the
+/// construction literally impossible outside apply.
+///
+/// There is deliberately NO public constructor.
+#[derive(Debug)]
+pub(crate) struct WriteCapability {
+    _private: (),
+}
+
+impl WriteCapability {
+    /// Mint a capability. Visibility is scoped to the apply subtree so only
+    /// code physically located at `src/state/projection/apply/**` can call
+    /// this. Every write path threads one of these tokens to the backend.
+    pub(in crate::state::projection::apply) fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 pub(crate) trait ProjectionBackend: ProjectionQueries {
     fn already_processed(
         &self,
@@ -317,10 +343,22 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
         signer_event_id: &[u8; 32],
     ) -> ProjectionApplyResult<SignerResolution>;
 
-    fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()>;
+    /// Execute a batch of write ops transactionally. Requires a
+    /// `WriteCapability` that only apply code can mint. Non-apply callers
+    /// can still hold a `&dyn ProjectionBackend`, but they cannot construct
+    /// the token — so they cannot call this method.
+    fn execute_write_ops(
+        &self,
+        _cap: &WriteCapability,
+        ops: &[WriteOp],
+    ) -> ProjectionApplyResult<()>;
 
+    /// Execute post-write emit commands. Also gated by `WriteCapability`
+    /// because commands mutate projection-tracked state (e.g., hard-purge,
+    /// index-fanout, retry-blocked-encrypted).
     fn execute_emit_commands(
         &self,
+        _cap: &WriteCapability,
         recorded_by: &str,
         commands: &[EmitCommand],
     ) -> ProjectionApplyResult<()>;
@@ -410,12 +448,17 @@ impl ProjectionBackend for Connection {
         resolve_signer_key(self, recorded_by, signer_event_id)
     }
 
-    fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {
+    fn execute_write_ops(
+        &self,
+        _cap: &WriteCapability,
+        ops: &[WriteOp],
+    ) -> ProjectionApplyResult<()> {
         execute_write_ops(self, ops)
     }
 
     fn execute_emit_commands(
         &self,
+        _cap: &WriteCapability,
         recorded_by: &str,
         commands: &[EmitCommand],
     ) -> ProjectionApplyResult<()> {
@@ -622,13 +665,18 @@ mod tests {
             Ok(SignerResolution::NotFound)
         }
 
-        fn execute_write_ops(&self, _ops: &[WriteOp]) -> ProjectionApplyResult<()> {
+        fn execute_write_ops(
+            &self,
+            _cap: &WriteCapability,
+            _ops: &[WriteOp],
+        ) -> ProjectionApplyResult<()> {
             *self.write_batches.borrow_mut() += 1;
             Ok(())
         }
 
         fn execute_emit_commands(
             &self,
+            _cap: &WriteCapability,
             _recorded_by: &str,
             commands: &[EmitCommand],
         ) -> ProjectionApplyResult<()> {

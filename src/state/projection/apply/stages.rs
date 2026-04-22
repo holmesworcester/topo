@@ -496,6 +496,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
         }
         ContextLoadDispositionPlan::EmitHardPurgeAndReturn { message_event_id } => {
             backend.execute_emit_commands(
+                &crate::state::projection::apply::backend::WriteCapability::new(),
                 recorded_by,
                 &[EmitCommand::HardPurgeMessageGraph { message_event_id }],
             )?;
@@ -758,12 +759,14 @@ fn apply_projection_frame<B: ProjectionBackend>(
     match decide_projection_decision_effect_plan(&projection_decision_effect_context) {
         ProjectionDecisionEffectPlan::ApplyWriteOpsAndEmitCommands => {
             super::write_exec::assert_writes_tenant_isolated(recorded_by, &result.write_ops);
-            backend.execute_write_ops(&result.write_ops)?;
-            backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
+            let cap = super::backend::WriteCapability::new();
+            backend.execute_write_ops(&cap, &result.write_ops)?;
+            backend.execute_emit_commands(&cap, recorded_by, &result.emit_commands)?;
         }
         ProjectionDecisionEffectPlan::EmitCommandsOnly { missing } => {
             backend.record_block(recorded_by, event_id_b64, &missing)?;
-            backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
+            let cap = super::backend::WriteCapability::new();
+            backend.execute_emit_commands(&cap, recorded_by, &result.emit_commands)?;
         }
         ProjectionDecisionEffectPlan::NoEffects => {}
     }
