@@ -1812,6 +1812,41 @@ Flow:
 
 All key acquisition flows through the same event-backed wrap/unwrap path.
 
+### 9.4.2 Key-request aggregation on shared paths
+
+One useful repair optimization is temporary request aggregation:
+
+1. if peer `B` is blocked on key `(key_event_id, frontier_hash)` and has already emitted its own live request for that target,
+2. and `B` later receives another request for the same target from downstream peer `C`,
+3. then `B` may temporarily suppress sharing `C`'s request further upstream,
+4. wait for its own request to resolve,
+5. and, if successful, emit its own `key_shared` response back toward `C`.
+
+This must be timeout-bounded. Without a timeout, `B` can black-hole `C` if `B`'s own upstream request never succeeds. With a timeout, suppressed requests are eventually released and behavior degrades back toward the ordinary non-aggregating case.
+
+The right aggregation key is the repair target, not just "same key" informally. At minimum it must include `(key_event_id, frontier_hash)`, and in practice the responder still generates per-recipient `key_shared` events using the downstream request's `recipient_event_id` and `unwrap_key_event_id`.
+
+First-order cost model for one blocked message key:
+
+1. Let `B_m` be the blocked peers for message `m`.
+2. Let `H_m` be the peers that already hold the key for `m`.
+3. Without aggregation, request traffic is proportional to `sum_{v in B_m} dist(v, H_m)`, and response traffic has the same shape.
+4. With perfect aggregation, request traffic is proportional to the number of edges in the minimal upstream path/tree carrying that key request, and response traffic has the same shape.
+
+This means the optimization is most useful when many blocked peers share a long upstream prefix toward the same holder:
+
+1. In a pure star with the holder at the hub and blocked peers on the leaves, the gain is minimal because there is no shared multi-hop prefix to compress.
+2. In a star or tree where many blocked leaves sit behind one blocked intermediate peer, the upstream bottleneck edge can collapse from "one request per blocked leaf" to "one aggregated request."
+3. In a general graph, the gain is large on corridor-heavy or tree-like regions and small on highly connected graphs whose shortest paths are mostly edge-disjoint.
+
+This optimization does **not** change the asymptotic dependence on message count when every message uses its own key. If a range contains `M` blocked messages and each message has a distinct key, the repair cost remains linear in `M`; request aggregation only removes duplicated traffic across peers for the same message key. In other words:
+
+1. aggregation helps spatial duplication,
+2. it does not eliminate the need to request many distinct keys when a peer is missing many distinct message keys,
+3. so batching or larger-granularity key distribution may still be needed if per-message-key repair becomes dominant.
+
+Operationally, this optimization is easiest to treat as a dynamic sendability/runtime policy rather than as a permanent projector-side `suppress_sharing` bit, because the suppression decision depends on whether the local request is still live and whether its timeout has expired.
+
 ## 9.5 Transport credential lifecycle model
 
 This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`.
