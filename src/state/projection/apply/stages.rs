@@ -621,11 +621,19 @@ fn apply_projection_frame<B: ProjectionBackend>(
             ));
         }
         let Some(key_bytes) = backend.load_key_secret_bytes(recorded_by, &enc.key_event_id)? else {
-            backend.record_block(recorded_by, event_id_b64, &[])?;
+            // Per-Message FS cascade normalization: block on the named
+            // key dep (semantically the message_key event id carried
+            // in enc.key_event_id). Standard cascade unblocks when the
+            // message_key projector inserts K_m into key_secrets and
+            // transitions to Valid. Replaces the old guard-block
+            // pattern + shape-specific RetryBlockedEncryptedByKey
+            // signal. Legacy KeyRotation/KeyShared paths still write
+            // into key_secrets keyed by the same id so they remain
+            // functional during the migration.
+            let missing = vec![enc.key_event_id];
+            backend.record_block(recorded_by, event_id_b64, &missing)?;
             return Ok((
-                ProjectionDecision::BlockOnMissingDeps {
-                    missing: Vec::new(),
-                },
+                ProjectionDecision::BlockOnMissingDeps { missing },
                 None,
                 false,
             ));
