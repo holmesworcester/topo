@@ -264,7 +264,9 @@ mod tests {
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 105);
         assert_eq!(USER_INVITE_WIRE_SIZE, 137);
         assert_eq!(DEVICE_INVITE_WIRE_SIZE, 105);
-        assert_eq!(ADMIN_WIRE_SIZE, 73);
+        // type(1) + created_at(8) + public_key(32) + authority_event_id(32)
+        //   + user_event_id(32) = 105
+        assert_eq!(ADMIN_WIRE_SIZE, 105);
         assert_eq!(TENANT_WIRE_SIZE, 41);
         assert_eq!(KEY_ROTATION_WIRE_SIZE, 524490);
         assert_eq!(KEY_HISTORY_WIRE_SIZE, 524357);

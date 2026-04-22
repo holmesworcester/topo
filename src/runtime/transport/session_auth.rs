@@ -1843,7 +1843,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_fallback_invite_plan_keeps_unique_candidate_even_if_workspace_is_already_local() {
+    fn bootstrap_fallback_invite_plan_rejects_unique_candidate_when_workspace_already_local() {
         let decision_context =
             normalize_bootstrap_fallback_invite_decision_context(&BootstrapFallbackInviteRawRows {
                 candidates: vec![BootstrapFallbackInviteCandidate {
@@ -1860,9 +1860,7 @@ mod tests {
         );
         assert_eq!(
             decide_bootstrap_fallback_invite_plan(&decision_context),
-            BootstrapFallbackInvitePlan::UseInvite {
-                invite_event_id: "invite-1".to_string(),
-            }
+            BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
         );
     }
 
@@ -1890,9 +1888,7 @@ mod tests {
         );
         assert_eq!(
             decide_bootstrap_fallback_invite_plan(&decision_context),
-            BootstrapFallbackInvitePlan::UseInvite {
-                invite_event_id: "invite-1".to_string(),
-            }
+            BootstrapFallbackInvitePlan::RejectAlreadyLocalWorkspaceCandidate
         );
     }
 
@@ -2591,7 +2587,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bootstrap_fallback_invite_for_daemon_keeps_pending_same_workspace_candidate() {
+    fn resolve_bootstrap_fallback_invite_for_daemon_rejects_pending_same_workspace_candidate() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("client.sqlite3");
         let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
@@ -2628,11 +2624,14 @@ mod tests {
             resolve_bootstrap_fallback_invite_for_daemon(&db, &recorded_by, &remote_daemon_peer_id)
                 .unwrap();
 
-        assert_eq!(invite.as_deref(), Some("pending-bootstrap"));
+        // Workspace is already accepted locally on the sibling
+        // tenant — the Verus-verified plan rejects the fallback
+        // invite rather than re-using it.
+        assert_eq!(invite.as_deref(), None);
     }
 
     #[test]
-    fn resolve_bootstrap_fallback_invite_for_daemon_keeps_accepted_same_workspace_candidate() {
+    fn resolve_bootstrap_fallback_invite_for_daemon_rejects_accepted_same_workspace_candidate() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("client.sqlite3");
         let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
@@ -2671,7 +2670,10 @@ mod tests {
             resolve_bootstrap_fallback_invite_for_daemon(&db, &recorded_by, &remote_daemon_peer_id)
                 .unwrap();
 
-        assert_eq!(invite.as_deref(), Some("invite-bootstrap"));
+        // Workspace is already accepted locally on the sibling
+        // tenant — the Verus-verified plan rejects the fallback
+        // invite rather than re-using it.
+        assert_eq!(invite.as_deref(), None);
     }
 
     #[test]

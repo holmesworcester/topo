@@ -77,7 +77,7 @@ fn encrypted_wrapper_key_event_id(
             |row| crate::db::sql_types::get_blob(row, 0),
         )
         .expect("load encrypted wrapper blob");
-    match parse_event(&blob).expect("parse encrypted wrapper") {
+    let raw_key_event_id = match parse_event(&blob).expect("parse encrypted wrapper") {
         ParsedEvent::Encrypted(enc) => enc.key_event_id,
         ParsedEvent::Signed(signed) => {
             match parse_event(&signed.payload).expect("parse signed wrapper payload") {
@@ -86,7 +86,28 @@ fn encrypted_wrapper_key_event_id(
             }
         }
         other => panic!("expected encrypted wrapper, got {:?}", other),
+    };
+    // Option C: the Encrypted.key_event_id points at a per-message
+    // `message_key` event, not the rotation/content-key event itself.
+    // Walk one hop into the message_key to recover the underlying
+    // `k_bundle_local_event_id` (which equals the rotation event id
+    // under the send-time helper
+    // `create_encrypted_event_with_message_key_via_rotation`). Return
+    // that so existing assertions comparing wrapper ↔ content-key
+    // reuse continue to match.
+    let key_blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![event_id_to_base64(&raw_key_event_id)],
+            |row| crate::db::sql_types::get_blob(row, 0),
+        )
+        .ok();
+    if let Some(key_blob) = key_blob {
+        if let Ok(ParsedEvent::MessageKey(mk)) = parse_event(&key_blob) {
+            return mk.k_bundle_local_event_id;
+        }
     }
+    raw_key_event_id
 }
 
 #[test]
