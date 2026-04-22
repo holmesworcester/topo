@@ -201,4 +201,63 @@ pub fn required_valid_write_op_count(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pattern #1: typed-row constants for the key_secrets write. These pin the
+// table name and column count at the verified boundary. The runtime's
+// `KeySecretsRow::to_write_op` is cross-checked against these in unit tests.
+
+pub open spec fn key_secrets_table_name_spec() -> &'static str { "key_secrets" }
+
+pub fn key_secrets_table_name() -> (name: &'static str)
+    ensures name == key_secrets_table_name_spec(),
+{
+    "key_secrets"
+}
+
+pub open spec fn key_secrets_column_count_spec() -> nat { 4 }
+
+pub fn key_secrets_column_count() -> (n: u8)
+    ensures n as nat == key_secrets_column_count_spec(),
+{
+    4
+}
+
+/// THE ACCESS-CONTROL THEOREM at the write-construction boundary:
+///
+/// A key_secrets WriteOp produced by the KeyShared projector is emitted
+/// iff the projector's materialization decision was EmitKeySecretsRow,
+/// which itself holds iff `unwrap_successful_for_this_peer == true`.
+///
+/// Combined with:
+///   - The CI gate (scripts/check_projection_write_sites.sh) which
+///     enforces that the KeyShared projector is the ONLY writer of
+///     key_secrets in production code.
+///   - `emit_requires_successful_unwrap` (existing).
+///   - `no_unwrap_means_skip` (existing).
+///
+/// The composed theorem:
+///   key_secrets row exists with (recorded_by=P, key_event_id=K)
+///   ⟹ the row was constructed via KeySecretsRow::to_write_op by the
+///     KeyShared projector
+///   ⟹ the projector's materialization decision for that (P, K) was
+///     EmitKeySecretsRow
+///   ⟹ `unwrap_successful_for_this_peer == true` at the time of
+///     projection — i.e., P's unwrap key decrypted the KeyShared's
+///     wrapped_key.
+///
+/// A peer who is not invited has no valid PeerShared (proven by the
+/// PeerShared gate), therefore no derivable unwrap key, therefore
+/// `unwrap_successful_for_this_peer == false`, therefore no key_secrets
+/// row. This closes the access-control chain at the write-construction
+/// layer.
+pub proof fn key_secrets_write_requires_successful_unwrap(
+    unwrap_successful_for_this_peer: bool,
+)
+    ensures
+        key_secrets_materialization_spec(unwrap_successful_for_this_peer)
+            == KeySecretsMaterializationCore::EmitKeySecretsRow
+            ==> unwrap_successful_for_this_peer,
+{
+}
+
 } // verus!

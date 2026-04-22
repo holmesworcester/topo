@@ -8,6 +8,44 @@ use super::removal::{
 };
 use super::{EventError, ParsedEvent, EVENT_TYPE_KEY_SHARED};
 
+// ---------------------------------------------------------------------------
+// Typed row (pattern #1): sole constructor for key_secrets WriteOps.
+
+/// Canonical table name. Matches the verus-verified constant.
+pub const KEY_SECRETS_TABLE: &str = "key_secrets";
+
+/// Canonical column order for key_secrets. MUST match verus-proofs constants.
+pub const KEY_SECRETS_COLUMNS: [&str; 4] =
+    ["event_id", "key_bytes", "created_at", "recorded_by"];
+
+/// Typed row for a single key_secrets insert. Named fields eliminate
+/// positional drift between column list and value list. This is the
+/// SOLE production-path constructor of a key_secrets WriteOp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeySecretsRow {
+    pub event_id_b64: String,
+    pub key_bytes: [u8; 32],
+    pub created_at_ms: i64,
+    pub recorded_by: String,
+}
+
+impl KeySecretsRow {
+    /// Convert this typed row into the canonical positional WriteOp.
+    pub fn to_write_op(&self) -> crate::projection::projector::WriteOp {
+        use crate::projection::projector::{SqlVal, WriteOp};
+        WriteOp::InsertOrIgnore {
+            table: KEY_SECRETS_TABLE,
+            columns: KEY_SECRETS_COLUMNS.to_vec(),
+            values: vec![
+                SqlVal::Text(self.event_id_b64.clone()),
+                SqlVal::Blob(self.key_bytes.to_vec()),
+                SqlVal::Int(self.created_at_ms),
+                SqlVal::Text(self.recorded_by.clone()),
+            ],
+        }
+    }
+}
+
 pub const KEY_SHARED_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("key_event_id"),
@@ -280,16 +318,18 @@ pub fn project_pure(
         .as_ref()
         .expect("verified EmitKeySecretsRow requires material to be Some");
 
-    ops.push(WriteOp::InsertOrIgnore {
-        table: "key_secrets",
-        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-        values: vec![
-            SqlVal::Text(event_id_to_base64(&ss.key_event_id)),
-            SqlVal::Blob(material.key_bytes.to_vec()),
-            SqlVal::Int(ss.created_at_ms as i64),
-            SqlVal::Text(recorded_by.to_string()),
-        ],
-    });
+    // Typed row (pattern #1): sole production-path constructor for a
+    // key_secrets WriteOp. The verus-verified ensures on the typed row's
+    // table name and column count are cross-checked by the runtime unit
+    // tests; the CI gate (scripts/check_projection_write_sites.sh) enforces
+    // that no other code path writes key_secrets directly.
+    let key_secrets_row = KeySecretsRow {
+        event_id_b64: event_id_to_base64(&ss.key_event_id),
+        key_bytes: material.key_bytes,
+        created_at_ms: ss.created_at_ms as i64,
+        recorded_by: recorded_by.to_string(),
+    };
+    ops.push(key_secrets_row.to_write_op());
 
     ProjectorResult::valid_with_commands(
         ops,
@@ -321,3 +361,70 @@ pub static KEY_SHARED_META: EventTypeMeta = crate::event_modules::registry::even
     projector: project_pure,
     context_loader: build_projector_context,
 };
+
+#[cfg(test)]
+mod typed_row_tests {
+    use super::*;
+    use crate::projection::projector::{SqlVal, WriteOp};
+
+    #[test]
+    fn to_write_op_produces_canonical_column_order() {
+        let row = KeySecretsRow {
+            event_id_b64: "abc".to_string(),
+            key_bytes: [0x42u8; 32],
+            created_at_ms: 1_700_000_000_000,
+            recorded_by: "tenant_0".to_string(),
+        };
+        let op = row.to_write_op();
+        match op {
+            WriteOp::InsertOrIgnore { table, columns, values } => {
+                assert_eq!(table, "key_secrets");
+                assert_eq!(columns, vec!["event_id", "key_bytes", "created_at", "recorded_by"]);
+                assert_eq!(values.len(), 4);
+                assert_eq!(values[0], SqlVal::Text("abc".to_string()));
+                assert_eq!(values[1], SqlVal::Blob(vec![0x42u8; 32]));
+                assert_eq!(values[2], SqlVal::Int(1_700_000_000_000));
+                assert_eq!(values[3], SqlVal::Text("tenant_0".to_string()));
+            }
+            _ => panic!("expected InsertOrIgnore, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn to_write_op_matches_verus_pinned_table_name() {
+        let row = KeySecretsRow {
+            event_id_b64: "x".to_string(),
+            key_bytes: [0u8; 32],
+            created_at_ms: 0,
+            recorded_by: "t".to_string(),
+        };
+        match row.to_write_op() {
+            WriteOp::InsertOrIgnore { table, .. } => {
+                assert_eq!(
+                    table,
+                    topo_verus_proofs::event_modules::key_shared::key_secrets_table_name(),
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn to_write_op_matches_verus_pinned_column_count() {
+        let row = KeySecretsRow {
+            event_id_b64: "x".to_string(),
+            key_bytes: [0u8; 32],
+            created_at_ms: 0,
+            recorded_by: "t".to_string(),
+        };
+        match row.to_write_op() {
+            WriteOp::InsertOrIgnore { columns, .. } => {
+                assert_eq!(
+                    columns.len() as u8,
+                    topo_verus_proofs::event_modules::key_shared::key_secrets_column_count(),
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
