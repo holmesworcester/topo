@@ -31,6 +31,7 @@ pub mod tenant;
 pub mod user;
 pub mod user_invite;
 pub mod workspace;
+pub mod wrap_pubkey;
 
 use rusqlite::Connection;
 use std::sync::OnceLock;
@@ -86,6 +87,7 @@ pub use tenant::TenantEvent;
 pub use user::UserEvent;
 pub use user_invite::UserInviteEvent;
 pub use workspace::WorkspaceEvent;
+pub use wrap_pubkey::WrapPubkeyEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
 pub const EVENT_TYPE_REACTION: u8 = 2;
@@ -114,6 +116,7 @@ pub const EVENT_TYPE_ENDPOINT_SECRET: u8 = 33;
 pub const EVENT_TYPE_ENDPOINT_SHARED: u8 = 34;
 pub const EVENT_TYPE_SIGNED: u8 = 35;
 pub const EVENT_TYPE_KEY_HISTORY: u8 = 36;
+pub const EVENT_TYPE_WRAP_PUBKEY: u8 = 37;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -151,6 +154,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     invite_secret::ensure_schema(conn)?;
     endpoint_secret::ensure_schema(conn)?;
     endpoint_shared::ensure_schema(conn)?;
+    wrap_pubkey::ensure_schema(conn)?;
     crate::state::subscriptions::ensure_schema(conn)?;
     Ok(())
 }
@@ -183,6 +187,7 @@ pub enum ParsedEvent {
     InviteSecret(InviteSecretEvent),
     EndpointSecret(EndpointSecretEvent),
     EndpointShared(EndpointSharedEvent),
+    WrapPubkey(WrapPubkeyEvent),
 }
 
 impl ParsedEvent {
@@ -214,6 +219,7 @@ impl ParsedEvent {
             ParsedEvent::InviteSecret(k) => k.created_at_ms,
             ParsedEvent::EndpointSecret(e) => e.created_at_ms,
             ParsedEvent::EndpointShared(e) => e.created_at_ms,
+            ParsedEvent::WrapPubkey(w) => w.created_at_ms,
         }
     }
 
@@ -345,6 +351,7 @@ impl ParsedEvent {
             ParsedEvent::InviteSecret(_) => vec![],
             ParsedEvent::EndpointSecret(_) => vec![],
             ParsedEvent::EndpointShared(_) => vec![],
+            ParsedEvent::WrapPubkey(_) => vec![],
         }
     }
 
@@ -376,6 +383,7 @@ impl ParsedEvent {
             ParsedEvent::InviteSecret(_) => EVENT_TYPE_INVITE_SECRET,
             ParsedEvent::EndpointSecret(_) => EVENT_TYPE_ENDPOINT_SECRET,
             ParsedEvent::EndpointShared(_) => EVENT_TYPE_ENDPOINT_SHARED,
+            ParsedEvent::WrapPubkey(_) => EVENT_TYPE_WRAP_PUBKEY,
         }
     }
 
@@ -408,6 +416,7 @@ impl ParsedEvent {
             ParsedEvent::InviteSecret(e) => e.human_fields(),
             ParsedEvent::EndpointSecret(e) => e.human_fields(),
             ParsedEvent::EndpointShared(e) => e.human_fields(),
+            ParsedEvent::WrapPubkey(e) => e.human_fields(),
         }
     }
 }
@@ -507,6 +516,7 @@ pub fn registry() -> &'static EventRegistry {
             &invite_secret::INVITE_SECRET_META,
             &endpoint_secret::ENDPOINT_SECRET_META,
             &endpoint_shared::ENDPOINT_SHARED_META,
+            &wrap_pubkey::WRAP_PUBKEY_META,
         ])
     })
 }

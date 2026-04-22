@@ -153,6 +153,7 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::InviteSecret(_) => "invite_secret",
         ParsedEvent::EndpointSecret(_) => "endpoint_secret",
         ParsedEvent::EndpointShared(_) => "endpoint_shared",
+        ParsedEvent::WrapPubkey(_) => "wrap_pubkey",
     }
 }
 
