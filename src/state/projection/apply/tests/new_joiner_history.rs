@@ -417,3 +417,136 @@ fn async_history_waits_for_bundle_then_unblocks() {
         "after async K_bundle delivery, B has K_m and can decrypt"
     );
 }
+
+/// Case B proof (DESIGN §9.6.5, PLAN §22.3.2): when a deletion
+/// happens AFTER invite creation (i.e., the joiner's state already
+/// holds K_bundle from the invite's history delivery by the time
+/// the deletion cascades), un-deleted messages in that retired
+/// bundle must remain decryptable for the joiner. Only the
+/// specifically-deleted message's K_m is purged; all other K_m rows
+/// survive; and the retirement gate prevents future re-hydration
+/// of the K_bundle row on any stale insert path.
+///
+/// This is the regression guard that answers the user's question:
+/// "when delete happens after invite, are not-deleted messages
+/// still received?" Answer: yes — the cascade preserves the K_m
+/// rows for un-deleted messages, and the gate is narrow enough
+/// (matches by event_id, not by table) that K_m inserts for
+/// un-deleted messages in retired bundles still land normally.
+#[test]
+fn joiner_keeps_undeleted_keys_when_delete_happens_after_invite_received() {
+    let conn = setup_db();
+    let b = "peer-B";
+
+    let k_bundle = [0x22u8; 32];
+
+    // Phase 1: joiner B receives K_bundle via invite's
+    // `key_history_bundle`. (Simulated by direct insert per the
+    // uniformity guarantees.)
+    let b_bundle_local_id = deliver_k_bundle_as_history(&conn, b, &k_bundle);
+    assert!(
+        key_secrets_for(&conn, b, &b_bundle_local_id),
+        "invite delivered K_bundle to joiner"
+    );
+
+    // Phase 2: joiner B syncs three messages under this bundle.
+    // Each message_key row + K_m row lands in joiner's state.
+    let m1 = test_eid(0x41);
+    let m1_mkey = test_eid(0x51);
+    let m2 = test_eid(0x42);
+    let m2_mkey = test_eid(0x52);
+    let m3 = test_eid(0x43);
+    let m3_mkey = test_eid(0x53);
+    populate_message(&conn, b, m1.as_str(), m1_mkey.as_str(), &b_bundle_local_id, &[0x61; 32], b"ct-m1");
+    populate_message(&conn, b, m2.as_str(), m2_mkey.as_str(), &b_bundle_local_id, &[0x62; 32], b"ct-m2");
+    populate_message(&conn, b, m3.as_str(), m3_mkey.as_str(), &b_bundle_local_id, &[0x63; 32], b"ct-m3");
+
+    assert!(key_secrets_for(&conn, b, m1_mkey.as_str()));
+    assert!(key_secrets_for(&conn, b, m2_mkey.as_str()));
+    assert!(key_secrets_for(&conn, b, m3_mkey.as_str()));
+
+    // Phase 3: AFTER invite + sync, a MessageDeletion for m2
+    // propagates to B. B's cascade runs locally.
+    conn.execute(
+        "INSERT OR IGNORE INTO deleted_messages
+             (recorded_by, message_id, deletion_event_id, author_id, deleted_at)
+         VALUES (?1, ?2, 'del-evt', 'a', 0)",
+        params![b, m2.as_str()],
+    )
+    .unwrap();
+    crate::projection::purge::hard_purge_deleted_message_graph(&conn, b, m2.as_str())
+        .expect("hard purge m2 on B");
+
+    // Assertions:
+
+    // (a) B has K_m for m1 and m3 — un-deleted messages are still
+    //     decryptable after delete-after-invite.
+    assert!(
+        key_secrets_for(&conn, b, m1_mkey.as_str()),
+        "m1 K_m survives — un-deleted message recoverable after \
+         delete-after-invite"
+    );
+    assert!(
+        key_secrets_for(&conn, b, m3_mkey.as_str()),
+        "m3 K_m survives — un-deleted message recoverable after \
+         delete-after-invite"
+    );
+
+    // (b) m2's K_m is gone — deleted message unrecoverable.
+    assert!(
+        !key_secrets_for(&conn, b, m2_mkey.as_str()),
+        "m2 K_m must be purged — deleted message lost"
+    );
+
+    // (c) K_bundle plaintext is gone — retention+compromise window
+    //     closed for this bundle going forward.
+    assert!(
+        !key_secrets_for(&conn, b, &b_bundle_local_id),
+        "K_bundle row shredded on delete cascade"
+    );
+
+    // (d) Retirement marker is durable on B.
+    let marked: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM retired_bundles
+             WHERE recorded_by = ?1 AND k_bundle_local_event_id = ?2",
+            params![b, &b_bundle_local_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(marked, "retired_bundles must mark the retirement on B");
+
+    // (e) A stale `key_history_bundle` replay that tries to
+    //     re-hydrate K_bundle on B must be refused by the gate.
+    //     Simulates a second joiner-sync-pass (e.g. B comes back
+    //     online later and re-projects the stale history event
+    //     from the wire).
+    use crate::projection::projector::{SqlVal, WriteOp};
+    crate::state::projection::apply::write_exec::execute_write_ops(
+        &conn,
+        &[WriteOp::InsertOrIgnore {
+            table: "key_secrets",
+            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+            values: vec![
+                SqlVal::Text(b_bundle_local_id.clone()),
+                SqlVal::Blob(k_bundle.to_vec()),
+                SqlVal::Int(0),
+                SqlVal::Text(b.to_string()),
+            ],
+        }],
+    )
+    .expect("write_ops execute");
+    assert!(
+        !key_secrets_for(&conn, b, &b_bundle_local_id),
+        "retired_bundles gate refuses the stale re-hydration — \
+         K_bundle stays gone even if an older key_history_bundle \
+         wire arrives later"
+    );
+
+    // (f) And critically: m1 and m3 K_m rows are still there after
+    //     the stale write attempt. The gate is narrow (event_id),
+    //     so K_m inserts would pass through unchanged even if
+    //     something tried to re-insert them.
+    assert!(key_secrets_for(&conn, b, m1_mkey.as_str()));
+    assert!(key_secrets_for(&conn, b, m3_mkey.as_str()));
+}

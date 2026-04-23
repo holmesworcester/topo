@@ -1891,6 +1891,8 @@ Two scenarios govern a new joiner's access to historical messages:
 
 The arithmetic continues to favor not rotating on delete. Rotating on every delete costs ~524 KB per emitted `key_broadcast` for the full active population; Case A's inline K_m wraps cost ~40 B per un-deleted message, within the existing 655 KB bulk-history-event wire cap. For workspaces with few deletions, Case A's added slots are minimal; for workspaces with many deletions, the inviter can evict un-deleted K_m values older than a policy horizon to stay within the slot budget.
 
+Future work: the current `key_history_bundle` layout caps at 8192 K_bundle slots + 4096 K_m slots, so an invite into a workspace with more history than fits is necessarily partial. A future extension should admit an unbounded amount of history-key material per invite — for example, chunked across multiple `key_history_bundle` events keyed by a common invite identifier and consumed as a set, or via a streaming sync primitive that avoids a single per-event cap. Out of scope for the current landing; tracked as an extensibility requirement for workspaces with deep history.
+
 ### 9.6.6 Threat model — what we claim and do not claim
 
 After `T_delete + propagation_delay` on any honest peer, FS holds against:
