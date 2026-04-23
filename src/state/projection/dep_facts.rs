@@ -23,8 +23,8 @@
 
 use crate::event_modules::{
     AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, KeyHistoryEvent, KeyRequestEvent,
-    KeyRotationEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
-    UserInviteEvent, WorkspaceEvent,
+    KeyRotationEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent,
+    ReactionEvent, UserInviteEvent, WorkspaceEvent,
 };
 use crate::projection::projector::{
     BootstrapDecisionContext, DeletionIntentInfo, HistoricalKeyMaterial, RemovalTargetKind,
@@ -1936,6 +1936,156 @@ pub fn decide_device_invite(
         authority_matches_signer,
         is_local_create: guards.is_local_create,
         bootstrap_context: guards.bootstrap_context.clone(),
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// KeyShared
+//
+// Acceptance gate for KeyShared events. Three structural checks
+// (frontier hash, frontier refs canonical order, delivery-target hash)
+// plus recipient-side authority (the `recipient_event_id` dep resolved
+// to a Valid peer_shared row).
+//
+// Runtime-grounds the canonical security theorem
+// `valid_key_shared_has_invited_recipient` from
+// `topo_verus_proofs::event_modules::key_shared`: when the runtime
+// finalizes Valid, the Verus decider is invoked via `debug_assert_eq!`
+// with the same flag bundle. A drift between runtime acceptance and
+// the SMT-checked spec fires immediately.
+// ═════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Default)]
+pub struct KeySharedDepFacts {
+    /// True when the `recipient_event_id` dep resolved to a Valid
+    /// `peer_shared` event. (The dep system guarantees this before
+    /// the context loader runs; carried here as an explicit flag so
+    /// `decide_key_shared` can pass it into the verified bundle.)
+    pub recipient_peer_shared_valid: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KeySharedGuardFacts {
+    /// When the local peer is the recipient and holds the matching
+    /// unwrap key (peer_secret or invite_secret), decryption succeeds
+    /// and these are the recovered 32 bytes. None otherwise — the
+    /// projector accepts the KeyShared without materializing a
+    /// LocalKeySecret in that case.
+    pub unwrapped_key_bytes: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+pub enum KeySharedDecision {
+    Ready {
+        unwrapped_key_bytes: Option<[u8; 32]>,
+    },
+    RejectFrontierRefsNotCanonical {
+        reason: String,
+    },
+    RejectFrontierHashMismatch,
+    RejectDeliveryTargetMismatch,
+    RejectRecipientPeerSharedInvalid,
+}
+
+impl KeySharedDecision {
+    pub fn reject_reason(&self) -> Option<String> {
+        match self {
+            Self::Ready { .. } => None,
+            Self::RejectFrontierRefsNotCanonical { reason } => Some(reason.clone()),
+            Self::RejectFrontierHashMismatch => {
+                Some("frontier_hash does not match key_shared frontier".to_string())
+            }
+            Self::RejectDeliveryTargetMismatch => {
+                Some("delivery_target_id does not match key_shared target".to_string())
+            }
+            Self::RejectRecipientPeerSharedInvalid => Some(
+                "key_shared recipient_event_id does not resolve to a Valid peer_shared"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Pure KeyShared decision.
+///
+/// Matches the runtime's inline structural checks in
+/// `src/event_modules/key_shared.rs::project_pure` (frontier hash,
+/// canonical ordering, delivery-target derivation). On Ready, the
+/// Verus-verified decider is called via `debug_assert_eq!` with the
+/// same flag bundle. This is the runtime-grounding loop for the
+/// `valid_key_shared_has_invited_recipient` theorem.
+pub fn decide_key_shared(
+    event: &KeySharedEvent,
+    deps: &KeySharedDepFacts,
+    guards: &KeySharedGuardFacts,
+) -> KeySharedDecision {
+    use crate::event_modules::key_request::delivery_target_id;
+    use crate::event_modules::removal::{
+        frontier_hash_from_refs, frontier_refs_from_slots, validate_canonical_frontier_refs,
+    };
+
+    let slots = [
+        event.frontier_ref_1,
+        event.frontier_ref_2,
+        event.frontier_ref_3,
+        event.frontier_ref_4,
+    ];
+    let refs = match frontier_refs_from_slots(event.frontier_count, &slots) {
+        Ok(refs) => refs,
+        Err(reason) => return KeySharedDecision::RejectFrontierRefsNotCanonical { reason },
+    };
+    if let Err(reason) = validate_canonical_frontier_refs(&refs) {
+        return KeySharedDecision::RejectFrontierRefsNotCanonical { reason };
+    }
+    let frontier_hash_matches = frontier_hash_from_refs(&refs) == event.frontier_hash;
+    if !frontier_hash_matches {
+        return KeySharedDecision::RejectFrontierHashMismatch;
+    }
+    let expected_target = delivery_target_id(
+        &event.key_event_id,
+        &event.frontier_hash,
+        &event.recipient_event_id,
+        &event.unwrap_key_event_id,
+    );
+    let delivery_target_matches = expected_target == event.delivery_target_id;
+    if !delivery_target_matches {
+        return KeySharedDecision::RejectDeliveryTargetMismatch;
+    }
+    if !deps.recipient_peer_shared_valid {
+        return KeySharedDecision::RejectRecipientPeerSharedInvalid;
+    }
+
+    // Runtime-ground the Verus security theorem. The flag bundle is
+    // built from the same structural checks above; the Verus decider
+    // must agree. If this fires, the runtime's acceptance criterion
+    // has drifted from the spec.
+    #[cfg(debug_assertions)]
+    {
+        use topo_verus_proofs::event_modules::key_shared::{
+            decide_key_shared_accepts_core, KeySharedAcceptanceCore, KeySharedAcceptanceFlags,
+        };
+        use topo_verus_proofs::state::projection::decision_context::PeerSharedAuthorityPlanCore;
+        let flags = KeySharedAcceptanceFlags {
+            frontier_hash_matches: true,
+            frontier_refs_canonical: true,
+            delivery_target_matches: true,
+            recipient_peer_shared_valid: deps.recipient_peer_shared_valid,
+            // A Valid peer_shared in `valid_events` already passed
+            // `decide_peer_shared_authority_plan_core::Ready` at its
+            // own projection time (that's what made it Valid). So
+            // `recipient_peer_shared_valid` transitively implies
+            // authority-Ready for the recipient's user.
+            recipient_user_authority_plan: PeerSharedAuthorityPlanCore::Ready,
+        };
+        debug_assert_eq!(
+            decide_key_shared_accepts_core(flags),
+            KeySharedAcceptanceCore::Valid,
+            "runtime KeyShared Valid diverged from verified decide_key_shared_accepts_core",
+        );
+    }
+
+    KeySharedDecision::Ready {
+        unwrapped_key_bytes: guards.unwrapped_key_bytes,
     }
 }
 

@@ -2229,6 +2229,110 @@ fn load_message_deletion_guard_facts(
     })
 }
 
+/// SQL-side dep-facts loader for KeyShared.
+///
+/// Returns `recipient_peer_shared_valid`: whether the event's
+/// `recipient_event_id` resolved to a Valid `peer_shared` row. The
+/// dep system guarantees this at the structural level (the dep_field
+/// type-code restriction is `&[PEER_SHARED]`); this loader just
+/// surfaces the fact as an explicit flag so `decide_key_shared` can
+/// pass it to the verified Verus decider.
+fn load_key_shared_dep_facts(
+    conn: &Connection,
+    recorded_by: &str,
+    key_shared: &KeySharedEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::KeySharedDepFacts> {
+    let recipient_b64 = event_id_to_base64(&key_shared.recipient_event_id);
+    let recipient_peer_shared_valid: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM valid_events
+             WHERE peer_id = ?1
+               AND event_id = ?2
+               AND semantic_type_code = ?3
+         )",
+        rusqlite::params![
+            recorded_by,
+            &recipient_b64,
+            i64::from(crate::event_modules::EVENT_TYPE_PEER_SHARED),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(crate::projection::dep_facts::KeySharedDepFacts {
+        recipient_peer_shared_valid,
+    })
+}
+
+/// SQL-side guard-facts loader for KeyShared.
+///
+/// Attempts to unwrap the wrapped_key using the local peer_secret or
+/// invite_secret that matches `recipient_event_id` + `unwrap_key_event_id`.
+/// On success, returns the recovered 32-byte key. On any missing
+/// material or signer-resolution failure, returns None — the projector
+/// still accepts the event (the key just doesn't materialize locally).
+fn load_key_shared_guard_facts(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    key_shared: &KeySharedEvent,
+) -> ProjectionQueryResult<crate::projection::dep_facts::KeySharedGuardFacts> {
+    let recipient_b64 = event_id_to_base64(&key_shared.recipient_event_id);
+    let unwrap_key_b64 = event_id_to_base64(&key_shared.unwrap_key_event_id);
+
+    let peer_secret_row: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT private_key
+             FROM peer_secrets
+             WHERE recorded_by = ?1
+               AND event_id = ?2
+               AND signer_event_id = ?3
+             LIMIT 1",
+            rusqlite::params![recorded_by, &unwrap_key_b64, &recipient_b64],
+            |row| crate::db::sql_types::get_blob(row, 0),
+        )
+        .optional()?;
+    let invite_secret_row: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT private_key
+             FROM invite_secrets
+             WHERE recorded_by = ?1
+               AND event_id = ?2
+               AND invite_event_id = ?3
+             LIMIT 1",
+            rusqlite::params![recorded_by, &unwrap_key_b64, &recipient_b64],
+            |row| crate::db::sql_types::get_blob(row, 0),
+        )
+        .optional()?;
+    let private_key_bytes = match peer_secret_row.or(invite_secret_row) {
+        Some(bytes) if bytes.len() == 32 => bytes,
+        _ => return Ok(crate::projection::dep_facts::KeySharedGuardFacts::default()),
+    };
+
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(crate::projection::dep_facts::KeySharedGuardFacts::default());
+    };
+    let Some(current_signer_event_id) = event_id_from_base64(&current_signer.event_id) else {
+        return Ok(crate::projection::dep_facts::KeySharedGuardFacts::default());
+    };
+
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&private_key_bytes);
+    let local_signing_key = SigningKey::from_bytes(&key_arr);
+
+    let sender_key = match resolve_signer_key(conn, recorded_by, &current_signer_event_id)? {
+        SignerResolution::Found(k) => k,
+        _ => return Ok(crate::projection::dep_facts::KeySharedGuardFacts::default()),
+    };
+    let Ok(sender_pub) = VerifyingKey::from_bytes(&sender_key.public_key) else {
+        return Ok(crate::projection::dep_facts::KeySharedGuardFacts::default());
+    };
+
+    let plaintext_key =
+        unwrap_key_from_sender(&local_signing_key, &sender_pub, &key_shared.wrapped_key);
+    Ok(crate::projection::dep_facts::KeySharedGuardFacts {
+        unwrapped_key_bytes: Some(plaintext_key),
+    })
+}
+
 /// SQL-side guard-facts loader for DeviceInvite.
 fn load_device_invite_guard_facts(
     conn: &Connection,
@@ -3109,70 +3213,22 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         key_shared: &KeySharedEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let recipient_b64 = event_id_to_base64(&key_shared.recipient_event_id);
-        let unwrap_key_b64 = event_id_to_base64(&key_shared.unwrap_key_event_id);
+        use crate::projection::dep_facts::{decide_key_shared, KeySharedDecision};
 
-        let peer_secret_row: Option<Vec<u8>> = self
-            .query_row(
-                "SELECT private_key
-                 FROM peer_secrets
-                 WHERE recorded_by = ?1
-                   AND event_id = ?2
-                   AND signer_event_id = ?3
-                 LIMIT 1",
-                rusqlite::params![recorded_by, &unwrap_key_b64, &recipient_b64],
-                |row| crate::db::sql_types::get_blob(row, 0),
-            )
-            .optional()?;
+        let deps = load_key_shared_dep_facts(self, recorded_by, key_shared)?;
+        let guards = load_key_shared_guard_facts(self, frame, recorded_by, key_shared)?;
+        let decision = decide_key_shared(key_shared, &deps, &guards);
 
-        let invite_secret_row: Option<Vec<u8>> = self
-            .query_row(
-                "SELECT private_key
-                 FROM invite_secrets
-                 WHERE recorded_by = ?1
-                   AND event_id = ?2
-                   AND invite_event_id = ?3
-                 LIMIT 1",
-                rusqlite::params![recorded_by, &unwrap_key_b64, &recipient_b64],
-                |row| crate::db::sql_types::get_blob(row, 0),
-            )
-            .optional()?;
-
-        let private_key_bytes = match peer_secret_row.or(invite_secret_row) {
-            Some(private_key_bytes) => private_key_bytes,
-            None => return Ok(ProjectorDecisionContext::default()),
+        let unwrapped = match decision {
+            KeySharedDecision::Ready {
+                unwrapped_key_bytes,
+            } => unwrapped_key_bytes,
+            _ => guards.unwrapped_key_bytes,
         };
-        if private_key_bytes.len() != 32 {
-            return Ok(ProjectorDecisionContext::default());
-        }
-
-        let Some(current_signer) = frame.current_signer.as_ref() else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-        let Some(current_signer_event_id) = event_id_from_base64(&current_signer.event_id) else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-
-        let mut key_arr = [0u8; 32];
-        key_arr.copy_from_slice(&private_key_bytes);
-        let local_signing_key = SigningKey::from_bytes(&key_arr);
-
-        let sender_key = match resolve_signer_key(self, recorded_by, &current_signer_event_id)? {
-            SignerResolution::Found(k) => k,
-            _ => return Ok(ProjectorDecisionContext::default()),
-        };
-        let sender_pub = match VerifyingKey::from_bytes(&sender_key.public_key) {
-            Ok(vk) => vk,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
-
-        let plaintext_key =
-            unwrap_key_from_sender(&local_signing_key, &sender_pub, &key_shared.wrapped_key);
 
         Ok(ProjectorDecisionContext {
-            unwrapped_secret_material: Some(UnwrappedSecretMaterial {
-                key_bytes: plaintext_key,
-            }),
+            unwrapped_secret_material: unwrapped
+                .map(|key_bytes| UnwrappedSecretMaterial { key_bytes }),
             ..ProjectorDecisionContext::default()
         })
     }

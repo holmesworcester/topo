@@ -64,14 +64,14 @@ pub struct KeySharedAcceptanceFlags {
     /// `(key_event_id, frontier_hash, recipient_event_id,
     ///   unwrap_key_event_id)`.
     pub delivery_target_matches: bool,
-    /// `key_event_id` dep resolved to a Valid event.
-    pub has_key_event_dep: bool,
-    /// …and that Valid dep event is of KeyRotation kind
-    /// (today) / KeySecret kind (under the LocalKeySecret
-    /// migration — same gate shape either way).
-    pub key_event_kind_ok: bool,
     /// `recipient_event_id` dep resolved to a Valid `peers_shared`
     /// row.
+    ///
+    /// Note: under the LocalKeySecret migration, `key_event_id` is no
+    /// longer a dep — it names the KeySecret the recipient will
+    /// derive by unwrapping. The acceptance gate therefore carries no
+    /// `has_key_event_dep` / `key_event_kind_ok` flags; the structural
+    /// claim is entirely about recipient authority.
     pub recipient_peer_shared_valid: bool,
     /// The recipient `peers_shared` row's user is admin-chained in
     /// the workspace, per the shared PeerSharedAuthority verified
@@ -97,8 +97,6 @@ pub open spec fn key_shared_accepts_spec(
     if flags.frontier_hash_matches
         && flags.frontier_refs_canonical
         && flags.delivery_target_matches
-        && flags.has_key_event_dep
-        && flags.key_event_kind_ok
         && flags.recipient_peer_shared_valid
         && flags.recipient_user_authority_plan == PeerSharedAuthorityPlanCore::Ready
     {
@@ -123,8 +121,6 @@ pub fn decide_key_shared_accepts_core(
     if flags.frontier_hash_matches
         && flags.frontier_refs_canonical
         && flags.delivery_target_matches
-        && flags.has_key_event_dep
-        && flags.key_event_kind_ok
         && flags.recipient_peer_shared_valid
         && authority_ready
     {
@@ -174,8 +170,6 @@ pub proof fn reject_implies_some_flag_false(flags: KeySharedAcceptanceFlags)
             ==> !flags.frontier_hash_matches
                 || !flags.frontier_refs_canonical
                 || !flags.delivery_target_matches
-                || !flags.has_key_event_dep
-                || !flags.key_event_kind_ok
                 || !flags.recipient_peer_shared_valid
                 || flags.recipient_user_authority_plan
                     != PeerSharedAuthorityPlanCore::Ready,
