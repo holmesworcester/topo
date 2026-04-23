@@ -520,11 +520,24 @@ fn delete_tenant_scoped_rows(
     // in this tenant's `key_secrets` disappears. K_m rows keyed by
     // the per-message `message_key` event ids are already handled by
     // the main manifest loop above and survive this step.
+    //
+    // Phase B: route the delete through `secure_shred_blob_pk2` so
+    // the `key_bytes` column is zero-overwritten in-place before the
+    // row is removed. Defense against SQLite page-reuse leakage:
+    // without the zero-overwrite step, the purged plaintext can
+    // survive in a freelist page inside the same .db file and be
+    // recovered by a later attacker who images the file. Not a
+    // defense against SSD wear-leveling / block remap — out of
+    // scope for the projection layer.
     for bundle_event_id in &manifest.bundle_key_secret_event_ids {
-        conn.execute(
-            "DELETE FROM key_secrets
-             WHERE recorded_by = ?1 AND event_id = ?2",
-            params![recorded_by, bundle_event_id],
+        crate::shared::crypto::secure_shred::secure_shred_blob_pk2(
+            conn,
+            "key_secrets",
+            "key_bytes",
+            "recorded_by",
+            recorded_by,
+            "event_id",
+            bundle_event_id,
         )?;
     }
 

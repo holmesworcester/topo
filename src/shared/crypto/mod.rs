@@ -9,6 +9,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub type EventId = [u8; 32];
 
 pub mod bao_verify;
+pub mod secure_shred;
 mod spki;
 
 pub use spki::spki_fingerprint_from_ed25519_pubkey;
