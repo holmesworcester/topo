@@ -1884,3 +1884,82 @@ automatically detect and respond to such behavior.
   `DaemonConnection` (peering_boundary.rs)
 - Check TTL on cache lookup; expire entries older than bootstrap trust TTL
 - Prevents long-lived QUIC connections from bypassing expired DB trust
+
+## 22. Per-Message Forward Secrecy (landed + in-progress)
+
+Execution track for strong forward secrecy on deleted and expired messages. Design reference: `docs/DESIGN.md` §9.6. Detailed internals and threat model: `docs/planning/STRONG_FS_VIA_DELETE_TRIGGERED_BUNDLE_PURGE.md`. Earlier iterations: `docs/planning/DELETE_TRIGGERED_REKEY_EXECUTION_PLAN.md` (the Plan 1 v4 analysis), `docs/planning/SEND_TIME_MESSAGE_KEY_INTEGRATION.md` (Option C wire resolution of the content-addressing cycle).
+
+Shape of the landed design:
+1. Per-message K_m (fresh random 32 bytes per send) wrapped under a per-sender-device K_bundle and carried on the wire in a deterministic-unsigned `message_key` event (~133 B).
+2. Ciphertext encrypted under K_m on an Encrypted wrapper whose `key_event_id` points at the `message_key` event.
+3. `messages_to_message_keys` reverse index populated at Encrypted projection time so the delete cascade can enumerate K_m from the message event id.
+4. On any `MessageDeletion`, the existing cascade purges the target message's ciphertext + K_m + message_key row + reverse-index row, AND (new) shreds the K_bundle plaintext row from `key_secrets`. The K_bundle's KeyRotation event itself stays live; only its plaintext per-tenant row disappears.
+5. Creator's next send naturally rotates via `ensure_content_key_for_peer_at`'s existing INNER JOIN on `key_secrets` — no explicit force-rotate machinery.
+6. Joiners to retired bundles take the `key_bundle_share` cold path (individually-wrapped K_m per un-deleted message) rather than bundle-level delivery.
+
+### 22.1 Landed (Option C wire + send-time emission + Phase A)
+
+- **Option C wire** (commit `db0f7440`): dropped `owning_message_event_id` from the `message_key` wire to break a content-addressing cycle; linkage lives in `messages_to_message_keys` reverse index populated at Encrypted-projection time. Purge cascade reads the reverse index for message_key enumeration.
+- **Send-time emission** (commit `e0e8eb40`): `message::commands::create` emits a fresh K_m per message via `create_encrypted_event_with_message_key_via_rotation`, carrying it in a `message_key` event and keying the Encrypted wrapper by the mkey event id.
+- **Option C hygiene** (commit `b6f1d1fb`): `ProjectionBackend::message_is_tombstoned` + synchronous defensive purge at the stages.rs Encrypted branch closes the race where a self-tombstoning message's reverse-index write could land after the cascade. No orphan state left for later GC.
+- **Phase A: delete-triggered K_bundle purge** (commit `e42a4b87`): `PurgeManifest::bundle_key_secret_event_ids` bucket, enumerated by walking `message_keys.k_bundle_local_event_id`. `latest_materialized_key_for_peer` + `existing_rotation_for_frontier` extended to INNER JOIN `key_secrets` / `key_rotations` so rotation-on-next-send emerges naturally.
+
+Test coverage at the FS boundary:
+- `src/state/projection/apply/tests/per_message_fs.rs` (4 tests, state level).
+- `src/state/projection/apply/tests/new_joiner_history.rs` (4 tests).
+- `tests/cli_per_message_fs_test.rs` (4 CLI-end-to-end tests covering send/delete/list, sequential deletes that exercise auto-rotation, delete-all leaves empty state, and a dedicated send-emits-message_key-and-delete-purges-it proof).
+- `tests/per_message_fs_producer_uniformity.rs` (3 tests).
+
+### 22.2 Phase B: secure-shred helpers (next)
+
+Touch: new module under `src/shared/crypto/` (e.g. `secure_shred.rs`), integrated into `src/state/projection/purge.rs::delete_tenant_rows` at the K_bundle-row delete site and optionally at the K_m-row delete site.
+
+Contract:
+1. `secure_zero(&mut [u8])` — volatile zero-overwrite of a byte slice resistant to compiler elision.
+2. `secure_shred_blob(&Connection, table, blob_col, where_col, where_val)` — overwrites the BLOB column to zeros in-place (via an UPDATE) before the row is DELETEd. Defense against SQLite page-reuse leakage on disk.
+
+Not in scope for Phase B: SSD-level wear-leveling / bad-block residues. That residual exists and is documented as an out-of-scope threat.
+
+### 22.3 Phase D: pattern-(b) polish on `key_bundle_share` heal path
+
+Touch: `src/event_modules/key_bundle_share.rs` projector and its context loader in `src/state/projection/decision_context.rs`.
+
+Status: the event type exists with a scaffold that records the header and surfaces the wrap material in the pattern-(b) shape the other FS producers already use. What remains: finish the materialize path so the projector emits `KeySecret(K_bundle)` via `EmitDeterministicBlob` on successful unwrap, matching the uniformity guaranteed by `three_producers_produce_identical_keysecret_event_ids`.
+
+Add the missing integration test: a joiner whose `key_history_bundle` arrives *after* the bundle has been retired (due to a deletion on the existing population). The joiner must obtain K_m per-un-deleted-message via targeted `key_bundle_share` delivery and successfully decrypt the un-deleted tail. This is the cold-path regression guard against Phase 6 assumptions in the original Plan 1 v4.
+
+### 22.4 Phase E: WrapPrivkey hygiene — deferred
+
+A defense-in-depth sweep that shreds `wrap_privkeys` rows at `valid_until_ms + grace` and simultaneously shreds any `key_secrets` K_bundle rows that were wrapped to the corresponding `WrapPubkey`. This protects against the narrow class of attacks where a peer's WrapPrivkey is re-acquired after nominal purge (disk forensic recovery, backup restore) and is used to re-unwrap a retained `key_broadcast` wire.
+
+Skipped for now: the delete-triggered purge is the load-bearing lever and covers the common FS threat. WrapPrivkey hygiene is only needed if operational reality admits WrapPrivkey re-acquisition. Revisit if a product/threat-model driver appears.
+
+### 22.5 Phase F: test suite
+
+Seven targeted regression tests per the planning doc, to be added as `tests/strong_fs_*.rs` integration suites or alongside the existing `per_message_fs.rs` state-level file:
+
+1. **Delete triggers K_bundle purge** — send 3, delete #2, assert K_bundle row gone and K_m rows for #1 and #3 remain.
+2. **K_m survives K_bundle purge** — same setup, explicit key_secrets contents check by event id.
+3. **Retained wire + post-purge compromise** — simulate a retained `message_key` blob after delete; assert no code path re-materializes K_bundle.
+4. **Creator forced-rotation via INNER JOIN** — after delete, next send emits a new `key_broadcast`; the Encrypted wrapper's `key_event_id` references a new `message_key` whose `k_bundle_local_event_id` is the fresh bundle.
+5. **Late-arrival `message_key` on retired bundle** — assert that such a mkey event blocks on the missing `k_bundle_local_event_id` and is not decrypted.
+6. **Joiner after bundle retirement** — exercises Phase D cold path end-to-end.
+7. **Per-device isolation** — two sender devices' concurrent bundles; deletion on device 1 does not purge device 2's K_bundle.
+
+### 22.6 Non-goals / explicitly rejected
+
+Per the design analysis and codex review, the following were considered and rejected:
+
+1. `purged_bundles` terminal-state table / bundle-expiry wire metadata — unnecessary under delete-triggered purge.
+2. Treating `MessageDeletion` as a bundle-expiry marker — the local purge is already the terminal state; no additional wire concept needed.
+3. Deterministic HKDF-derived K_m (index-in-Encrypted replacing `message_key` entirely) — keeping Option C's per-message `message_key` event is simpler and does not add meaningful bandwidth overhead at realistic workloads.
+4. Message re-encryption on delete (the original Plan 1 v1/v2 rekey proposal) — fully superseded by delete → bundle-purge.
+5. Force-rotate-on-delete tables or hooks — rotation emerges from existing `ensure_content_key_for_peer_at` + the INNER JOINs on `key_secrets`.
+6. `events` / `event_blobs` table split for differentiated blob lifecycles — the row-delete path handles FS-relevant purges in-place against the single `events` table.
+
+### 22.7 FS-adjacent maintenance
+
+Two low-visibility follow-ups that depend on the FS track:
+
+1. **Per-device bundle lineage at send time** — the send path currently uses a workspace-shared content key for `bundle_id`. Swap for per-device resolution so that one device's deletion cascade does not retire another device's active bundle. This is invariant 9.6.1 / the plan's "per-device K_bundle lineage" requirement. Previously noted in `docs/planning/SEND_TIME_MESSAGE_KEY_INTEGRATION.md`.
+2. **Verus mirror** — the FS changes touch `src/event_modules/message_key.rs`, `src/state/projection/purge.rs`, and `src/state/projection/decision_context.rs`. The formal-mirror gate (`boundary_tests::test_formal_mirror_updates_enforced`) will fail until `verus-proofs/src/event_modules/message_key.rs` and the purge/decision-context mirrors are updated. Currently deferred; when resumed, mirror the new `bundle_key_secret_event_ids` enumeration and the K_bundle-row shred into the Verus core.

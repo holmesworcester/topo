@@ -1840,6 +1840,81 @@ TLC-verified invariants (from `TransportCredentialLifecycle.tla`, mapped to Rust
 
 Abstract boundary: TLS handshake and session-key derivation remain unmodeled. The TLA spec covers trust-source state transitions but not the cryptographic session establishment that consumes them.
 
+## 9.6 Forward secrecy for deleted and expired messages
+
+Forward secrecy (FS) in poc-7 is scoped to *message-level deletion*: once a message is deleted by any authorized author, admin, or TTL-expiry trigger, its plaintext must be unrecoverable on every honest peer — even by an adversary who retains a full copy of the sync wire and who later compromises an honest peer's local state.
+
+This goes beyond the weaker "local cascade purge" property. Any peer that acts as a long-term store-and-forward relay can retain encrypted events indefinitely; if the per-bundle content key stayed in honest-peer local state, a later peer compromise plus retained wire = full decryption. We therefore bind per-bundle content keys to the deletion event, not to their wrap-key expiry window.
+
+### 9.6.1 Key hierarchy
+
+Three keys cooperate:
+
+1. `K_bundle` — a 32-byte symmetric content key per *sender device*. Delivered asymmetrically to each recipient's `WrapPubkey` via a `key_broadcast` event at rotation time. Per-device bundle lineage means one device's deletion cascade does not retire another device's active bundle.
+
+2. `K_m` — a 32-byte symmetric per-message key, fresh and random on every send. Wrapped under the sender's current `K_bundle` via AEAD with a deterministic nonce, carried on the wire in a `message_key` event. At projection time, the recipient decrypts `wrapped_k_m` and caches `K_m` in `key_secrets` keyed by the `message_key` event's own id.
+
+3. Ciphertext — `AEAD(K_m, plaintext)` carried on an `Encrypted` wrapper whose `key_event_id` field points at the `message_key` event. The standard dep-cascade unblocks decryption when `key_secrets` becomes populated for that id.
+
+`message_key` events are deterministic-unsigned (content-addressed) so the same `(bundle, K_m, wrapped_k_m)` produces the same event id across every emitter, enabling re-emission without churn.
+
+### 9.6.2 Forward-secrecy lever: delete-triggered K_bundle purge
+
+The FS guarantee is enforced by a single mechanism: **when a `MessageDeletion` cascade runs on any honest peer, the same transaction that purges the target message's ciphertext, K_m, and `message_key` row also shreds the K_bundle plaintext row from that tenant's `key_secrets`.**
+
+Concretely, `collect_projection_dependents` in `src/state/projection/purge.rs`:
+1. walks `messages_to_message_keys` from the deleted message's event id to the `message_key_event_id` (already existing behavior);
+2. walks `message_keys.k_bundle_local_event_id` from each of those mkey rows to the K_bundle's event id (new, delete-triggered strong-FS enumeration);
+3. accumulates the K_bundle ids in a dedicated `bundle_key_secret_event_ids` manifest bucket.
+
+`delete_tenant_rows` then issues a narrow `DELETE FROM key_secrets WHERE recorded_by = ? AND event_id = ?` for each such id. It deliberately does NOT cascade the K_bundle's KeyRotation event into the full per-event manifest — the `events` / `valid_events` / `recorded_events` rows for the rotation stay live, since late-joining peers or sync correctness may still need the rotation visible; only the plaintext bytes in this tenant's `key_secrets` disappear.
+
+### 9.6.3 Why K_m values survive K_bundle purge
+
+`K_m` is keyed in `key_secrets` by its own `message_key` event id, not by the bundle. A single-row delete of the K_bundle row does not touch any K_m row. Messages that are not the deletion target stay fully decryptable for the recipient and for future replay passes. History access for an already-connected peer is unaffected by the deletion except for the one message that was actually deleted.
+
+### 9.6.4 Rotation on next send emerges naturally
+
+The delete-triggered purge is symmetric across all honest peers — the creator device shreds its own K_bundle row too. The send path's `ensure_content_key_for_peer_at` uses `latest_content_key_for_frontier`, which `INNER JOIN`s `key_rotations` against `key_secrets` (matching fix in `existing_rotation_for_frontier`). With the K_bundle row gone, both queries return None, and the existing "no valid content key → rotate" branch fires on the next send. The creator emits a fresh `key_broadcast` with new K_bundle material, and subsequent `message_key` events reference the new bundle.
+
+There is no explicit "force-rotate" table, no dirty-bundles tracking, no new wire fields. The rotation is produced entirely by the pre-existing lookup logic observing a purged `key_secrets` row. If the creator never sends again, no rotation ever occurs — the bundle is quietly retired.
+
+### 9.6.5 Joiner history under this model
+
+A new joiner who arrives during a bundle's active life receives the bundle in a single asymmetric wrap via `key_history_bundle`, then unwraps every `message_key` they encounter and caches `K_m` locally for each one. History delivery is bundle-level, not per-message.
+
+A joiner who arrives after a bundle has been retired (because some message under it was deleted) cannot obtain the bundle — no honest peer has its `key_secrets` row any more. For un-deleted messages in that retired bundle they fall back to the targeted heal path: they emit a `key_request` naming the specific `message_key` events they need, and a peer whose K_m cache still holds those values emits individually-wrapped `key_bundle_share` responses. This is the "cold path" — more bandwidth than a bundle delivery (approximately 200 bytes per un-deleted message versus ~64 bytes per slot in a bulk `key_history_bundle`) but still a single asymmetric wrap per message, not a whole new rotation.
+
+The arithmetic favors not rotating on delete: even for bundles with up to ~2600 messages the cold-path cost per late joiner is cheaper than the ~524 KB of a fresh `key_broadcast` for 8192 recipients. For typical chat workloads, "retire the bundle and let late joiners take the cold path" is the cheaper aggregate choice.
+
+### 9.6.6 Threat model — what we claim and do not claim
+
+After `T_delete + propagation_delay` on any honest peer, FS holds against:
+
+1. An adversary who has retained wire copies of `key_broadcast`, `message_key`, and `Encrypted` events for the deleted message but has never compromised peer state. The retained `message_key` blob requires K_bundle to unwrap; the peer's K_bundle plaintext is gone; the `key_broadcast` blob requires a WrapPrivkey that may have been purged on its own schedule. No path to recovery.
+2. An adversary who compromises peer state *after* deletion propagates to that peer. The compromised `key_secrets` holds K_m rows for un-deleted messages (expected) but not for the deleted one (purged) and not K_bundle (purged). The retained wire for the deleted message cannot be unwrapped.
+
+FS does *not* hold against:
+1. An adversary who compromises peer state *before* the deletion has propagated to that peer. Local state at that moment legitimately contains K_bundle and every K_m the peer has projected — the peer is a decryption oracle for those messages by design, and the deletion has not yet reached it.
+2. An adversary against a peer that refuses to purge. This is a social-contract failure, not a cryptographic one — such a peer is equivalent to a post-deletion backup, and the protocol cannot distinguish legitimate offline caches from deliberate retention.
+3. SSD-level forensic recovery (wear-leveling, bad-block remap, TRIM timing). A background track (currently unimplemented in poc-7) covers in-place secure-zero of `key_bytes` columns prior to DELETE; the filesystem residual question is outside the protocol layer.
+
+The window of FS exposure for any deleted message is thus bounded by event-propagation latency for `MessageDeletion`, not by any fixed grace period.
+
+### 9.6.7 Relationship to existing key lifecycle
+
+`WrapPubkey` rotation (Phase 1 self-tombstoning, already landed) and `WrapPrivkey` expiry-based purge (defense-in-depth, currently a follow-up track) operate on their own schedule and do not gate FS correctness under this design. They exist to prevent an adversary who somehow re-acquires an old `WrapPrivkey` (disk backup, forensic image) from re-unwrapping a retained `key_broadcast` — a belt-and-suspenders property relative to the delete-triggered purge. If every honest peer purges K_bundle promptly on deletion and never restores pre-deletion state, the WrapPrivkey track adds no load-bearing FS guarantee; if peer purge hygiene is imperfect, the WrapPrivkey track catches the remaining exposure window.
+
+Abstract boundary: this section describes the Rust-projector-level FS invariant. Cryptographic primitives (AES-GCM, Ed25519, AEAD nonce policy) are trusted. The TLA model does not yet encode FS explicitly; a future extension would model `key_secrets` as a per-peer mutable set with deletion-triggered shrink and verify that retained wire cannot reconstruct plaintext.
+
+### 9.6.8 Implementation references
+
+- Wire events: `src/event_modules/message_key.rs` (~133 B deterministic-unsigned wrap event), `src/event_modules/key_broadcast.rs`, `src/event_modules/key_history_bundle.rs`, `src/event_modules/key_bundle_share.rs`, `src/event_modules/wrap_pubkey.rs`.
+- Purge cascade: `src/state/projection/purge.rs` (`collect_projection_dependents` + `delete_tenant_rows`; `bundle_key_secret_event_ids` bucket).
+- Rotation-on-purge emergence: `src/event_modules/workspace/identity_ops.rs` (`latest_content_key_for_frontier`, `existing_rotation_for_frontier`, `latest_materialized_key_for_peer` — all INNER JOIN `key_secrets`/`key_rotations` as appropriate).
+- Reverse index: `src/event_modules/message_key.rs` (`messages_to_message_keys` table).
+- Plan tracking: `docs/PLAN.md` §22.
+
 ---
 
 # 10. Convergence and Test Invariants
