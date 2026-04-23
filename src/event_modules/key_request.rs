@@ -228,8 +228,12 @@ pub static KEY_REQUEST_META: EventTypeMeta = crate::event_modules::registry::eve
     type_name: "key_request",
     projection_table: "key_requests",
     share_scope: ShareScope::Shared,
-    dep_fields: &["key_event_id", "recipient_event_id"],
-    dep_field_type_codes: &[&[super::EVENT_TYPE_KEY_ROTATION], &[10, 12, 16]],
+    // Note: `key_event_id` is an identifier of the key being requested,
+    // not a dep — a peer requesting a key by definition doesn't have
+    // the corresponding KeySecret yet. Keeping only `recipient_event_id`
+    // as a dep (it names the peer whose key material we're asking for).
+    dep_fields: &["recipient_event_id"],
+    dep_field_type_codes: &[&[10, 12, 16]],
     signer_required: true,
     signature_byte_len: 0,
     encryptable: false,

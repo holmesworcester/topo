@@ -254,15 +254,21 @@ pub static KEY_SHARED_META: EventTypeMeta = crate::event_modules::registry::even
     type_name: "key_shared",
     projection_table: "key_shared",
     share_scope: ShareScope::Shared,
+    // Note: `key_event_id` is the identifier of the KeySecret being
+    // delivered — not a dep. The recipient derives the KeySecret
+    // locally by unwrapping `wrapped_key`; the event's projector
+    // emits a deterministic KeySecret blob so the Encrypted wrapper
+    // can then dep-resolve normally. Keeping `key_event_id` as a dep
+    // would be circular (the recipient is trying to obtain the key,
+    // so they can't already have it).
     dep_fields: &[
-        "key_event_id",
         "recipient_event_id",
         "frontier_ref_1",
         "frontier_ref_2",
         "frontier_ref_3",
         "frontier_ref_4",
     ],
-    dep_field_type_codes: &[&[super::EVENT_TYPE_KEY_ROTATION], &[10, 12, 16], &[], &[], &[], &[]],
+    dep_field_type_codes: &[&[10, 12, 16], &[], &[], &[], &[]],
     signer_required: true,
     signature_byte_len: 0,
     encryptable: false,

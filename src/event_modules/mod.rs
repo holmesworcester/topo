@@ -279,8 +279,10 @@ impl ParsedEvent {
                     .collect::<Vec<_>>();
                 deps
             }
+            // `key_event_id` is the identifier of the key being
+            // requested, not a dep (the requester by definition does
+            // not have the KeySecret yet). See KEY_REQUEST_META.
             ParsedEvent::KeyRequest(k) => vec![
-                ("key_event_id", k.key_event_id),
                 ("recipient_event_id", k.recipient_event_id),
             ],
             ParsedEvent::KeyHistory(_) => vec![],
@@ -316,8 +318,11 @@ impl ParsedEvent {
                     s.frontier_ref_3,
                     s.frontier_ref_4,
                 ];
+                // `key_event_id` names the KeySecret being delivered —
+                // the recipient derives it locally by unwrapping the
+                // `wrapped_key`, so it can't be a dep (would be
+                // circular). See KEY_SHARED_META.
                 let mut deps = vec![
-                    ("key_event_id", s.key_event_id),
                     ("recipient_event_id", s.recipient_event_id),
                 ];
                 deps.extend(
