@@ -197,17 +197,44 @@ fn collect_projection_dependents(
         }
     }
     for mkey_eid in &mkey_event_ids {
-        let bundle_event_id: Option<String> = conn
+        // A K_bundle's plaintext may live in `key_secrets` under TWO
+        // distinct event_ids for the same bytes:
+        //   - `k_bundle_local_event_id` = the canonical deterministic
+        //     `KeySecret(K_bundle)` event id (emitted at send time
+        //     and materialized by every producer:
+        //     key_broadcast / key_history_bundle / key_bundle_share).
+        //   - `bundle_id` = the legacy rotation/`key_broadcast` event
+        //     id (keyed by the KeyRotation event_id whose projector
+        //     also writes the K_bundle bytes into `key_secrets`).
+        // Both rows must be shredded on retirement so that
+        // `latest_content_key_for_frontier`'s INNER JOIN
+        // (`key_rotations` × `key_secrets`) sees no match and the
+        // sender's next call to `ensure_content_key_for_peer_at`
+        // auto-rotates to fresh bytes. Otherwise the rotation-evid
+        // row survives, the sender reuses the retired K_bundle, and
+        // the `retired_bundles` gate blocks the deterministic
+        // re-materialization — leaving the next send's message_key
+        // blocked. Walk both columns and add both ids to the narrow
+        // shred bucket.
+        let row: Option<(String, String)> = conn
             .query_row(
-                "SELECT k_bundle_local_event_id
+                "SELECT k_bundle_local_event_id, bundle_id
                  FROM message_keys
                  WHERE recorded_by = ?1 AND event_id = ?2",
                 params![recorded_by, mkey_eid],
-                |row| crate::db::sql_types::get_text(row, 0),
+                |row| {
+                    Ok((
+                        crate::db::sql_types::get_text(row, 0)?,
+                        crate::db::sql_types::get_text(row, 1)?,
+                    ))
+                },
             )
             .ok();
-        if let Some(bundle_eid) = bundle_event_id {
-            changed |= manifest.add_bundle_key_secret_event_id(bundle_eid);
+        if let Some((k_bundle_local_eid, bundle_eid)) = row {
+            changed |= manifest.add_bundle_key_secret_event_id(k_bundle_local_eid);
+            if !bundle_eid.is_empty() {
+                changed |= manifest.add_bundle_key_secret_event_id(bundle_eid);
+            }
         }
     }
 
