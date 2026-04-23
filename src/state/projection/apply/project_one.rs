@@ -113,28 +113,15 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
 
     let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
 
-    // Refinement bridge to the abstract access-control model (see
-    // verus-proofs/src/state/access_control.rs). At this point all runtime
-    // dep/signer/guard stages have passed, so we pass all-honest flags to the
-    // verified checker. The call acts as a live linkage: if a future change
-    // to `apply_accepts_primitives_spec` starts rejecting an event kind the
-    // runtime still projects, this debug_assert fires. Non-tautological parts
-    // (kind-specific recipient matching) can be added as the model grows.
-    // Use `sub_event` (the semantic inner event for Encrypted wrappers), not
-    // `parsed` (the outer wire event). For non-wrapper events these coincide.
-    debug_assert!(
-        topo_verus_proofs::state::access_control::abstract_apply_accepts_primitives(
-            sub_event.event_type_code(),
-            /* recipient_is_this_peer */ true,
-            /* has_required_dep */ true,
-            /* dep_is_valid */ true,
-            /* dep_kind_matches */ true,
-            /* dep_workspace_matches */ true,
-            /* dep_recipient_matches */ true,
-        ),
-        "abstract access-control model rejected an event the runtime is finalizing as Valid (kind_code={})",
-        sub_event.event_type_code(),
-    );
+    // Note: the prior `abstract_apply_accepts_primitives` tautological
+    // canary (all-true flags wired into the abstract access-control
+    // PeerState model) was retired. The canonical content-key-sharing
+    // security claim now lives in
+    // `verus-proofs/src/event_modules/key_shared.rs` as the runtime-
+    // grounded `valid_key_shared_has_invited_recipient` theorem —
+    // grounded via `decide_key_shared_accepts_core` in
+    // `dep_facts::decide_key_shared`. No per-event finalization
+    // bridge is required here.
 
     backend.finalize_valid_projection(&cap, recorded_by, &event_id_b64, sub_event, suppress_sharing)?;
 
