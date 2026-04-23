@@ -1961,14 +1961,52 @@ Preferred design: include every still-active invite pubkey as an additional reci
 
 Reactive heal via the existing `key_request` / `key_bundle_share` path continues to cover edge cases where a bundle emission races a joiner's identity materialization (sender's `active_rotation_recipients_for_frontier` ran before the joiner's `peer_shared` projected on the sender) or where the invite's pubkey was excluded from a specific rotation. This is strictly additive to the bundle-to-invite-pubkey scheme.
 
-Test contract codifying the end-state requirement is in
-`src/state/projection/apply/tests/new_joiner_history.rs::joiner_decrypts_messages_encrypted_under_bundle_created_after_invite`.
-The test simulates the delivery at the projection-layer level so it's
-valid whichever delivery mechanism ends up implementing it. Delivery-
-layer implementation (updating `active_rotation_recipients_for_frontier`
-to enumerate active invites alongside `peers_shared`) is deferred
-until the invite lifecycle tracking for bundle-recipient enumeration
-is built out.
+Test contract codifying the end-state requirement is the CLI
+black-box test
+`tests/cli_post_invite_bundle_delivery_test.rs::cli_joiner_sees_messages_encrypted_under_post_invite_bundle`,
+currently `#[ignore]` because the delivery mechanism isn't wired up
+yet. When the delivery layer lands, flip `#[ignore]` off.
+
+### 22.3.4 Delivery-layer implementation scope (open)
+
+Touch points identified while probing the ignored CLI test:
+
+1. **`active_rotation_recipients_for_frontier`** in
+   `src/event_modules/workspace/identity_ops.rs` currently enumerates
+   only `peers_shared` rows. Extend to ALSO enumerate active invites
+   (rows in `user_invites` / `device_invites` whose invite hasn't
+   been consumed or expired), mapping each to a
+   `RotationRecipient { recipient_event_id: <invite_event_id>,
+   public_key: <invite_pubkey> }`.
+
+2. **`load_key_rotation_context`** in
+   `src/state/projection/decision_context.rs` currently only checks
+   `wrap_privkeys` / `peer_shared` signer to find a matching slot.
+   Extend to also check `invite_secrets` so a joiner whose only local
+   match is an invite private key can still unwrap their slot on a
+   `KeyRotation` / `key_broadcast`.
+
+3. **Auto-rotation interaction (resolved).** Phase A now shreds
+   BOTH `key_secrets` rows (the deterministic KeySecret id AND the
+   rotation/`bundle_id` row) on first-delete-in-bundle (commit
+   `1f8d63b4`), so `ensure_content_key_for_peer_at` naturally
+   auto-rotates on the sender's next send. The new rotation must
+   include active invite pubkeys as recipients (item 1) so any
+   unconsumed invite retains decryption capability for future
+   bundles.
+
+4. **Session auth interaction (open).** The ignored CLI test's
+   current failure mode (after the purge-cascade double-row fix) is
+   Bob's mTLS session authentication against Alice's post-retirement
+   state: initiator sync fails with "session io internal error,
+   connection lost." The session presumably pins something that
+   changes when Alice rotates or retires her bundle — investigate
+   and document the interaction before landing the delivery-layer
+   changes, since fixing (1)+(2) without understanding this may
+   surface additional breakage.
+
+5. **Regression coverage.** Flip `#[ignore]` off on the CLI test
+   once delivery lands; it becomes the regression guard.
 
 ### 22.4 Phase E: WrapPrivkey hygiene — deferred
 
