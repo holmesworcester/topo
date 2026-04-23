@@ -442,14 +442,7 @@ pub fn create_encrypted_event(
     inner_event: &ParsedEvent,
     signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
-    create_encrypted_event_with_owner(
-        conn,
-        recorded_by,
-        key_event_id,
-        None,
-        inner_event,
-        signer,
-    )
+    create_encrypted_event_with_owner(conn, recorded_by, key_event_id, None, inner_event, signer)
 }
 
 /// Create an encrypted event with optional outer owner linkage for convergent
@@ -522,31 +515,30 @@ pub fn create_encrypted_event_with_owner(
 
     // 5. Store either the plaintext encrypted wrapper or Signed(Encrypted(inner)).
     match signer {
-        Some((signer_event_id, signing_key)) => create_signed_event(
-            conn,
-            recorded_by,
-            signer_event_id,
-            &wrapper,
-            signing_key,
-        ),
+        Some((signer_event_id, signing_key)) => {
+            create_signed_event(conn, recorded_by, signer_event_id, &wrapper, signing_key)
+        }
         None => create_event(conn, recorded_by, &wrapper),
     }
 }
 
 /// Convenience: send a message under Per-Message FS given a legacy
 /// content-key event id (as returned by `ensure_content_key_for_peer`).
-/// Loads K_epoch bytes from the existing `key_secrets` row keyed by
+/// Loads K_bundle bytes from the existing `key_secrets` row keyed by
 /// the rotation event id, then delegates to
-/// `create_encrypted_event_with_message_key` using the rotation event
-/// id as both `bundle_id` and `k_bundle_local_event_id`.
+/// `create_encrypted_event_with_message_key`.
 ///
-/// Using the rotation event id (rather than a freshly-derived
-/// deterministic id) keeps the `message_key` dep pointing at the same
-/// `key_secrets` row that receivers already materialize through the
-/// legacy KeyRotation projector path — no new cascade plumbing
-/// required on the receive side, and device-link content-key replay
-/// (which inserts directly into `key_secrets`) continues to unblock
-/// `message_key` uniformly.
+/// The emitted `message_key` keeps `bundle_id = content_key_event_id`
+/// for lineage/debugging, but its blocking dep
+/// `k_bundle_local_event_id` must be the canonical
+/// `deterministic_key_secret_event_id(K_bundle)`. That is the id that
+/// the new producer family (`key_broadcast`, `key_history_bundle`,
+/// `key_bundle_share`) materializes into `key_secrets`, so send-time
+/// deps must name the same row or remote `message_key` projection can
+/// never unblock from those producers. We also materialize that
+/// deterministic local `KeySecret(K_bundle)` before emitting the
+/// `message_key`, so the sender's own projection path remains
+/// synchronous.
 pub fn create_encrypted_event_with_message_key_via_rotation(
     conn: &Connection,
     recorded_by: &str,
@@ -571,12 +563,23 @@ pub fn create_encrypted_event_with_message_key_via_rotation(
     }
     let mut k_bundle_bytes = [0u8; 32];
     k_bundle_bytes.copy_from_slice(&key_bytes_vec);
+    let expected_k_bundle_local_event_id =
+        crate::event_modules::key_secret::deterministic_key_secret_event_id(&k_bundle_bytes);
+    let materialized_k_bundle_local_event_id = create_event(
+        conn,
+        recorded_by,
+        &crate::event_modules::key_secret::deterministic_key_secret_event(k_bundle_bytes),
+    )?;
+    debug_assert_eq!(
+        materialized_k_bundle_local_event_id, expected_k_bundle_local_event_id,
+        "deterministic KeySecret(K_bundle) must hash to its derived local event id",
+    );
 
     create_encrypted_event_with_message_key(
         conn,
         recorded_by,
         content_key_event_id,
-        content_key_event_id,
+        &materialized_k_bundle_local_event_id,
         &k_bundle_bytes,
         owner_event_id,
         inner_event,
@@ -605,8 +608,7 @@ pub fn create_encrypted_event_with_message_key(
     signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
     use crate::event_modules::message_key::{
-        deterministic_message_key_created_at_ms, deterministic_message_key_nonce,
-        MessageKeyEvent,
+        deterministic_message_key_created_at_ms, deterministic_message_key_nonce, MessageKeyEvent,
     };
     use rand::RngCore;
 
@@ -643,11 +645,8 @@ pub fn create_encrypted_event_with_message_key(
 
     // 3. Build + emit the message_key event (deterministic, unsigned,
     //    content-addressed).
-    let created_at_ms = deterministic_message_key_created_at_ms(
-        bundle_id,
-        k_bundle_local_event_id,
-        &wrapped_k_m,
-    );
+    let created_at_ms =
+        deterministic_message_key_created_at_ms(bundle_id, k_bundle_local_event_id, &wrapped_k_m);
     let mkey = ParsedEvent::MessageKey(MessageKeyEvent {
         created_at_ms,
         bundle_id: *bundle_id,
@@ -676,13 +675,9 @@ pub fn create_encrypted_event_with_message_key(
     });
 
     match signer {
-        Some((signer_event_id, signing_key)) => create_signed_event(
-            conn,
-            recorded_by,
-            signer_event_id,
-            &wrapper,
-            signing_key,
-        ),
+        Some((signer_event_id, signing_key)) => {
+            create_signed_event(conn, recorded_by, signer_event_id, &wrapper, signing_key)
+        }
         None => create_event(conn, recorded_by, &wrapper),
     }
 }
@@ -957,8 +952,7 @@ mod tests {
             key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         let uib_eid =
-            create_signed_event(conn, recorded_by, &net_eid, &uib, &workspace_key)
-                .unwrap();
+            create_signed_event(conn, recorded_by, &net_eid, &uib, &workspace_key).unwrap();
 
         let user_key = SigningKey::generate(&mut rng);
         let ub = ParsedEvent::User(UserEvent {
@@ -966,8 +960,7 @@ mod tests {
             public_key: user_key.verifying_key().to_bytes(),
             username: "test-user".to_string(),
         });
-        let ub_eid =
-            create_signed_event(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
+        let ub_eid = create_signed_event(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
 
         let device_invite_key = SigningKey::generate(&mut rng);
         let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
@@ -976,8 +969,7 @@ mod tests {
             authority_event_id: ub_eid,
             key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
-        let dif_eid =
-            create_signed_event(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
+        let dif_eid = create_signed_event(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
 
         let endpoint_key = SigningKey::generate(&mut rng);
         let endpoint_event =
@@ -985,8 +977,7 @@ mod tests {
                 endpoint_key.to_bytes(),
             );
         let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
-        let endpoint_shared_event_id =
-            create_event(conn, &endpoint_id, &endpoint_event).unwrap();
+        let endpoint_shared_event_id = create_event(conn, &endpoint_id, &endpoint_event).unwrap();
 
         let peer_shared_key = SigningKey::generate(&mut rng);
         let psf = ParsedEvent::PeerShared(PeerSharedEvent {
@@ -997,8 +988,7 @@ mod tests {
             device_name: "test-device".to_string(),
         });
         let psf_eid =
-            create_signed_event(conn, recorded_by, &dif_eid, &psf, &device_invite_key)
-                .unwrap();
+            create_signed_event(conn, recorded_by, &dif_eid, &psf, &device_invite_key).unwrap();
         conn.execute(
             "INSERT INTO peer_secrets
              (recorded_by, event_id, signer_event_id, private_key, created_at)
@@ -1076,6 +1066,89 @@ mod tests {
             )
             .unwrap();
         assert!(valid);
+    }
+
+    #[test]
+    fn test_per_message_fs_send_uses_deterministic_bundle_secret_dep() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
+
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
+        let key_event_id_b64 = event_id_to_base64(&key_event_id);
+        let key_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &key_event_id_b64],
+                |row| crate::db::sql_types::get_blob(row, 0),
+            )
+            .unwrap();
+        let mut k_bundle = [0u8; 32];
+        k_bundle.copy_from_slice(&key_bytes);
+        let expected_local_id =
+            crate::event_modules::key_secret::deterministic_key_secret_event_id(&k_bundle);
+        let expected_local_id_b64 = event_id_to_base64(&expected_local_id);
+
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: now_ms(),
+            workspace_id: net_eid,
+            author_id: user_event_id,
+            content: "hello per-message-fs".to_string(),
+        });
+
+        let message_event_id = create_encrypted_event_with_message_key_via_rotation(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            None,
+            &msg,
+            Some((&signer_eid, &signing_key)),
+        )
+        .unwrap();
+        let message_event_id_b64 = event_id_to_base64(&message_event_id);
+
+        let message_key_event_id_b64: String = conn
+            .query_row(
+                "SELECT message_key_event_id
+                 FROM messages_to_message_keys
+                 WHERE recorded_by = ?1 AND message_event_id = ?2",
+                rusqlite::params![recorded_by, &message_event_id_b64],
+                |row| crate::db::sql_types::get_text(row, 0),
+            )
+            .unwrap();
+        let (bundle_id_b64, k_bundle_local_event_id_b64): (String, String) = conn
+            .query_row(
+                "SELECT bundle_id, k_bundle_local_event_id
+                 FROM message_keys
+                 WHERE recorded_by = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &message_key_event_id_b64],
+                |row| {
+                    Ok((
+                        crate::db::sql_types::get_text(row, 0)?,
+                        crate::db::sql_types::get_text(row, 1)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            bundle_id_b64, key_event_id_b64,
+            "bundle lineage should still point at the current rotation event id"
+        );
+        assert_eq!(
+            k_bundle_local_event_id_b64, expected_local_id_b64,
+            "message_key dep must name the canonical KeySecret(K_bundle) id"
+        );
+        assert_ne!(
+            k_bundle_local_event_id_b64, bundle_id_b64,
+            "legacy rotation ids and canonical bundle-secret ids must not be conflated"
+        );
     }
 
     #[test]
@@ -1220,9 +1293,8 @@ mod tests {
             content: "signed content".to_string(),
         });
 
-        let err =
-            create_signed_event(&conn, recorded_by, &signer_eid, &msg, &signing_key)
-                .expect_err("plaintext content should be rejected");
+        let err = create_signed_event(&conn, recorded_by, &signer_eid, &msg, &signing_key)
+            .expect_err("plaintext content should be rejected");
         match err {
             CreateEventError::Rejected { reason, .. } => {
                 assert!(reason.contains("must be carried inside encrypted wrappers"));
