@@ -99,6 +99,30 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             recorded_by TEXT NOT NULL,
             PRIMARY KEY (recorded_by, event_id)
         );
+
+        -- Strong-FS Case B (`docs/DESIGN.md` §9.6.5,
+        -- `docs/PLAN.md` §22.3.2): once a K_bundle has been shredded
+        -- locally due to a MessageDeletion cascade, any future
+        -- projection attempting to write THAT SPECIFIC K_bundle row
+        -- back into `key_secrets` must be refused. The gate is keyed
+        -- by `(recorded_by, k_bundle_local_event_id)` — it does NOT
+        -- block rehydration of K_m rows for un-deleted messages in
+        -- the retired bundle. Those K_m rows live in `key_secrets`
+        -- under the message_key's own event id, a different key,
+        -- and MUST be allowed to rematerialize via Case A's K_m
+        -- slots in `key_history_bundle` or via the heal-path
+        -- `key_message_share` event (if/when it lands) so
+        -- un-deleted messages stay decryptable for late joiners.
+        -- Populated by `delete_tenant_rows` at the same site that
+        -- shreds the K_bundle row. Consulted in `write_exec.rs` at
+        -- every `InsertOrIgnore` into `key_secrets` — the gate
+        -- matches by event_id so it's table-specific and narrow.
+        CREATE TABLE IF NOT EXISTS retired_bundles (
+            recorded_by TEXT NOT NULL,
+            k_bundle_local_event_id TEXT NOT NULL,
+            retired_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (recorded_by, k_bundle_local_event_id)
+        );
         ",
     )?;
     Ok(())

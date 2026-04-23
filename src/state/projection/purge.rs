@@ -539,9 +539,32 @@ fn delete_tenant_scoped_rows(
             "event_id",
             bundle_event_id,
         )?;
+        // Strong FS Case B (`DESIGN.md` §9.6.5 / `PLAN.md` §22.3.2):
+        // durably mark this bundle as retired on this tenant. Future
+        // `key_history_bundle` / `key_bundle_share` / `key_broadcast`
+        // projections referencing this bundle event id must REFUSE
+        // to re-materialize its K_bundle into `key_secrets`. Without
+        // this marker a stale invite-time `key_history_bundle` (one
+        // that was emitted before retirement but arrives at a joiner
+        // after) would unwrap and re-hydrate K_bundle bytes on that
+        // joiner, violating the FS invariant.
+        conn.execute(
+            "INSERT OR IGNORE INTO retired_bundles
+                 (recorded_by, k_bundle_local_event_id, retired_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![recorded_by, bundle_event_id, current_timestamp_ms_local()],
+        )?;
     }
 
     Ok(())
+}
+
+fn current_timestamp_ms_local() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn delete_global_rows(

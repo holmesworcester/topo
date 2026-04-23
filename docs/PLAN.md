@@ -1920,16 +1920,40 @@ Contract:
 
 Not in scope for Phase B: SSD-level wear-leveling / bad-block residues. That residual exists and is documented as an out-of-scope threat.
 
-### 22.3 Phase D: retired-bundle-joiner cold path — deferred
+### 22.3 Phase D: retired-bundle joiner recovery
 
-Phase D was originally planned as pattern-(b) polish on `key_bundle_share` so late joiners could recover un-deleted messages in a retired bundle. On closer audit, `key_bundle_share` wraps K_bundle, not K_m. Once a bundle is retired, the K_bundle is gone on every honest peer; `key_bundle_share` cannot deliver anything for that bundle. A true cold path requires a new event type analogous to `key_bundle_share` but wrapping K_m under a recipient's `WrapPubkey` (`key_message_share` in future shorthand). (The existing `key_bundle_share` projector already does pattern-(b) materialize correctly — emits `KeySecret(K_bundle)` via `EmitDeterministicBlob` on unwrap; see `src/event_modules/key_bundle_share.rs::project_pure`. That part is landed.)
+Three sub-cases govern late-joiner history access (see `DESIGN.md` §9.6.5):
 
-Current decision per the design trade (`DESIGN.md` §9.6.5): **accept history loss for retired bundles in the initial landing.** Common case (bundle never sees a deletion): future joiners get the bundle via `key_history_bundle` and materialize every K_m they need. Retired bundles: late joiners miss the un-deleted tail. The math trades ~524 KB per rotation (avoided) against history loss for a subset of late joiners who needed that specific range; typical chat workloads favor not rotating.
+**Case A — bundle retired before invite creation.** Inviter bundles per-K_m wraps for un-deleted messages in retired bundles directly into the `key_history_bundle` event that accompanies the invite. Wire format for `key_history_bundle` slots is unified: each slot is `(target_event_id, wrapped_32_bytes)`, where `target_event_id` is either a KeyRotation/key_broadcast event id (slot carries K_bundle) or a `message_key` event id (slot carries K_m). Projector unwraps each slot and writes to `key_secrets` keyed by `target_event_id`; Kahn cascade dispatches based on what's blocked on that id. No new event type — existing `key_history_bundle` takes both shapes.
 
-`key_message_share` deferred until a concrete product driver surfaces. When implemented, the path will be:
-- New 4-field wire event (timestamp + bundle_id + recipient_wrappubkey_event_id + wrapped_k_m), deterministic-unsigned.
-- Projector: same pattern-(b) unwrap as `key_bundle_share`, materializes K_m into `key_secrets` keyed by the corresponding `message_key` event id so the Encrypted wrapper's existing dep cascade fires.
-- Targeted heal: late joiner's projector sees a Valid `message_key` whose `k_bundle_local_event_id` is not resolvable locally (K_bundle retired), emits a `key_request` naming the specific `message_key` event id. A peer whose K_m cache still holds the value responds with `key_message_share`.
+Invite emitter policy: at `create_user_invite` / `create_device_invite`, enumerate local `message_keys` rows whose `k_bundle_local_event_id` is NOT present in `key_secrets` (retired bundles). For each, if the K_m row still exists in `key_secrets` keyed by the `message_key` event id, wrap it to the invite pubkey and include as a slot in the key_history_bundle. Skip messages that are locally tombstoned (the joiner should never be able to recover a deleted message).
+
+Slot budget: `key_history_bundle` currently caps at 8192 historical slots. Add a config policy for invite size: if the total (live K_bundle slots + retired-bundle K_m slots) would exceed 8192, evict oldest K_m slots first. A workspace with so much history that the invite can't carry it all is a separate feature (chunked history delivery) and out of scope here.
+
+Common case where the bundle is still live at invite-creation (Case C): no change — `key_history_bundle` already includes the K_bundle slot, and the joiner will unwrap message_key events as they arrive.
+
+**Case B — bundle retires after invite creation, before joiner sync.** Open design question; asked codex for a recommendation (in-flight, reply stored at `/tmp/codex_case_b_reply.txt`). Candidate strategies under review:
+- Pre-project `MessageDeletion` events and consult `deleted_messages` / `deletion_intents` before unwrapping a key_history_bundle slot; refuse the K_bundle slot if any deletion is known for a message in that bundle.
+- Serialize the whole bootstrap batch through projection before marking any key material usable.
+- Other options described in the codex prompt.
+
+Once codex replies, land the chosen mechanism in this sub-phase.
+
+**Case C — bundle live throughout.** Existing behavior. Nothing new needed.
+
+### 22.3.1 Implementation checklist (Case A)
+
+- [ ] Extend `key_history_bundle` wire slot interpretation: document that `target_event_id` can be either a `KeyRotation`/`key_broadcast` event id OR a `message_key` event id. Projector writes to `key_secrets` keyed by `target_event_id` in both cases. (No wire shape change if the slot is already `(event_id, wrapped_bytes)`; otherwise a minor binary-layout amendment.)
+- [ ] Extend the invite-emitting side (`create_user_invite`, `create_device_invite`): enumerate retired-bundle un-deleted K_m's and add them as slots.
+- [ ] Purge-side invariant: joiner's `MessageDeletion` cascade already purges K_m rows keyed by `message_key` event id, so retired-bundle slots delivered via the invite respect the same FS cascade if a deletion for that message arrives later.
+- [ ] Test: `joiner_after_bundle_retirement_sees_undeleted_tail_as_history_lost` (state-level test currently asserts history loss); flip its assertion once Case A lands — joiner should recover un-deleted messages.
+- [ ] Integration test via CLI: invite a new peer into a workspace with a retired bundle containing un-deleted messages; assert the new peer's `topo messages` lists all un-deleted messages.
+
+### 22.3.2 Implementation checklist (Case B)
+
+- [ ] Resolve codex's recommendation.
+- [ ] Land the chosen safeguard in the `key_history_bundle` projector / decision context so a stale slot doesn't re-hydrate K_bundle on the joiner.
+- [ ] Test: joiner projects a key_history_bundle whose K_bundle slot was retired between invite creation and joiner sync; assert joiner does NOT end up with K_bundle plaintext in local state (strong-FS preserved even across the invite-TTL race).
 
 ### 22.4 Phase E: WrapPrivkey hygiene — deferred
 

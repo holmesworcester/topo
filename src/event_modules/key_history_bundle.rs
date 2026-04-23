@@ -24,6 +24,19 @@ pub const KEY_HISTORY_BUNDLE_CAP: usize = 8192;
 pub const HISTORICAL_SLOT_BYTES: usize = 32 + 48;
 pub const KEY_HISTORY_BUNDLE_SLOTS_TOTAL: usize = KEY_HISTORY_BUNDLE_CAP * HISTORICAL_SLOT_BYTES;
 
+/// Capacity for per-message K_m slots carried alongside historical
+/// K_bundle slots. These are populated for un-deleted messages that
+/// reside in a bundle that was RETIRED (K_bundle purged on every
+/// honest peer) before the invite was created. Case A recovery per
+/// `docs/DESIGN.md` §9.6.5.
+pub const MESSAGE_KEY_SLOT_CAP: usize = 4096;
+/// Each message_key slot is 32B target_mkey_event_id + 48B AEAD
+/// ciphertext (32B K_m_bytes + 16B GCM tag) = 80 bytes. Same layout
+/// as historical K_bundle slots — we dispatch by the separate field
+/// position rather than by a per-slot type tag.
+pub const MESSAGE_KEY_SLOT_BYTES: usize = 32 + 48;
+pub const MESSAGE_KEY_SLOTS_TOTAL: usize = MESSAGE_KEY_SLOT_CAP * MESSAGE_KEY_SLOT_BYTES;
+
 pub const KEY_HISTORY_BUNDLE_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("anchor_bundle_id"),
@@ -31,6 +44,7 @@ pub const KEY_HISTORY_BUNDLE_FIELDS: &[FieldSpec] = &[
     FieldSpec::EventId("wrapped_anchor_bundle"),
     FieldSpec::FixedBytes("nonce", 12),
     FieldSpec::FixedBytes("historical_slots", KEY_HISTORY_BUNDLE_SLOTS_TOTAL),
+    FieldSpec::FixedBytes("message_key_slots", MESSAGE_KEY_SLOTS_TOTAL),
 ];
 
 pub const KEY_HISTORY_BUNDLE_WIRE_SIZE: usize = wire_size_for_fields(KEY_HISTORY_BUNDLE_FIELDS);
@@ -42,8 +56,22 @@ pub struct KeyHistoryBundleEvent {
     pub recipient_wrappubkey_event_id: [u8; 32],
     pub wrapped_anchor_bundle: [u8; 32],
     pub nonce: [u8; 12],
-    /// 8192 slots × 80 bytes each. Unused slots zero-filled.
+    /// 8192 slots × 80 bytes each. Each populated slot is
+    /// (bundle_id 32B, AEAD(K_anchor, K_bundle_bytes) 48B). Used for
+    /// historical K_bundle delivery — each slot materializes a
+    /// canonical `KeySecret(K_bundle)` event on unwrap. Unused slots
+    /// zero-filled.
     pub historical_slots: Vec<u8>,
+    /// 4096 slots × 80 bytes each. Each populated slot is
+    /// (target_message_key_event_id 32B, AEAD(K_anchor, K_m_bytes)
+    /// 48B). Populated for un-deleted messages whose bundle was
+    /// retired on every honest peer before the invite was created
+    /// (Case A per `docs/DESIGN.md` §9.6.5). Projector unwraps K_m
+    /// and writes it into `key_secrets` keyed by the target
+    /// message_key event id, then emits
+    /// `RetryBlockedEncryptedByKey` so the joiner's Encrypted
+    /// wrappers can decrypt. Unused slots zero-filled.
+    pub message_key_slots: Vec<u8>,
 }
 
 impl super::Describe for KeyHistoryBundleEvent {
@@ -73,6 +101,10 @@ pub fn parse_key_history_bundle(blob: &[u8]) -> Result<ParsedEvent, EventError> 
         .clone()
         .into_fixed_bytes()
         .ok_or(EventError::WrongVariant)?;
+    let message_key_slots = values[6]
+        .clone()
+        .into_fixed_bytes()
+        .ok_or(EventError::WrongVariant)?;
     Ok(ParsedEvent::KeyHistoryBundle(KeyHistoryBundleEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         anchor_bundle_id: values[1].as_event_id().unwrap(),
@@ -80,6 +112,7 @@ pub fn parse_key_history_bundle(blob: &[u8]) -> Result<ParsedEvent, EventError> 
         wrapped_anchor_bundle: values[3].as_event_id().unwrap(),
         nonce,
         historical_slots,
+        message_key_slots,
     }))
 }
 
@@ -93,6 +126,11 @@ pub fn encode_key_history_bundle(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
             "historical_slots size does not match key_history_bundle cap",
         ));
     }
+    if kh.message_key_slots.len() != MESSAGE_KEY_SLOTS_TOTAL {
+        return Err(EventError::InvalidMetadata(
+            "message_key_slots size does not match key_history_bundle cap",
+        ));
+    }
     let values = vec![
         FieldValue::Timestamp(kh.created_at_ms),
         FieldValue::EventId(kh.anchor_bundle_id),
@@ -100,6 +138,7 @@ pub fn encode_key_history_bundle(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
         FieldValue::EventId(kh.wrapped_anchor_bundle),
         FieldValue::FixedBytes(kh.nonce.to_vec()),
         FieldValue::FixedBytes(kh.historical_slots.clone()),
+        FieldValue::FixedBytes(kh.message_key_slots.clone()),
     ];
     Ok(encode_fields(
         EVENT_TYPE_KEY_HISTORY_BUNDLE,
@@ -110,7 +149,9 @@ pub fn encode_key_history_bundle(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
 
 // ─── Projector ───
 
-use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::projector::{
+    EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
+};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -219,6 +260,58 @@ pub fn project_pure(
                 }
             }
         }
+
+        // Walk message_key_slots (80 bytes each: 32B target_mkey_event_id
+        // + 48B AEAD ciphertext under anchor K_bundle). Case A recovery
+        // per `docs/DESIGN.md` §9.6.5: these slots carry K_m for un-
+        // deleted messages whose bundle had been retired on every
+        // honest peer before the invite was created. We write K_m
+        // directly into `key_secrets` keyed by the target message_key
+        // event id — bypassing the normal `message_key` projection
+        // path, since that path requires a live K_bundle which is
+        // gone by definition for retired bundles. Then emit
+        // `RetryBlockedEncryptedByKey(target_mkey)` so the joiner's
+        // Encrypted wrappers can decrypt via the standard
+        // `enc.key_event_id` lookup against `key_secrets`.
+        for chunk in kh.message_key_slots.chunks_exact(MESSAGE_KEY_SLOT_BYTES) {
+            if chunk.iter().all(|b| *b == 0) {
+                continue;
+            }
+            let mut target_mkey_event_id = [0u8; 32];
+            target_mkey_event_id.copy_from_slice(&chunk[0..32]);
+            let ciphertext = &chunk[32..64];
+            let mut auth_tag = [0u8; 16];
+            auth_tag.copy_from_slice(&chunk[64..80]);
+            if let Ok(plaintext) = crate::projection::encrypted::decrypt_event_blob(
+                &anchor_k_bundle,
+                &kh.nonce,
+                ciphertext,
+                &auth_tag,
+            ) {
+                if plaintext.len() == 32 {
+                    let target_b64 =
+                        crate::crypto::event_id_to_base64(&target_mkey_event_id);
+                    ops.push(WriteOp::InsertOrIgnore {
+                        table: "key_secrets",
+                        columns: vec![
+                            "event_id",
+                            "key_bytes",
+                            "created_at",
+                            "recorded_by",
+                        ],
+                        values: vec![
+                            SqlVal::Text(target_b64.clone()),
+                            SqlVal::Blob(plaintext),
+                            SqlVal::Int(kh.created_at_ms as i64),
+                            SqlVal::Text(recorded_by.to_string()),
+                        ],
+                    });
+                    emit_commands.push(EmitCommand::RetryBlockedEncryptedByKey {
+                        key_event_id: target_b64,
+                    });
+                }
+            }
+        }
     }
     ProjectorResult::valid_with_commands(ops, emit_commands)
 }
@@ -254,10 +347,10 @@ mod tests {
     #[test]
     fn wire_size_class() {
         // type(1) + created_at(8) + anchor(32) + recipient(32) + wrapped(32)
-        //   + nonce(12) + historical_slots(8192*80) = 655_477
+        //   + nonce(12) + historical_slots(8192*80) + message_key_slots(4096*80)
         assert_eq!(
             KEY_HISTORY_BUNDLE_WIRE_SIZE,
-            1 + 8 + 32 + 32 + 32 + 12 + KEY_HISTORY_BUNDLE_SLOTS_TOTAL
+            1 + 8 + 32 + 32 + 32 + 12 + KEY_HISTORY_BUNDLE_SLOTS_TOTAL + MESSAGE_KEY_SLOTS_TOTAL
         );
     }
 
@@ -270,6 +363,7 @@ mod tests {
             wrapped_anchor_bundle: [3u8; 32],
             nonce: [4u8; 12],
             historical_slots: vec![0u8; KEY_HISTORY_BUNDLE_SLOTS_TOTAL],
+            message_key_slots: vec![0u8; MESSAGE_KEY_SLOTS_TOTAL],
         });
         let blob = encode_key_history_bundle(&original).expect("encode");
         assert_eq!(blob.len(), KEY_HISTORY_BUNDLE_WIRE_SIZE);

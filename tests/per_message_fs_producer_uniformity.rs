@@ -116,8 +116,9 @@ fn wire_sizes_follow_plan_targets() {
     assert_eq!(KEY_BUNDLE_SHARE_WIRE_SIZE, 105);
 
     // Bulk events: key_broadcast (8192 × 2 × 32 B slots) and
-    // key_history_bundle (8192 × 80 B slots) match master's capped
-    // rotation/history class.
+    // key_history_bundle (8192 × 80 B K_bundle slots + 4096 × 80 B K_m
+    // slots for Case A retired-bundle recovery per DESIGN §9.6.5).
     assert_eq!(KEY_BROADCAST_WIRE_SIZE, 524_329);
-    assert_eq!(KEY_HISTORY_BUNDLE_WIRE_SIZE, 655_477);
+    // 655_477 + 4096 * 80 = 983_157.
+    assert_eq!(KEY_HISTORY_BUNDLE_WIRE_SIZE, 983_157);
 }

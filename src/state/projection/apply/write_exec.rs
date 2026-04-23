@@ -8,6 +8,27 @@ use topo_verus_proofs::state::projection::apply::writeop_idempotency::{
     is_idempotent_writeop, WriteOpKind,
 };
 
+/// Extract `(recorded_by, event_id)` from a `key_secrets` InsertOrIgnore
+/// WriteOp's columns+values arrays, if both are present. Used by the
+/// strong-FS Case B gate in `execute_write_ops` to decide whether the
+/// insert targets a retired bundle and should be dropped.
+fn key_secrets_row_key(columns: &[&str], values: &[SqlVal]) -> Option<(String, String)> {
+    let mut recorded_by: Option<String> = None;
+    let mut event_id: Option<String> = None;
+    for (idx, col) in columns.iter().enumerate() {
+        if *col == "recorded_by" {
+            if let Some(SqlVal::Text(v)) = values.get(idx) {
+                recorded_by = Some(v.clone());
+            }
+        } else if *col == "event_id" {
+            if let Some(SqlVal::Text(v)) = values.get(idx) {
+                event_id = Some(v.clone());
+            }
+        }
+    }
+    recorded_by.zip(event_id)
+}
+
 /// Trusted extractor: exhaustive match over runtime `WriteOp` variants into the
 /// verus-proofs `WriteOpKind` tag. If a new `WriteOp` variant is ever added, this
 /// match goes non-exhaustive at compile time, forcing a new branch and a matching
@@ -97,6 +118,40 @@ pub(crate) fn execute_write_ops(
                 columns,
                 values,
             } => {
+                // Strong-FS Case B gate (`docs/DESIGN.md` §9.6.5,
+                // `docs/PLAN.md` §22.3.2): refuse to write a
+                // retired K_bundle's plaintext row back into
+                // `key_secrets`. The match key is `event_id`, so
+                // the gate fires ONLY on the specific retired
+                // K_bundle's event id — K_m rows (for un-deleted
+                // messages in that bundle, keyed by the message_key
+                // event id, a different id) pass through and are
+                // written normally. That asymmetry is load-bearing:
+                // it lets Case A's K_m slots in `key_history_bundle`
+                // rehydrate K_m for the un-deleted tail of a retired
+                // bundle without the gate blocking them. Protects
+                // against stale `key_history_bundle` /
+                // `key_bundle_share` / `key_broadcast` events that
+                // would otherwise re-hydrate a K_bundle after the
+                // `MessageDeletion` cascade has run.
+                if *table == "key_secrets" {
+                    if let Some((tenant, event_id)) =
+                        key_secrets_row_key(columns, values)
+                    {
+                        let retired: bool = conn
+                            .query_row(
+                                "SELECT COUNT(*) > 0 FROM retired_bundles
+                                 WHERE recorded_by = ?1
+                                   AND k_bundle_local_event_id = ?2",
+                                rusqlite::params![tenant, event_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(false);
+                        if retired {
+                            continue;
+                        }
+                    }
+                }
                 let cols = columns.join(", ");
                 let placeholders: Vec<String> =
                     (1..=values.len()).map(|i| format!("?{}", i)).collect();

@@ -697,3 +697,74 @@ fn per_device_bundle_isolation_delete_in_b1_does_not_purge_b2() {
     assert!(events_row_exists(&conn, device2_msg.as_str()));
     assert!(key_secrets_row_exists(&conn, device2_mkey.as_str()));
 }
+
+/// Case B regression (DESIGN §9.6.5, PLAN §22.3.2): a stale
+/// `key_secrets` InsertOrIgnore for a retired K_bundle must be
+/// refused by the WriteOp execution gate. Simulates the scenario
+/// where a joiner projects a `key_history_bundle` whose K_bundle
+/// slot was emitted before retirement but arrives after the
+/// joiner has already projected the deletion — or more generally,
+/// any code path that would re-hydrate the plaintext.
+///
+/// The mechanism under test is the `retired_bundles` table + the
+/// `execute_write_ops` gate in `write_exec.rs`.
+#[test]
+fn retired_bundle_gate_refuses_rehydrate_via_key_secrets_insert() {
+    use crate::projection::projector::{SqlVal, WriteOp};
+
+    let conn = setup_db();
+
+    let k_bundle = [0x91u8; 32];
+    let k_bundle_id_b64 = insert_k_bundle(&conn, &k_bundle);
+
+    let m_msg = test_event_id(0xB0);
+    let m_mkey = test_event_id(0xB1);
+    insert_event_row(&conn, m_msg.as_str(), "encrypted", b"ct");
+    insert_message_key_index(&conn, m_mkey.as_str(), &k_bundle_id_b64, m_msg.as_str());
+    insert_k_m(&conn, m_mkey.as_str(), &[0x77u8; 32]);
+
+    // Retire the bundle via MessageDeletion.
+    insert_tombstone(&conn, m_msg.as_str());
+    crate::projection::purge::hard_purge_deleted_message_graph(
+        &conn,
+        "peer-test",
+        m_msg.as_str(),
+    )
+    .expect("hard purge");
+
+    // Bundle row is gone and retirement marker is durable.
+    assert!(!key_secrets_row_exists(&conn, &k_bundle_id_b64));
+    let marked: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM retired_bundles
+             WHERE recorded_by = ?1 AND k_bundle_local_event_id = ?2",
+            params!["peer-test", &k_bundle_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(marked, "retired_bundles must record the purge");
+
+    // Now try to re-hydrate via an InsertOrIgnore WriteOp — this
+    // is what a stale `key_history_bundle` / `key_bundle_share`
+    // projector would do if it unwrapped the wire and tried to
+    // write the plaintext back.
+    crate::state::projection::apply::write_exec::execute_write_ops(
+        &conn,
+        &[WriteOp::InsertOrIgnore {
+            table: "key_secrets",
+            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
+            values: vec![
+                SqlVal::Text(k_bundle_id_b64.clone()),
+                SqlVal::Blob(k_bundle.to_vec()),
+                SqlVal::Int(0),
+                SqlVal::Text("peer-test".to_string()),
+            ],
+        }],
+    )
+    .expect("write_ops execute");
+
+    assert!(
+        !key_secrets_row_exists(&conn, &k_bundle_id_b64),
+        "retired-bundle gate must refuse the stale re-hydration insert"
+    );
+}
