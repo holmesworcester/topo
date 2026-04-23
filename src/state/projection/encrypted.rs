@@ -25,7 +25,15 @@ pub fn project_encrypted(
     event_id_b64: &str,
     enc: &EncryptedEvent,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
-    // 1. Resolve key from key_secrets table
+    // 1. Resolve key from key_secrets table.
+    //
+    // Post-migration invariant: the encrypted wrapper's `key_event_id`
+    // satisfies a hard dep on a KeySecret (type EVENT_TYPE_KEY_SECRET) event
+    // that is tenant-scoped in `valid_events`. The KeySecret projector writes
+    // the corresponding `key_secrets` row atomically. Reaching this point
+    // with no matching key_secrets row therefore means the dep system let a
+    // dep-unsatisfied encrypted event through, which is an invariant
+    // violation — not a transient block.
     let key_bytes: Vec<u8> = match conn.query_row(
         "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
         rusqlite::params![recorded_by, event_id_to_base64(&enc.key_event_id)],
@@ -33,12 +41,13 @@ pub fn project_encrypted(
     ) {
         Ok(k) => k,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return Ok((
-                ProjectionDecision::BlockOnMissingDeps {
-                    missing: Vec::new(),
-                },
-                None,
-            ));
+            return Err(format!(
+                "invariant violation: encrypted event {} reached project_encrypted without its KeySecret dep {} present in key_secrets (recorded_by={})",
+                event_id_b64,
+                event_id_to_base64(&enc.key_event_id),
+                recorded_by,
+            )
+            .into());
         }
         Err(e) => return Err(e.into()),
     };

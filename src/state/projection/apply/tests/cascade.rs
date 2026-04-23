@@ -148,11 +148,13 @@ fn test_encrypted_inner_dep_cascade_unblock() {
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     // DON'T project message yet
 
-    // Create the secret key for encryption
+    // Create the secret key for encryption. Post-migration, encrypted
+    // wrappers depend on a KeySecret event (type 6), so insert that blob
+    // (without projecting it) instead of a KeyRotation.
     let key_bytes: [u8; 32] = rand::random();
-    let (_sk, sk_blob) =
-        make_self_key_rotation_blob(&conn, &signer_eid, &signing_key, key_bytes);
-    let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
+    let (sk_eid, sk_blob) = make_deterministic_key_secret_blob(key_bytes);
+    let inserted = insert_event_raw(&conn, recorded_by, &sk_blob);
+    assert_eq!(inserted, sk_eid);
     // DON'T project key yet
 
     // Create inner event: a Reaction targeting the message
@@ -503,9 +505,9 @@ fn test_source_isomorphism_encrypted_message() {
     // --- Path A: Direct (key first, then encrypted) ---
     let conn_a = setup();
     let (signer_a, signing_key_a) = make_identity_chain(&conn_a, recorded_by);
-    let (_sk_a, sk_blob_a) =
-        make_self_key_rotation_blob(&conn_a, &signer_a, &signing_key_a, key_bytes);
-    let sk_eid_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
+    let (sk_eid_a, sk_blob_a) = make_deterministic_key_secret_blob(key_bytes);
+    let inserted_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
+    assert_eq!(inserted_a, sk_eid_a);
     project_one(&conn_a, recorded_by, &sk_eid_a).unwrap();
 
     let msg_a = ParsedEvent::Message(MessageEvent {
@@ -528,9 +530,9 @@ fn test_source_isomorphism_encrypted_message() {
     // --- Path B: Cascade (encrypted first, blocks; then key unblocks) ---
     let conn_b = setup();
     let (signer_b, signing_key_b) = make_identity_chain(&conn_b, recorded_by);
-    let (_sk_b, sk_blob_b) =
-        make_self_key_rotation_blob(&conn_b, &signer_b, &signing_key_b, key_bytes);
-    let sk_eid_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
+    let (sk_eid_b, sk_blob_b) = make_deterministic_key_secret_blob(key_bytes);
+    let inserted_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
+    assert_eq!(inserted_b, sk_eid_b);
 
     let msg_b = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
@@ -791,9 +793,9 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
     let (signer_a, signing_key_a) = make_identity_chain(&conn_a, recorded_by);
 
     // Key
-    let (_sk_a, sk_blob_a) =
-        make_self_key_rotation_blob(&conn_a, &signer_a, &signing_key_a, key_bytes);
-    let sk_eid_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
+    let (sk_eid_a, sk_blob_a) = make_deterministic_key_secret_blob(key_bytes);
+    let inserted_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
+    assert_eq!(inserted_a, sk_eid_a);
     project_one(&conn_a, recorded_by, &sk_eid_a).unwrap();
 
     // Message (target for inner reaction)
@@ -824,9 +826,9 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
     let (signer_b, signing_key_b) = make_identity_chain(&conn_b, recorded_by);
 
     // Insert all but don't project content events yet
-    let (_sk_b, sk_blob_b) =
-        make_self_key_rotation_blob(&conn_b, &signer_b, &signing_key_b, key_bytes);
-    let sk_eid_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
+    let (sk_eid_b, sk_blob_b) = make_deterministic_key_secret_blob(key_bytes);
+    let inserted_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
+    assert_eq!(inserted_b, sk_eid_b);
 
     let (_msg_b, msg_blob_b) = make_message_signed(&signing_key_b, &signer_b, "enc rxn target");
     let msg_eid_b = insert_event_raw(&conn_b, recorded_by, &msg_blob_b);

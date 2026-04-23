@@ -472,13 +472,18 @@ fn latest_content_key_for_frontier(
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
     let slots = slotted_frontier_refs(frontier_refs)?;
     let frontier_hash = frontier_hash_from_refs(frontier_refs);
+    // After migration, `key_rotations.key_event_id` points at the
+    // deterministic KeySecret event_id (type 6), and `key_secrets` is keyed
+    // by that same KeySecret event_id. Join on kr.key_event_id and return
+    // the KeySecret event_id so the caller can use it as the encrypted
+    // wrapper dep target.
     let existing: Option<String> = conn
         .query_row(
-            "SELECT kr.event_id
+            "SELECT ks.event_id
              FROM key_rotations kr
              JOIN key_secrets ks
                ON ks.recorded_by = kr.recorded_by
-              AND ks.event_id = kr.event_id
+              AND ks.event_id = kr.key_event_id
              JOIN events e
                ON e.event_id = kr.event_id
              WHERE kr.recorded_by = ?1
@@ -503,7 +508,7 @@ fn latest_content_key_for_frontier(
         )
         .optional()?;
     existing
-        .map(|eid_b64| parse_event_id_b64(&eid_b64, "key_rotations.event_id"))
+        .map(|eid_b64| parse_event_id_b64(&eid_b64, "key_secrets.event_id"))
         .transpose()
 }
 
@@ -512,12 +517,15 @@ fn recent_key_history_entries_for_peer(
     recorded_by: &str,
     limit: usize,
 ) -> Result<Vec<KeyHistoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
+    // Post-migration: key_secrets.event_id = deterministic KeySecret id (type
+    // 6). Join key_rotations.key_event_id = key_secrets.event_id to resolve
+    // the KeySecret id for each rotation.
     let mut stmt = conn.prepare(
-        "SELECT kr.event_id, ks.key_bytes
+        "SELECT ks.event_id, ks.key_bytes
          FROM key_rotations kr
          JOIN key_secrets ks
            ON ks.recorded_by = kr.recorded_by
-          AND ks.event_id = kr.event_id
+          AND ks.event_id = kr.key_event_id
          JOIN events e
            ON e.event_id = kr.event_id
          WHERE kr.recorded_by = ?1
@@ -533,7 +541,7 @@ fn recent_key_history_entries_for_peer(
     let mut out = Vec::new();
     for row in rows {
         let (event_id_b64, key_bytes_blob) = row?;
-        let key_event_id = parse_event_id_b64(&event_id_b64, "key_rotations.event_id")?;
+        let key_event_id = parse_event_id_b64(&event_id_b64, "key_secrets.event_id")?;
         let key_bytes = parse_blob_event_id(key_bytes_blob, "key_secrets.key_bytes")?;
         out.push(KeyHistoryEntry {
             key_event_id,
@@ -1058,26 +1066,35 @@ pub(crate) fn ensure_content_key_for_peer_at(
     created_at_ms: u64,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let frontier_refs = current_removal_frontier_for_peer(conn, recorded_by)?;
-    if let Some(existing) = latest_content_key_for_frontier(conn, recorded_by, &frontier_refs)? {
+    // `latest_content_key_for_frontier` returns the deterministic KeySecret
+    // event_id (type 6) which is the canonical dep target for encrypted
+    // wrappers.
+    if let Some(existing) = latest_content_key_for_frontier(conn, recorded_by, &frontier_refs)?
+    {
         return Ok(existing);
     }
     if frontier_refs.is_empty() {
-        if let Some(existing) = latest_materialized_key_for_peer(conn, recorded_by)? {
-            if let Some(existing_rotation) = existing_rotation_for_frontier(conn, recorded_by, &[])? {
-                return Ok(existing_rotation);
+        if let Some(existing_key_secret) = latest_materialized_key_for_peer(conn, recorded_by)? {
+            if existing_rotation_for_frontier(conn, recorded_by, &[])?.is_some() {
+                return Ok(existing_key_secret);
             }
-            let key_bytes = load_key_secret_bytes(conn, recorded_by, &existing)?;
-            return create_key_rotation_event_with_key_bytes_at(
+            let key_bytes = load_key_secret_bytes(conn, recorded_by, &existing_key_secret)?;
+            let _ = create_key_rotation_event_with_key_bytes_at(
                 conn,
                 recorded_by,
                 &[],
                 key_bytes,
                 created_at_ms,
-            );
+            )?;
+            return Ok(existing_key_secret);
         }
     }
-    rotate_content_key_for_peer_at(conn, recorded_by, created_at_ms)
-        .map(|result| result.key_event_id)
+    let _ = rotate_content_key_for_peer_at(conn, recorded_by, created_at_ms)?;
+    // After rotating, look up the newly materialized KeySecret for the same
+    // frontier.
+    latest_content_key_for_frontier(conn, recorded_by, &frontier_refs)?.ok_or_else(|| {
+        "ensure_content_key_for_peer_at: rotation did not materialize key_secret".into()
+    })
 }
 
 /// Emit the most recent capped key history for an invite target.

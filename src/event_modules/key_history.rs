@@ -200,7 +200,7 @@ pub fn project_pure(
     if history.ciphertext.len() != KEY_HISTORY_BUNDLE_BYTES {
         return ProjectorResult::reject("ciphertext size does not match key history cap".to_string());
     }
-    let mut ops = vec![WriteOp::InsertOrIgnore {
+    let ops = vec![WriteOp::InsertOrIgnore {
         table: "key_histories",
         columns: vec![
             "recorded_by",
@@ -218,28 +218,27 @@ pub fn project_pure(
         ],
     }];
 
+    // Emit one deterministic KeySecret blob per unwrapped history entry via the
+    // normal event pipeline. The KeySecret projector writes `key_secrets` and
+    // encrypted wrappers referencing each KeySecret event_id unblock via the
+    // standard dep cascade.
+    let mut emit_cmds: Vec<EmitCommand> =
+        Vec::with_capacity(ctx.unwrapped_key_history_material.len());
     for entry in &ctx.unwrapped_key_history_material {
-        ops.push(WriteOp::InsertOrIgnore {
-            table: "key_secrets",
-            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(crate::crypto::event_id_to_base64(&entry.key_event_id)),
-                SqlVal::Blob(entry.key_bytes.to_vec()),
-                SqlVal::Int(history.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        });
+        let sk_event =
+            crate::event_modules::key_secret::deterministic_key_secret_event(entry.key_bytes);
+        let sk_blob = match crate::event_modules::encode_event(&sk_event) {
+            Ok(blob) => blob,
+            Err(err) => {
+                return ProjectorResult::reject(format!(
+                    "failed to encode deterministic key_secret: {err}"
+                ));
+            }
+        };
+        emit_cmds.push(EmitCommand::EmitDeterministicBlob { blob: sk_blob });
     }
 
-    ProjectorResult::valid_with_commands(
-        ops,
-        ctx.unwrapped_key_history_material
-            .iter()
-            .map(|entry| EmitCommand::RetryBlockedEncryptedByKey {
-                key_event_id: crate::crypto::event_id_to_base64(&entry.key_event_id),
-            })
-            .collect(),
-    )
+    ProjectorResult::valid_with_commands(ops, emit_cmds)
 }
 
 pub static KEY_HISTORY_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

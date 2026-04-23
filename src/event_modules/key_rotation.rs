@@ -227,7 +227,21 @@ pub fn project_pure(
         return ProjectorResult::reject("frontier_hash does not match frontier refs".to_string());
     }
 
-    let mut ops = vec![WriteOp::InsertOrIgnore {
+    // `key_rotations.key_event_id` = deterministic KeySecret event_id (type 6),
+    // when the projector has unwrapped material. Otherwise fall back to the
+    // rotation's own event_id so downstream joins still produce a non-null
+    // key column even if the local tenant cannot unwrap yet.
+    let key_event_id_b64 = if let Some(material) = &ctx.unwrapped_secret_material {
+        event_id_to_base64(
+            &crate::event_modules::key_secret::deterministic_key_secret_event_id(
+                &material.key_bytes,
+            ),
+        )
+    } else {
+        event_id_b64.to_string()
+    };
+
+    let ops = vec![WriteOp::InsertOrIgnore {
         table: "key_rotations",
         columns: vec![
             "recorded_by",
@@ -244,7 +258,7 @@ pub fn project_pure(
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(key_event_id_b64),
             SqlVal::Text(event_id_to_base64(&rotation.frontier_hash)),
             SqlVal::Int(rotation.frontier_count as i64),
             SqlVal::Text(event_id_to_base64(&rotation.frontier_ref_1)),
@@ -256,21 +270,23 @@ pub fn project_pure(
     }];
 
     if let Some(material) = &ctx.unwrapped_secret_material {
-        ops.push(WriteOp::InsertOrIgnore {
-            table: "key_secrets",
-            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Blob(material.key_bytes.to_vec()),
-                SqlVal::Int(rotation.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        });
+        // Emit the deterministic KeySecret blob through the normal event
+        // pipeline. The KeySecret projector writes `key_secrets` and the
+        // encrypted wrapper dep resolves on the KeySecret event_id.
+        let sk_event = crate::event_modules::key_secret::deterministic_key_secret_event(
+            material.key_bytes,
+        );
+        let sk_blob = match crate::event_modules::encode_event(&sk_event) {
+            Ok(blob) => blob,
+            Err(err) => {
+                return ProjectorResult::reject(format!(
+                    "failed to encode deterministic key_secret: {err}"
+                ));
+            }
+        };
         return ProjectorResult::valid_with_commands(
             ops,
-            vec![EmitCommand::RetryBlockedEncryptedByKey {
-                key_event_id: event_id_b64.to_string(),
-            }],
+            vec![EmitCommand::EmitDeterministicBlob { blob: sk_blob }],
         );
     }
 

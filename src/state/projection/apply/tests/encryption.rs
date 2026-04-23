@@ -68,9 +68,11 @@ fn test_encrypted_blocks_on_missing_key() {
 
     // Create identity chain for signing the inner message
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-    let (_sk, sk_blob) =
-        make_self_key_rotation_blob(&conn, &signer_eid, &signing_key, key_bytes);
-    let sk_eid = hash_event(&sk_blob);
+    // Compute the deterministic KeySecret event_id for these key bytes, but
+    // do NOT insert/project it — the encrypted wrapper must block on this
+    // missing KeySecret dep.
+    let sk_eid =
+        crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
 
     // Create encrypted event referencing the missing key
     let msg = ParsedEvent::Message(MessageEvent {
@@ -102,9 +104,14 @@ fn test_encrypted_unblocks_when_key_arrives() {
 
     // Create identity chain for signing the inner message
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-    let (_sk, sk_blob) =
-        make_self_key_rotation_blob(&conn, &signer_eid, &signing_key, key_bytes);
-    let sk_eid = hash_event(&sk_blob);
+    // Deterministic KeySecret (type 6) event id for these key bytes. The
+    // encrypted wrapper's `key_event_id` dep resolves to this id.
+    let sk_blob = events::encode_event(
+        &crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes),
+    )
+    .unwrap();
+    let sk_eid =
+        crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
 
     // Insert encrypted event first (before key)
     let msg = ParsedEvent::Message(MessageEvent {

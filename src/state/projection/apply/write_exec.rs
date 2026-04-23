@@ -257,51 +257,9 @@ pub(crate) fn execute_emit_commands(
                 )
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
-            EmitCommand::RetryBlockedEncryptedByKey { key_event_id } => {
-                let mut stmt = conn.prepare(
-                    "SELECT be.event_id, e.blob
-                     FROM blocked_events be
-                     JOIN events e ON e.event_id = be.event_id
-                     WHERE be.peer_id = ?1
-                       AND e.event_type IN ('signed', 'encrypted')
-                     ORDER BY e.created_at ASC, e.event_id ASC",
-                )?;
-                let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-                    Ok((
-                        crate::db::sql_types::get_text(row, 0)?,
-                        crate::db::sql_types::get_blob(row, 1)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (event_id_b64, blob) = row?;
-                    let parsed = crate::event_modules::parse_event(&blob)?;
-                    let semantic = unwrap_signed_for_retry(parsed)?;
-                    let crate::event_modules::ParsedEvent::Encrypted(enc) = semantic else {
-                        continue;
-                    };
-                    if crate::crypto::event_id_to_base64(&enc.key_event_id) != *key_event_id {
-                        continue;
-                    }
-                    if let Some(event_id) = event_id_from_base64(&event_id_b64) {
-                        let _ = super::project_one(conn, recorded_by, &event_id)?;
-                    }
-                }
-            }
         }
     }
     Ok(())
-}
-
-fn unwrap_signed_for_retry(
-    parsed: crate::event_modules::ParsedEvent,
-) -> Result<crate::event_modules::ParsedEvent, Box<dyn std::error::Error>> {
-    match parsed {
-        crate::event_modules::ParsedEvent::Signed(signed) => {
-            let inner = crate::event_modules::parse_event(&signed.payload)?;
-            unwrap_signed_for_retry(inner)
-        }
-        other => Ok(other),
-    }
 }
 
 #[cfg(test)]

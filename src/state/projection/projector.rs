@@ -57,9 +57,6 @@ pub enum EmitCommand {
         workspace_id: String,
         endpoint_shared_event_id: String,
     },
-    /// Retry blocked encrypted events that reference this logical key id after
-    /// local key material becomes available.
-    RetryBlockedEncryptedByKey { key_event_id: String },
 }
 
 /// The pure projector contract: everything a projector returns.

@@ -229,22 +229,23 @@ pub fn project_pure(
         None => return ProjectorResult::valid(ops),
     };
 
-    ops.push(WriteOp::InsertOrIgnore {
-        table: "key_secrets",
-        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-        values: vec![
-            SqlVal::Text(event_id_to_base64(&ss.key_event_id)),
-            SqlVal::Blob(material.key_bytes.to_vec()),
-            SqlVal::Int(ss.created_at_ms as i64),
-            SqlVal::Text(recorded_by.to_string()),
-        ],
-    });
-
+    // Emit the deterministic KeySecret blob through the normal event
+    // pipeline. The KeySecret projector writes `key_secrets` and the
+    // encrypted wrapper dep resolves on the KeySecret event_id.
+    let sk_event = crate::event_modules::key_secret::deterministic_key_secret_event(
+        material.key_bytes,
+    );
+    let sk_blob = match crate::event_modules::encode_event(&sk_event) {
+        Ok(blob) => blob,
+        Err(err) => {
+            return ProjectorResult::reject(format!(
+                "failed to encode deterministic key_secret: {err}"
+            ));
+        }
+    };
     ProjectorResult::valid_with_commands(
         ops,
-        vec![EmitCommand::RetryBlockedEncryptedByKey {
-            key_event_id: event_id_to_base64(&ss.key_event_id),
-        }],
+        vec![EmitCommand::EmitDeterministicBlob { blob: sk_blob }],
     )
 }
 
@@ -253,15 +254,21 @@ pub static KEY_SHARED_META: EventTypeMeta = crate::event_modules::registry::even
     type_name: "key_shared",
     projection_table: "key_shared",
     share_scope: ShareScope::Shared,
+    // Note: `key_event_id` is the identifier of the KeySecret being
+    // delivered — not a dep. The recipient derives the KeySecret
+    // locally by unwrapping `wrapped_key`; the event's projector
+    // emits a deterministic KeySecret blob so the Encrypted wrapper
+    // can then dep-resolve normally. Keeping `key_event_id` as a dep
+    // would be circular (the recipient is trying to obtain the key,
+    // so they can't already have it).
     dep_fields: &[
-        "key_event_id",
         "recipient_event_id",
         "frontier_ref_1",
         "frontier_ref_2",
         "frontier_ref_3",
         "frontier_ref_4",
     ],
-    dep_field_type_codes: &[&[super::EVENT_TYPE_KEY_ROTATION], &[10, 12, 16], &[], &[], &[], &[]],
+    dep_field_type_codes: &[&[10, 12, 16], &[], &[], &[], &[]],
     signer_required: true,
     signature_byte_len: 0,
     encryptable: false,
