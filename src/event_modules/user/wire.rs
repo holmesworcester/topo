@@ -83,7 +83,7 @@ pub static USER_META: EventTypeMeta = crate::event_modules::registry::event_type
     parse: parse_user,
     encode: encode_user,
     projector: super::projector::project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: super::projector::build_projector_context,
 };
 
 #[cfg(test)]

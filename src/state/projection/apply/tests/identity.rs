@@ -611,7 +611,28 @@ fn setup_admin_signer_peer(
 }
 
 #[test]
-fn test_user_projects_with_workspace_signer_at_projection() {
+fn test_user_projects_with_user_invite_signer_at_projection() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
+    let (invite_eid, invite_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (user_eid, _user_key) =
+        project_valid_user_from_invite(&conn, recorded_by, invite_eid, &invite_key, "alice");
+
+    let users_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM users WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, event_id_to_base64(&user_eid)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(users_count, 1);
+}
+
+#[test]
+fn test_user_rejects_workspace_signer_at_projection() {
     let conn = setup();
     let recorded_by = "peer1";
 
@@ -622,20 +643,12 @@ fn test_user_projects_with_workspace_signer_at_projection() {
         username: "alice".to_string(),
     });
     let blob = sign_blob(&workspace_key, &workspace_eid, &event);
-    let event_id = insert_event_raw(&conn, recorded_by, &blob);
-    assert_eq!(
-        project_one(&conn, recorded_by, &event_id).unwrap(),
-        ProjectionDecision::Valid
+    assert_projection_rejection_with_reason(
+        &conn,
+        recorded_by,
+        &blob,
+        "user signer must be user_invite",
     );
-
-    let users_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM users WHERE recorded_by = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_to_base64(&event_id)],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(users_count, 1);
 }
 
 #[test]
