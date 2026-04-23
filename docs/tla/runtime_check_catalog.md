@@ -67,6 +67,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_DI_AUTHORITY | event_modules/device_invite::project_pure + build_projector_context | InvDeviceInviteChain | projector_local |
 | CHK_DI_PENDING_TRUST | event_modules/device_invite::project_pure | InvPendingTrustOnlyOnInviter | projector_local |
 | CHK_DI_PENDING_BOOTSTRAP_SRC | event_modules/device_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
+| CHK_USR_SIGNER_FAMILY | event_modules/user::build_projector_context | InvUserInviteChain | projector_local |
 | CHK_USR_INSERT | event_modules/user::project_pure | InvDeps | projector_local |
 | CHK_PS_INSERT | event_modules/peer_shared::project_pure | InvPeerSharedTrustSource | projector_local |
 | CHK_PS_AUTHORIZED_USER | state/projection/queries::decide_peer_shared_authority_plan + event_modules/peer_shared::build_projector_context | InvDeviceInviteChain | projector_context |

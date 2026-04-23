@@ -74,6 +74,10 @@ both `pass` and `break` polarity unless waived.
 | SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_user_invite_projects_with_workspace_signer_family | pass |
 | SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_user_invite_projects_with_peer_signed_admin_authority | pass |
 | SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_user_invite_rejects_wrong_signer_family_at_projection | break |
+| SPEC_USR_SIGNER_01 | InvUserInviteChain | CHK_USR_SIGNER_FAMILY | projector_unit | event_modules::user::projector::projector_tests::test_user_accepts_user_invite_signer | pass |
+| SPEC_USR_SIGNER_01 | InvUserInviteChain | CHK_USR_SIGNER_FAMILY | projector_unit | event_modules::user::projector::projector_tests::test_user_rejects_workspace_signer | break |
+| SPEC_USR_SIGNER_01 | InvUserInviteChain | CHK_USR_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_user_projects_with_user_invite_signer_at_projection | pass |
+| SPEC_USR_SIGNER_01 | InvUserInviteChain | CHK_USR_SIGNER_FAMILY | pipeline_integration | apply::tests::identity::test_user_rejects_workspace_signer_at_projection | break |
 | SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | user_invite_projector_tests::tests::test_user_invite_basic_valid | pass |
 | SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | pipeline_integration | apply::tests::identity::test_user_invite_projects_with_peer_signed_admin_authority | pass |
 | SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | pipeline_integration | apply::tests::identity::test_user_invite_rejects_bootstrap_authority_mismatch_at_projection | break |

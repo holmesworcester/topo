@@ -120,7 +120,7 @@ signer's user, not an admin event.
 | 11 | retired (code reserved) | — | rejected as unknown type |
 | 12 | project_device_invite | device_invites | bootstrap requires authority user == signer user; peer-signed requires signer peer to resolve to claimed admin identity; emits WritePendingBootstrapTrust (gated by is_local_create) |
 | 13 | retired (code reserved) | — | rejected as unknown type |
-| 14 | project_user | users | — |
+| 14 | project_user | users | requires user_invite signer |
 | 15 | retired (code reserved) | — | rejected as unknown type |
 | 16 | project_peer_shared | peers_shared | rejects when claimed `user_event_id` does not match the user authorized by the signing DeviceInvite chain; emits SupersedeBootstrapTrust |
 | 17 | retired (code reserved) | — | rejected as unknown type |
