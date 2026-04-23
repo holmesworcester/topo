@@ -1920,13 +1920,16 @@ Contract:
 
 Not in scope for Phase B: SSD-level wear-leveling / bad-block residues. That residual exists and is documented as an out-of-scope threat.
 
-### 22.3 Phase D: pattern-(b) polish on `key_bundle_share` heal path
+### 22.3 Phase D: retired-bundle-joiner cold path — deferred
 
-Touch: `src/event_modules/key_bundle_share.rs` projector and its context loader in `src/state/projection/decision_context.rs`.
+Phase D was originally planned as pattern-(b) polish on `key_bundle_share` so late joiners could recover un-deleted messages in a retired bundle. On closer audit, `key_bundle_share` wraps K_bundle, not K_m. Once a bundle is retired, the K_bundle is gone on every honest peer; `key_bundle_share` cannot deliver anything for that bundle. A true cold path requires a new event type analogous to `key_bundle_share` but wrapping K_m under a recipient's `WrapPubkey` (`key_message_share` in future shorthand). (The existing `key_bundle_share` projector already does pattern-(b) materialize correctly — emits `KeySecret(K_bundle)` via `EmitDeterministicBlob` on unwrap; see `src/event_modules/key_bundle_share.rs::project_pure`. That part is landed.)
 
-Status: the event type exists with a scaffold that records the header and surfaces the wrap material in the pattern-(b) shape the other FS producers already use. What remains: finish the materialize path so the projector emits `KeySecret(K_bundle)` via `EmitDeterministicBlob` on successful unwrap, matching the uniformity guaranteed by `three_producers_produce_identical_keysecret_event_ids`.
+Current decision per the design trade (`DESIGN.md` §9.6.5): **accept history loss for retired bundles in the initial landing.** Common case (bundle never sees a deletion): future joiners get the bundle via `key_history_bundle` and materialize every K_m they need. Retired bundles: late joiners miss the un-deleted tail. The math trades ~524 KB per rotation (avoided) against history loss for a subset of late joiners who needed that specific range; typical chat workloads favor not rotating.
 
-Add the missing integration test: a joiner whose `key_history_bundle` arrives *after* the bundle has been retired (due to a deletion on the existing population). The joiner must obtain K_m per-un-deleted-message via targeted `key_bundle_share` delivery and successfully decrypt the un-deleted tail. This is the cold-path regression guard against Phase 6 assumptions in the original Plan 1 v4.
+`key_message_share` deferred until a concrete product driver surfaces. When implemented, the path will be:
+- New 4-field wire event (timestamp + bundle_id + recipient_wrappubkey_event_id + wrapped_k_m), deterministic-unsigned.
+- Projector: same pattern-(b) unwrap as `key_bundle_share`, materializes K_m into `key_secrets` keyed by the corresponding `message_key` event id so the Encrypted wrapper's existing dep cascade fires.
+- Targeted heal: late joiner's projector sees a Valid `message_key` whose `k_bundle_local_event_id` is not resolvable locally (K_bundle retired), emits a `key_request` naming the specific `message_key` event id. A peer whose K_m cache still holds the value responds with `key_message_share`.
 
 ### 22.4 Phase E: WrapPrivkey hygiene — deferred
 
@@ -1943,7 +1946,7 @@ Seven targeted regression tests per the planning doc, to be added as `tests/stro
 3. **Retained wire + post-purge compromise** — simulate a retained `message_key` blob after delete; assert no code path re-materializes K_bundle.
 4. **Creator forced-rotation via INNER JOIN** — after delete, next send emits a new `key_broadcast`; the Encrypted wrapper's `key_event_id` references a new `message_key` whose `k_bundle_local_event_id` is the fresh bundle.
 5. **Late-arrival `message_key` on retired bundle** — assert that such a mkey event blocks on the missing `k_bundle_local_event_id` and is not decrypted.
-6. **Joiner after bundle retirement** — exercises Phase D cold path end-to-end.
+6. **Joiner after bundle retirement (history-lost regression)** — joiner attempts to replay a retired bundle's un-deleted messages, assert they correctly see them as blocked/unrecoverable (no accidental recovery via a lingering K_bundle row); flip the assertion when `key_message_share` lands.
 7. **Per-device isolation** — two sender devices' concurrent bundles; deletion on device 1 does not purge device 2's K_bundle.
 
 ### 22.6 Non-goals / explicitly rejected
