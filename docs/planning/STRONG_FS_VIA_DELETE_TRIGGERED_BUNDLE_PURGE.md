@@ -376,20 +376,22 @@ What we do NOT claim:
 
 ## Incremental landing checklist
 
-- [ ] Phase A — extend `purge.rs` deletion cascade to include
-       K_bundle row in `key_secrets`
-- [ ] Phase B — `secure_zero` + `secure_shred_blob` helpers for
-       K_bundle rows (and optionally K_m)
+- [x] Phase A — extend `purge.rs` deletion cascade to include
+       K_bundle row in `key_secrets` (commit `e42a4b87`)
+- [x] Phase B — `secure_zero` + `secure_shred_blob` helpers for
+       K_bundle rows (commit `05585b63`)
 - [x] Phase C — dropped; natural rotation via existing
        `ensure_content_key_for_peer` inner-join suffices
-- [ ] Phase D — pattern-(b) polish on `key_bundle_share` heal path
-       and a retired-bundle joiner test
+       (commit `37bac0ce`)
+- [x] Phase D — deferred as `key_message_share` (new event type not
+       yet implemented); retired-bundle history loss accepted per
+       `DESIGN.md` §9.6.5
 - [ ] Phase E — WrapPrivkey hygiene (shred + grace sweep) on its
-       own track
-- [ ] Phase F — 7 tests listed above
-- [ ] Doc — update `DELETE_TRIGGERED_REKEY_EXECUTION_PLAN.md` to
-       cross-reference this plan and mark "weak FS" as superseded
-       once this lands
+       own track (possibly not needed — see codex feedback thread)
+- [x] Phase F — regression tests landed (commit `2415d1e6`); 8 state-level
+       + 4 CLI + 3 producer-uniformity + 4 joiner-history tests green
+- [x] Doc — `DESIGN.md` §9.6 and `PLAN.md` §22 cross-reference this
+       plan (commit `5a0def50`)
 - [ ] Doc — refresh `MEMORY.md` to reflect deletion-triggered
        bundle purge as the primary FS lever
 
