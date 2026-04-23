@@ -1951,9 +1951,24 @@ Once codex replies, land the chosen mechanism in this sub-phase.
 
 ### 22.3.2 Implementation checklist (Case B)
 
-- [ ] Resolve codex's recommendation.
-- [ ] Land the chosen safeguard in the `key_history_bundle` projector / decision context so a stale slot doesn't re-hydrate K_bundle on the joiner.
-- [ ] Test: joiner projects a key_history_bundle whose K_bundle slot was retired between invite creation and joiner sync; assert joiner does NOT end up with K_bundle plaintext in local state (strong-FS preserved even across the invite-TTL race).
+- [x] Resolve codex's recommendation (option `d'`: durable `retired_bundles` marker + narrow `execute_write_ops` gate on `key_secrets` inserts by event_id). See `/tmp/codex_case_b_reply.txt`.
+- [x] Land the chosen safeguard (commit `50b7a289`): `retired_bundles(recorded_by, k_bundle_local_event_id, retired_at_ms)` schema + INSERT on purge + gate in `write_exec.rs`. Gate matches by event_id so K_m rows for un-deleted messages in retired bundles rehydrate normally.
+- [x] Test: `retired_bundle_gate_refuses_rehydrate_via_key_secrets_insert` in `per_message_fs.rs` (direct gate exercise); `joiner_keeps_undeleted_keys_when_delete_happens_after_invite_received` in `new_joiner_history.rs` (end-to-end delete-after-invite flow, asserts un-deleted messages remain decryptable after cascade).
+
+### 22.3.3 Future direction for post-invite bundle delivery
+
+Preferred design: include every still-active invite pubkey as an additional recipient slot in each `key_broadcast`. When the joiner consumes the invite, they hold the WrapPrivkey and can unwrap any bundle broadcast during the invite's validity window. This subsumes Case C (live bundle, joiner arrives while live) and handles the common post-invite rotation flow without a new event type.
+
+Reactive heal via the existing `key_request` / `key_bundle_share` path continues to cover edge cases where a bundle emission races a joiner's identity materialization (sender's `active_rotation_recipients_for_frontier` ran before the joiner's `peer_shared` projected on the sender) or where the invite's pubkey was excluded from a specific rotation. This is strictly additive to the bundle-to-invite-pubkey scheme.
+
+Test contract codifying the end-state requirement is in
+`src/state/projection/apply/tests/new_joiner_history.rs::joiner_decrypts_messages_encrypted_under_bundle_created_after_invite`.
+The test simulates the delivery at the projection-layer level so it's
+valid whichever delivery mechanism ends up implementing it. Delivery-
+layer implementation (updating `active_rotation_recipients_for_frontier`
+to enumerate active invites alongside `peers_shared`) is deferred
+until the invite lifecycle tracking for bundle-recipient enumeration
+is built out.
 
 ### 22.4 Phase E: WrapPrivkey hygiene — deferred
 

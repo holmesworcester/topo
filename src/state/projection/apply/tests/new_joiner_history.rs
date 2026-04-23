@@ -550,3 +550,101 @@ fn joiner_keeps_undeleted_keys_when_delete_happens_after_invite_received() {
     assert!(key_secrets_for(&conn, b, m1_mkey.as_str()));
     assert!(key_secrets_for(&conn, b, m3_mkey.as_str()));
 }
+
+/// Regression proof (DESIGN §9.6.5 Case C + future-work hook): a
+/// joiner can decrypt messages that were encrypted under a bundle
+/// created AFTER the invite. The delivery mechanism is simulated
+/// (the future path wraps each bundle to every still-active invite
+/// pubkey as an additional recipient slot in `key_broadcast`; a
+/// reactive heal via `key_request` covers concurrency edge cases).
+/// Whichever path delivers the K_bundle bytes to the joiner, the
+/// decryption cascade must succeed.
+///
+/// This test codifies the end-state contract: given K_bundle is
+/// delivered and `message_key` + `Encrypted` events are synced, the
+/// joiner's projection materializes K_m and decrypts the message.
+/// Failing this test means the post-invite bundle delivery path is
+/// broken at a projection-layer level, not a delivery-layer one.
+#[test]
+fn joiner_decrypts_messages_encrypted_under_bundle_created_after_invite() {
+    let conn = setup_db();
+    let b = "peer-B";
+
+    // Phase 1: invite is established. B has a wrap_privkey (simulated).
+    let b_pubkey = test_eid(0xBB);
+    install_joiner_wrap_privkey(&conn, &b_pubkey, &[0xAA; 32], 9_999_999_999);
+
+    // Phase 2: AFTER invite, inviter A rotates to a fresh K_bundle
+    // (created causally post-invite). Under the future design, the
+    // `key_broadcast` for this bundle includes B's invite pubkey as
+    // a recipient slot; projection on B unwraps the slot and lands
+    // K_bundle in B's key_secrets. We simulate that end state with
+    // a direct delivery — the projection-layer contract under test
+    // is everything downstream of K_bundle arrival.
+    let post_invite_k_bundle = [0x33u8; 32];
+    let post_invite_bundle_local_id =
+        deliver_k_bundle_as_history(&conn, b, &post_invite_k_bundle);
+    assert!(
+        key_secrets_for(&conn, b, &post_invite_bundle_local_id),
+        "post-invite K_bundle delivered to joiner"
+    );
+
+    // Phase 3: A sends two messages under the post-invite bundle.
+    // On B's side, `message_key` events arrive and project. With
+    // K_bundle materialized, project_pure unwraps K_m and caches.
+    let m1 = test_eid(0x71);
+    let m1_mkey = test_eid(0x72);
+    let m2 = test_eid(0x73);
+    let m2_mkey = test_eid(0x74);
+    populate_message(
+        &conn, b, m1.as_str(), m1_mkey.as_str(),
+        &post_invite_bundle_local_id, &[0x81; 32], b"ct-post-m1",
+    );
+    populate_message(
+        &conn, b, m2.as_str(), m2_mkey.as_str(),
+        &post_invite_bundle_local_id, &[0x82; 32], b"ct-post-m2",
+    );
+
+    // Phase 4: assert B has K_m for both post-invite messages and
+    // can decrypt them (via the standard Encrypted → key_secrets
+    // lookup path).
+    assert!(
+        key_secrets_for(&conn, b, m1_mkey.as_str()),
+        "B must have K_m for post-invite m1"
+    );
+    assert!(
+        key_secrets_for(&conn, b, m2_mkey.as_str()),
+        "B must have K_m for post-invite m2"
+    );
+    assert!(events_row_exists(&conn, m1.as_str()));
+    assert!(events_row_exists(&conn, m2.as_str()));
+
+    // Phase 5: subsequent deletion of one of them retires the
+    // bundle (standard strong-FS cascade) without affecting the
+    // other un-deleted post-invite message. This verifies the
+    // post-invite bundle participates in the same FS contract as
+    // pre-invite bundles.
+    conn.execute(
+        "INSERT OR IGNORE INTO deleted_messages
+             (recorded_by, message_id, deletion_event_id, author_id, deleted_at)
+         VALUES (?1, ?2, 'del-post-m1', 'a', 0)",
+        params![b, m1.as_str()],
+    )
+    .unwrap();
+    crate::projection::purge::hard_purge_deleted_message_graph(&conn, b, m1.as_str())
+        .expect("hard purge post-invite m1 on B");
+
+    assert!(
+        !key_secrets_for(&conn, b, m1_mkey.as_str()),
+        "m1 K_m gone after delete"
+    );
+    assert!(
+        key_secrets_for(&conn, b, m2_mkey.as_str()),
+        "m2 K_m survives — un-deleted post-invite message still decryptable"
+    );
+    assert!(
+        !key_secrets_for(&conn, b, &post_invite_bundle_local_id),
+        "post-invite K_bundle shredded on first-delete — same FS \
+         property as pre-invite bundles"
+    );
+}

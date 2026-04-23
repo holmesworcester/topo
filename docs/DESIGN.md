@@ -1893,6 +1893,16 @@ The arithmetic continues to favor not rotating on delete. Rotating on every dele
 
 Future work: the current `key_history_bundle` layout caps at 8192 K_bundle slots + 4096 K_m slots, so an invite into a workspace with more history than fits is necessarily partial. A future extension should admit an unbounded amount of history-key material per invite — for example, chunked across multiple `key_history_bundle` events keyed by a common invite identifier and consumed as a set, or via a streaming sync primitive that avoids a single per-event cap. Out of scope for the current landing; tracked as an extensibility requirement for workspaces with deep history.
 
+**Future design — post-invite bundle delivery via invite-pubkey recipient slots.** Messages encrypted under a K_bundle created AFTER the invite are reached by wrapping each new bundle to every still-active invite pubkey as one of the `key_broadcast` recipient slots, alongside the actual peer recipients. When the joiner consumes the invite they hold the invite's WrapPrivkey and can unwrap any bundle broadcast during the invite's lifetime. Reactive heal via `key_request`/`key_message_share` covers concurrency edge cases where a bundle rotation and a joiner's sync race (e.g. bundle emitted with a recipient set that didn't include the joiner's fresh peer_shared yet). The test contract for this path is codified at
+`src/state/projection/apply/tests/new_joiner_history.rs::
+joiner_decrypts_messages_encrypted_under_bundle_created_after_invite`
+— failing that test means the projection-layer decryption path for a
+post-invite bundle is broken, regardless of whether the delivery
+mechanism used was the invite-pubkey recipient slot or a targeted
+heal. Out of scope for the current landing; the test codifies the
+end-state invariant so future delivery-layer work can be validated
+against it.
+
 ### 9.6.6 Threat model — what we claim and do not claim
 
 After `T_delete + propagation_delay` on any honest peer, FS holds against:
