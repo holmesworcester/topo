@@ -48,4 +48,17 @@ pub proof fn all_known_writeop_kinds_are_idempotent(kind: WriteOpKind)
 {
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Note on retired control-channel emit commands.
+//
+// `EmitCommand::RetryBlockedEncryptedByKey` was retired in the
+// LocalKeySecret migration. Its write-site (a custom scan of
+// `blocked_events` for encrypted rows matching a specific
+// key_event_id, re-projecting them one by one) was never covered by
+// a Verus invariant — the retry signal ran alongside the event
+// graph, not inside it. Its replacement is the standard cascade
+// unblock triggered when a KeySecret event projects. That cascade
+// path is already covered by the `cascade_invariant` mirror; no new
+// mirror obligation is introduced by the retirement.
+
 } // verus!

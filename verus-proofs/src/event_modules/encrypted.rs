@@ -68,4 +68,21 @@ pub fn nonce_range() -> (range: (usize, usize))
     (NONCE_OFFSET, CIPHERTEXT_OFFSET)
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Note: `key_event_id` semantics under the LocalKeySecret migration.
+//
+// `EncryptedEvent::key_event_id` used to reference a KeyRotation
+// event id; under the LocalKeySecret migration (see
+// `docs/planning/LOCAL_KEY_SECRET_MIGRATION.md`) it references a
+// KeySecret (type 6) event id — the deterministic hash of the
+// plaintext key bytes. Runtime `ENCRYPTED_META.dep_field_type_codes`
+// pins this at the dep-resolution layer. Wire format is unchanged
+// (still 32 bytes in the same offset); only the semantic referent
+// moved.
+//
+// The wire-level encode/decode proofs here are agnostic to which
+// event kind the 32-byte id references — they prove only that the
+// id bytes round-trip through the codec, which is what this mirror
+// covers.
+
 } // verus!

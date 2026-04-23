@@ -109,4 +109,23 @@ pub fn formal_family_of(code: EventTypeCode) -> (family: FormalProjectorFamily)
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Note: KeyRequest and KeyShared's `key_event_id` field is an event
+// *identifier*, not a *dep*.
+//
+// Under the LocalKeySecret migration (see
+// `docs/planning/LOCAL_KEY_SECRET_MIGRATION.md`), Encrypted events
+// depend on a KeySecret (type 6) event whose id is the deterministic
+// hash of the key bytes. Non-material peers request that KeySecret
+// via KeyRequest; recipients derive it locally from a KeyShared's
+// wrapped_key. Both referents would be circular if `key_event_id`
+// were a dep — a peer requesting a key does not have it, and a
+// recipient unwrapping a KeyShared has to project the KeyShared in
+// order to emit the KeySecret.
+//
+// Runtime `KEY_REQUEST_META` / `KEY_SHARED_META` therefore omit
+// `key_event_id` from `dep_fields`; only `recipient_event_id` (and
+// for KeyShared, frontier_ref_1..4) remain as deps. The runtime's
+// `ParsedEvent::dep_field_values` arms match.
+
 } // verus!
