@@ -1995,15 +1995,14 @@ Touch points identified while probing the ignored CLI test:
    unconsumed invite retains decryption capability for future
    bundles.
 
-4. **Session auth interaction (open).** The ignored CLI test's
-   current failure mode (after the purge-cascade double-row fix) is
-   Bob's mTLS session authentication against Alice's post-retirement
-   state: initiator sync fails with "session io internal error,
-   connection lost." The session presumably pins something that
-   changes when Alice rotates or retires her bundle — investigate
-   and document the interaction before landing the delivery-layer
-   changes, since fixing (1)+(2) without understanding this may
-   surface additional breakage.
+4. **Transport session auth is intentionally decoupled from
+   rotation.** Session identity uses long-term material (peer_shared
+   transport identity / endpoint_secret), not K_bundle or
+   WrapPubkey. The transient "session io internal error" WARNs
+   observed while running the ignored CLI test are retries during
+   connect; the authoritative failure is the `message_count >= 1`
+   timeout on Bob, meaning he synced the events but couldn't
+   decrypt — exactly the gap items (1) and (2) close.
 
 5. **Regression coverage.** Flip `#[ignore]` off on the CLI test
    once delivery lands; it becomes the regression guard.

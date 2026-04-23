@@ -2394,16 +2394,63 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         key_rotation: &KeyRotationEvent,
     ) -> ProjectionQueryResult<ProjectorDecisionContext> {
-        let Some((local_recipient_event_id, local_signing_key)) = crate::event_modules::peer_shared::load_local_peer_signer(self, recorded_by)
-            .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?
-        else {
-            return Ok(ProjectorDecisionContext::default());
-        };
-        let Some(slot_index) = key_rotation
-            .recipient_slots
-            .iter()
-            .position(|slot| *slot == local_recipient_event_id)
-        else {
+        // First try the peer_shared match (steady-state path): any
+        // peer_shared signer on this tenant whose event_id appears
+        // in the rotation's recipient_slots unwraps via its own
+        // private key.
+        let local_peer_signer = crate::event_modules::peer_shared::load_local_peer_signer(
+            self,
+            recorded_by,
+        )
+        .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?;
+        let mut matched: Option<([u8; 32], usize)> = None;
+        if let Some((local_recipient_event_id, local_signing_key)) = local_peer_signer {
+            if let Some(slot_index) = key_rotation
+                .recipient_slots
+                .iter()
+                .position(|slot| *slot == local_recipient_event_id)
+            {
+                matched = Some((local_signing_key.to_bytes(), slot_index));
+            }
+        }
+
+        // Delivery-layer fallback: if no peer_shared slot matched,
+        // try the invite_secrets path. A fresh joiner who holds an
+        // invite privkey but hasn't yet materialized a peer_shared
+        // (or whose peer_shared was not in the rotation's recipient
+        // list) still needs to unwrap a K_bundle rotated after the
+        // invite was created. Every locally-projected invite was
+        // included as a recipient slot by
+        // `active_rotation_recipients_for_frontier`; find the one
+        // whose event_id appears in `recipient_slots` and for which
+        // we have a matching `invite_secrets` private key.
+        if matched.is_none() {
+            for (slot_index, slot_event_id) in key_rotation.recipient_slots.iter().enumerate() {
+                if *slot_event_id == [0u8; 32] {
+                    continue;
+                }
+                let slot_b64 = event_id_to_base64(slot_event_id);
+                let privkey: Option<Vec<u8>> = self
+                    .query_row(
+                        "SELECT private_key FROM invite_secrets
+                         WHERE recorded_by = ?1 AND invite_event_id = ?2
+                         ORDER BY created_at DESC LIMIT 1",
+                        rusqlite::params![recorded_by, &slot_b64],
+                        |row| crate::db::sql_types::get_blob(row, 0),
+                    )
+                    .optional()?;
+                if let Some(privkey_bytes) = privkey {
+                    if privkey_bytes.len() == 32 {
+                        let mut key_arr = [0u8; 32];
+                        key_arr.copy_from_slice(&privkey_bytes);
+                        matched = Some((key_arr, slot_index));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let Some((local_signing_key_bytes, slot_index)) = matched else {
             return Ok(ProjectorDecisionContext::default());
         };
         let Some(current_signer) = frame.current_signer.as_ref() else {
@@ -2420,7 +2467,7 @@ impl ProjectionQueries for Connection {
 
         // Pattern (b): surface raw material; projector unwraps.
         Ok(ProjectorDecisionContext {
-            local_signing_key_bytes: Some(local_signing_key.to_bytes()),
+            local_signing_key_bytes: Some(local_signing_key_bytes),
             sender_verifying_key_bytes: Some(sender_key.public_key),
             wrapped_key_bytes: Some(key_rotation.wrapped_keys[slot_index]),
             ..ProjectorDecisionContext::default()

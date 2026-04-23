@@ -276,11 +276,22 @@ pub fn project_pure(
                 SqlVal::Text(recorded_by.to_string()),
             ],
         });
+        // Per-message-FS: also emit the canonical deterministic
+        // KeySecret(K_bundle) event so any `message_key` blocked on
+        // `k_bundle_local_event_id = deterministic_key_secret_event_id
+        // (K_bundle)` unblocks via the standard dep machinery. Sender
+        // (`create_encrypted_event_with_message_key_via_rotation`)
+        // emits this same event locally; receivers must too.
         return ProjectorResult::valid_with_commands(
             ops,
-            vec![EmitCommand::RetryBlockedEncryptedByKey {
-                key_event_id: event_id_b64.to_string(),
-            }],
+            vec![
+                EmitCommand::RetryBlockedEncryptedByKey {
+                    key_event_id: event_id_b64.to_string(),
+                },
+                crate::event_modules::key_broadcast::emit_deterministic_key_secret_command(
+                    &plaintext_key,
+                ),
+            ],
         );
     }
 

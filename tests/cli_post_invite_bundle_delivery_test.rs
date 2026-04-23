@@ -47,11 +47,6 @@ fn delete_latest_message(db: &str) {
 }
 
 #[test]
-#[ignore = "requires post-invite bundle delivery to be wired up \
-           (active_rotation_recipients_for_frontier must include \
-           active invite pubkeys, or a reactive heal path must \
-           deliver new K_bundles to joiners). Tracked in \
-           docs/PLAN.md §22.3.3."]
 fn cli_joiner_sees_messages_encrypted_under_post_invite_bundle() {
     let _lock = hold_network_test_lock_for_binary();
     let tmpdir = tempfile::tempdir().unwrap();

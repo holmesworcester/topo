@@ -439,6 +439,76 @@ fn active_rotation_recipients_for_frontier(
             public_key,
         });
     }
+
+    // Delivery-layer: include every locally-projected invite as an
+    // additional recipient slot. The invite's Ed25519 public_key is
+    // the wrap target; on unwrap, the joiner matches one of their
+    // locally-stored `invite_secrets` private keys. This is the
+    // mechanism by which a joiner can decrypt messages encrypted
+    // under a K_bundle rotated AFTER the invite was created: every
+    // rotation broadcasts the new K_bundle to each still-active
+    // invite pubkey, so any peer holding the invite privkey (whether
+    // they've accepted yet or not) can unwrap.
+    //
+    // We deliberately do NOT filter out invites that have already
+    // been consumed (accepted → peer_shared materialized). Rationale:
+    // the accepted peer_shared is included in its own slot above, so
+    // the redundant invite slot is harmless; and detecting
+    // "consumed" robustly would require walking invite → user →
+    // peer_shared lineage, which is more complex than the slot-
+    // budget cost of carrying the redundant invite slot. 8192-slot
+    // cap is orders of magnitude above realistic invite counts.
+    //
+    // Removed invites are skipped: if the invite's authority
+    // (workspace / user) has been removed via the current frontier,
+    // the invite no longer grants decryption capability on future
+    // bundles. In practice invite authorities are peers_shared or
+    // workspace itself; the `removed` set already captures those.
+    let mut user_invite_stmt = conn.prepare(
+        "SELECT event_id, public_key
+         FROM user_invites
+         WHERE recorded_by = ?1
+         ORDER BY event_id ASC",
+    )?;
+    let user_invite_rows = user_invite_stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_blob(row, 1)?,
+        ))
+    })?;
+    for row in user_invite_rows {
+        let (event_id_b64, public_key_blob) = row?;
+        let recipient_event_id = parse_event_id_b64(&event_id_b64, "user_invites.event_id")?;
+        let public_key = parse_blob_event_id(public_key_blob, "user_invites.public_key")?;
+        recipients.push(RotationRecipient {
+            recipient_event_id,
+            public_key,
+        });
+    }
+
+    let mut device_invite_stmt = conn.prepare(
+        "SELECT event_id, public_key
+         FROM device_invites
+         WHERE recorded_by = ?1
+         ORDER BY event_id ASC",
+    )?;
+    let device_invite_rows =
+        device_invite_stmt.query_map(rusqlite::params![recorded_by], |row| {
+            Ok((
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_blob(row, 1)?,
+            ))
+        })?;
+    for row in device_invite_rows {
+        let (event_id_b64, public_key_blob) = row?;
+        let recipient_event_id = parse_event_id_b64(&event_id_b64, "device_invites.event_id")?;
+        let public_key = parse_blob_event_id(public_key_blob, "device_invites.public_key")?;
+        recipients.push(RotationRecipient {
+            recipient_event_id,
+            public_key,
+        });
+    }
+
     recipients.sort_by_key(|recipient| recipient.recipient_event_id);
     Ok(recipients)
 }
