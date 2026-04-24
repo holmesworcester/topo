@@ -1,9 +1,10 @@
 # FS Alt Design — Revised Plan (v2)
 
 Revised after codex review of `FS_ALT_CONVERGENT_WRAP_DESIGN.md` and
-subsequent design iteration. This doc is a **decisions summary**, not
-a full spec. The v1 design doc and codex review remain for context;
-this supersedes their conclusions where they conflict.
+subsequent design iteration. This doc is a **decisions summary with
+enough concrete detail to scope an execution plan**. The v1 design
+doc and codex review remain for context; this supersedes their
+conclusions where they conflict.
 
 Status: proposal; supersedes v1's specific constructions. Branch
 `design-fs-alt-convergent-wrap`.
@@ -12,111 +13,573 @@ Status: proposal; supersedes v1's specific constructions. Branch
 
 ## Core design (decisions)
 
-1. **Reuse the existing `key_shared` event as THE distribution event.**
-   Drop `key_rotation` and `key_history_bundle`. `key_shared` is
-   already a 1×1 (one recipient × one target key) shape. No new event
-   type for the wrap.
+### 1. Reuse the existing `key_shared` event as THE distribution event
 
-2. **Add `eph_pubkey_request`.** Member-signed, one-shot, short
-   `valid_until_ms`, optional `supersedes_eph_pubkey_event_id`.
-   Carries `target_key_id` (either `bundle_id` or a future key id
-   shape) + ephemeral pubkey. Privkey stored in local
-   `eph_privkeys`, shredded on first successful unwrap.
+**What:** Make `key_shared` (already on the branch, 1 recipient × 1
+target-key shape at `src/event_modules/key_shared.rs`) the sole
+K_bundle distribution event. Drop `key_rotation` (8192 recipient
+slots) and `key_history_bundle` (1 recipient × 4096 bundle slots +
+4096 K_m slots).
 
-3. **Deterministic `key_shared` construction for convergence.**
-   Ephemeral sender keypair derived from
-   `blake3("fs-wrap-v1" ‖ target_key_id ‖ recipient_pubkey)` →
-   sealed-box ciphertext is byte-identical across independent
-   holders. Multiple holders react to the same request/invite →
-   emit the same event → dedupe on the wire.
-   Resolves codex gap #1.
+**Wire shape (existing, reused):**
+```
+key_shared {
+    target_key_id: [u8; 32],      // = bundle_id (canonical K_bundle id)
+    recipient_pubkey: [u8; 32],
+    ephemeral_sender_pubkey: [u8; 32],
+    ciphertext: [u8; 32],          // wrapped K_bundle
+    auth_tag: [u8; 16],
+    nonce: [u8; 12],
+    created_at_ms: u64,
+}
+```
 
-4. **Preserve `k_bundle_local_event_id` as the canonical dep key.**
-   `key_shared` projector, on successful unwrap, emits the
-   deterministic `KeySecret(K_bundle)` local event — same pattern
-   `key_broadcast` and `key_rotation` use today. `message_key`
-   continues to dep on `k_bundle_local_event_id`. No hand-waving
-   "message → wrap_event → key_secrets" chain.
-   Resolves codex gap #2.
+**Why this works:** every broadcast / history / heal case decomposes
+into one `(recipient_pubkey, target_key_id)` emission. 8192-recipient
+rotation = 8192 `key_shared` events. History bundle = one per
+(historical_bundle, invite_pubkey). Heal = one. No dedicated variant
+per case.
 
-5. **Preemptive emit triggers.** Two deterministic holder-side
-   triggers replace the `key_history_bundle` + invite-slot fanout:
-   - **Trigger A** (learn of new invite): emit `key_shared` for
-     every `bundle_id` in local `key_secrets` the invite is
-     entitled to.
-   - **Trigger B** (learn of new bundle): emit `key_shared` for
-     every still-active invite pubkey entitled on that bundle's
-     frontier.
-   Works with the existing `retired_bundles` gate — retired bundles
-   are absent from `key_secrets`, so trigger A naturally skips them.
+**What drops from the branch:**
+- `src/event_modules/key_rotation.rs` (~340 LOC)
+- `src/event_modules/key_history_bundle.rs` (~380 LOC)
+- `active_rotation_recipients_for_frontier` special-case for invites
+  in `workspace/identity_ops.rs:469-536`
+- `load_key_rotation_context` invite-secret fallback in
+  `decision_context.rs:2416-2449`
+- `load_key_history_context` in `decision_context.rs`
 
-6. **Self-contained `MessageDeletion` carries all ids.**
-   New fields: `message_event_id`, `message_key_event_id`,
-   `bundle_id`. Cascade becomes straight-line DELETEs + retired-set
-   inserts. Drops the `messages_to_message_keys` reverse index.
-   Late-replay works: deletion arriving before any of
-   message/message_key/rotation inserts its ids into
-   `retired_bundles` + `retired_keys` immediately; subsequent
-   arrivals fail to rehydrate.
-   Resolves codex gap about `messages_to_message_keys` and
-   cascade lookup complexity.
+**What remains:**
+- `key_shared` projector preserved; only change is it must emit the
+  canonical deterministic `KeySecret(K_bundle)` on successful unwrap
+  (decision 4) — `key_broadcast` already does this at
+  `event_modules/key_broadcast.rs:210-219`; copy the pattern.
 
-7. **Add `retired_keys` table and gate.** New per-`message_key_event_id`
-   gate alongside existing `retired_bundles`. Spec:
-   ```
-   CREATE TABLE retired_keys (
-       recorded_by TEXT NOT NULL,
-       message_key_event_id TEXT NOT NULL,
-       retired_at_ms INTEGER NOT NULL,
-       PRIMARY KEY (recorded_by, message_key_event_id)
-   );
-   ```
-   `execute_write_ops` refuses `key_secrets` insert whose `event_id`
-   matches a retired key, AND refuses `message_keys` row insert with
-   that event_id. Populated by the self-contained `MessageDeletion`
-   projector from (6).
-   Resolves codex gap #3.
+**Size consequence:** rotation event (≈524 KB at 8192 slots) becomes
+a flood of 8192 × ~155-byte `key_shared` events (≈1.2 MB total in the
+worst case). BUT most recipients are inactive or already have
+K_bundle → trigger A/B emit only for the ones that need it. In
+practice the flood is sparse.
 
-8. **Entitlement predicate is a SQL query, not a lineage walk.**
-   Materialize a `frontier_removed_peers(recorded_by, frontier_ref,
-   peer_ref)` table at projection time. Predicate:
-   ```sql
-   SELECT 1 FROM frontier_removed_peers
-    WHERE recorded_by = ?1 AND frontier_ref = ?2 AND peer_ref = ?3
-    LIMIT 1;
-   ```
-   0 rows = entitled. Index on `(recorded_by, frontier_ref,
-   peer_ref)` → O(log n). "Definitive negative" holds because
-   projection is complete before the query runs.
-   Consulted by: `key_shared` responder side, Trigger A/B
-   recipient filter.
-   Resolves codex gap #5.
+---
 
-9. **`frontier_advance` merges `removal` + `key_rotation`.**
-   Admin-signed. Carries frontier delta + new `bundle_id`. Atomic
-   by construction.
-   Multi-parent frontier support preserved via the flat
-   `frontier_removed_peers` set (from 8): two concurrent advances
-   each contribute rows independently; queries read the union. No
-   linearization required.
-   Resolves codex gap #6.
+### 2. Add `eph_pubkey_request`
 
-10. **KDF `K_m` with random salt per message (optional but
-    preferred).** `K_m = HKDF(K_bundle, salt=random_12B,
-    info="fs-per-message-v1")`. Drops the `message_key` event
-    entirely. Message header gains `kdf_salt_12B`.
-    - Collision bound: 2^48 messages per bundle. Irrelevant.
-    - Back-derivation: infeasible (HKDF is a PRF via HMAC-SHA256).
-    - Cache-on-first-derive: store K_m in `key_secrets` keyed by
-      message_event_id (or the deletion-carried
-      `message_key_event_id` surrogate when present). Preserves
-      per-message purge granularity.
-    - Drops `message_keys`, `messages_to_message_keys`, and the
-      `message_key` event's projector + dep-chain entirely.
-   Supersedes codex's point that the branch's plan "rejected HKDF":
-   that rejection was for a different shape. This shape pairs KDF
-   with the self-contained `MessageDeletion` from (6) so
-   per-message granularity isn't lost.
+**What:** A new member-signed event that publishes an ephemeral public
+key as a standing request for some target key. The request exists for
+two reasons: to let a member re-request after shredding an earlier
+privkey, and to let responders confirm a specific pubkey is
+authorized.
+
+**Wire shape (new):**
+```
+eph_pubkey_request {
+    target_key_id: [u8; 32],            // bundle_id or frontier_ref
+    target_is_frontier: bool,           // 1 = frontier, 0 = bundle
+    pubkey: [u8; 32],                   // ephemeral X25519 pubkey
+    valid_until_ms: u64,                // short (minutes, not days)
+    supersedes_eph_pubkey_event_id: [u8; 32],  // zero if not superseding
+    created_at_ms: u64,
+    // + signer envelope + signature (standard)
+}
+```
+
+**Local table (new):**
+```sql
+CREATE TABLE eph_privkeys (
+    recorded_by TEXT NOT NULL,
+    eph_pubkey_event_id TEXT NOT NULL,
+    privkey BLOB NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    valid_until_ms INTEGER NOT NULL,
+    PRIMARY KEY (recorded_by, eph_pubkey_event_id)
+);
+```
+
+**Lifecycle:**
+- Requester publishes the event + persists the privkey locally.
+- On receiving a `key_shared` whose `recipient_pubkey` matches a row:
+  unwrap, cache K_bundle, `secure_shred_blob` the privkey row.
+- Expired rows (by `valid_until_ms + grace`): sweep + shred.
+- `supersedes_` ref: when projecting a new request, shred the
+  superseded row's privkey.
+
+**Why signed:** binds request to an admitted member. DoS blast
+radius = member count. Ban-on-abuse is an out-of-band admin action
+(a future `frontier_advance` with this member removed).
+
+**Invite pubkeys are implicit standing requests.** When projecting
+any `user_invite` / `device_invite`, the invite's pubkey is treated as
+a permanent request bound to the invite's `valid_until_ms`. No
+separate `eph_pubkey_request` needed for invites. Holders react via
+trigger A (decision 5).
+
+---
+
+### 3. Deterministic `key_shared` construction for convergence
+
+**The problem v1 had:** `key_shared` ciphertext depends on the
+sender's ephemeral key choice; independent holders emit different
+ciphertexts. No on-wire dedupe. Codex flagged this at
+`FS_ALT_CONVERGENT_WRAP_DESIGN.md:152-159`.
+
+**Fix:** derive the ephemeral sender keypair deterministically from
+the (target, recipient) pair. Any holder that has K_bundle for
+`target_key_id` can emit the same sealed box:
+
+```
+ephemeral_seed   = blake3("fs-wrap-v1" ‖ target_key_id ‖ recipient_pubkey)
+ephemeral_sk     = clamp_to_x25519(ephemeral_seed)
+ephemeral_pk     = X25519_pubkey(ephemeral_sk)
+shared_secret    = X25519(ephemeral_sk, recipient_pubkey)
+kdf_key          = HKDF(shared_secret, salt=target_key_id, info="fs-wrap-v1")
+nonce            = first_12B(blake3("fs-wrap-nonce-v1" ‖ target_key_id ‖ recipient_pubkey))
+(ciphertext, tag) = AES-GCM-encrypt(kdf_key, nonce, K_bundle)
+created_at_ms    = 0  // NOT holder-dependent — see below
+```
+
+Every field is a function of (`target_key_id`, `recipient_pubkey`,
+K_bundle). Different holders with the same K_bundle emit byte-
+identical `key_shared` events. Content-addressed event id is
+identical across holders → standard dedupe on the wire.
+
+**`created_at_ms` handling:** must NOT be holder-current-time.
+Either:
+- Set to 0 (or a fixed sentinel), since the event's timing isn't
+  semantically meaningful (it's a convergent idempotent emission).
+- OR set to the request/invite's `created_at_ms` (whichever triggered
+  the emission). This is deterministic as long as all holders react
+  to the same trigger event.
+- Pick the simpler: 0. Ordering isn't load-bearing for `key_shared`.
+
+**Signer:** `key_shared` today is signed; under this scheme,
+signatures also break convergence. Drop the signature; rely on AEAD
+decryption at the recipient as validity proof. A forged `key_shared`
+has no real K_bundle to wrap; it fails AEAD at the recipient and is
+discarded. Responder identity is carried by who propagated the event,
+not who "signed" it.
+
+This lines `key_shared` up structurally with `message_key` on the
+current branch: both are deterministic, unsigned, content-addressed.
+
+---
+
+### 4. Preserve `k_bundle_local_event_id` as the canonical dep key
+
+**The problem v1 had:** by pitching `wrap_event` as the dep target,
+v1 forced a many-to-one dep chain that doesn't work cleanly (one
+message_key blocks on which `wrap_event`?). Codex flagged this at
+`FS_ALT_CONVERGENT_WRAP_DESIGN.md:490-491`.
+
+**Fix:** keep the current dep chain unchanged:
+```
+message  -blocks on->  message_key
+message_key  -blocks on->  KeySecret(K_bundle) [deterministic local id]
+```
+
+`key_shared`'s projector, on successful unwrap, uses the existing
+helper to emit a canonical `KeySecret(K_bundle)` local event:
+```rust
+// In key_shared::project_pure, after successful unwrap:
+let k_bundle_plaintext: [u8; 32] = unwrap_key_from_sender(...);
+emit_commands.push(
+    key_broadcast::emit_deterministic_key_secret_command(&k_bundle_plaintext)
+);
+```
+
+Pattern lifted verbatim from `src/event_modules/key_broadcast.rs:210-219`.
+No new mechanism invented. `k_bundle_local_event_id =
+deterministic_key_secret_event_id(K_bundle)` continues to work as
+today.
+
+**Deps in the `key_shared` projector:** target bundle presence isn't
+a dep — the whole point of `key_shared` is to materialize K_bundle.
+But the sender-envelope (signer) is validated via the standard
+signer chain. And the requesting `eph_pubkey` should be a dep so
+`key_shared` can't arrive before the request it answers to a peer
+that hasn't seen the request yet.
+
+Actually — no. `key_shared` is unsigned under decision 3. Signer
+envelope disappears. Request also isn't a strict dep: an invite's
+pubkey counts as a standing request, and invites project via their
+own dep chain. If `key_shared` arrives before its matching request
+OR invite, it has no local privkey to unwrap and is quietly ignored
+(decision 2's shredding rule; recipient-side behavior).
+
+Cascade unblocks: standard `blocked_event_deps` + `cascade_unblocked`
+in `apply/cascade.rs`.
+
+---
+
+### 5. Preemptive emit triggers
+
+Two deterministic holder-side emission paths replace today's
+`key_history_bundle` bootstrap and today's invite-slot fanout in
+`key_rotation`.
+
+**Trigger A: "new invite for a frontier I have bundles on."**
+
+Fires on: projection of `user_invite` or `device_invite`.
+
+Projector side-effect (new command):
+```
+for each bundle_id in local `key_secrets` (K_bundle rows only) where
+      frontier_entitles(invite, bundle_id):
+   emit key_shared(target=bundle_id, recipient=invite.pubkey)
+      via the deterministic construction from decision 3.
+```
+
+Entitlement check = decision 8's SQL query.
+
+Replaces `key_history_bundle`. Naturally skips retired bundles: they
+are absent from `key_secrets` (purged by the cascade).
+
+**Trigger B: "new bundle, I should seed it to active invites."**
+
+Fires on: projection of `KeySecret(K_bundle)` (or
+`frontier_advance`, since the advance pins a new bundle_id).
+
+Projector side-effect:
+```
+for each active invite_pubkey in this frontier's invite tables where
+      frontier_entitles(invite, new_bundle_id):
+   emit key_shared(target=new_bundle_id, recipient=invite.pubkey).
+```
+
+Replaces `active_rotation_recipients_for_frontier`'s current invite-
+slot special case.
+
+**Trigger C (implicit): response to explicit `eph_pubkey_request`.**
+
+Fires on: projection of `eph_pubkey_request`.
+
+Projector side-effect:
+```
+if frontier_entitles(request.requester, request.target_key_id) AND
+   local key_secrets has K_bundle for target:
+   emit key_shared(target=request.target_key_id,
+                   recipient=request.pubkey).
+```
+
+All three triggers use the same deterministic `key_shared`
+construction, so output dedupes across holders.
+
+**Idempotency:** two identical `key_shared` events from independent
+holders are one event after content-addressing. No holder-side
+"already responded" tracking needed for the A/B/C triggers.
+
+---
+
+### 6. Self-contained `MessageDeletion`
+
+**What:** `MessageDeletion` carries the ids needed to perform its
+entire cascade directly, without reverse-index lookups.
+
+**Wire shape (revised):**
+```
+MessageDeletion {
+    message_event_id:     [u8; 32],    // target message
+    message_key_event_id: [u8; 32],    // that message's K_m event
+    bundle_id:            [u8; 32],    // K_bundle under which msg was sent
+    created_at_ms: u64,
+    // + signer envelope (author) + signature
+}
+```
+
+**Cascade becomes straight-line:**
+```
+BEGIN;
+  DELETE FROM messages           WHERE event_id = message_event_id;
+  DELETE FROM events             WHERE event_id = message_event_id;
+  DELETE FROM message_keys       WHERE event_id = message_key_event_id;
+  DELETE FROM events             WHERE event_id = message_key_event_id;
+  DELETE FROM key_secrets        WHERE event_id IN (
+       message_key_event_id,   -- K_m
+       bundle_id,              -- K_bundle (rotation alias)
+       deterministic_k_bundle_local_id_for(bundle_id)  -- if we can
+                                                       -- derive it
+  );
+  secure_shred_blob(message_event_id);
+  secure_shred_blob(message_key_event_id);
+  -- bundle blob only shredded if this is the last message under it
+  INSERT INTO retired_bundles(bundle_id);
+  INSERT INTO retired_keys(message_key_event_id);
+  -- deleted_messages tombstone as today
+  INSERT INTO deleted_messages(message_event_id, ...);
+COMMIT;
+```
+
+**Drops:** `messages_to_message_keys` reverse-index table entirely.
+Purge walker at `src/state/projection/purge.rs:163-238` becomes a
+direct executor — no joins, no reverse-lookups, no late-index
+race.
+
+**Late-replay (strictly better than today):**
+- MessageDeletion arriving before `message` / `message_key` / rotation:
+  ids are known directly → insert into `retired_bundles` +
+  `retired_keys` immediately. The retirement gate (decision 7)
+  refuses subsequent `key_secrets` inserts for those ids. When the
+  message/message_key/rotation events finally arrive, they project
+  the row headers but produce no decryption material → inert.
+
+**Validation:** author signed the deletion. If the `message_key`
+event later arrives and its `bundle_id` doesn't match the deletion's
+claim, the author is malicious. The gate is still safe (it only
+refuses, never fabricates), but we can also reject the tampered
+message_key at projection. Byzantine authors are treated as today.
+
+**`bundle_id` derivation bookkeeping:** today the deterministic
+K_bundle local id isn't always recoverable from the rotation
+bundle_id alone — it requires the K_bundle bytes. So on cascade we
+must also look up the `k_bundle_local_event_id` from the message_key
+row we're about to delete (`message_keys.k_bundle_local_event_id`)
+and add that to the shred set. Single-row lookup, no index required.
+
+---
+
+### 7. `retired_keys` table and gate
+
+**Schema (new):**
+```sql
+CREATE TABLE retired_keys (
+    recorded_by TEXT NOT NULL,
+    message_key_event_id TEXT NOT NULL,
+    retired_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (recorded_by, message_key_event_id)
+);
+CREATE INDEX idx_retired_keys_by_mkey
+    ON retired_keys (recorded_by, message_key_event_id);
+```
+
+**Gate point:** `src/state/projection/apply/write_exec.rs` in
+`execute_write_ops`, alongside the existing `retired_bundles` gate
+at `:122-153`. Two additional checks:
+
+```rust
+// 1. Refuse key_secrets insert whose event_id matches a retired key.
+if is_key_secrets_insert(op)
+   && row_in_retired_keys(conn, recorded_by, insert_event_id)? {
+    return Ok(WriteOpOutcome::RefusedByGate);
+}
+
+// 2. Refuse message_keys row insert with that event_id.
+if is_message_keys_insert(op)
+   && row_in_retired_keys(conn, recorded_by, insert_event_id)? {
+    return Ok(WriteOpOutcome::RefusedByGate);
+}
+```
+
+**Populated by:** `MessageDeletion`'s cascade (decision 6). One
+`retired_keys` row per deletion.
+
+**What it protects:** late-arriving `message_key` events whose
+target message was already deleted (stops K_m rehydration); late-
+arriving `key_shared` targeted at a retired K_m (inert — decrypted
+bytes can't be re-cached).
+
+**Interaction with `retired_bundles`:** orthogonal. `retired_bundles`
+protects K_bundle rehydration; `retired_keys` protects K_m
+rehydration. Both gates consulted on every `key_secrets` insert.
+
+**Tests to add:**
+- Late `message_key` for already-deleted message → refused; no K_m row.
+- Late `key_shared` for retired K_m → refused; no K_m row.
+- Deletion of message X doesn't retire K_m's for messages Y, Z under
+  same bundle.
+- Per-device bundle isolation: deletion in bundle B1 retires
+  bundle_id_B1 only; B2's K_m rows untouched. (resolves codex's
+  `per_device_bundle_isolation` regression concern)
+
+---
+
+### 8. Entitlement predicate as SQL query
+
+**The problem v1 had:** predicate was "present in invite tables and
+not tombstoned." Codex flagged this at
+`FS_ALT_CONVERGENT_WRAP_DESIGN.md:420-424` as weaker than today's
+walk-the-frontier-and-removal-lineage check at
+`identity_ops.rs:419-467` and `key_repair.rs:799-887`.
+
+**Fix:** materialize a flat set at projection time, query it with a
+single-row lookup.
+
+**Schema (new):**
+```sql
+CREATE TABLE frontier_removed_peers (
+    recorded_by TEXT NOT NULL,
+    frontier_ref TEXT NOT NULL,       -- frontier_advance event_id
+    peer_ref TEXT NOT NULL,           -- peer/user/invite event_id
+    removed_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (recorded_by, frontier_ref, peer_ref)
+);
+CREATE INDEX idx_frontier_removed_by_peer
+    ON frontier_removed_peers (recorded_by, peer_ref, frontier_ref);
+```
+
+**Populator:** `frontier_advance` projector (decision 9). For each
+`removed_peer_ref` in the event's `frontier_delta`, insert a row.
+Multi-parent frontier advances each populate independently; the set
+is the union.
+
+**Predicate (reused throughout):**
+```sql
+-- "is peer_ref removed at frontier_ref?"
+SELECT 1 FROM frontier_removed_peers
+ WHERE recorded_by = ?1 AND frontier_ref = ?2 AND peer_ref = ?3
+ LIMIT 1;
+```
+
+**Definitive negative:** because projection is complete before any
+query runs (standard projector invariant), absence of the row is
+proof of non-removal at that frontier. No lineage walk required.
+
+**Consulted by:**
+- `key_shared` responder side (trigger C) — check requester_peer_ref
+  against the bundle's frontier_ref.
+- Trigger A/B preemptive emits — check each candidate recipient
+  pubkey's binding peer_ref against the bundle's frontier_ref.
+- `key_repair.rs` heal responder (replaces the current lineage walk
+  at `:799-887`).
+
+**Frontier resolution helper (unchanged from TLA+ `ResolveNet`):** a
+bundle's frontier_ref is read from its `frontier_advance` event
+(decision 9), OR from the current branch's `key_rotations`/
+`removal`-chain join during the transition period.
+
+---
+
+### 9. `frontier_advance` merges `removal` + `key_rotation`
+
+**What:** one admin-signed event that declares a new frontier and
+pins a new K_bundle atomically.
+
+**Wire shape (new):**
+```
+frontier_advance {
+    prev_frontier_refs: Vec<[u8; 32]>,   // multi-parent: Vec, not one
+    frontier_hash: [u8; 32],              // hash of sorted parent set
+    added_peers:   Vec<[u8; 32]>,         // user/device/invite event_ids
+    removed_peers: Vec<[u8; 32]>,         // same
+    bundle_id:     [u8; 32],              // new K_bundle content-addr id
+    created_at_ms: u64,
+    // + admin signer envelope + signature
+}
+```
+
+(Vec encoded with the existing FieldSpec layout pattern; length-
+prefixed, capped.)
+
+**Semantics:**
+- `added_peers` — new members. Triggers trigger A equivalents for
+  their pubkeys over historical bundles (if they're entitled).
+- `removed_peers` — populates `frontier_removed_peers` (decision 8).
+- `bundle_id` — new K_bundle's content-addressed id. Declares the
+  canonical name for the fresh bundle.
+
+**Atomicity:** impossible to have a `frontier_advance` without a new
+bundle, or a removal without rotation. The
+`workspace/commands.rs:971-1015` two-step sequence becomes one step.
+
+**Multi-parent:** `prev_frontier_refs` is a set (vec of sorted
+event_ids). Two concurrent advances referencing the same parent
+produce two siblings; both populate `frontier_removed_peers`; queries
+read the union. No linearization required — codex's gap at
+`FS_ALT_CONVERGENT_WRAP_DESIGN.md:614-620` is addressed structurally.
+
+**Deps:** each `prev_frontier_ref` is a blocking dep. Standard
+dep-machinery cascade. Matches how `removal` + `key_rotation`'s
+`frontier_ref_*` slots work today.
+
+**Bundle materialization:** admin emits the event + emits a local
+`KeySecret(K_bundle)` for the new bundle (same deterministic pattern
+as today's rotation path). Trigger B immediately fires for active
+invites. Other members receive K_bundle via trigger C after
+publishing their own eph_pubkey_request (or they materialize it on
+the next message send if they're not admin).
+
+**Retires:** `key_rotation` + `removal` events. Their projectors +
+schemas + tests migrate/retire in lockstep.
+
+**Tests to migrate:** `src/state/projection/apply/tests/removal_rotation.rs`
+is primarily rewritten rather than retained — the event set
+changes. But the multi-parent convergence invariants at
+`:309-483` transfer directly: same property expressed over
+`frontier_advance` siblings.
+
+---
+
+### 10. KDF `K_m` with random 12B salt per message
+
+**What:** derive per-message K_m from K_bundle via HKDF with a
+random 12B salt carried in the message header. Drops the
+`message_key` event entirely.
+
+**Derivation:**
+```
+K_m = HKDF-Extract-and-Expand(
+    salt = kdf_salt_12B,
+    ikm  = K_bundle,
+    info = "fs-per-message-v1",
+    L    = 32
+)
+```
+
+**Encrypted message header gains:**
+```
+kdf_salt: [u8; 12]
+```
+
+(12B because that's sufficient for collision avoidance — 2^48
+birthday bound — and it matches standard AEAD nonce sizes for
+ergonomic reuse. Can reuse the existing AEAD nonce if we're careful
+about domain separation via `info`.)
+
+**Security:**
+- **Uniqueness:** 12B random salt → 2^48 messages per bundle before
+  any collision. Irrelevant.
+- **Back-derivation:** given `(K_m, kdf_salt)` (or many such pairs),
+  recovering K_bundle requires breaking HMAC-SHA256 PRF. Standard
+  crypto assumption; treated as infeasible.
+- **Forward security:** K_bundle shred → no future K_m derivable.
+  Same strong-FS lever as today.
+
+**Cache policy:** cache-on-first-derive.
+```sql
+-- Store K_m in key_secrets keyed by message_event_id.
+INSERT INTO key_secrets(event_id, key_bytes, created_at, recorded_by)
+VALUES (?message_event_id, ?k_m, ?ts, ?recorded_by);
+```
+
+**Per-message purge granularity (preserved via decision 6):**
+`MessageDeletion` carries `message_event_id`; cascade does:
+```sql
+DELETE FROM key_secrets WHERE event_id = ?message_event_id;
+INSERT INTO retired_keys(?message_event_id);
+```
+No need for a separate `message_key_event_id` since K_m is keyed by
+message_event_id directly.
+
+**What drops:**
+- `src/event_modules/message_key.rs` entirely (~400 LOC)
+- `message_keys` table
+- `messages_to_message_keys` reverse index
+- `message_key`'s dep chain entry; `message` deps directly on its
+  `bundle_id`'s `k_bundle_local_event_id`.
+
+**Per-peer storage delta (100k messages):** drops ~300k SQL rows +
+~13 MB wire.
+
+**Adoption optionality:** decision 10 is orthogonal to 1–9. We can
+ship 1–9 and keep `message_key` (tighter scope, conservative). Or
+ship 1–10 and take the full storage win. Recommend shipping 1–9
+first; 10 as a follow-up once 1–9 stabilizes.
+
+**Differs from the HKDF path the branch previously rejected:**
+previous rejection was for a path that tried to bolt HKDF onto
+`message_key` without dropping it. This shape drops `message_key`
+entirely AND pairs the drop with decision 6's ids-in-deletion, so
+per-message granularity is preserved without the `message_key`
+event carrying it.
 
 ---
 
@@ -139,39 +602,105 @@ Status: proposal; supersedes v1's specific constructions. Branch
 |---|---|
 | `wrap_event` convergence broken (nonce + ciphertext emitter-dependent) | Decision 3: deterministic ephemeral sender keypair → byte-identical sealed box |
 | No canonical dep key | Decision 4: preserve `k_bundle_local_event_id` via existing deterministic KeySecret emit |
-| `retired_keys` is fiction | Decision 7: specified (schema + gate point + populator) |
-| Trigger A dead-end for retired bundles | Expected behavior per v1 (retired bundles absent from `key_secrets` intentionally); matches existing `joiner_after_bundle_retirement_sees_undeleted_tail_as_history_lost` test |
-| Entitlement predicate too weak | Decision 8: SQL-table query against materialized removal set |
-| `frontier_advance` linearization breaks multi-parent | Decision 9: flat set in `frontier_removed_peers`, union queries |
-| Factual errors about current branch (§1.1/§7.1/§7.4) | Acknowledged; rewrite v1 doc when this plan is executed |
+| `retired_keys` is fiction | Decision 7: full schema + gate point + populator specified |
+| Trigger A dead-end for retired bundles | Decision 5: expected behavior per v1 (retired bundles absent from `key_secrets` intentionally); matches existing `joiner_after_bundle_retirement_sees_undeleted_tail_as_history_lost` test |
+| Entitlement predicate too weak | Decision 8: SQL-table query against materialized `frontier_removed_peers` |
+| `frontier_advance` linearization breaks multi-parent | Decision 9: `prev_frontier_refs: Vec`, flat set in `frontier_removed_peers`, union queries |
+| Factual errors about current branch (§1.1/§7.1/§7.4) | Acknowledged; the v1 doc's §1/§7 will be rewritten when this plan is executed |
 | "Already litigated" HKDF rejection | Decision 10: paired with self-contained deletion, different shape from the rejected variant |
 
 ---
 
 ## Deferred / out of scope
 
-- DoS rate-limiting spec for `eph_pubkey_request`. Soft rate-limit
-  via `valid_until_ms`; ban-on-abuse via signed audit trail.
-- Multi-device request coalescing.
-- Migration plan from current per-message-fs branch. This doc is a
-  design, not an execution plan.
-- TLA+ updates. Scope of the adoption execution plan.
+- **DoS rate-limiting spec for `eph_pubkey_request`.** Soft rate-
+  limit via `valid_until_ms`; ban-on-abuse via signed audit trail
+  (admin publishes `frontier_advance` with offender in
+  `removed_peers`).
+- **Multi-device request coalescing.** Two devices of one user may
+  independently publish requests. Both get answered. Future
+  optimization.
+- **Migration plan from current `per-message-fs` branch.** This doc
+  is a design; the execution plan is separate. Migration is a
+  coordinated wire-format break with defined cutover.
+- **TLA+ updates.** Scope of the adoption execution plan.
+- **On-the-wire targeted delivery optimization.** Mentioned in v1
+  §3.3; a transport-layer optimization independent of the event
+  model.
 
 ---
 
 ## Open questions
 
-- Is decision 10 (KDF K_m) required for the design to be a win, or
-  can we ship (1)–(9) without it and treat KDF as a later
-  orthogonal simplification? v1 estimated KDF as a ~1-week lift,
-  but interaction with decision 6 changes that — per-message
-  granularity is carried by the deletion event now, not the
-  `message_key` event, so KDF is more tractable.
-- Exactly which event carries `frontier_advance`'s multi-parent
-  reference field(s)? Needs alignment with the existing removal
-  frontier reference mechanism.
-- Should `frontier_removed_peers` also carry `added_at_frontier_ref`
-  to express membership windows, or is removal alone sufficient?
+- Exactly how does `frontier_advance`'s `prev_frontier_refs` cap
+  size? Current `key_rotation` uses 4 slots + overflow mechanism.
+  Reuse the same cap.
+- Should `frontier_removed_peers` also carry
+  `added_at_frontier_ref` to express membership windows, or is
+  removal alone sufficient? Depends on whether we want to query
+  "when was this peer added." For the entitlement predicate, only
+  the removal set matters.
+- `eph_pubkey_request` `valid_until_ms` — what's the default?
+  Hours for explicit heal requests; invite's own `valid_until_ms`
+  for invite-implicit requests. Pick concrete defaults at
+  implementation time.
+- Should `key_shared` under decision 3 still carry a `created_at_ms`
+  of 0 (pure determinism) or match the triggering event's timestamp
+  (deterministic given the trigger)? Pick 0 unless ordering becomes
+  load-bearing elsewhere.
+
+---
+
+## Adoption sequencing
+
+Follow-on execution plan after `per-message-fs` lands on master.
+
+**Phase 1 — dep-chain refactor (1 week):**
+- Make `key_shared` projector emit deterministic `KeySecret(K_bundle)`
+  on unwrap (decision 4). Net change: one `emit_commands.push()`
+  line in the projector. Verifies the dep chain works without any
+  other changes.
+
+**Phase 2 — deterministic `key_shared` construction (1 week):**
+- Switch `key_shared` emission to the deterministic ephemeral
+  keypair construction (decision 3). Drop signature. Update tests.
+
+**Phase 3 — `eph_pubkey_request` + trigger C (1–2 weeks):**
+- Add `eph_pubkey_request` event + `eph_privkeys` table (decision 2).
+- Add trigger C response path (decision 5).
+- Replaces `key_request.rs` heal loop; maps to existing repair
+  architecture at `runtime/key_repair.rs`.
+
+**Phase 4 — triggers A/B (1 week):**
+- Add `user_invite` / `device_invite` projection side-effect:
+  enumerate entitled bundles, emit `key_shared` for each.
+- Add `KeySecret(K_bundle)` projection side-effect: enumerate
+  active invites, emit `key_shared` for each (trigger B).
+- Drop `key_history_bundle` entirely.
+
+**Phase 5 — `retired_keys` + self-contained deletion (1–2 weeks):**
+- Add `retired_keys` table + gate (decision 7).
+- Extend `MessageDeletion` wire shape with three id fields
+  (decision 6). Backfill on re-projection of existing tombstones.
+- Drop `messages_to_message_keys` reverse index.
+
+**Phase 6 — entitlement materialization (1 week):**
+- Add `frontier_removed_peers` table + projector population
+  (decision 8).
+- Replace lineage walks in `key_repair.rs` with SQL-query calls.
+
+**Phase 7 — `frontier_advance` (2–3 weeks):**
+- Add `frontier_advance` event (decision 9). Migrate emitters
+  (removal, scheduled rotation, delete-triggered rotation).
+- Retire `removal` + `key_rotation` event types. Migrate tests.
+
+**Phase 8 — optional KDF K_m (1 week):**
+- Add `kdf_salt_12B` to `Encrypted` header. Switch send/receive
+  paths to HKDF derivation with cache-on-first-derive. Drop
+  `message_key` event entirely.
+- Gated behind a version bump; can be deferred indefinitely.
+
+Each phase is independently landable and testable.
 
 ---
 
@@ -179,32 +708,10 @@ Status: proposal; supersedes v1's specific constructions. Branch
 
 - `FS_ALT_CONVERGENT_WRAP_DESIGN.md` (v1) — original proposal.
   Retained for context. Its §2 event shapes and §3 distribution
-  mechanics remain mostly valid; §4 retired_keys was
-  underspecified (fixed in decision 7); §5 KDF variant now
-  pairs with decision 6 (fixed).
+  mechanics remain mostly valid with the renames/corrections in
+  decisions 1, 3, 4; §4 `retired_keys` was underspecified (fixed
+  in decision 7); §5 KDF now pairs with decision 6 (fixed).
 - `FS_ALT_CONVERGENT_WRAP_DESIGN_CODEX_REVIEW.md` — codex's
-  review of v1. Decisions above directly map to its flagged gaps.
-  The "don't adopt as written" verdict applies to v1; v2
-  addresses every concrete gap it raised.
-
----
-
-## Adoption sequencing (preliminary)
-
-This would be a follow-on execution plan after `per-message-fs`
-lands on master. Rough sequencing:
-
-1. Add `eph_pubkey_request` event + `eph_privkeys` table (decision 2).
-2. Make `key_shared` projector deterministic + emit canonical
-   `KeySecret(K_bundle)` on unwrap (decisions 3, 4).
-3. Add preemptive Trigger A/B emission paths (decision 5).
-4. Self-contained `MessageDeletion` with ids (decision 6) +
-   `retired_keys` table/gate (decision 7).
-5. `frontier_removed_peers` table + entitlement predicate
-   (decision 8).
-6. `frontier_advance` event merging removal + rotation (decision 9).
-7. Retire `key_rotation`, `key_history_bundle`, `removal` events
-   (rely on decisions 1, 9).
-8. (Optional) KDF K_m + drop `message_key` event (decision 10).
-
-Each step is independently testable against existing invariants.
+  review of v1. Decisions above directly map to each flagged gap
+  (see the mapping table). The "don't adopt as written" verdict
+  applies to v1; v2 addresses every concrete gap it raised.
