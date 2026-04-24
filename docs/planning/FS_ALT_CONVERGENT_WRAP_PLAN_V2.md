@@ -615,78 +615,173 @@ changes. But the multi-parent convergence invariants at
 
 ---
 
-### 10. KDF `K_m` with random 12B salt per message
+### 10. KDF `K_m` with per-peer sequence + pre-derive-and-shred K_bundle
 
-**What:** derive per-message K_m from K_bundle via HKDF with a
-random 12B salt carried in the message header. Drops the
-`message_key` event entirely.
+**What:** derive K_m from K_bundle via HKDF, namespaced by
+`(sender_peer_id, seq)`. Each peer owns their own seq counter per
+bundle. Peers pre-derive a batch of N (e.g., 1000) future K_m's
+per (peer, bundle) at bundle provisioning, cache them, and then
+**shred K_bundle locally**. Drops the `message_key` event entirely.
 
 **Derivation:**
 ```
-K_m = HKDF-Extract-and-Expand(
-    salt = kdf_salt_12B,
+K_m(peer_id, seq) = HKDF-Extract-and-Expand(
+    salt = bundle_id,
     ikm  = K_bundle,
-    info = "fs-per-message-v1",
+    info = "fs-per-message-v1" ‖ peer_id ‖ seq,
     L    = 32
 )
 ```
 
 **Encrypted message header gains:**
 ```
-kdf_salt: [u8; 12]
+sender_peer_id: [u8; 32]     // (already present via signer envelope;
+                             //  carried implicitly)
+seq:            u32          // monotonic per (sender, bundle)
 ```
 
-(12B because that's sufficient for collision avoidance — 2^48
-birthday bound — and it matches standard AEAD nonce sizes for
-ergonomic reuse. Can reuse the existing AEAD nonce if we're careful
-about domain separation via `info`.)
+No random salt needed — (peer_id, seq) gives uniqueness by
+construction. No collisions possible.
 
-**Security:**
-- **Uniqueness:** 12B random salt → 2^48 messages per bundle before
-  any collision. Irrelevant.
-- **Back-derivation:** given `(K_m, kdf_salt)` (or many such pairs),
-  recovering K_bundle requires breaking HMAC-SHA256 PRF. Standard
-  crypto assumption; treated as infeasible.
-- **Forward security:** K_bundle shred → no future K_m derivable.
-  Same strong-FS lever as today.
+**Pre-derive and shred protocol:**
 
-**Cache policy:** cache-on-first-derive.
+At bundle provisioning (either local rotation emit, or receipt of a
+`key_shared` that delivers K_bundle), each peer:
+
+1. Derive `K_m(self_peer_id, seq)` for `seq ∈ [current_seq,
+   current_seq + N)`. Cache each in `key_secrets` keyed by a
+   compound id (see below). N = 1000 default.
+2. For each OTHER peer expected to send on this bundle: derive
+   `K_m(other_peer_id, seq)` for `seq ∈ [0, N)`. Cache.
+3. `secure_shred_blob` the K_bundle row from `key_secrets`.
+
+Total pre-derived K_m's per peer: `P × N` where P = active peer
+count on frontier. At P = 10, N = 1000 → 10k K_m's × 32B = 320 KB
+per peer. Cheap.
+
+Expected-peer list: derived from the bundle's frontier at the
+moment of provisioning. Members added later via `frontier_advance`
+may require a mid-bundle re-batch (see below).
+
+**Why this is a real FS win over random-salt:**
+
+- **K_bundle lifetime is bounded to the pre-derive window.** Once
+  every peer on the frontier pre-derives and shreds, K_bundle does
+  not exist anywhere in the system except in ephemeral RAM during
+  the derivation.
+- **Attacker compromise post-pre-derive recovers only cached K_m's,
+  not K_bundle.** Cannot derive any K_m outside the cached set.
+- **Delete-triggered retirement has teeth at message granularity
+  without K_bundle shred being the lever.** Deletion of message X
+  shreds `K_m(sender_X, seq_X)`; attacker cannot re-derive because
+  no K_bundle anywhere.
+- **Strong-FS per-deleted-message, not just per-retired-bundle.**
+
+Compare today's branch: K_bundle is alive on every active peer
+until delete-triggered retirement. Compromise during the bundle's
+lifetime = K_bundle leak = every K_m in that bundle recoverable.
+Under decision 10: attacker gets only pre-derived K_m's, and
+deleted messages' K_m rows are already shredded and gated.
+
+**Caching identifier.**
+
+`K_m(peer_id, seq)` for bundle B needs a stable id. Two options:
+
+- **`(B, peer_id, seq)` tuple.** Store in a dedicated table, not in
+  `key_secrets`. Cleaner semantics, more refactoring.
+- **`k_m_id = blake3("fs-km-v1" ‖ bundle_id ‖ peer_id ‖ seq)`.**
+  Store in `key_secrets` keyed by this content-addressed id. Fits
+  the existing `key_secrets` schema. No new table needed.
+
+Recommend the content-addressed id (option 2). Then
+`MessageDeletion.message_key_event_id` (field from decision 6) IS
+`k_m_id`. Cascade and `retired_keys` gate work unchanged.
+
+**Mid-bundle re-batch.**
+
+When `seq` approaches `current_seq + N`, peer needs K_bundle back
+to derive the next batch. Options:
+
+- **Publish a `key_request` with `target_kind=0, target=bundle_id`.**
+  Any holder who hasn't yet shredded (i.e., still in their
+  pre-derive window) or any holder who re-fetched for their own
+  batch can respond. After re-fetching, re-batch, shred K_bundle.
+- **Alternatively: rotate bundles more aggressively.** If N = 1000
+  messages per peer and bundles rotate per-frontier-advance, most
+  peers never hit re-batch. Re-batch is a cold path.
+
+Network effect: if all peers shred K_bundle simultaneously, a
+re-batch requires someone to re-fetch from a holder who hasn't
+shredded yet. For truly global shred (no one has K_bundle
+anywhere), re-batch is impossible → peer must await a fresh
+bundle (`frontier_advance`). Tradeoff: stronger FS vs. bounded
+message throughput per bundle per peer.
+
+Default N = 1000 gives roughly "one bundle = ~1000 messages per
+peer" which aligns with typical conversational cadence and
+natural rotation points.
+
+**Members added mid-bundle:**
+
+A new invite arriving on a bundle that's already pre-derived and
+shredded: some holder must re-fetch K_bundle to emit the
+per-slot K_m's for the new invite via trigger A. This is the
+re-batch case. Acceptable if holders don't shred too aggressively;
+pragmatic default is "shred K_bundle ~N seconds after pre-derive,
+giving a window for trigger-A work." Or: one designated holder
+keeps K_bundle longer (the admin / most-recently-active peer).
+
+**Per-message purge granularity (via decision 6):**
+
+`MessageDeletion` carries `message_key_event_id = k_m_id`. Cascade:
 ```sql
--- Store K_m in key_secrets keyed by message_event_id.
-INSERT INTO key_secrets(event_id, key_bytes, created_at, recorded_by)
-VALUES (?message_event_id, ?k_m, ?ts, ?recorded_by);
+DELETE FROM key_secrets WHERE event_id = ?k_m_id;
+INSERT INTO retired_keys(?k_m_id);
+-- K_bundle already shredded or soon will be; no separate action
+-- needed for K_bundle unless this is the last live holder.
 ```
-
-**Per-message purge granularity (preserved via decision 6):**
-`MessageDeletion` carries `message_event_id`; cascade does:
-```sql
-DELETE FROM key_secrets WHERE event_id = ?message_event_id;
-INSERT INTO retired_keys(?message_event_id);
-```
-No need for a separate `message_key_event_id` since K_m is keyed by
-message_event_id directly.
 
 **What drops:**
 - `src/event_modules/message_key.rs` entirely (~400 LOC)
 - `message_keys` table
 - `messages_to_message_keys` reverse index
-- `message_key`'s dep chain entry; `message` deps directly on its
-  `bundle_id`'s `k_bundle_local_event_id`.
+- `message_key`'s dep chain entry; `message` deps directly on
+  a single KeySecret row keyed by `k_m_id`.
 
-**Per-peer storage delta (100k messages):** drops ~300k SQL rows +
-~13 MB wire.
+**Per-peer storage delta (100k messages, 10 peers):** drops ~300k
+SQL rows + ~13 MB wire for `message_key` events. Adds ~320 KB
+pre-derived K_m cache per peer per bundle. Net win is still large.
 
-**Adoption optionality:** decision 10 is orthogonal to 1–9. We can
-ship 1–9 and keep `message_key` (tighter scope, conservative). Or
-ship 1–10 and take the full storage win. Recommend shipping 1–9
-first; 10 as a follow-up once 1–9 stabilizes.
+**Adoption optionality:**
+
+Decision 10 is the biggest structural change and the biggest FS
+improvement. Ship phases 1–9 first (conservative), then 10. Or
+ship 1–10 together if the team is comfortable with the wire break.
 
 **Differs from the HKDF path the branch previously rejected:**
-previous rejection was for a path that tried to bolt HKDF onto
-`message_key` without dropping it. This shape drops `message_key`
-entirely AND pairs the drop with decision 6's ids-in-deletion, so
-per-message granularity is preserved without the `message_key`
-event carrying it.
+
+Previous rejection was for bolting HKDF onto `message_key`. This
+shape:
+- Drops `message_key` entirely
+- Namespaces derivation by `(peer_id, seq)`
+- Pre-derives and shreds K_bundle for a real FS improvement
+- Pairs with decision 6's ids-in-deletion so per-message
+  granularity is preserved without `message_key`
+
+Structurally different from the rejected path.
+
+**Open questions:**
+
+- Default N (pre-derive batch size). 1000 is a guess; depends on
+  message cadence. Too small → frequent re-batches; too large →
+  attacker recovers more K_m's on compromise.
+- K_bundle shred policy on holders (how long to wait before
+  shredding after pre-derive). Must be long enough for trigger A
+  to fire for mid-bundle invites, short enough to close the FS
+  window.
+- Should recipients pre-derive slots for all known peers, or only
+  "soon-likely" senders? Full pre-derive simpler; lazy pre-derive
+  saves storage at the cost of keeping K_bundle longer.
 
 ---
 
@@ -701,7 +796,14 @@ event carrying it.
   Deletion of message X retires `X.K_m` via `retired_keys` and
   purges X's ciphertext; an attacker compromising a peer post-delete
   finds no ciphertext for X, no cached K_m, and — if K_bundle was
-  retired — no derivation path. X is unrecoverable.
+  retired OR shredded post-pre-derive (decision 10) — no derivation
+  path. X is unrecoverable.
+- **K_bundle ephemerality under decision 10:** K_bundle exists in
+  any peer's storage only during the brief pre-derive window.
+  Attacker compromising a peer at any OTHER time recovers only
+  pre-derived K_m's, not K_bundle, so cannot derive K_m's outside
+  the cache. This strengthens the FS boundary to per-cached-K_m
+  rather than per-bundle.
 - **Improvement over the current branch's bundle-granularity
   tradeoff for joiners.** Under v2, new joiners receive
   surviving-message K_m's via trigger A even when K_bundle is
