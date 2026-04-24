@@ -63,7 +63,7 @@ practice the flood is sparse.
 
 ---
 
-### 2. Add `eph_pubkey_request`
+### 2. Add `key_request`
 
 **What:** A new member-signed event that publishes an ephemeral public
 key as a standing request for some target key. The request exists for
@@ -73,26 +73,45 @@ authorized.
 
 **Wire shape (new):**
 ```
-eph_pubkey_request {
-    target_key_id: [u8; 32],            // bundle_id or frontier_ref
-    target_is_frontier: bool,           // 1 = frontier, 0 = bundle
-    pubkey: [u8; 32],                   // ephemeral X25519 pubkey
-    valid_until_ms: u64,                // short (minutes, not days)
-    supersedes_eph_pubkey_event_id: [u8; 32],  // zero if not superseding
-    created_at_ms: u64,
+key_request {
+    target_key_id:   [u8; 32],                   // opaque 32-B id
+    target_kind:     u8,                         // see table below
+    pubkey:          [u8; 32],                   // ephemeral X25519 pubkey
+    valid_until_ms:  u64,
+    supersedes_key_request_event_id: [u8; 32],   // zero if not superseding
+    created_at_ms:   u64,
     // + signer envelope + signature (standard)
 }
 ```
+
+**`target_kind` enumeration:**
+
+| kind | `target_key_id` means | responder lookup | response wraps |
+|---|---|---|---|
+| 0 | `bundle_id` | `key_secrets.event_id = bundle_id` | K_bundle |
+| 1 | `frontier_ref` | current K_bundle for that frontier | K_bundle |
+| 2 | `message_event_id` | K_m cached for that message | K_m |
+| 3 | `message_key_event_id` | K_m cached via its message_key (no-KDF variant) | K_m |
+
+`target_kind=0` and `=1` are bundle-level requests (joiners, fresh
+members, heal after K_bundle loss). `=2` and `=3` are per-K_m
+requests for existing members who lost per-message cache state
+(multi-device sync, local DB corruption, etc.) — see
+§"Per-K_m recovery for existing members" below.
+
+All kinds use the same `key_request` / `key_shared` event pair. The
+responder's behavior differs only in which table they look up the
+target in.
 
 **Local table (new):**
 ```sql
 CREATE TABLE eph_privkeys (
     recorded_by TEXT NOT NULL,
-    eph_pubkey_event_id TEXT NOT NULL,
+    key_request_event_id TEXT NOT NULL,
     privkey BLOB NOT NULL,
     created_at_ms INTEGER NOT NULL,
     valid_until_ms INTEGER NOT NULL,
-    PRIMARY KEY (recorded_by, eph_pubkey_event_id)
+    PRIMARY KEY (recorded_by, key_request_event_id)
 );
 ```
 
@@ -111,7 +130,7 @@ radius = member count. Ban-on-abuse is an out-of-band admin action
 **Invite pubkeys are implicit standing requests.** When projecting
 any `user_invite` / `device_invite`, the invite's pubkey is treated as
 a permanent request bound to the invite's `valid_until_ms`. No
-separate `eph_pubkey_request` needed for invites. Holders react via
+separate `key_request` needed for invites. Holders react via
 trigger A (decision 5).
 
 ---
@@ -195,7 +214,7 @@ today.
 **Deps in the `key_shared` projector:** target bundle presence isn't
 a dep — the whole point of `key_shared` is to materialize K_bundle.
 But the sender-envelope (signer) is validated via the standard
-signer chain. And the requesting `eph_pubkey` should be a dep so
+signer chain. And the requesting `key_request` should be a dep so
 `key_shared` can't arrive before the request it answers to a peer
 that hasn't seen the request yet.
 
@@ -249,9 +268,9 @@ for each active invite_pubkey in this frontier's invite tables where
 Replaces `active_rotation_recipients_for_frontier`'s current invite-
 slot special case.
 
-**Trigger C (implicit): response to explicit `eph_pubkey_request`.**
+**Trigger C (implicit): response to explicit `key_request`.**
 
-Fires on: projection of `eph_pubkey_request`.
+Fires on: projection of `key_request`.
 
 Projector side-effect:
 ```
@@ -267,6 +286,73 @@ construction, so output dedupes across holders.
 **Idempotency:** two identical `key_shared` events from independent
 holders are one event after content-addressing. No holder-side
 "already responded" tracking needed for the A/B/C triggers.
+
+---
+
+#### Per-K_m recovery for existing members
+
+The question: after `bundle B` is retired due to deletion of one
+message, `B`'s `K_bundle` is gone everywhere. Surviving messages
+under B still have their K_m's cached on members who decrypted
+them. But what about a member who lost state (device wipe, DB
+corruption, multi-device out-of-sync) and never cached K_m for
+surviving message M?
+
+They can't re-derive K_m (K_bundle is retired globally). So they
+need a peer who has K_m cached to wrap it directly.
+
+**Mechanism:** same `key_request` event (decision 2), `target_kind=2`
+(`message_event_id`) or `=3` (`message_key_event_id`). Trigger C
+answers from any holder whose `key_secrets` table has a row keyed
+by the requested id.
+
+```
+member with state loss                  holder with K_m cached
+  |                                       |
+  |-- key_request(kind=2,                 |
+  |       target=msg_event_id,            |
+  |       pubkey=pk) ------------------->-|-- trigger C fires
+  |                                       |   check entitlement
+  |                                       |   look up K_m by msg id
+  |<-- key_shared(target=msg_event_id, ---|-- deterministic wrap
+  |       recipient=pk, ct) --------------|
+  | unwrap; insert into key_secrets       |
+  | shred eph_privkey                     |
+```
+
+**Responder entitlement (decision 8):** holder checks that the
+requester is still a member of the frontier under which M was
+sent. If yes, respond. If removed, drop silently.
+
+**Gate interaction:** `retired_keys` (decision 7) is NOT consulted
+here. Retired keys correspond to *deleted* messages. A surviving
+message's K_m is never in `retired_keys` — its `event_id` / K_m id
+has never been retired. So inserts proceed normally.
+
+**Convergence:** multiple holders may respond. Deterministic
+`key_shared` construction (decision 3) means their events are
+byte-identical → one event on the wire. Same story as bundle-level
+recovery.
+
+**No new trigger needed.** Trigger C already handles explicit
+requests; we just broaden `target_kind` to include K_m ids.
+
+**What this does NOT cover (by design):**
+
+New joiners who arrive *after* K_bundle retirement cannot decrypt
+surviving messages in retired bundles. This is today's documented
+FS tradeoff: "strong-FS at bundle granularity for joiners."
+Preserved in v2. Test:
+`joiner_after_bundle_retirement_sees_undeleted_tail_as_history_lost`
+at `src/state/projection/apply/tests/per_message_fs.rs:597-658`.
+
+If we wanted joiners to see surviving messages in retired bundles,
+we'd extend trigger A to enumerate cached K_m's for surviving
+messages under retired bundles and emit per-K_m `key_shared` to
+the invite pubkey. Not currently in scope — would be a separate
+decision. The tradeoff: N per-K_m events per joiner per retired
+bundle vs. a cleaner "joiners don't see retired-bundle survivors"
+invariant.
 
 ---
 
@@ -494,7 +580,7 @@ dep-machinery cascade. Matches how `removal` + `key_rotation`'s
 `KeySecret(K_bundle)` for the new bundle (same deterministic pattern
 as today's rotation path). Trigger B immediately fires for active
 invites. Other members receive K_bundle via trigger C after
-publishing their own eph_pubkey_request (or they materialize it on
+publishing their own key_request (or they materialize it on
 the next message send if they're not admin).
 
 **Retires:** `key_rotation` + `removal` events. Their projectors +
@@ -613,7 +699,7 @@ event carrying it.
 
 ## Deferred / out of scope
 
-- **DoS rate-limiting spec for `eph_pubkey_request`.** Soft rate-
+- **DoS rate-limiting spec for `key_request`.** Soft rate-
   limit via `valid_until_ms`; ban-on-abuse via signed audit trail
   (admin publishes `frontier_advance` with offender in
   `removed_peers`).
@@ -640,7 +726,7 @@ event carrying it.
   removal alone sufficient? Depends on whether we want to query
   "when was this peer added." For the entitlement predicate, only
   the removal set matters.
-- `eph_pubkey_request` `valid_until_ms` — what's the default?
+- `key_request` `valid_until_ms` — what's the default?
   Hours for explicit heal requests; invite's own `valid_until_ms`
   for invite-implicit requests. Pick concrete defaults at
   implementation time.
@@ -665,11 +751,16 @@ Follow-on execution plan after `per-message-fs` lands on master.
 - Switch `key_shared` emission to the deterministic ephemeral
   keypair construction (decision 3). Drop signature. Update tests.
 
-**Phase 3 — `eph_pubkey_request` + trigger C (1–2 weeks):**
-- Add `eph_pubkey_request` event + `eph_privkeys` table (decision 2).
+**Phase 3 — `key_request` + trigger C (1–2 weeks):**
+- Add `key_request` event + `eph_privkeys` table (decision 2).
+  Retargets / replaces today's `key_request.rs` and
+  `key_bundle_request.rs` events.
 - Add trigger C response path (decision 5).
-- Replaces `key_request.rs` heal loop; maps to existing repair
-  architecture at `runtime/key_repair.rs`.
+- Support all four `target_kind` values from the start so per-K_m
+  recovery for existing members (§"Per-K_m recovery…") works from
+  day one.
+- Rewrites the heal loop in `runtime/key_repair.rs` to emit
+  `key_request` events instead of today's bespoke heal protocol.
 
 **Phase 4 — triggers A/B (1 week):**
 - Add `user_invite` / `device_invite` projection side-effect:
