@@ -615,13 +615,19 @@ changes. But the multi-parent convergence invariants at
 
 ---
 
-### 10. KDF `K_m` with per-peer sequence + pre-derive-and-shred K_bundle
+### 10. KDF `K_m` with per-peer sequence + rolling pre-derive buffer
 
 **What:** derive K_m from K_bundle via HKDF, namespaced by
 `(sender_peer_id, seq)`. Each peer owns their own seq counter per
-bundle. Peers pre-derive a batch of N (e.g., 1000) future K_m's
-per (peer, bundle) at bundle provisioning, cache them, and then
-**shred K_bundle locally**. Drops the `message_key` event entirely.
+bundle. Peers maintain a rolling pre-derive buffer of the next N
+K_m's per (peer, bundle), refreshed as seq advances. Drops the
+`message_key` event entirely.
+
+**K_bundle is NOT shredded proactively.** It lives for the full
+bundle lifetime, exactly as today. Delete-triggered retirement is
+the shred trigger (decision 7 via self-contained MessageDeletion
+from decision 6). The pre-derive buffer exists for a specific UX
+reason, not an FS reason — see "Why pre-derive" below.
 
 **Derivation:**
 ```
@@ -635,153 +641,136 @@ K_m(peer_id, seq) = HKDF-Extract-and-Expand(
 
 **Encrypted message header gains:**
 ```
-sender_peer_id: [u8; 32]     // (already present via signer envelope;
-                             //  carried implicitly)
-seq:            u32          // monotonic per (sender, bundle)
+sender_peer_id: [u8; 32]    // (carried via signer envelope, implicit)
+seq:            u32         // monotonic per (sender, bundle)
 ```
 
 No random salt needed — (peer_id, seq) gives uniqueness by
-construction. No collisions possible.
+construction. No collisions possible; sender's seq is monotonic
+in their own slot.
 
-**Pre-derive and shred protocol:**
+**Why pre-derive (the late-decrypt grace window).**
 
-At bundle provisioning (either local rotation emit, or receipt of a
-`key_shared` that delivers K_bundle), each peer:
+Scenario that motivates this: Alice deletes M1 at T. Her cascade
+retires K_bundle locally. Bob hasn't synced the delete yet; at
+T+ε he sends M2 under the same bundle, with `seq=S`. When Alice
+receives M2, her K_bundle is gone — she cannot derive
+`K_m(Bob, S)` from K_bundle. She can't decrypt M2 and M2 appears
+"lost" to her.
 
-1. Derive `K_m(self_peer_id, seq)` for `seq ∈ [current_seq,
-   current_seq + N)`. Cache each in `key_secrets` keyed by a
-   compound id (see below). N = 1000 default.
-2. For each OTHER peer expected to send on this bundle: derive
-   `K_m(other_peer_id, seq)` for `seq ∈ [0, N)`. Cache.
-3. `secure_shred_blob` the K_bundle row from `key_secrets`.
+Under today's branch this happens too, and it's a real UX
+problem. The `retired_bundles` gate refuses re-hydration of
+K_bundle, so even if a late `key_rotation` arrives, Alice's local
+state stays retired. Messages in flight at delete time are
+dropped on the floor.
 
-Total pre-derived K_m's per peer: `P × N` where P = active peer
-count on frontier. At P = 10, N = 1000 → 10k K_m's × 32B = 320 KB
-per peer. Cheap.
+**Pre-derive fixes this.** Before the delete, Alice's rolling
+buffer already contained `K_m(Bob, S)` for S in Bob's expected
+range. When K_bundle is shredded on delete, the buffer survives.
+Alice decrypts M2 from her cached K_m row. No gap.
 
-Expected-peer list: derived from the bundle's frontier at the
-moment of provisioning. Members added later via `frontier_advance`
-may require a mid-bundle re-batch (see below).
+**Rolling buffer maintenance:**
 
-**Why this is a real FS win over random-salt:**
+At any moment, a peer maintains for each (other_peer, bundle):
+- Cached K_m's for observed seqs up to `observed_max_seq`
+- A pre-derived buffer for seqs `(observed_max_seq, observed_max_seq + N]`
 
-- **K_bundle lifetime is bounded to the pre-derive window.** Once
-  every peer on the frontier pre-derives and shreds, K_bundle does
-  not exist anywhere in the system except in ephemeral RAM during
-  the derivation.
-- **Attacker compromise post-pre-derive recovers only cached K_m's,
-  not K_bundle.** Cannot derive any K_m outside the cached set.
-- **Delete-triggered retirement has teeth at message granularity
-  without K_bundle shred being the lever.** Deletion of message X
-  shreds `K_m(sender_X, seq_X)`; attacker cannot re-derive because
-  no K_bundle anywhere.
-- **Strong-FS per-deleted-message, not just per-retired-bundle.**
+When a message arrives with seq > observed_max_seq:
+- Consume from the buffer.
+- Derive `observed_max_seq + N + 1` from K_bundle (still live) and
+  cache.
+- Advance observed_max_seq.
 
-Compare today's branch: K_bundle is alive on every active peer
-until delete-triggered retirement. Compromise during the bundle's
-lifetime = K_bundle leak = every K_m in that bundle recoverable.
-Under decision 10: attacker gets only pre-derived K_m's, and
-deleted messages' K_m rows are already shredded and gated.
+Buffer size N: tune based on how large a "in flight at delete
+time" window you want to protect. N = 64 covers ~most practical
+delete-race cases; N = 256 is paranoid. Per-peer cost: N × 32 B ×
+active peer count. At N=64, 10 peers → 20 KB per bundle. Cheap.
 
 **Caching identifier.**
 
-`K_m(peer_id, seq)` for bundle B needs a stable id. Two options:
+`K_m(peer_id, seq)` for bundle B needs a stable id:
 
-- **`(B, peer_id, seq)` tuple.** Store in a dedicated table, not in
-  `key_secrets`. Cleaner semantics, more refactoring.
-- **`k_m_id = blake3("fs-km-v1" ‖ bundle_id ‖ peer_id ‖ seq)`.**
-  Store in `key_secrets` keyed by this content-addressed id. Fits
-  the existing `key_secrets` schema. No new table needed.
+`k_m_id = blake3("fs-km-v1" ‖ bundle_id ‖ peer_id ‖ seq)`
 
-Recommend the content-addressed id (option 2). Then
-`MessageDeletion.message_key_event_id` (field from decision 6) IS
-`k_m_id`. Cascade and `retired_keys` gate work unchanged.
+Stored in `key_secrets` keyed by this content-addressed id. Fits
+the existing schema. `MessageDeletion.message_key_event_id` (field
+from decision 6) IS `k_m_id`. Cascade + `retired_keys` gate
+unchanged.
 
-**Mid-bundle re-batch.**
+**Why per-peer namespacing (not shared seq).**
 
-When `seq` approaches `current_seq + N`, peer needs K_bundle back
-to derive the next batch. Options:
+- **No coordination needed.** Each peer advances their own seq
+  without consulting others. Concurrent sends can't collide.
+- **Pre-derive is per-(peer, bundle) independent.** Alice's buffer
+  for Bob is populated by Alice alone; no need to sync with Bob.
+- **Per-peer revocation is implicit.** When Bob is removed from
+  the frontier, Alice simply stops refreshing Bob's buffer.
+  Already-cached entries get purged at retirement / bundle change.
 
-- **Publish a `key_request` with `target_kind=0, target=bundle_id`.**
-  Any holder who hasn't yet shredded (i.e., still in their
-  pre-derive window) or any holder who re-fetched for their own
-  batch can respond. After re-fetching, re-batch, shred K_bundle.
-- **Alternatively: rotate bundles more aggressively.** If N = 1000
-  messages per peer and bundles rotate per-frontier-advance, most
-  peers never hit re-batch. Re-batch is a cold path.
+**FS story — same as today, not strictly stronger.**
 
-Network effect: if all peers shred K_bundle simultaneously, a
-re-batch requires someone to re-fetch from a holder who hasn't
-shredded yet. For truly global shred (no one has K_bundle
-anywhere), re-batch is impossible → peer must await a fresh
-bundle (`frontier_advance`). Tradeoff: stronger FS vs. bounded
-message throughput per bundle per peer.
+- K_bundle lives for the full bundle lifetime. Attacker compromise
+  during that window = K_bundle leak = any K_m recoverable.
+  Same as today's weak-FS edge.
+- Delete-triggered retirement shreds K_bundle. Attacker compromise
+  post-delete = no K_bundle. Same as today.
+- Per-message granularity via `retired_keys` gate + ciphertext
+  shred. Same as decision 6/7.
+- Pre-derive buffer is NOT a FS weakener: it caches only K_m's
+  that K_bundle could already derive. An attacker who had K_bundle
+  (before delete) already has these. After delete, buffer survives
+  but only covers a bounded window; messages outside that window
+  are unrecoverable.
 
-Default N = 1000 gives roughly "one bundle = ~1000 messages per
-peer" which aligns with typical conversational cadence and
-natural rotation points.
+**What pre-derive ACTUALLY buys** is UX, not FS:
+- No messages lost during delete propagation.
+- Clean recovery from transient bundle-state-loss (e.g., DB
+  corruption on one peer while others still hold K_bundle — the
+  affected peer's pre-derive buffer can be re-seeded via
+  `key_request`).
 
-**Members added mid-bundle:**
-
-A new invite arriving on a bundle that's already pre-derived and
-shredded: some holder must re-fetch K_bundle to emit the
-per-slot K_m's for the new invite via trigger A. This is the
-re-batch case. Acceptable if holders don't shred too aggressively;
-pragmatic default is "shred K_bundle ~N seconds after pre-derive,
-giving a window for trigger-A work." Or: one designated holder
-keeps K_bundle longer (the admin / most-recently-active peer).
-
-**Per-message purge granularity (via decision 6):**
-
-`MessageDeletion` carries `message_key_event_id = k_m_id`. Cascade:
-```sql
-DELETE FROM key_secrets WHERE event_id = ?k_m_id;
-INSERT INTO retired_keys(?k_m_id);
--- K_bundle already shredded or soon will be; no separate action
--- needed for K_bundle unless this is the last live holder.
-```
-
-**What drops:**
+**What drops from the branch:**
 - `src/event_modules/message_key.rs` entirely (~400 LOC)
 - `message_keys` table
 - `messages_to_message_keys` reverse index
-- `message_key`'s dep chain entry; `message` deps directly on
-  a single KeySecret row keyed by `k_m_id`.
+- `message_key`'s dep chain; `message` deps directly on a single
+  `KeySecret` row keyed by `k_m_id`.
 
-**Per-peer storage delta (100k messages, 10 peers):** drops ~300k
-SQL rows + ~13 MB wire for `message_key` events. Adds ~320 KB
-pre-derived K_m cache per peer per bundle. Net win is still large.
+**Per-peer storage delta (100k messages, 10 peers):**
+- Drops ~300k SQL rows + ~13 MB wire for `message_key` events.
+- Adds ~20 KB pre-derive buffer per peer per active bundle.
+- Net win is still large.
 
 **Adoption optionality:**
 
-Decision 10 is the biggest structural change and the biggest FS
-improvement. Ship phases 1–9 first (conservative), then 10. Or
-ship 1–10 together if the team is comfortable with the wire break.
+Decision 10 is a large structural change but orthogonal to 1–9.
+Ship phases 1–9 first (conservative), then 10. Or ship together if
+the team is comfortable with the wire break.
 
 **Differs from the HKDF path the branch previously rejected:**
 
 Previous rejection was for bolting HKDF onto `message_key`. This
 shape:
-- Drops `message_key` entirely
-- Namespaces derivation by `(peer_id, seq)`
-- Pre-derives and shreds K_bundle for a real FS improvement
-- Pairs with decision 6's ids-in-deletion so per-message
-  granularity is preserved without `message_key`
+- Drops `message_key` entirely.
+- Namespaces derivation by `(peer_id, seq)`.
+- Adds a rolling pre-derive buffer to close the "messages lost in
+  flight at delete time" UX gap.
+- Pairs with decision 6's ids-in-deletion so per-message purge
+  granularity is preserved without `message_key`.
 
 Structurally different from the rejected path.
 
 **Open questions:**
 
-- Default N (pre-derive batch size). 1000 is a guess; depends on
-  message cadence. Too small → frequent re-batches; too large →
-  attacker recovers more K_m's on compromise.
-- K_bundle shred policy on holders (how long to wait before
-  shredding after pre-derive). Must be long enough for trigger A
-  to fire for mid-bundle invites, short enough to close the FS
-  window.
-- Should recipients pre-derive slots for all known peers, or only
-  "soon-likely" senders? Full pre-derive simpler; lazy pre-derive
-  saves storage at the cost of keeping K_bundle longer.
+- Default buffer size N. 64 is my guess; depends on worst-case
+  propagation latency for deletes + peer send rate.
+- Should the pre-derive buffer be wiped at delete-triggered
+  retirement, or retained? Retaining = longer grace window.
+  Wiping = tighter FS bound. Recommend retaining for a configurable
+  window (e.g., retain until buffer is fully consumed or
+  `retire_at_ms + grace` elapses).
+- Seq overflow. u32 seq = 4B messages per peer per bundle. Bundles
+  rotate on frontier_advance long before that. Non-issue.
 
 ---
 
@@ -798,12 +787,13 @@ Structurally different from the rejected path.
   finds no ciphertext for X, no cached K_m, and — if K_bundle was
   retired OR shredded post-pre-derive (decision 10) — no derivation
   path. X is unrecoverable.
-- **K_bundle ephemerality under decision 10:** K_bundle exists in
-  any peer's storage only during the brief pre-derive window.
-  Attacker compromising a peer at any OTHER time recovers only
-  pre-derived K_m's, not K_bundle, so cannot derive K_m's outside
-  the cache. This strengthens the FS boundary to per-cached-K_m
-  rather than per-bundle.
+- **Late-decrypt grace under decision 10:** K_bundle is NOT
+  shredded proactively (same as today). Delete-triggered
+  retirement still shreds K_bundle. But a rolling pre-derive
+  buffer of K_m's (per (peer, bundle)) survives K_bundle
+  retirement, so messages in flight from peers who didn't know
+  about the delete can still be decrypted. This is a UX improvement,
+  not an FS change — FS story is the same as today.
 - **Improvement over the current branch's bundle-granularity
   tradeoff for joiners.** Under v2, new joiners receive
   surviving-message K_m's via trigger A even when K_bundle is
