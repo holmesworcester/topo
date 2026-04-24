@@ -615,19 +615,22 @@ changes. But the multi-parent convergence invariants at
 
 ---
 
-### 10. KDF `K_m` with per-peer sequence + rolling pre-derive buffer
+### 10. KDF `K_m` with per-peer sequence + full-allotment pre-derive
 
 **What:** derive K_m from K_bundle via HKDF, namespaced by
 `(sender_peer_id, seq)`. Each peer owns their own seq counter per
-bundle. Peers maintain a rolling pre-derive buffer of the next N
-K_m's per (peer, bundle), refreshed as seq advances. Drops the
-`message_key` event entirely.
+bundle with a **per-peer send quota of N** enforced by the send
+path (seq = N triggers mandatory rotation via `frontier_advance`).
+At bundle provisioning, peers pre-derive **the full allotment** —
+N K_m's for every peer on the frontier — cache them, and are then
+free to decrypt any message under this bundle without K_bundle.
+Drops the `message_key` event entirely.
 
-**K_bundle is NOT shredded proactively.** It lives for the full
-bundle lifetime, exactly as today. Delete-triggered retirement is
-the shred trigger (decision 7 via self-contained MessageDeletion
-from decision 6). The pre-derive buffer exists for a specific UX
-reason, not an FS reason — see "Why pre-derive" below.
+**K_bundle stays alive through the bundle's natural lifetime.**
+Delete-triggered retirement shreds it (decision 7 via
+self-contained MessageDeletion from decision 6). The full-allotment
+pre-derive covers late-decrypt over arbitrarily long partitions —
+bounded by the rotation policy, not by a heuristic window size.
 
 **Derivation:**
 ```
@@ -649,42 +652,76 @@ No random salt needed — (peer_id, seq) gives uniqueness by
 construction. No collisions possible; sender's seq is monotonic
 in their own slot.
 
-**Why pre-derive (the late-decrypt grace window).**
+**Why pre-derive the full allotment (not a rolling buffer).**
 
 Scenario that motivates this: Alice deletes M1 at T. Her cascade
-retires K_bundle locally. Bob hasn't synced the delete yet; at
-T+ε he sends M2 under the same bundle, with `seq=S`. When Alice
-receives M2, her K_bundle is gone — she cannot derive
-`K_m(Bob, S)` from K_bundle. She can't decrypt M2 and M2 appears
-"lost" to her.
+retires K_bundle locally. Bob and Carol are in a long network
+partition. At T+ε, Bob and Carol continue sending under the same
+bundle — Bob sends msgs with seq = 47, 48, …, 312 before the
+partition heals. When the messages finally reach Alice, her
+K_bundle is gone — she cannot derive `K_m(Bob, S)` for any S she
+hasn't already cached.
 
-Under today's branch this happens too, and it's a real UX
-problem. The `retired_bundles` gate refuses re-hydration of
-K_bundle, so even if a late `key_rotation` arrives, Alice's local
-state stays retired. Messages in flight at delete time are
-dropped on the floor.
+A rolling buffer ("next 64 K_m's per sender") wouldn't cover this:
+by the time Alice saw seq=47, she'd only have 47..111 derived.
+Bob's 312 is outside the window.
 
-**Pre-derive fixes this.** Before the delete, Alice's rolling
-buffer already contained `K_m(Bob, S)` for S in Bob's expected
-range. When K_bundle is shredded on delete, the buffer survives.
-Alice decrypts M2 from her cached K_m row. No gap.
+**Full allotment fixes this.** Each peer has a send quota of N
+per bundle, enforced at send time (seq ≥ N → must rotate). So
+Bob's seq is *necessarily* in [0, N) for this bundle — any send
+beyond that forces Bob to publish a `frontier_advance` and switch
+to a new K_bundle. If Bob sent more than N under a given bundle,
+that's a protocol violation.
 
-**Rolling buffer maintenance:**
+If we pre-derive all N slots per peer at provisioning, Alice
+covers every possible sender seq under the current bundle
+regardless of partition length. No UX gap.
 
-At any moment, a peer maintains for each (other_peer, bundle):
-- Cached K_m's for observed seqs up to `observed_max_seq`
-- A pre-derived buffer for seqs `(observed_max_seq, observed_max_seq + N]`
+Today's branch drops these in-flight messages on the floor. This
+fixes it.
 
-When a message arrives with seq > observed_max_seq:
-- Consume from the buffer.
-- Derive `observed_max_seq + N + 1` from K_bundle (still live) and
-  cache.
-- Advance observed_max_seq.
+**Pre-derive at provisioning:**
 
-Buffer size N: tune based on how large a "in flight at delete
-time" window you want to protect. N = 64 covers ~most practical
-delete-race cases; N = 256 is paranoid. Per-peer cost: N × 32 B ×
-active peer count. At N=64, 10 peers → 20 KB per bundle. Cheap.
+At bundle provisioning (local rotation emit, or receipt of a
+`key_shared` that delivers K_bundle), each peer:
+
+1. For self: derive `K_m(self_peer_id, seq)` for `seq ∈ [0, N)`.
+   Cache each keyed by `k_m_id`.
+2. For each OTHER peer on the frontier: derive
+   `K_m(other_peer_id, seq)` for `seq ∈ [0, N)`. Cache.
+
+Total pre-derived K_m's per peer: `P × N` where P = frontier
+active peer count. At P=10, N=1000 → 10k K_m's × 32 B = 320 KB
+per peer per bundle. Fine.
+
+N is a policy parameter tied to rotation cadence. If the workspace
+rotates per frontier_advance (membership change), N can be
+generous (1000 or higher — bundles typically span membership
+stable periods). If more frequent rotation is desired, N is
+smaller. Workspace-configurable.
+
+**Send path enforces the quota.** Send wraps `next_seq` against
+N; if `next_seq == N`, sender must emit a `frontier_advance`
+rotation before proceeding. This bounds the pre-derive size and
+makes recipients' allotments definitive.
+
+**Mid-bundle peer addition (via `frontier_advance`):**
+
+A new peer joining mid-bundle needs their full allotment
+pre-derived too. Existing peers don't know about the new peer at
+provisioning. When a new `user_invite`/`device_invite` projects:
+- Trigger A fires (decision 5), emitting per-K_m `key_shared` for
+  each cached row.
+- Other peers, on seeing the new invite, pre-derive K_m's for
+  the new peer's allotment from K_bundle (still live) and cache.
+  Next `key_request` from the new peer's eph pubkey is served
+  from the cache.
+
+If K_bundle has already been delete-retired before the new peer
+arrives, the new peer gets surviving-message K_m's via
+trigger A only; they cannot receive K_m's for future sends in the
+retired bundle (but there shouldn't be any — the bundle is
+retired, forcing rotation on next send).
 
 **Caching identifier.**
 
@@ -736,10 +773,16 @@ unchanged.
 - `message_key`'s dep chain; `message` deps directly on a single
   `KeySecret` row keyed by `k_m_id`.
 
-**Per-peer storage delta (100k messages, 10 peers):**
+**Per-peer storage delta (100k messages, 10 peers, N=1000):**
 - Drops ~300k SQL rows + ~13 MB wire for `message_key` events.
-- Adds ~20 KB pre-derive buffer per peer per active bundle.
-- Net win is still large.
+- Adds ~320 KB pre-derive allotment per peer per bundle.
+- At typical usage (~1 bundle per 1000 messages), effective cost
+  is ~320 KB × 100 bundles = 32 MB across the history. Vs. the
+  dropped 13 MB + 300k rows → comparable storage, but we gain
+  message-granular FS, arbitrary-partition late-decrypt, and a
+  much simpler dep chain.
+- At small N (say N=256), storage win becomes unambiguous:
+  ~80 KB/bundle × 100 bundles = 8 MB total.
 
 **Adoption optionality:**
 
@@ -762,15 +805,40 @@ Structurally different from the rejected path.
 
 **Open questions:**
 
-- Default buffer size N. 64 is my guess; depends on worst-case
-  propagation latency for deletes + peer send rate.
-- Should the pre-derive buffer be wiped at delete-triggered
-  retirement, or retained? Retaining = longer grace window.
-  Wiping = tighter FS bound. Recommend retaining for a configurable
-  window (e.g., retain until buffer is fully consumed or
-  `retire_at_ms + grace` elapses).
-- Seq overflow. u32 seq = 4B messages per peer per bundle. Bundles
-  rotate on frontier_advance long before that. Non-issue.
+- **Default allotment N (per-peer send quota).** Workspace-
+  configurable. Tradeoff:
+  - Larger N → longer bundle lifetime, more storage pre-derived
+    upfront, less rotation churn.
+  - Smaller N → more frequent rotations, smaller pre-derive cost,
+    but more `frontier_advance` events on the wire.
+  Pick based on expected message cadence. 1000 is a reasonable
+  default for "one bundle ≈ one day of active chat."
+- **Optional aggressive K_bundle shred.** After pre-deriving the
+  full allotment, K_bundle is strictly unnecessary (every possible
+  K_m under it is already cached). Peers could shred K_bundle
+  locally immediately after pre-derive. This gives a stronger FS
+  story: K_bundle exists only during the pre-derive window, so
+  attacker compromise at any other time recovers only pre-derived
+  K_m's, not K_bundle.
+  Tradeoff: mid-bundle invites need some holder to still have
+  K_bundle to pre-derive for the new peer. So at least one holder
+  (admin, or "most-recently-active") keeps K_bundle alive until
+  all likely invites have arrived. Or: pre-derive is re-doable on
+  demand if any peer still has K_bundle.
+  Default: keep K_bundle alive for bundle lifetime (simpler),
+  revisit aggressive shred as a follow-up once 1–9 lands.
+- **Should the pre-derive cache be wiped at delete-triggered
+  retirement?** No. The whole point is the grace window. Retain
+  until the bundle's natural end (next rotation + grace).
+  Individual K_m rows are wiped via `retired_keys` on their own
+  message deletes.
+- **Seq overflow.** u32 seq = 4B messages per peer per bundle,
+  but the quota N caps this well below overflow. Non-issue.
+- **Cross-quota violation by byzantine peer.** A malicious peer
+  could send seq ≥ N anyway, producing messages with no
+  pre-derived K_m. These fail to decrypt; recipients log the
+  protocol violation. Byzantine handling is out of scope for FS
+  but worth noting for the spec.
 
 ---
 
@@ -787,13 +855,15 @@ Structurally different from the rejected path.
   finds no ciphertext for X, no cached K_m, and — if K_bundle was
   retired OR shredded post-pre-derive (decision 10) — no derivation
   path. X is unrecoverable.
-- **Late-decrypt grace under decision 10:** K_bundle is NOT
-  shredded proactively (same as today). Delete-triggered
-  retirement still shreds K_bundle. But a rolling pre-derive
-  buffer of K_m's (per (peer, bundle)) survives K_bundle
-  retirement, so messages in flight from peers who didn't know
-  about the delete can still be decrypted. This is a UX improvement,
-  not an FS change — FS story is the same as today.
+- **Arbitrary-partition late-decrypt under decision 10:** K_bundle
+  is shredded only at delete-triggered retirement (same as today).
+  But at bundle provisioning, peers pre-derive the full allotment
+  of N K_m's per (peer, bundle) — the rotation-policy cap on how
+  many messages a peer can send before forced rotation. This
+  allotment cache survives K_bundle retirement, covering
+  decryption of any in-flight message sent under the pre-delete
+  bundle regardless of partition length (bounded by N per peer).
+  Today's branch drops these messages on the floor.
 - **Improvement over the current branch's bundle-granularity
   tradeoff for joiners.** Under v2, new joiners receive
   surviving-message K_m's via trigger A even when K_bundle is
