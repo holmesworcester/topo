@@ -236,23 +236,32 @@ Two deterministic holder-side emission paths replace today's
 `key_history_bundle` bootstrap and today's invite-slot fanout in
 `key_rotation`.
 
-**Trigger A: "new invite for a frontier I have keys on."**
+**Trigger A: "new user discovered — emit to fill the gap."**
 
-Fires on: projection of `user_invite` or `device_invite`.
+Fires on: projection of `user_invite` or `device_invite` that
+introduces a peer_ref NOT already a member of the bundle's
+frontier at the bundle's creation time.
 
-Projector iterates EVERY `key_secrets` row the invite is entitled
-to — both K_bundle rows AND cached per-message K_m rows — and emits
-one `key_shared` per row targeting the invite pubkey:
+That new-user guard is the key refinement: if the invite's
+peer_ref was already in `frontier_members` for bundle B's frontier
+at B's creation, the invite already received K_bundle via the
+original trigger-B fanout; redundant emission is a waste. Only
+truly-new users need trigger A to fire.
+
+Projector iterates EVERY `key_secrets` row the NEW invite is
+entitled to — both K_bundle rows AND cached per-message K_m rows
+— and emits one `key_shared` per row targeting the invite pubkey:
 
 ```
-for each row in key_secrets where frontier_entitles(invite, row):
-   if row is a K_bundle:
-       emit key_shared(target=bundle_id,
-                       recipient=invite.pubkey)
-   else if row is a K_m:           // surviving msg in retired bundle
-       emit key_shared(target=message_event_id (or mkey_event_id),
-                       recipient=invite.pubkey)
-   via the deterministic construction from decision 3.
+if invite.peer_ref NOT IN frontier_members(bundle.frontier_ref):
+   for each row in key_secrets where frontier_entitles(invite, row):
+      if row is a K_bundle:
+          emit key_shared(target=bundle_id,
+                          recipient=invite.pubkey)
+      else if row is a K_m:           // surviving msg in retired bundle
+          emit key_shared(target=message_event_id (or mkey_event_id),
+                          recipient=invite.pubkey)
+      via the deterministic construction from decision 3.
 ```
 
 Entitlement check = decision 8's SQL query.
@@ -277,20 +286,27 @@ construction → every holder emits the same event → on-wire dedupe
 reduces this by the number of holders emitting, so effective wire
 cost is ~155 KB × 1k = 155 KB for that joiner set, not 5k × 155 B.
 
-**Trigger B: "new bundle, I should seed it to active invites."**
+**Trigger B: "new bundle created — seed it to every member of the
+bundle's frontier."**
 
-Fires on: projection of `KeySecret(K_bundle)` (or
-`frontier_advance`, since the advance pins a new bundle_id).
+Fires on: projection of `KeySecret(K_bundle)` (or, equivalently, on
+projection of `frontier_advance` which pins the new bundle_id).
 
 Projector side-effect:
 ```
-for each active invite_pubkey in this frontier's invite tables where
-      frontier_entitles(invite, new_bundle_id):
-   emit key_shared(target=new_bundle_id, recipient=invite.pubkey).
+for each peer_ref in frontier_members(new_bundle.frontier_ref):
+   if peer_ref resolves to an invite with pubkey,
+      or to a peer_shared with a wrap pubkey:
+      emit key_shared(target=new_bundle_id,
+                      recipient=resolved_pubkey).
 ```
 
-Replaces `active_rotation_recipients_for_frontier`'s current invite-
-slot special case.
+Fires once per new bundle. After this, trigger A handles the
+post-bundle incremental case (new users discovered later).
+
+Replaces `active_rotation_recipients_for_frontier`'s current
+invite-slot special case AND the recipient-slot packing in
+`key_rotation`.
 
 **Trigger C (implicit): response to explicit `key_request`.**
 
@@ -499,23 +515,47 @@ rehydration. Both gates consulted on every `key_secrets` insert.
 
 ---
 
-### 8. Entitlement predicate as SQL query
+### 8. Frontier is a full membership state, queried by SQL
 
-**The problem v1 had:** predicate was "present in invite tables and
-not tombstoned." Codex flagged this at
+**The concept:** a "frontier" at a given DAG position is the full
+membership state at that point — both the set of known members AND
+the set of removed peers. Today's branch has "removal frontier"
+terminology, which is a narrow view. Under v2 the frontier is
+the complete state tuple.
+
+Why the broader framing matters: trigger A/B emission logic needs
+to know "was this user known to bundle B's frontier at B's
+creation time?" If yes, they already received K_bundle at
+provisioning; we don't need to emit again. If no, emit. This is
+decision 5's trigger-A refinement — see the membership-based
+guard below.
+
+**The problem v1 had:** entitlement predicate was "present in
+invite tables and not tombstoned." Codex flagged this at
 `FS_ALT_CONVERGENT_WRAP_DESIGN.md:420-424` as weaker than today's
 walk-the-frontier-and-removal-lineage check at
 `identity_ops.rs:419-467` and `key_repair.rs:799-887`.
 
-**Fix:** materialize a flat set at projection time, query it with a
-single-row lookup.
+**Fix:** materialize both sets as flat tables at projection time;
+query with single-row lookups. The frontier is two coordinated
+tables, not one.
 
 **Schema (new):**
 ```sql
-CREATE TABLE frontier_removed_peers (
+CREATE TABLE frontier_members (
     recorded_by TEXT NOT NULL,
     frontier_ref TEXT NOT NULL,       -- frontier_advance event_id
     peer_ref TEXT NOT NULL,           -- peer/user/invite event_id
+    added_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (recorded_by, frontier_ref, peer_ref)
+);
+CREATE INDEX idx_frontier_members_by_peer
+    ON frontier_members (recorded_by, peer_ref, frontier_ref);
+
+CREATE TABLE frontier_removed_peers (
+    recorded_by TEXT NOT NULL,
+    frontier_ref TEXT NOT NULL,
+    peer_ref TEXT NOT NULL,
     removed_at_ms INTEGER NOT NULL,
     PRIMARY KEY (recorded_by, frontier_ref, peer_ref)
 );
@@ -524,38 +564,66 @@ CREATE INDEX idx_frontier_removed_by_peer
 ```
 
 **Populator:** `frontier_advance` projector (decision 9). For each
-`removed_peer_ref` in the event's `frontier_delta`, insert a row.
-Multi-parent frontier advances each populate independently; the set
-is the union.
+frontier_advance event at `event_id = F`:
+- For each `added_peer_ref` in the event's delta: insert row
+  `(F, added_peer_ref)` into `frontier_members`.
+- For each `removed_peer_ref`: insert row into
+  `frontier_removed_peers`.
+- Inherit members from each `prev_frontier_ref`: copy rows from
+  prior frontier whose peer isn't in this frontier's removed
+  delta. (Multi-parent: union over all parents.)
 
-**Predicate (reused throughout):**
+Cost: O(membership size) per frontier_advance. Amortized; frontier
+advances are infrequent relative to messages.
+
+**Predicates (reused throughout):**
 ```sql
+-- "is peer_ref a member at frontier_ref?"
+SELECT 1 FROM frontier_members
+ WHERE recorded_by = ?1 AND frontier_ref = ?2 AND peer_ref = ?3
+ LIMIT 1;
+
 -- "is peer_ref removed at frontier_ref?"
 SELECT 1 FROM frontier_removed_peers
  WHERE recorded_by = ?1 AND frontier_ref = ?2 AND peer_ref = ?3
  LIMIT 1;
 ```
 
-**Definitive negative:** because projection is complete before any
-query runs (standard projector invariant), absence of the row is
-proof of non-removal at that frontier. No lineage walk required.
+**Definitive answers:** because projection is complete before any
+query runs (standard projector invariant), absence / presence of
+a row is the ground truth.
 
 **Consulted by:**
 - `key_shared` responder side (trigger C) — check requester_peer_ref
-  against the bundle's frontier_ref.
-- Trigger A/B preemptive emits — check each candidate recipient
-  pubkey's binding peer_ref against the bundle's frontier_ref.
-- `key_repair.rs` heal responder (replaces the current lineage walk
+  against the bundle's frontier_ref (must be member, not removed).
+- Trigger A preemptive emits — check each candidate bundle's
+  frontier: if the new invite is NOT a member of the bundle's
+  frontier, they're genuinely new → emit. If they ARE (shouldn't
+  happen for a fresh invite, but possible for a re-issued invite
+  or multi-device invite matching an existing member), skip.
+- Trigger B preemptive emits — at bundle creation, enumerate
+  frontier_members of the bundle's frontier → emit key_shared for
+  each. Post-creation, no-op (the bundle's membership was sealed
+  at creation).
+- `key_repair.rs` heal responder (replaces the lineage walk
   at `:799-887`).
+
+**Trigger refinement "emit only on new-user discovery":**
+under v2, trigger B fires once (at bundle creation) for the full
+member set of that bundle's frontier. After that, only trigger A
+fires — and only when a new invite / new user appears that wasn't
+in the bundle's frontier at creation. This avoids redundant
+emissions to users who already received K_bundle via the initial
+trigger-B fanout or via the bundle's own announcement path.
 
 **Frontier resolution helper (unchanged from TLA+ `ResolveNet`):** a
 bundle's frontier_ref is read from its `frontier_advance` event
-(decision 9), OR from the current branch's `key_rotations`/
+(decision 9), OR from the current branch's `key_rotations` /
 `removal`-chain join during the transition period.
 
 ---
 
-### 9. `frontier_advance` merges `removal` + `key_rotation`
+### 9. `frontier_advance` merges `removal` + `key_rotation`, carries full membership deltas
 
 **What:** one admin-signed event that declares a new frontier and
 pins a new K_bundle atomically.
@@ -577,9 +645,17 @@ frontier_advance {
 prefixed, capped.)
 
 **Semantics:**
-- `added_peers` — new members. Triggers trigger A equivalents for
-  their pubkeys over historical bundles (if they're entitled).
-- `removed_peers` — populates `frontier_removed_peers` (decision 8).
+- `added_peers` — new members. Projector inserts rows into
+  `frontier_members` for this new frontier_ref and each added
+  peer. Trigger A may fire for each if not already covered by
+  prior frontier.
+- `removed_peers` — projector inserts rows into
+  `frontier_removed_peers`.
+- Inherited membership: projector also copies forward each
+  `prev_frontier_ref`'s `frontier_members` rows minus any peer
+  in `removed_peers`. This makes `frontier_members(F)` the full
+  membership snapshot at F without requiring a lineage walk at
+  query time.
 - `bundle_id` — new K_bundle's content-addressed id. Declares the
   canonical name for the fresh bundle.
 
