@@ -20,10 +20,14 @@ use crate::event_modules::removal::{
     canonicalize_frontier_refs, frontier_hash_from_refs, frontier_refs_from_slots,
     MAX_REMOVAL_FRONTIER_REFS,
 };
+use crate::event_modules::workspace::wrap_plans::{
+    decide_rotation_recipient_authorization_plan, planned_key_history_recipient_public_key,
+    planned_rotation_recipient_slots_prefix, RotationRecipientAuthorizationDecisionContext,
+    RotationRecipientAuthorizationPlan,
+};
 use crate::event_modules::*;
 use crate::projection::create::{
-    create_event, create_signed_event, event_id_or_blocked,
-    store_signed_event_then_project,
+    create_event, create_signed_event, event_id_or_blocked, store_signed_event_then_project,
 };
 use crate::projection::encrypted::wrap_key_for_recipient;
 use crate::state::db::queue::current_timestamp_ms_u64;
@@ -47,7 +51,7 @@ struct KeyRotationSummary {
 }
 
 #[derive(Debug, Clone)]
-struct RotationRecipient {
+struct AuthorizedRotationRecipient {
     recipient_event_id: EventId,
     public_key: [u8; 32],
 }
@@ -306,7 +310,8 @@ fn removed_member_refs_for_frontier(
         if !visited.insert(removal_event_id) {
             continue;
         }
-        let Some((removed_member_ref, parents)) = removal_row(conn, recorded_by, &removal_event_id)?
+        let Some((removed_member_ref, parents)) =
+            removal_row(conn, recorded_by, &removal_event_id)?
         else {
             continue;
         };
@@ -321,8 +326,7 @@ pub(crate) fn peer_shared_removal_refs(
     conn: &Connection,
     peer_shared_event_id: &EventId,
     user_event_id: Option<EventId>,
-) -> Result<Option<std::collections::BTreeSet<EventId>>, Box<dyn std::error::Error + Send + Sync>>
-{
+) -> Result<Option<std::collections::BTreeSet<EventId>>, Box<dyn std::error::Error + Send + Sync>> {
     let peer_shared_event_id_b64 = event_id_to_base64(peer_shared_event_id);
     let peer_shared_blob: Option<Vec<u8>> = conn
         .query_row(
@@ -397,7 +401,7 @@ fn active_rotation_recipients_for_frontier(
     conn: &Connection,
     recorded_by: &str,
     frontier_refs: &[EventId],
-) -> Result<Vec<RotationRecipient>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<AuthorizedRotationRecipient>, Box<dyn std::error::Error + Send + Sync>> {
     let removed = removed_member_refs_for_frontier(conn, recorded_by, frontier_refs)?;
     let mut stmt = conn.prepare(
         "SELECT event_id, user_event_id, public_key
@@ -428,13 +432,33 @@ fn active_rotation_recipients_for_frontier(
         let Some(removal_refs) =
             peer_shared_removal_refs(conn, &recipient_event_id, user_event_id)?
         else {
+            debug_assert!(
+                matches!(
+                    decide_rotation_recipient_authorization_plan(
+                        &RotationRecipientAuthorizationDecisionContext {
+                            has_peer_pedigree: false,
+                            touches_removed_member: false,
+                        },
+                    ),
+                    RotationRecipientAuthorizationPlan::ExcludeMissingPedigree
+                ),
+                "missing peer pedigree may not authorize a rotation recipient"
+            );
             continue;
         };
-        if removal_refs.iter().any(|removed_ref| removed.contains(removed_ref)) {
+        let plan = decide_rotation_recipient_authorization_plan(
+            &RotationRecipientAuthorizationDecisionContext {
+                has_peer_pedigree: true,
+                touches_removed_member: removal_refs
+                    .iter()
+                    .any(|removed_ref| removed.contains(removed_ref)),
+            },
+        );
+        if !matches!(plan, RotationRecipientAuthorizationPlan::Include) {
             continue;
         }
         let public_key = parse_blob_event_id(public_key_blob, "peers_shared.public_key")?;
-        recipients.push(RotationRecipient {
+        recipients.push(AuthorizedRotationRecipient {
             recipient_event_id,
             public_key,
         });
@@ -559,12 +583,10 @@ fn create_key_history_event_for_public_key(
         recorded_by,
         history_cap,
     )?)?;
-    let (nonce, ciphertext, auth_tag) = encrypt_bundle_for_recipient(
-        signer_key,
-        &recipient_vk,
-        &plaintext,
-    )
-    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.to_string().into() })?;
+    let (nonce, ciphertext, auth_tag) =
+        encrypt_bundle_for_recipient(signer_key, &recipient_vk, &plaintext).map_err(
+            |err| -> Box<dyn std::error::Error + Send + Sync> { err.to_string().into() },
+        )?;
     let event = ParsedEvent::KeyHistory(KeyHistoryEvent {
         created_at_ms,
         recipient_public_key: *recipient_public_key,
@@ -572,6 +594,18 @@ fn create_key_history_event_for_public_key(
         ciphertext,
         auth_tag,
     });
+    #[cfg(debug_assertions)]
+    {
+        let planned_recipient_public_key =
+            planned_key_history_recipient_public_key(recipient_public_key);
+        let ParsedEvent::KeyHistory(history) = &event else {
+            unreachable!("key history builder always constructs a key_history event");
+        };
+        debug_assert_eq!(
+            history.recipient_public_key, planned_recipient_public_key,
+            "runtime key_history recipient_public_key diverged from verified wrap target core"
+        );
+    }
     Ok(create_signed_event(
         conn,
         recorded_by,
@@ -588,9 +622,8 @@ fn existing_rotation_for_frontier(
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
     let slots = slotted_frontier_refs(frontier_refs)?;
     let frontier_hash = frontier_hash_from_refs(frontier_refs);
-    conn
-        .query_row(
-            "SELECT event_id
+    conn.query_row(
+        "SELECT event_id
              FROM key_rotations
              WHERE recorded_by = ?1
                AND frontier_hash = ?2
@@ -601,28 +634,28 @@ fn existing_rotation_for_frontier(
                AND frontier_ref_4 = ?7
              ORDER BY rowid DESC
              LIMIT 1",
-            rusqlite::params![
-                recorded_by,
-                event_id_to_base64(&frontier_hash),
-                frontier_refs.len() as i64,
-                event_id_to_base64(&slots[0]),
-                event_id_to_base64(&slots[1]),
-                event_id_to_base64(&slots[2]),
-                event_id_to_base64(&slots[3]),
-            ],
-            |row| crate::db::sql_types::get_text(row, 0),
-        )
-        .optional()?
-        .map(|existing| parse_event_id_b64(&existing, "key_rotations.event_id"))
-        .transpose()
+        rusqlite::params![
+            recorded_by,
+            event_id_to_base64(&frontier_hash),
+            frontier_refs.len() as i64,
+            event_id_to_base64(&slots[0]),
+            event_id_to_base64(&slots[1]),
+            event_id_to_base64(&slots[2]),
+            event_id_to_base64(&slots[3]),
+        ],
+        |row| crate::db::sql_types::get_text(row, 0),
+    )
+    .optional()?
+    .map(|existing| parse_event_id_b64(&existing, "key_rotations.event_id"))
+    .transpose()
 }
 
-pub(crate) fn create_key_rotation_event_with_selected_recipients_at(
+fn create_key_rotation_event_for_authorized_recipients_at(
     conn: &Connection,
     recorded_by: &str,
     frontier_refs: &[EventId],
     key_bytes: [u8; 32],
-    recipient_keys: &[(EventId, [u8; 32])],
+    recipient_keys: &[AuthorizedRotationRecipient],
     created_at_ms: u64,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let authoring =
@@ -641,21 +674,37 @@ pub(crate) fn create_key_rotation_event_with_selected_recipients_at(
     let mut recipient_slots = Vec::with_capacity(KEY_ROTATION_CAP);
     let mut wrapped_keys = Vec::with_capacity(KEY_ROTATION_CAP);
 
-    for (recipient_event_id, public_key) in recipient_keys {
-        let recipient_vk = VerifyingKey::from_bytes(public_key)
+    for recipient in recipient_keys {
+        let recipient_vk = VerifyingKey::from_bytes(&recipient.public_key)
             .map_err(|err| format!("invalid peer_shared public key: {err}"))?;
-        recipient_slots.push(*recipient_event_id);
+        recipient_slots.push(recipient.recipient_event_id);
         wrapped_keys.push(wrap_key_for_recipient(
             &authoring.signing_key,
             &recipient_vk,
             &key_bytes,
         ));
     }
+    #[cfg(debug_assertions)]
+    {
+        let recipient_ids = recipient_keys
+            .iter()
+            .map(|recipient| recipient.recipient_event_id)
+            .collect::<Vec<_>>();
+        let planned_prefix = planned_rotation_recipient_slots_prefix(&recipient_ids);
+        debug_assert_eq!(
+            &recipient_slots[..planned_prefix.len()],
+            planned_prefix.as_slice(),
+            "runtime key_rotation recipient prefix diverged from verified wrap target core"
+        );
+    }
     while recipient_slots.len() < KEY_ROTATION_CAP {
         let chaff_key = SigningKey::generate(&mut rng);
         let mut chaff_recipient_id = [0u8; 32];
         rng.fill_bytes(&mut chaff_recipient_id);
-        if recipient_slots.iter().any(|existing| *existing == chaff_recipient_id) {
+        if recipient_slots
+            .iter()
+            .any(|existing| *existing == chaff_recipient_id)
+        {
             continue;
         }
         let mut dummy_key = [0u8; 32];
@@ -689,6 +738,33 @@ pub(crate) fn create_key_rotation_event_with_selected_recipients_at(
     )?)
 }
 
+pub(crate) fn create_key_rotation_event_with_selected_recipients_at(
+    conn: &Connection,
+    recorded_by: &str,
+    frontier_refs: &[EventId],
+    key_bytes: [u8; 32],
+    recipient_keys: &[(EventId, [u8; 32])],
+    created_at_ms: u64,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    let authorized = recipient_keys
+        .iter()
+        .map(
+            |(recipient_event_id, public_key)| AuthorizedRotationRecipient {
+                recipient_event_id: *recipient_event_id,
+                public_key: *public_key,
+            },
+        )
+        .collect::<Vec<_>>();
+    create_key_rotation_event_for_authorized_recipients_at(
+        conn,
+        recorded_by,
+        frontier_refs,
+        key_bytes,
+        &authorized,
+        created_at_ms,
+    )
+}
+
 fn create_key_rotation_event_with_key_bytes_at(
     conn: &Connection,
     recorded_by: &str,
@@ -697,16 +773,12 @@ fn create_key_rotation_event_with_key_bytes_at(
     created_at_ms: u64,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let recipients = active_rotation_recipients_for_frontier(conn, recorded_by, frontier_refs)?;
-    let recipient_keys = recipients
-        .iter()
-        .map(|recipient| (recipient.recipient_event_id, recipient.public_key))
-        .collect::<Vec<_>>();
-    create_key_rotation_event_with_selected_recipients_at(
+    create_key_rotation_event_for_authorized_recipients_at(
         conn,
         recorded_by,
         frontier_refs,
         key_bytes,
-        &recipient_keys,
+        &recipients,
         created_at_ms,
     )
 }
@@ -1063,7 +1135,8 @@ pub(crate) fn ensure_content_key_for_peer_at(
     }
     if frontier_refs.is_empty() {
         if let Some(existing) = latest_materialized_key_for_peer(conn, recorded_by)? {
-            if let Some(existing_rotation) = existing_rotation_for_frontier(conn, recorded_by, &[])? {
+            if let Some(existing_rotation) = existing_rotation_for_frontier(conn, recorded_by, &[])?
+            {
                 return Ok(existing_rotation);
             }
             let key_bytes = load_key_secret_bytes(conn, recorded_by, &existing)?;

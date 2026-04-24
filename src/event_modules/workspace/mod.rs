@@ -13,6 +13,7 @@ pub mod invite_link;
 pub mod projector;
 pub mod queries;
 pub mod wire;
+mod wrap_plans;
 
 // Re-export stable public API so callers import from `event_modules::workspace`.
 pub use authoring::{load_local_authoring_context, LocalAuthoringContext};

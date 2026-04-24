@@ -89,6 +89,49 @@ fn encrypted_wrapper_key_event_id(
     }
 }
 
+fn load_parsed_event(conn: &rusqlite::Connection, event_id: &EventId) -> ParsedEvent {
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![event_id_to_base64(event_id)],
+            |row| crate::db::sql_types::get_blob(row, 0),
+        )
+        .expect("load event blob");
+    parse_event(&blob).expect("parse event blob")
+}
+
+fn key_rotation_recipient_slots(
+    conn: &rusqlite::Connection,
+    key_rotation_event_id: &EventId,
+) -> Vec<EventId> {
+    match load_parsed_event(conn, key_rotation_event_id) {
+        ParsedEvent::KeyRotation(rotation) => rotation.recipient_slots,
+        ParsedEvent::Signed(signed) => {
+            match parse_event(&signed.payload).expect("parse signed key_rotation payload") {
+                ParsedEvent::KeyRotation(rotation) => rotation.recipient_slots,
+                other => panic!("expected signed key_rotation payload, got {:?}", other),
+            }
+        }
+        other => panic!("expected key_rotation event, got {:?}", other),
+    }
+}
+
+fn user_invite_key_history_and_public_key(
+    conn: &rusqlite::Connection,
+    invite_event_id: &EventId,
+) -> (EventId, [u8; 32]) {
+    match load_parsed_event(conn, invite_event_id) {
+        ParsedEvent::UserInvite(invite) => (invite.key_history_event_id, invite.public_key),
+        ParsedEvent::Signed(signed) => {
+            match parse_event(&signed.payload).expect("parse signed user_invite payload") {
+                ParsedEvent::UserInvite(invite) => (invite.key_history_event_id, invite.public_key),
+                other => panic!("expected signed user_invite payload, got {:?}", other),
+            }
+        }
+        other => panic!("expected user_invite event, got {:?}", other),
+    }
+}
+
 #[test]
 fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
     let conn = open_in_memory().expect("open in-memory db");
@@ -494,15 +537,10 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
     let workspace =
         create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
     let creator_peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
-    let creator_user_eid: EventId = conn
-        .query_row(
-            "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
-            rusqlite::params![&creator_peer_id],
-            |row| crate::db::sql_types::get_text(row, 0),
-        )
-        .ok()
-        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
-        .expect("creator user event");
+    let creator_user_eid =
+        crate::event_modules::workspace::load_local_authoring_context(&conn, &creator_peer_id)
+            .expect("load local authoring context")
+            .author_id;
     let content_key_event_id =
         crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
             &conn,
@@ -645,6 +683,63 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
 }
 
 #[test]
+fn create_user_invite_targets_key_history_to_invite_public_key() {
+    let conn = open_in_memory().expect("open in-memory db");
+    create_tables(&conn).expect("create tables");
+    materialize_local_daemon_identity(&conn);
+
+    let workspace =
+        create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
+    let creator_peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
+    let creator_admin_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator admin event");
+
+    let invite = create_user_invite_raw(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_key,
+        &workspace.peer_shared_event_id,
+        &creator_admin_eid,
+        &workspace.workspace_id,
+    )
+    .expect("create invite");
+
+    let (key_history_event_id, invite_public_key) =
+        user_invite_key_history_and_public_key(&conn, &invite.invite_event_id);
+    assert_ne!(
+        key_history_event_id,
+        crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
+        "live user invite path should emit a key_history event for the invite target"
+    );
+
+    let history = match load_parsed_event(&conn, &key_history_event_id) {
+        ParsedEvent::KeyHistory(history) => history,
+        ParsedEvent::Signed(signed) => {
+            match parse_event(&signed.payload).expect("parse signed key_history payload") {
+                ParsedEvent::KeyHistory(history) => history,
+                other => panic!("expected signed key_history payload, got {:?}", other),
+            }
+        }
+        other => panic!("expected key_history event, got {:?}", other),
+    };
+    assert_eq!(
+        history.recipient_public_key, invite_public_key,
+        "key_history must target the exact public key embedded in the authored invite"
+    );
+    assert_ne!(
+        history.recipient_public_key, [0xCD; 32],
+        "key_history may not drift to an unrelated public key"
+    );
+}
+
+#[test]
 fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
@@ -752,5 +847,105 @@ fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
         encrypted_wrapper_key_event_id(&conn, &second_post_removal_wrapper),
         frontier_key,
         "once a key exists for the current frontier, later sends should reuse it"
+    );
+}
+
+#[test]
+fn post_removal_key_rotation_excludes_removed_peer_from_real_recipient_slots() {
+    let conn = open_in_memory().expect("open in-memory db");
+    create_tables(&conn).expect("create tables");
+    materialize_local_daemon_identity(&conn);
+
+    let workspace =
+        create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
+    let creator_peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
+    let creator_admin_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator admin event");
+
+    let invite = create_user_invite_raw(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_key,
+        &workspace.peer_shared_event_id,
+        &creator_admin_eid,
+        &workspace.workspace_id,
+    )
+    .expect("create invite");
+
+    let bob_key = SigningKey::from_bytes(&[7u8; 32]);
+    let bob_peer_id = peer_id_for_signing_key(&bob_key);
+    record_invite_link_workspace(
+        &conn,
+        &bob_peer_id,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+    );
+    let join = join_workspace_as_new_user(
+        &conn,
+        &bob_peer_id,
+        &invite.invite_key,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+        "bob",
+        "tablet",
+        bob_key,
+    )
+    .expect("join workspace");
+    persist_join_peer_secret(&conn, &bob_peer_id, &join).expect("persist peer secret");
+
+    let _root_key = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+        &conn,
+        &creator_peer_id,
+    )
+    .expect("root content key");
+    let creator_user_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator user event");
+
+    let _removal_event_id = create_local_removal(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        join.user_event_id,
+        &[],
+    );
+
+    let wrapper_event_id = crate::event_modules::message::commands::create(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        11_000,
+        crate::event_modules::message::commands::CreateMessageCmd {
+            workspace_id: workspace.workspace_id,
+            author_id: creator_user_eid,
+            content: "after-removal".to_string(),
+        },
+    )
+    .expect("create message after removal");
+    let frontier_key_event_id = encrypted_wrapper_key_event_id(&conn, &wrapper_event_id);
+    let recipient_slots = key_rotation_recipient_slots(&conn, &frontier_key_event_id);
+
+    assert!(
+        recipient_slots.contains(&workspace.peer_shared_event_id),
+        "sender's active peer_shared signer should stay in the real recipient set"
+    );
+    assert!(
+        !recipient_slots.contains(&join.peer_shared_event_id),
+        "removed peer_shared recipient may not stay in the live key_rotation recipient set"
     );
 }
