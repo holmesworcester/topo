@@ -236,22 +236,46 @@ Two deterministic holder-side emission paths replace today's
 `key_history_bundle` bootstrap and today's invite-slot fanout in
 `key_rotation`.
 
-**Trigger A: "new invite for a frontier I have bundles on."**
+**Trigger A: "new invite for a frontier I have keys on."**
 
 Fires on: projection of `user_invite` or `device_invite`.
 
-Projector side-effect (new command):
+Projector iterates EVERY `key_secrets` row the invite is entitled
+to — both K_bundle rows AND cached per-message K_m rows — and emits
+one `key_shared` per row targeting the invite pubkey:
+
 ```
-for each bundle_id in local `key_secrets` (K_bundle rows only) where
-      frontier_entitles(invite, bundle_id):
-   emit key_shared(target=bundle_id, recipient=invite.pubkey)
-      via the deterministic construction from decision 3.
+for each row in key_secrets where frontier_entitles(invite, row):
+   if row is a K_bundle:
+       emit key_shared(target=bundle_id,
+                       recipient=invite.pubkey)
+   else if row is a K_m:           // surviving msg in retired bundle
+       emit key_shared(target=message_event_id (or mkey_event_id),
+                       recipient=invite.pubkey)
+   via the deterministic construction from decision 3.
 ```
 
 Entitlement check = decision 8's SQL query.
 
-Replaces `key_history_bundle`. Naturally skips retired bundles: they
-are absent from `key_secrets` (purged by the cascade).
+Replaces `key_history_bundle` AND seeds joiners with surviving K_m's
+for messages under retired bundles. K_m rows whose bundle is retired
+still exist on members who decrypted before the retirement; trigger
+A enumerates them and forwards to the joiner's invite pubkey. The
+joiner receives per-K_m `key_shared` events, unwraps, caches, and
+can decrypt the surviving messages directly.
+
+This means joiners **DO** see surviving messages in retired bundles.
+That improves on the current branch's
+`joiner_after_bundle_retirement_sees_undeleted_tail_as_history_lost`
+test, which would become obsolete under v2 — it'd be replaced by
+`joiner_sees_surviving_messages_in_retired_bundles`.
+
+Cost: N per-K_m `key_shared` events per new invite for a retired
+bundle with N surviving messages. Each event is ~155 bytes. 1k
+survivors × 5 invites = 5k events = ~775 KB wire. Deterministic
+construction → every holder emits the same event → on-wire dedupe
+reduces this by the number of holders emitting, so effective wire
+cost is ~155 KB × 1k = 155 KB for that joiner set, not 5k × 155 B.
 
 **Trigger B: "new bundle, I should seed it to active invites."**
 
@@ -337,22 +361,19 @@ recovery.
 **No new trigger needed.** Trigger C already handles explicit
 requests; we just broaden `target_kind` to include K_m ids.
 
-**What this does NOT cover (by design):**
+**Joiner case is covered by trigger A, not by key_request.**
 
-New joiners who arrive *after* K_bundle retirement cannot decrypt
-surviving messages in retired bundles. This is today's documented
-FS tradeoff: "strong-FS at bundle granularity for joiners."
-Preserved in v2. Test:
-`joiner_after_bundle_retirement_sees_undeleted_tail_as_history_lost`
-at `src/state/projection/apply/tests/per_message_fs.rs:597-658`.
+New joiners don't need to publish explicit `key_request`s for
+surviving K_m's — trigger A (decision 5) iterates every
+`key_secrets` row and emits per-K_m `key_shared` events targeted
+at the invite pubkey. So joiners DO see surviving messages in
+retired bundles.
 
-If we wanted joiners to see surviving messages in retired bundles,
-we'd extend trigger A to enumerate cached K_m's for surviving
-messages under retired bundles and emit per-K_m `key_shared` to
-the invite pubkey. Not currently in scope — would be a separate
-decision. The tradeoff: N per-K_m events per joiner per retired
-bundle vs. a cleaner "joiners don't see retired-bundle survivors"
-invariant.
+The explicit `key_request` path here (target_kind = 2 or 3) is for
+established members who already unwrapped once but lost local
+cache state (device wipe, DB corruption, multi-device sync gap).
+Trigger A doesn't fire for them because they're not a new invite;
+they need the request/response path.
 
 ---
 
@@ -669,16 +690,24 @@ event carrying it.
 
 ---
 
-## FS guarantees (unchanged from v1)
+## FS guarantees
 
 - Delete-triggered K_bundle retirement: `retired_bundles` gate
   refuses rehydration post-delete.
 - Per-K_m purge: `retired_keys` gate at per-message granularity.
 - Weak-FS edge for retain-then-compromise attacker: accepted, same
   as today.
-- Strong-FS for no-retention attacker: holds at bundle granularity;
-  at message granularity when the delete cascade shreds the cached
-  K_m row before compromise.
+- Strong-FS for no-retention attacker: holds at message granularity.
+  Deletion of message X retires `X.K_m` via `retired_keys` and
+  purges X's ciphertext; an attacker compromising a peer post-delete
+  finds no ciphertext for X, no cached K_m, and — if K_bundle was
+  retired — no derivation path. X is unrecoverable.
+- **Improvement over the current branch's bundle-granularity
+  tradeoff for joiners.** Under v2, new joiners receive
+  surviving-message K_m's via trigger A even when K_bundle is
+  retired. So the joiner-facing FS boundary is per-deleted-message,
+  not per-bundle. Deleted messages stay invisible to joiners;
+  surviving messages become visible. Today's branch drops both.
 
 ---
 
@@ -689,7 +718,7 @@ event carrying it.
 | `wrap_event` convergence broken (nonce + ciphertext emitter-dependent) | Decision 3: deterministic ephemeral sender keypair → byte-identical sealed box |
 | No canonical dep key | Decision 4: preserve `k_bundle_local_event_id` via existing deterministic KeySecret emit |
 | `retired_keys` is fiction | Decision 7: full schema + gate point + populator specified |
-| Trigger A dead-end for retired bundles | Decision 5: expected behavior per v1 (retired bundles absent from `key_secrets` intentionally); matches existing `joiner_after_bundle_retirement_sees_undeleted_tail_as_history_lost` test |
+| Trigger A dead-end for retired bundles | Decision 5: trigger A iterates ALL `key_secrets` rows (K_bundle AND per-message K_m), so joiners DO receive surviving K_m's under retired bundles. Fully resolves the gap AND *improves* on today's branch, which drops surviving messages for joiners. Obsoletes `joiner_after_bundle_retirement_sees_undeleted_tail_as_history_lost`; replace with `joiner_sees_surviving_messages_in_retired_bundles`. |
 | Entitlement predicate too weak | Decision 8: SQL-table query against materialized `frontier_removed_peers` |
 | `frontier_advance` linearization breaks multi-parent | Decision 9: `prev_frontier_refs: Vec`, flat set in `frontier_removed_peers`, union queries |
 | Factual errors about current branch (§1.1/§7.1/§7.4) | Acknowledged; the v1 doc's §1/§7 will be rewritten when this plan is executed |
