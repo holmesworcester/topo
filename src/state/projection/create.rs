@@ -92,6 +92,112 @@ impl CreateAttemptOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolvedCreateEncryptionKey {
+    key_event_id: EventId,
+    key_bytes: [u8; 32],
+}
+
+fn resolve_create_encryption_key(
+    conn: &Connection,
+    recorded_by: &str,
+    key_event_id: &EventId,
+) -> Result<ResolvedCreateEncryptionKey, CreateEventError> {
+    let key_b64 = event_id_to_base64(key_event_id);
+    let key_bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_b64],
+            |row| crate::db::sql_types::get_blob(row, 0),
+        )
+        .map_err(|e| CreateEventError::DbError(format!("key lookup: {}", e)))?;
+
+    if key_bytes.len() != 32 {
+        return Err(CreateEventError::EncodeError(format!(
+            "secret key wrong length: {}",
+            key_bytes.len()
+        )));
+    }
+
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&key_bytes);
+    Ok(ResolvedCreateEncryptionKey {
+        key_event_id: *key_event_id,
+        key_bytes: key_arr,
+    })
+}
+
+fn build_encrypted_wrapper_for_resolved_key(
+    resolved_key: &ResolvedCreateEncryptionKey,
+    owner_event_id: Option<&EventId>,
+    inner_event: &ParsedEvent,
+    inner_blob: &[u8],
+) -> Result<ParsedEvent, CreateEventError> {
+    let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&resolved_key.key_bytes, inner_blob)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let owner_event_id = owner_event_id.copied().unwrap_or(NO_OWNER_EVENT_ID);
+    let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
+        // Preserve the inner event's logical timestamp on the wrapper so
+        // recency-based discovery/sync policies can prioritize encrypted
+        // content by the user-visible event time without decrypting first.
+        created_at_ms: inner_event.created_at_ms(),
+        key_event_id: resolved_key.key_event_id,
+        owner_event_id,
+        inner_type_code: inner_event.event_type_code(),
+        nonce,
+        ciphertext,
+        auth_tag,
+    });
+
+    #[cfg(debug_assertions)]
+    {
+        use topo_verus_proofs::state::projection::create::build_encrypted_wrapper_core;
+
+        let ParsedEvent::Encrypted(enc) = &wrapper else {
+            unreachable!("build_encrypted_wrapper_for_resolved_key always builds Encrypted");
+        };
+        let plan = build_encrypted_wrapper_core(
+            inner_event.created_at_ms(),
+            &resolved_key.key_event_id,
+            &owner_event_id,
+            inner_event.event_type_code(),
+            &enc.nonce,
+            &enc.ciphertext,
+            &enc.auth_tag,
+        );
+        debug_assert_eq!(
+            enc.created_at_ms, plan.created_at_ms,
+            "runtime encrypted wrapper timestamp diverged from verified create core"
+        );
+        debug_assert_eq!(
+            enc.key_event_id, plan.key_event_id,
+            "runtime encrypted wrapper key_event_id diverged from verified create core"
+        );
+        debug_assert_eq!(
+            enc.owner_event_id, plan.owner_event_id,
+            "runtime encrypted wrapper owner_event_id diverged from verified create core"
+        );
+        debug_assert_eq!(
+            enc.inner_type_code, plan.inner_type_code,
+            "runtime encrypted wrapper inner_type_code diverged from verified create core"
+        );
+        debug_assert_eq!(
+            enc.nonce, plan.nonce,
+            "runtime encrypted wrapper nonce diverged from verified create core"
+        );
+        debug_assert_eq!(
+            enc.ciphertext, plan.ciphertext,
+            "runtime encrypted wrapper ciphertext diverged from verified create core"
+        );
+        debug_assert_eq!(
+            enc.auth_tag, plan.auth_tag,
+            "runtime encrypted wrapper auth_tag diverged from verified create core"
+        );
+    }
+
+    Ok(wrapper)
+}
+
 /// Extract event_id from Ok or Blocked (event is stored in both cases).
 /// Returns Err only for true failures (encode, db, rejected).
 ///
@@ -442,14 +548,7 @@ pub fn create_encrypted_event(
     inner_event: &ParsedEvent,
     signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
-    create_encrypted_event_with_owner(
-        conn,
-        recorded_by,
-        key_event_id,
-        None,
-        inner_event,
-        signer,
-    )
+    create_encrypted_event_with_owner(conn, recorded_by, key_event_id, None, inner_event, signer)
 }
 
 /// Create an encrypted event with optional outer owner linkage for convergent
@@ -483,52 +582,22 @@ pub fn create_encrypted_event_with_owner(
     let inner_blob = events::encode_event(inner_event)
         .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
 
-    // 2. Resolve encryption key from key_secrets table
-    let key_b64 = event_id_to_base64(key_event_id);
-    let key_bytes: Vec<u8> = conn
-        .query_row(
-            "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &key_b64],
-            |row| crate::db::sql_types::get_blob(row, 0),
-        )
-        .map_err(|e| CreateEventError::DbError(format!("key lookup: {}", e)))?;
-
-    if key_bytes.len() != 32 {
-        return Err(CreateEventError::EncodeError(format!(
-            "secret key wrong length: {}",
-            key_bytes.len()
-        )));
-    }
-    let mut key_arr = [0u8; 32];
-    key_arr.copy_from_slice(&key_bytes);
-
-    // 3. Encrypt
-    let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_arr, &inner_blob)
-        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
-
-    // 4. Build EncryptedEvent wrapper
-    let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
-        // Preserve the inner event's logical timestamp on the wrapper so
-        // recency-based discovery/sync policies can prioritize encrypted
-        // content by the user-visible event time without decrypting first.
-        created_at_ms: inner_event.created_at_ms(),
-        key_event_id: *key_event_id,
-        owner_event_id: owner_event_id.copied().unwrap_or(NO_OWNER_EVENT_ID),
-        inner_type_code: inner_event.event_type_code(),
-        nonce,
-        ciphertext,
-        auth_tag,
-    });
+    // 2. Resolve the requested KeySecret and build the wrapper from that exact
+    // resolved key. This keeps the "encrypt with requested key id, then write
+    // the same key id into the wrapper" seam explicit and proof-friendly.
+    let resolved_key = resolve_create_encryption_key(conn, recorded_by, key_event_id)?;
+    let wrapper = build_encrypted_wrapper_for_resolved_key(
+        &resolved_key,
+        owner_event_id,
+        inner_event,
+        &inner_blob,
+    )?;
 
     // 5. Store either the plaintext encrypted wrapper or Signed(Encrypted(inner)).
     match signer {
-        Some((signer_event_id, signing_key)) => create_signed_event(
-            conn,
-            recorded_by,
-            signer_event_id,
-            &wrapper,
-            signing_key,
-        ),
+        Some((signer_event_id, signing_key)) => {
+            create_signed_event(conn, recorded_by, signer_event_id, &wrapper, signing_key)
+        }
         None => create_event(conn, recorded_by, &wrapper),
     }
 }
@@ -803,8 +872,7 @@ mod tests {
             key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         let uib_eid =
-            create_signed_event(conn, recorded_by, &net_eid, &uib, &workspace_key)
-                .unwrap();
+            create_signed_event(conn, recorded_by, &net_eid, &uib, &workspace_key).unwrap();
 
         let user_key = SigningKey::generate(&mut rng);
         let ub = ParsedEvent::User(UserEvent {
@@ -812,8 +880,7 @@ mod tests {
             public_key: user_key.verifying_key().to_bytes(),
             username: "test-user".to_string(),
         });
-        let ub_eid =
-            create_signed_event(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
+        let ub_eid = create_signed_event(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
 
         let device_invite_key = SigningKey::generate(&mut rng);
         let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
@@ -822,8 +889,7 @@ mod tests {
             authority_event_id: ub_eid,
             key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
-        let dif_eid =
-            create_signed_event(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
+        let dif_eid = create_signed_event(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
 
         let endpoint_key = SigningKey::generate(&mut rng);
         let endpoint_event =
@@ -831,8 +897,7 @@ mod tests {
                 endpoint_key.to_bytes(),
             );
         let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
-        let endpoint_shared_event_id =
-            create_event(conn, &endpoint_id, &endpoint_event).unwrap();
+        let endpoint_shared_event_id = create_event(conn, &endpoint_id, &endpoint_event).unwrap();
 
         let peer_shared_key = SigningKey::generate(&mut rng);
         let psf = ParsedEvent::PeerShared(PeerSharedEvent {
@@ -843,8 +908,7 @@ mod tests {
             device_name: "test-device".to_string(),
         });
         let psf_eid =
-            create_signed_event(conn, recorded_by, &dif_eid, &psf, &device_invite_key)
-                .unwrap();
+            create_signed_event(conn, recorded_by, &dif_eid, &psf, &device_invite_key).unwrap();
         conn.execute(
             "INSERT INTO peer_secrets
              (recorded_by, event_id, signer_event_id, private_key, created_at)
@@ -860,6 +924,36 @@ mod tests {
         .unwrap();
 
         (psf_eid, peer_shared_key, ub_eid)
+    }
+
+    fn create_local_key_secret(
+        conn: &Connection,
+        recorded_by: &str,
+        key_bytes: [u8; 32],
+    ) -> EventId {
+        let event = crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes);
+        create_event(conn, recorded_by, &event).unwrap()
+    }
+
+    fn load_stored_encrypted_wrapper(conn: &Connection, event_id: &EventId) -> EncryptedEvent {
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![event_id_to_base64(event_id)],
+                |row| crate::db::sql_types::get_blob(row, 0),
+            )
+            .unwrap();
+        let parsed = crate::event_modules::parse_event(&blob).unwrap();
+        match parsed {
+            ParsedEvent::Encrypted(enc) => enc,
+            ParsedEvent::Signed(signed) => {
+                match crate::event_modules::parse_event(&signed.payload).unwrap() {
+                    ParsedEvent::Encrypted(enc) => enc,
+                    other => panic!("expected Signed(Encrypted(_)), got {other:?}"),
+                }
+            }
+            other => panic!("expected encrypted wrapper, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1066,9 +1160,8 @@ mod tests {
             content: "signed content".to_string(),
         });
 
-        let err =
-            create_signed_event(&conn, recorded_by, &signer_eid, &msg, &signing_key)
-                .expect_err("plaintext content should be rejected");
+        let err = create_signed_event(&conn, recorded_by, &signer_eid, &msg, &signing_key)
+            .expect_err("plaintext content should be rejected");
         match err {
             CreateEventError::Rejected { reason, .. } => {
                 assert!(reason.contains("must be carried inside encrypted wrappers"));
@@ -1362,6 +1455,94 @@ mod tests {
         let wrapper = crate::event_modules::parse_event(&wrapper_blob).unwrap();
 
         assert_eq!(wrapper.created_at_ms(), inner_created_at_ms);
+    }
+
+    #[test]
+    fn test_create_encrypted_event_uses_requested_key_and_not_other_local_key() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let intended_key_bytes = [0x11; 32];
+        let wrong_key_bytes = [0x22; 32];
+        let intended_key_event_id = create_local_key_secret(&conn, recorded_by, intended_key_bytes);
+        let wrong_key_event_id = create_local_key_secret(&conn, recorded_by, wrong_key_bytes);
+
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: now_ms(),
+            workspace_id: net_eid,
+            author_id: user_event_id,
+            content: "intended key only".to_string(),
+        });
+
+        let event_id = create_encrypted_event(
+            &conn,
+            recorded_by,
+            &intended_key_event_id,
+            &msg,
+            Some((&signer_eid, &signing_key)),
+        )
+        .unwrap();
+        let wrapper = load_stored_encrypted_wrapper(&conn, &event_id);
+
+        assert_eq!(wrapper.key_event_id, intended_key_event_id);
+        assert_ne!(wrapper.key_event_id, wrong_key_event_id);
+
+        let plaintext = crate::projection::encrypted::decrypt_event_blob(
+            &intended_key_bytes,
+            &wrapper.nonce,
+            &wrapper.ciphertext,
+            &wrapper.auth_tag,
+        )
+        .expect("intended key must decrypt created wrapper");
+        let decrypted = crate::event_modules::parse_event(&plaintext).unwrap();
+        assert_eq!(decrypted, msg);
+
+        let wrong = crate::projection::encrypted::decrypt_event_blob(
+            &wrong_key_bytes,
+            &wrapper.nonce,
+            &wrapper.ciphertext,
+            &wrapper.auth_tag,
+        );
+        assert!(
+            wrong.is_err(),
+            "a different local key must not decrypt a wrapper created for the intended key"
+        );
+    }
+
+    #[test]
+    fn test_create_encrypted_event_errors_when_requested_key_missing() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let missing_key_event_id = [0x77; 32];
+
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: now_ms(),
+            workspace_id: net_eid,
+            author_id: user_event_id,
+            content: "missing key".to_string(),
+        });
+
+        let err = create_encrypted_event(
+            &conn,
+            recorded_by,
+            &missing_key_event_id,
+            &msg,
+            Some((&signer_eid, &signing_key)),
+        )
+        .unwrap_err();
+
+        match err {
+            CreateEventError::DbError(reason) => {
+                assert!(
+                    reason.contains("key lookup"),
+                    "expected key lookup failure, got {reason}"
+                );
+            }
+            other => panic!("expected DbError for missing requested key, got {other:?}"),
+        }
     }
 
     #[test]
