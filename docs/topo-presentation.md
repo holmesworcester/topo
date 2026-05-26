@@ -2,8 +2,8 @@
 marp: true
 paginate: true
 size: 16:9
-title: Topo demo presentation
-description: How Topo addresses major pain points in p2p stacks
+title: Context demo presentation
+description: How Context addresses major pain points in p2p stacks
 style: |
   section {
     background: #0f1115;
@@ -86,9 +86,9 @@ style: |
 
 <!-- _class: lead -->
 
-# Topo 🐭
+# Context
 
-## Can building p2p collaboration tools be made easier? 🥹
+## Can building p2p collaboration tools be made easier by making context explicit?
 
 ---
 
@@ -98,11 +98,11 @@ style: |
 
 - Many problems to solve: p2p, e2ee, sync, files, push etc.
 - Solutions aren't generic; must fit product needs
-- Concurrency is a minefield 💥, time bomb 💣, quagmire 🐊, rat's nest 🐀, death march 💀 — choose your favorite metaphor, it is *the* hard part!
+- Concurrency is the hard part: races, partial knowledge, retry, local state, and network state all interact.
 
 ---
 
-# Can't we just use existing approaches? 😥
+# Can't we just use existing approaches?
 
 <!-- pt:incremental_lists: true -->
 
@@ -113,7 +113,7 @@ style: |
 
 ---
 
-# Our experience with existing p2p tools: 🫤
+# Our experience with existing p2p tools
 
 <!-- pt:incremental_lists: true -->
 
@@ -125,95 +125,118 @@ style: |
 
 ---
 
-# Specific gripes with existing p2p tools 😡
+# Specific gripes with existing p2p tools
 
 <!-- pt:incremental_lists: true -->
 
-- **Arbitrary dependencies in data** - these are the opposite of what you want: they block content when you *don't* need that and not when you do 
-- **No iOS support** - especially for push & the iOS NSE memory limit 🐼
-- **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications 🐼
-- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend needs 🐼
+- **Dependency-only data models** - exact prerequisites are not enough; products also need range context, future context, and contextual proof
+- **No iOS support** - especially for push & the iOS NSE memory limit
+- **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications
+- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend needs
 
-(**p2panda** is a lot better than others, but all gripes marked 🐼 apply to it too)
+(**p2panda** is a lot better than others, but those last three gripes apply there too)
 
 ---
 
-# Topo 🐭 proposes a better way
+# Context proposes a better way
 
 Instead of providing lots of features for *parts* of the problem, it focuses on covering
 
 <!-- pt:incremental_lists: true -->
 
 - **All layers**: everything from networking to the local app API.
-- **Most contexts**: everything from iOS notification fetching to multi-tenant servers. (Soon the web, too.)
+- **Most deployment contexts**: everything from iOS notification fetching to multi-tenant servers. (Soon the web, too.)
+- **Protocol context**: facts offer context to other facts, and those relationships drive deterministic progress.
 
 ...in a principled solution to the hard problem, **concurrency**.
 
 ---
 
-#  Topo 🐭 makes your backend simpler
+# Context makes your backend simpler
 
 <!-- pt:incremental_lists: true -->
 
 - Uses SQLite to stay memory-bounded so **no separate backend for iOS**
 - One endpoint can host many tenants so **no separate infra for cloud** 
 - SQLite contains all state including files; **no OS filesystem quirks**
-- Dependencies can match product needs
+- Context relationships can be exact facts, fact ranges, or offers waiting for future facts
 - End-to-end testing is cheap and easy
 - You get a flexible, concurrency-safe way to do encryption and auth
 
-You have to model causal order as dependency graphs, but this is inevitable in a p2p world (unless you have a really fast blockchain?) so we embrace it!
+You model durable facts and the context they offer, rather than building a custom state machine for every product edge case.
 
 ---
 
-# Topo 🐭 makes your frontend simpler
+# Context makes your frontend simpler
 
 <!-- pt:incremental_lists: true -->
 
-- Events turn into SQLite tables so **data can have whatever shape it wants**
+- Facts turn into SQLite tables so **data can have whatever shape it wants**
 - The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress" so **you don't need a middle layer**
-- A local `client_op_id` can return with eventually-updated events, so **you don't need a custom sync state machine for optimistic updates**
+- A local `client_op_id` can return with later-updated facts, so **you don't need a custom sync state machine for optimistic updates**
 - Frontends can get subscription feeds of changes and poll for the latest state, so **frontend state management is easy.**
 
 This makes P2P frontend development *easier* than centralized apps (less frontend state)
 
 ---
 
-# Topo 🐭 tames concurrency
+# Context tames concurrency
 
 <!-- pt:incremental_lists: true -->
 
-- **Data** including files, who to connect to, is represented as a set of events with dependencies
-- **Peer connection** is ongoing behavior determined by this set
-- **Sync** is a process that ensures all peers converge on the same event set
-- **Event pipeline** decrypts, validates, and writes events into easily-queried tables
-- **Topo sort** blocks action on events until their dependencies arrive
-- **State and auth** is derived deterministically from the event set (think: Redux but with dependencies)
-- **Secrets** are stored as events and block dependent encrypted events until known
+- **Data** including files and who to connect to is represented as immutable facts
+- **Context needs/offers** express exact and range relationships between facts
+- Connection, sync, and auth are facts too, not side channels with separate concurrency rules
+- **Sync** ensures peers converge on shared facts and the context needed to project them
+- **Projectors** decrypt, validate, and write facts into easily queried tables
+- **State and auth** are derived deterministically from the fact set
+- **Secrets** are facts that offer key coverage context to encrypted facts
 
-This way, devs can think about dependency & converging sets, **not concurrency**.
+This way, devs can think about facts, context, and converging sets, **not concurrency**.
+
+---
+
+# How context needs/offers work
+
+<!-- pt:incremental_lists: true -->
+
+- A fact's projector emits the complete current set of **needs** and **offers** for that fact
+- A need is a role, scope, and byte range; an offer is the same shape
+- Core wakes a fact when a need range overlaps an offer range
+- The consuming projector still validates the matched payload before writing rows or emitting follow-up work
+- Offers can exist before the facts that will need them, which makes context more general than blocking
+
+```mermaid
+flowchart LR
+    OFFER["fact A offers role/scope/range"] --> MATCH["core range matcher"]
+    NEED["fact B needs overlapping role/scope/range"] --> MATCH
+    MATCH --> WAKE["wake fact B projector"]
+    WAKE --> VALIDATE["projector validates payload"]
+    VALIDATE --> EFFECTS["rows, offers, intents, facts"]
+```
 
 ---
 
 # Runtime Loop
 
-```text
-CLI / RPC Control
-  |\
-  | +--> Local create/query --> Projection / DB
-  |
-  +--> Daemon --> Supervisor --> Transport <--> Sync
-                                    |
-                                    v
-                              Event pipeline
-                                    |
-                                    v
-                             Projection / DB
-                                    |
-                              trust/tenant SQL
-                                    |
-                                    v
-                                Transport
+```mermaid
+flowchart TD
+    CLI["CLI / command"] --> CORE["core runtime"]
+    DAEMON["daemon tick"] --> CORE
+    NETWORK["network bytes"] --> CONNECTION["connection facts"]
+    CONNECTION --> CORE
+    CORE --> PIPE["pipeline"]
+    PIPE --> PROJECTORS["protocol projectors"]
+    PROJECTORS --> CONTEXT["context needs/offers"]
+    CONTEXT --> MATCH["range matcher wakes facts"]
+    MATCH --> PIPE
+    PROJECTORS --> ROWS["SQLite read models"]
+    PROJECTORS --> INTENTS["durable/local intents"]
+    INTENTS --> HANDLERS["intent handlers"]
+    HANDLERS --> CORE
+    PROJECTORS --> SYNC["sync visibility"]
+    SYNC --> CONNECTION
+    CONNECTION --> PEERS["remote peers"]
 ```
 
 ---
@@ -222,7 +245,7 @@ CLI / RPC Control
 
 And hard stuff stays possible.
 
-Next, a demo 🐭
+Next, a demo
 
 ---
 
@@ -230,7 +253,7 @@ Next, a demo 🐭
 
 * Create, invite, message, react, attach a file
 * Link a device
-* Event and sync logs
+* Fact, context, and sync logs
 * Multitenancy in action
 
 **Won't demo:** subscriptions, holepunching, mDNS discovery, multi-source sync.
@@ -243,7 +266,7 @@ Next, a demo 🐭
 
 **Most p2p stacks** offer lots of features that aren't what you need; you're on your own in a hard battle with concurrency.
 
-**Topo 🐭** covers the concurrency problem; features are up to you.
+**Context** covers the concurrency problem; features are up to you.
 
 
 # An observation 💡
@@ -272,18 +295,18 @@ Instead, maybe what you need is a **concurrency approach** covering the whole pr
 
 ---
 
-# Event Sync Throughput
+# Fact Sync Throughput
 
 Peer-to-peer QUIC sync over localhost with negentropy reconciliation (daemon-based, warm start).
 
-| Test | Events | Wall Time | Msgs/s | Peak VmHWM |
+| Test | Facts | Wall Time | Msgs/s | Peak VmHWM |
 |------|-------:|----------:|-------:|-----------:|
 | 10k bidirectional (5k each) | 10,000 | 2.37s | 4,211 | 70.4 MiB |
 | 50k one-way | 50,000 | 16.13s | 3,100 | 131.2 MiB |
 | 10k continuous inject | 10,000 | 1.85s | 5,412 | 66.6 MiB |
 
 
-* *continuous inject* means events injected while sync is running
+* *continuous inject* means facts injected while sync is running
 * Maybe not network-bound on a fast network and slow device, but fast enough
 
 ---
@@ -354,18 +377,18 @@ Local encode + store + project for 256 KiB ciphertext slices (no sync).
 
 ---
 
-# Topo-sort Cascade
+# Context-Match Cascade
 
-What happens when each event depends on a max (10) prior events and they are processed in reverse order to maximize block/unblock workload?
+What happens when each fact needs context from a max (10) prior facts and they are processed in reverse order to maximize park/wake workload?
 
-| Scale | Blocking | Cascade | Cascade Rate | Total | Peak RSS |
+| Scale | Parking | Wake Cascade | Cascade Rate | Total | Peak RSS |
 |------:|---------:|--------:|-------------:|------:|---------:|
-| 10k | 1.614s | 1.168s | 8,555 ev/s | 2.850s | 59.0 MiB |
-| 50k | 10.633s | 6.786s | 7,366 ev/s | 17.797s | 106.0 MiB |
-| 500k | 92.460s | 71.961s | 6,948 ev/s | 169.185s | 399.6 MiB |
+| 10k | 1.614s | 1.168s | 8,555 facts/s | 2.850s | 59.0 MiB |
+| 50k | 10.633s | 6.786s | 7,366 facts/s | 17.797s | 106.0 MiB |
+| 500k | 92.460s | 71.961s | 6,948 facts/s | 169.185s | 399.6 MiB |
 
-- Cascade rate ~7-8.5k ev/s across all scales (linear scaling)
-- Memory grows sub-linearly: 50x events = ~7x RSS
+- Cascade rate ~7-8.5k facts/s across all scales (linear scaling)
+- Memory grows sub-linearly: 50x facts = ~7x RSS
 
 ---
 
@@ -376,15 +399,15 @@ For these runs, `lowmem` uses a 256 KiB SQLite cache, `temp_store=FILE`, `mmap_s
 
 ---
 
-# Low-Memory Topo-sort Cascade (10k)
+# Low-Memory Context-Match Cascade (10k)
 
 Same worst-case cascade as above, but with `lowmem` enabled.
 
-| Scale | Blocking | Cascade | Cascade Rate | Total | Peak RSS |
+| Scale | Parking | Wake Cascade | Cascade Rate | Total | Peak RSS |
 |------:|---------:|--------:|-------------:|------:|---------:|
-| 10k | 1.36s | 1.30s | 7,710 ev/s | 2.75s | 9.6 MiB |
+| 10k | 1.36s | 1.30s | 7,710 facts/s | 2.75s | 9.6 MiB |
 
-- Same throughput as normal mode (~7-8k ev/s) — cascade is CPU-bound, not cache-bound
+- Same throughput as normal mode (~7-8k facts/s) — cascade is CPU-bound, not cache-bound
 - Peak RSS 9.6 MiB — well under the 24 MiB iOS NSE budget
 
 ---
@@ -401,9 +424,9 @@ Per-daemon VmHWM is measured via the lowmem delta harness.
 | 50k+20x1MiB files | all 80 slices | 7,016 | PASS | PASS |
 
 
-- Memory increase varies with number of new events synced and (to a lesser extent) total number of events. 
-- Files pass easily because the number of events is small
-- Full sync of 100k+ events is not possible in background, but expecting background-fetched diffs to be <10k events seems reasonable.
+- Memory increase varies with number of new facts synced and (to a lesser extent) total number of facts.
+- Files pass easily because the number of facts is small
+- Full sync of 100k+ facts is not possible in background, but expecting background-fetched diffs to be <10k facts seems reasonable.
 
 ---
 
@@ -416,72 +439,74 @@ Per-daemon VmHWM is measured via the lowmem delta harness.
 # Repo Layout
 
 ```text
-src/runtime/control/      CLI entrypoint + daemon RPC
-src/runtime/peering/      runtime worker graph
-src/runtime/transport/    QUIC + trust boundary
-src/runtime/sync_engine/  reconciliation + session loops
-src/event_modules/        commands / projectors / queries
-src/state/projection/     create + apply pipeline
+src/main.rs               product entrypoint
+src/context_app.rs        Context app boundary
+src/core/                 protocol-neutral runtime, context, intents
+src/core/pipeline/        fact admission, projection, handler commits
+src/protocol/auth/        authority and key-material facts
+src/protocol/content/     message, file, deletion, retention facts
+src/protocol/connection/  sealed transport and receipts
+src/protocol/sync/        convergence, range summaries, live tail
 tests/                    projector, sync, CLI/e2e checks
 ```
 
-- Read order for this walkthrough: `runtime/control` -> `event_modules` -> `state/projection` -> `runtime/sync_engine`
-- `docs/DESIGN_DIAGRAMS.md` mirrors the same boundaries at a higher level
+- Read order for this walkthrough: `core` -> `core/pipeline` -> `protocol/*` -> `protocol/sync` and `protocol/connection`
+- The important boundary is that core owns mechanics while protocol scopes own meaning
 
 ---
 
 # Local Send Path
 
-- `src/runtime/control/main.rs`: `topo send` turns into `RpcMethod::Send`
-- `src/runtime/control/rpc/server.rs`: daemon dispatch calls `message::send_for_peer`
-- `src/event_modules/message/commands.rs`: resolve signer/workspace/author, build `ParsedEvent::Message`
-- `src/state/projection/create.rs`: encode, sign, store, and immediately project the event
+- `src/core/app.rs`: `con send` dispatches through the protocol command table
+- `src/core/command_context.rs`: commands get read-only store access plus local capabilities
+- `src/protocol/content/message/*`: resolve signer/workspace/author and build a message fact
+- `src/core/pipeline/*`: admit the fact, project it, and commit rows/intents
 
 ```text
-topo send "hello"
-  -> rpc_require_daemon(...)
-  -> RpcMethod::Send
-  -> message::send_for_peer(...)
-  -> create_signed_event_synchronous(...)
+con send "hello"
+  -> command constructor returns facts
+  -> core admits immutable fact bytes
+  -> message projector validates auth and key context
+  -> rows + share_fact_with_sync intent
 ```
 
-- The important design choice: local writes go through the same event + projection machinery as synced writes
+- The important design choice: local writes go through the same fact + projection machinery as synced writes
 
 ---
 
 # Projection + Query Path
 
-- `src/state/projection/apply/project_one.rs`: single canonical projection entrypoint
-- `src/event_modules/registry.rs`: lookup parser, projector, share scope, and context loader by event type
-- `src/event_modules/message/projector.rs`: pure projector writes `messages` or `deleted_messages`
-- `src/event_modules/message/queries.rs`: join projected rows into the UI/RPC shape
+- `src/core/pipeline/project_pending_facts.rs`: projection commit boundary
+- `src/protocol/registry.rs`: lookup projector and intent handler by fact tag or intent kind
+- `src/protocol/content/message/project.rs`: projector writes message rows after context validates
+- Scope queries join projected rows into the UI/CLI shape
 
 ```text
-events blob
-  -> parse via registry
-  -> dependency + signer checks
-  -> module projector
-  -> valid_events + subscription hook
+fact bytes
+  -> route by registered tag
+  -> load matched context
+  -> owning projector validates payload and context
+  -> row mutations + context offers + intents
   -> query response with users / reactions / files
 ```
 
-- This is where Topo gets its "SQLite is the app API" property: frontend-friendly reads come from projected tables, not ad hoc sync state
+- This is where Context gets its "SQLite is the app API" property: frontend-friendly reads come from projected tables, not ad hoc sync state
 
 ---
 
 # Runtime + Sync Path
 
-- `src/runtime/peering/engine/supervisor.rs`: owns accept loop, target dispatcher, and shared ingest writer
-- `src/runtime/transport/peering_boundary.rs`: transport boundary around QUIC sessions and trust checks
-- `src/runtime/sync_engine/session/*`: reconciliation plus control/data streams
-- Wire-received events land in the same ingest/projection pipeline used by local creates
+- `src/core/daemon.rs`: daemon tick accepts bytes, admits due time wakes, and drains queued work
+- `src/protocol/connection/*`: opens sealed frames and emits child facts plus receipts
+- `src/protocol/sync/*`: compares range summaries, requests exact ids, and live-tails new shared facts
+- Wire-received facts land in the same admission/projection pipeline used by local creates
 
 ```text
-peer session
-  -> sync control/data frames
-  -> shared ingest channel
-  -> batch_writer / project_queue
-  -> project_one(...)
+peer connection
+  -> sealed frames
+  -> connection receive/open projectors
+  -> ordinary fact admission
+  -> projectors + context matching
   -> SQLite rows visible to queries
 ```
 
