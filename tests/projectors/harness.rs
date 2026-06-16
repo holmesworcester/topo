@@ -288,25 +288,48 @@ pub mod fixtures {
         }
     }
 
-    /// Assert that write_ops contain an InsertOrIgnore to the given table.
+    /// Does this WriteOp INSERT into the given table? Used by
+    /// `assert_writes_to_table` which verifies materialization.
+    /// Deletes are NOT considered inserts — a test asserting "this
+    /// projector writes to table X" must actually observe an insert.
+    fn writeop_inserts_to_table(op: &WriteOp, table: &str) -> bool {
+        match op {
+            WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
+            WriteOp::Delete { .. } => false,
+            WriteOp::InsertKeySecretFromUnwrap(_) | WriteOp::InsertKeySecretLocal(_) => {
+                table == topo::event_modules::key_shared::KEY_SECRETS_TABLE
+            }
+        }
+    }
+
+    /// Does this WriteOp touch the given table in ANY way (insert OR
+    /// delete)? Used by `assert_no_write_to_table` to check that a
+    /// projector didn't mutate the table at all.
+    fn writeop_touches_table(op: &WriteOp, table: &str) -> bool {
+        match op {
+            WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
+            WriteOp::Delete { table: t, .. } => *t == table,
+            WriteOp::InsertKeySecretFromUnwrap(_) | WriteOp::InsertKeySecretLocal(_) => {
+                table == topo::event_modules::key_shared::KEY_SECRETS_TABLE
+            }
+        }
+    }
+
+    /// Assert that write_ops contain an INSERT to the given table.
+    /// A projector that only deletes from the table does NOT satisfy this.
     pub fn assert_writes_to_table(result: &ProjectorResult, table: &str) {
         assert!(
-            result.write_ops.iter().any(|op| matches!(
-                op, WriteOp::InsertOrIgnore { table: t, .. } if *t == table
-            )),
-            "expected InsertOrIgnore to table '{}', ops: {:?}",
+            result.write_ops.iter().any(|op| writeop_inserts_to_table(op, table)),
+            "expected insert to table '{}', ops: {:?}",
             table,
             result.write_ops
         );
     }
 
-    /// Assert that no write_ops target the given table.
+    /// Assert that no write_ops target the given table (insert OR delete).
     pub fn assert_no_write_to_table(result: &ProjectorResult, table: &str) {
         assert!(
-            !result.write_ops.iter().any(|op| match op {
-                WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
-                WriteOp::Delete { table: t, .. } => *t == table,
-            }),
+            !result.write_ops.iter().any(|op| writeop_touches_table(op, table)),
             "expected no write to table '{}', but found one",
             table
         );

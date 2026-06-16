@@ -193,84 +193,180 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
+    use topo_verus_proofs::event_modules::removal::{
+        decide_removal_acceptance_core, RemovalAcceptanceInputs, RemovalDecisionCore,
+    };
     let removal = match parsed {
         ParsedEvent::Removal(event) => event,
         _ => return ProjectorResult::reject("not a removal event".to_string()),
     };
-    let Some(current_signer) = ctx.current_signer.as_ref() else {
-        return ProjectorResult::reject("removal missing current signer envelope".to_string());
-    };
-    if removal.removed_by
-        != crate::crypto::event_id_from_base64(&current_signer.event_id).unwrap_or([0u8; 32])
-    {
-        return ProjectorResult::reject("removed_by must equal current signer".to_string());
-    }
-    if let Some(reason) = ctx.removal_signer_reject_reason.as_ref() {
-        return ProjectorResult::reject(reason.clone());
-    }
+
+    // --- Extract the seven primitive flags the verified decision depends on.
+    let current_signer = ctx.current_signer.as_ref();
+    let has_current_signer = current_signer.is_some();
+    let removed_by_matches_signer = current_signer
+        .map(|sig| {
+            removal.removed_by
+                == crate::crypto::event_id_from_base64(&sig.event_id).unwrap_or([0u8; 32])
+        })
+        .unwrap_or(false);
+    let signer_not_rejected = ctx.removal_signer_reject_reason.is_none();
+
     let slots = [
         removal.parent_1,
         removal.parent_2,
         removal.parent_3,
         removal.parent_4,
     ];
-    let refs = match frontier_refs_from_slots(removal.parent_count, &slots) {
-        Ok(refs) => refs,
-        Err(reason) => return ProjectorResult::reject(reason),
-    };
-    if let Err(reason) = validate_canonical_frontier_refs(&refs) {
-        return ProjectorResult::reject(reason);
-    }
-    let expected_hash = frontier_hash_from_refs(&refs);
-    if expected_hash != removal.frontier_hash {
-        return ProjectorResult::reject("frontier_hash does not match parent frontier".to_string());
+    let refs_result = frontier_refs_from_slots(removal.parent_count, &slots);
+    let frontier_refs_well_formed = refs_result.is_ok();
+    let canonical_result = refs_result
+        .as_ref()
+        .ok()
+        .map(|refs| validate_canonical_frontier_refs(refs));
+    let frontier_refs_canonical = matches!(&canonical_result, Some(Ok(())));
+    let frontier_hash_matches = refs_result
+        .as_ref()
+        .ok()
+        .map(|refs| frontier_hash_from_refs(refs) == removal.frontier_hash)
+        .unwrap_or(false);
+    let target_kind_present = ctx.removal_target_kind.is_some();
+
+    // --- Delegate acceptance to the Verus-verified decision core.
+    let decision = decide_removal_acceptance_core(RemovalAcceptanceInputs {
+        has_current_signer,
+        removed_by_matches_signer,
+        signer_not_rejected,
+        frontier_refs_well_formed,
+        frontier_refs_canonical,
+        frontier_hash_matches,
+        target_kind_present,
+    });
+
+    match decision {
+        RemovalDecisionCore::RejectNoCurrentSigner => {
+            return ProjectorResult::reject(
+                "removal missing current signer envelope".to_string(),
+            );
+        }
+        RemovalDecisionCore::RejectRemovedByMismatch => {
+            return ProjectorResult::reject("removed_by must equal current signer".to_string());
+        }
+        RemovalDecisionCore::RejectSignerItselfRejected => {
+            // Flag was set only when removal_signer_reject_reason.is_some().
+            let reason = ctx
+                .removal_signer_reject_reason
+                .as_ref()
+                .expect("verified SignerItselfRejected requires reason to be present")
+                .clone();
+            return ProjectorResult::reject(reason);
+        }
+        RemovalDecisionCore::RejectFrontierRefsMalformed => {
+            // Flag was set only when refs_result is Err.
+            let reason = refs_result
+                .err()
+                .expect("verified FrontierRefsMalformed requires refs_result to be Err");
+            return ProjectorResult::reject(reason);
+        }
+        RemovalDecisionCore::RejectFrontierRefsNotCanonical => {
+            let reason = match canonical_result {
+                Some(Err(reason)) => reason,
+                _ => unreachable!(
+                    "verified FrontierRefsNotCanonical requires canonical_result == Some(Err)"
+                ),
+            };
+            return ProjectorResult::reject(reason);
+        }
+        RemovalDecisionCore::RejectFrontierHashMismatch => {
+            return ProjectorResult::reject(
+                "frontier_hash does not match parent frontier".to_string(),
+            );
+        }
+        RemovalDecisionCore::RejectTargetKindUnknown => {
+            return ProjectorResult::reject(
+                "removal target must be a projected user or peer_shared event".to_string(),
+            );
+        }
+        RemovalDecisionCore::Valid => {}
     }
 
-    let Some(target_kind) = ctx.removal_target_kind else {
-        return ProjectorResult::reject(
-            "removal target must be a projected user or peer_shared event".to_string(),
-        );
-    };
+    // --- Verified decision was Valid; all seven preconditions hold. Rehydrate
+    // --- the specific values the write_ops need.
+    let current_signer = current_signer
+        .expect("verified Valid requires current_signer to be Some");
+    let target_kind = ctx
+        .removal_target_kind
+        .expect("verified Valid requires removal_target_kind to be Some");
     let removed_member_ref_b64 = event_id_to_base64(&removal.removed_member_ref);
-    ProjectorResult::valid(vec![
-        WriteOp::InsertOrIgnore {
-            table: "removals",
-            columns: vec![
-                "recorded_by",
-                "event_id",
-                "removed_member_ref",
-                "frontier_hash",
-                "parent_count",
-                "parent_1",
-                "parent_2",
-                "parent_3",
-                "parent_4",
-                "remover_signer_event_id",
-            ],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(removed_member_ref_b64.clone()),
-                SqlVal::Text(event_id_to_base64(&removal.frontier_hash)),
-                SqlVal::Int(removal.parent_count as i64),
-                SqlVal::Text(event_id_to_base64(&removal.parent_1)),
-                SqlVal::Text(event_id_to_base64(&removal.parent_2)),
-                SqlVal::Text(event_id_to_base64(&removal.parent_3)),
-                SqlVal::Text(event_id_to_base64(&removal.parent_4)),
-                SqlVal::Text(current_signer.event_id.clone()),
-            ],
-        },
-        WriteOp::InsertOrIgnore {
-            table: "removed_entities",
-            columns: vec!["recorded_by", "event_id", "target_event_id", "removal_type"],
-            values: vec![
-                SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(removed_member_ref_b64),
-                SqlVal::Text(target_kind.as_str().to_string()),
-            ],
-        },
-    ])
+
+    // --- Build write ops; assert structure against the Verus-verified constants
+    // --- so a schema drift (e.g. dropping a column, renaming a table, emitting
+    // --- the wrong number of ops) fails compilation of the debug tests.
+    use topo_verus_proofs::event_modules::removal::{
+        required_removal_op_column_count, required_removal_op_table,
+        required_valid_write_op_count,
+    };
+    let removals_write = WriteOp::InsertOrIgnore {
+        table: required_removal_op_table(0),
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "removed_member_ref",
+            "frontier_hash",
+            "parent_count",
+            "parent_1",
+            "parent_2",
+            "parent_3",
+            "parent_4",
+            "remover_signer_event_id",
+        ],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(removed_member_ref_b64.clone()),
+            SqlVal::Text(event_id_to_base64(&removal.frontier_hash)),
+            SqlVal::Int(removal.parent_count as i64),
+            SqlVal::Text(event_id_to_base64(&removal.parent_1)),
+            SqlVal::Text(event_id_to_base64(&removal.parent_2)),
+            SqlVal::Text(event_id_to_base64(&removal.parent_3)),
+            SqlVal::Text(event_id_to_base64(&removal.parent_4)),
+            SqlVal::Text(current_signer.event_id.clone()),
+        ],
+    };
+    let removed_entities_write = WriteOp::InsertOrIgnore {
+        table: required_removal_op_table(1),
+        columns: vec!["recorded_by", "event_id", "target_event_id", "removal_type"],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(removed_member_ref_b64),
+            SqlVal::Text(target_kind.as_str().to_string()),
+        ],
+    };
+    debug_assert_eq!(
+        write_op_column_len(&removals_write) as u8,
+        required_removal_op_column_count(0),
+        "removal op 0: column count drift",
+    );
+    debug_assert_eq!(
+        write_op_column_len(&removed_entities_write) as u8,
+        required_removal_op_column_count(1),
+        "removal op 1: column count drift",
+    );
+    let ops = vec![removals_write, removed_entities_write];
+    debug_assert_eq!(
+        ops.len() as u8,
+        required_valid_write_op_count(RemovalDecisionCore::Valid),
+        "removal Valid must emit exactly 2 write ops",
+    );
+    ProjectorResult::valid(ops)
+}
+
+fn write_op_column_len(op: &WriteOp) -> usize {
+    match op {
+        WriteOp::InsertOrIgnore { columns, .. } => columns.len(),
+        _ => 0,
+    }
 }
 
 define_query_context_loader!(build_projector_context, Removal, load_removal_context, "removal");

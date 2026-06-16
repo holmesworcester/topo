@@ -1950,7 +1950,11 @@ impl ProjectionBackend for NodeBehaviorEngine {
         resolve_signer_key_behavior(&self.state.borrow(), recorded_by, signer_event_id)
     }
 
-    fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {
+    fn execute_write_ops(
+        &self,
+        _cap: &crate::state::projection::apply::backend::WriteCapability,
+        ops: &[WriteOp],
+    ) -> ProjectionApplyResult<()> {
         let mut state = self.state.borrow_mut();
         for op in ops {
             match op {
@@ -1987,6 +1991,35 @@ impl ProjectionBackend for NodeBehaviorEngine {
                         });
                     }
                 }
+                WriteOp::InsertKeySecretFromUnwrap(r) | WriteOp::InsertKeySecretLocal(r) => {
+                    let table = crate::event_modules::key_shared::KEY_SECRETS_TABLE;
+                    let columns = crate::event_modules::key_shared::KEY_SECRETS_COLUMNS;
+                    let mut row_values = BTreeMap::new();
+                    row_values.insert(columns[0].to_string(),
+                        BehaviorValue::Text(r.event_id_b64.clone()));
+                    row_values.insert(columns[1].to_string(),
+                        BehaviorValue::Blob(r.key_bytes.to_vec()));
+                    row_values.insert(columns[2].to_string(),
+                        BehaviorValue::Int(r.created_at_ms));
+                    row_values.insert(columns[3].to_string(),
+                        BehaviorValue::Text(r.recorded_by.clone()));
+                    let row = BehaviorRow { values: row_values };
+                    let rows = state.tables.entry(table.to_string()).or_default();
+                    // SQLite executes this as `INSERT OR IGNORE INTO key_secrets`
+                    // which conflicts on the primary key (recorded_by, event_id).
+                    // Match that semantics in the sim: reject a duplicate based on
+                    // primary key, regardless of whether non-key columns differ.
+                    let primary_key_exists = rows.iter().any(|existing| {
+                        existing.values.get(columns[0])
+                            == Some(&BehaviorValue::Text(r.event_id_b64.clone()))
+                            && existing.values.get(columns[3])
+                                == Some(&BehaviorValue::Text(r.recorded_by.clone()))
+                    });
+                    if !primary_key_exists {
+                        rows.push(row);
+                        rows.sort();
+                    }
+                }
             }
         }
         Ok(())
@@ -1994,6 +2027,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
 
     fn execute_emit_commands(
         &self,
+        _cap: &crate::state::projection::apply::backend::WriteCapability,
         _recorded_by: &str,
         commands: &[EmitCommand],
     ) -> ProjectionApplyResult<()> {

@@ -51,6 +51,121 @@ directly. A body change that violates an `ensures` fails the merge gate.
    compile; importing a proof fn is nonsense. Runtime-callable items all
    live as `pub fn` inside `verus!` with `ensures` clauses.
 
+## Real proofs vs. fake proofs
+
+The lint catches **syntactic** fakery (spec/proof fns with no ensures
+citation). It cannot catch **semantic** fakery — abstract models that
+pass `cargo-verus verify` but prove nothing about running code. Future
+contributors and agents: read this section before writing a Verus file.
+
+### What makes a proof REAL
+
+A real proof has all three properties.
+
+1. **The ensures is on an exec fn the runtime calls with varying
+   inputs.** The runtime crate imports a `pub fn` via
+   `pub use topo_verus_proofs::...`, passes real state-derived values
+   into it, and consumes its output. The call site cannot be replaced
+   by a constant without breaking the runtime's behavior.
+
+2. **Changing the function body to something incorrect makes
+   `cargo-verus verify` fail.** This is what the tamper test
+   demonstrates. Flip a branch, break a comparison, drop a condition —
+   the SMT solver must produce "postcondition not satisfied." If you
+   can mutate the body freely without breaking verification, the
+   `ensures` is too weak to be a real proof.
+
+3. **If the runtime has a bug that violates the stated property, the
+   proof catches it.** Invert this: if you introduce a runtime bug
+   that should make the invariant false, does a gate anywhere in the
+   pipeline fail? If no gate fails, the proof isn't protecting
+   anything.
+
+### What makes a proof FAKE (even if verification passes)
+
+Any of these disqualify a proof even if `cargo-verus verify` reports
+`N verified, 0 errors`:
+
+- **Abstract model with no refinement bridge.** A verified `apply_spec`
+  over a Verus-only `Seq<Event>` says nothing about the runtime's
+  `apply_projection` unless a theorem mechanically ties one to the
+  other. Defining abstract machinery and *believing* it corresponds
+  to the runtime is not a proof.
+
+- **Exec fn the runtime calls with tautologically-constant inputs.**
+  A `pub fn check(a, b, c, d)` whose ensures requires `a && b && c && d`,
+  called as `debug_assert!(check(true, true, true, true))`, is
+  worthless. The runtime never exercises the interesting cases.
+
+- **Exec fn the runtime imports but doesn't meaningfully invoke.** If
+  the grounding is only a test-only or unused import, the lint is
+  satisfied but nothing is protected.
+
+- **Spec fn cited only by a soundness lemma with trivial body.** A
+  proof fn whose ensures is a tautology (`P || !P`) grounds spec-fn
+  names for the lint but proves nothing.
+
+- **Projector mapping encoded wrong.** If your primitive-input check
+  uses `kind_code == 3` for "InviteAccepted" but the runtime emits
+  kind_code 9, the proof is mechanically sound against the model and
+  mechanically worthless against the code. Always cross-check
+  constants against the runtime registry (see
+  `src/event_modules/mod.rs::EVENT_TYPE_*`).
+
+- **Ensures clause that restates the implementation.** `ensures out == body(args)`
+  where the ensures is a copy of the body proves only that Rust
+  evaluates deterministically. Real ensures state *properties* the body
+  must satisfy, not the body itself.
+
+### Self-test questions before merging a proof
+
+Answer all five honestly. If any is "no," the proof is fake.
+
+1. Does the runtime crate `import` a verified `pub fn` from this file?
+2. Does the runtime pass state-derived values (not constants) into
+   that fn and act on the result?
+3. If I flip the `ensures` condition to its negation, does
+   `cargo-verus verify` fail with a concrete counterexample?
+4. If I introduce a plausible runtime bug that violates the stated
+   property, does a gate in the merge-readiness pipeline fail?
+5. Does the proof's abstract state (any `Seq`, `Set`, `Map` in spec
+   position) correspond to real runtime state through a named and
+   verified mapping — or at minimum through a runtime test that
+   cross-validates?
+
+### The `access_control.rs` cautionary tale
+
+In April 2026 an access-control proof (`verus-proofs/src/state/access_control.rs`,
+commits 87a0e9f0..4482e534) was merged claiming to prove "non-invited peer
+cannot decrypt workspace messages." It passed Verus, the lint, and all
+gates. It was later reverted as a fake proof.
+
+What went wrong:
+
+- The `apply_spec` inductive invariant was over a `PeerState` type
+  with no mapping to runtime `NodeBehaviorEngine` or the SQL-backed
+  projector state.
+- The refinement-bridge exec fn `abstract_apply_accepts_primitives`
+  was called from the runtime with all-true flags, making the check
+  tautological in the accepted path. The runtime never computed
+  non-trivial flags from real state.
+- The kind_code constants didn't match the runtime registry
+  (`InviteAccepted=3` in the proof, `9` in the runtime), so even
+  when the check was non-tautological it was exercising the wrong
+  branches.
+- Result: 16 verified items, zero runtime bugs caught, zero
+  protection against future regressions. Every self-test question
+  above answered "no."
+
+The lesson: **a proof whose abstract state has no refinement mapping
+to runtime state is documentation at best, noise at worst.** The sim
+(`src/sim/node_behavior.rs`) is the intended refinement target for
+system-level invariants — a real proof over the sim would have the
+runtime calling verified primitive predicates over sim-derived
+primitive state, with the sim's state serving as the abstract model
+whose relationship to production-projector state is covered by
+existing shared-projector-code tests.
+
 ## When a spec fn is legitimate
 
 Exactly two cases are allowed (and the lint script's `EXEMPT_FILES` lists

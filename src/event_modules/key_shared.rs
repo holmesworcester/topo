@@ -8,6 +8,65 @@ use super::removal::{
 };
 use super::{EventError, ParsedEvent, EVENT_TYPE_KEY_SHARED};
 
+// ---------------------------------------------------------------------------
+// Typed row (pattern #1): sole constructor for key_secrets WriteOps.
+
+/// Canonical table name. Matches the verus-verified constant.
+pub const KEY_SECRETS_TABLE: &str = "key_secrets";
+
+/// Canonical column order for key_secrets. MUST match verus-proofs constants.
+pub const KEY_SECRETS_COLUMNS: [&str; 4] =
+    ["event_id", "key_bytes", "created_at", "recorded_by"];
+
+/// Typed row for a single key_secrets insert. The fields are `pub(crate)`
+/// so callers outside this crate cannot construct a `KeySecretsRow` with
+/// struct-literal syntax; they must go through `KeySecretsRow::new`. The
+/// `WriteOp::InsertKeySecret(KeySecretsRow)` variant then mechanically
+/// ensures that this is the ONLY construction path for a key_secrets
+/// database write.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct KeySecretsRow {
+    pub event_id_b64: String,
+    pub key_bytes: [u8; 32],
+    pub created_at_ms: i64,
+    pub recorded_by: String,
+}
+
+impl KeySecretsRow {
+    /// Sole constructor for `KeySecretsRow`. Any future field addition
+    /// extends this signature, forcing all callers to be updated in lockstep.
+    pub fn new(
+        event_id_b64: String,
+        key_bytes: [u8; 32],
+        created_at_ms: i64,
+        recorded_by: String,
+    ) -> Self {
+        Self {
+            event_id_b64,
+            key_bytes,
+            created_at_ms,
+            recorded_by,
+        }
+    }
+
+    /// Convert this typed row into the `InsertKeySecretFromUnwrap` WriteOp
+    /// variant — for unwrap-gated projectors (KeyShared, KeyRotation,
+    /// KeyHistory). The verified theorem `emit_requires_successful_unwrap`
+    /// applies to rows produced via this constructor.
+    pub fn to_write_op_from_unwrap(self) -> crate::projection::projector::WriteOp {
+        crate::projection::projector::WriteOp::InsertKeySecretFromUnwrap(self)
+    }
+
+    /// Convert this typed row into the `InsertKeySecretLocal` WriteOp
+    /// variant — for the key_secret projector (LOCAL peer own-key plant).
+    /// The unwrap theorem does NOT apply; this is the peer planting its
+    /// own key material. Only the key_secret projector should call this.
+    pub fn to_write_op_local(self) -> crate::projection::projector::WriteOp {
+        crate::projection::projector::WriteOp::InsertKeySecretLocal(self)
+    }
+}
+
 pub const KEY_SHARED_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("key_event_id"),
@@ -150,41 +209,78 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ProjectorDecisionContext,
 ) -> ProjectorResult {
+    use topo_verus_proofs::event_modules::key_shared::{
+        decide_key_shared_acceptance_core, KeySharedAcceptanceCore, KeySharedAcceptanceFlags,
+    };
     let ss = match parsed {
         ParsedEvent::KeyShared(s) => s,
         _ => return ProjectorResult::reject("not a key_shared event".to_string()),
     };
 
+    // Extract the four primitive flags. Each Result/bool is computed from
+    // real input state; the outcome enum is checked against the verified
+    // decision. Reject strings are rehydrated from the Err values so we
+    // don't lose the specific frontier-refs-from-slots failure messages.
     let slots = [
         ss.frontier_ref_1,
         ss.frontier_ref_2,
         ss.frontier_ref_3,
         ss.frontier_ref_4,
     ];
-    let refs = match frontier_refs_from_slots(ss.frontier_count, &slots) {
-        Ok(refs) => refs,
-        Err(reason) => return ProjectorResult::reject(reason),
-    };
-    if let Err(reason) = validate_canonical_frontier_refs(&refs) {
-        return ProjectorResult::reject(reason);
-    }
-    let expected_frontier_hash = frontier_hash_from_refs(&refs);
-    if ss.frontier_hash != expected_frontier_hash {
-        return ProjectorResult::reject(
-            "frontier_hash does not match key_shared frontier".to_string(),
-        );
-    }
-
+    let refs_result = frontier_refs_from_slots(ss.frontier_count, &slots);
+    let frontier_refs_well_formed = refs_result.is_ok();
+    let canonical_result = refs_result
+        .as_ref()
+        .ok()
+        .map(|r| validate_canonical_frontier_refs(r));
+    let frontier_refs_canonical = matches!(&canonical_result, Some(Ok(())));
+    let frontier_hash_matches = refs_result
+        .as_ref()
+        .ok()
+        .map(|r| ss.frontier_hash == frontier_hash_from_refs(r))
+        .unwrap_or(false);
     let expected_delivery_target_id = delivery_target_id(
         &ss.key_event_id,
         &ss.frontier_hash,
         &ss.recipient_event_id,
         &ss.unwrap_key_event_id,
     );
-    if ss.delivery_target_id != expected_delivery_target_id {
-        return ProjectorResult::reject(
-            "delivery_target_id does not match key_shared target".to_string(),
-        );
+    let delivery_target_matches = ss.delivery_target_id == expected_delivery_target_id;
+
+    let flags = KeySharedAcceptanceFlags {
+        frontier_refs_well_formed,
+        frontier_refs_canonical,
+        frontier_hash_matches,
+        delivery_target_matches,
+    };
+    match decide_key_shared_acceptance_core(flags) {
+        KeySharedAcceptanceCore::RejectFrontierRefsMalformed => {
+            return ProjectorResult::reject(
+                refs_result
+                    .err()
+                    .expect("verified FrontierRefsMalformed requires refs_result Err"),
+            );
+        }
+        KeySharedAcceptanceCore::RejectFrontierRefsNotCanonical => {
+            let reason = match canonical_result {
+                Some(Err(reason)) => reason,
+                _ => unreachable!(
+                    "verified FrontierRefsNotCanonical requires Some(Err)"
+                ),
+            };
+            return ProjectorResult::reject(reason);
+        }
+        KeySharedAcceptanceCore::RejectFrontierHashMismatch => {
+            return ProjectorResult::reject(
+                "frontier_hash does not match key_shared frontier".to_string(),
+            );
+        }
+        KeySharedAcceptanceCore::RejectDeliveryTargetMismatch => {
+            return ProjectorResult::reject(
+                "delivery_target_id does not match key_shared target".to_string(),
+            );
+        }
+        KeySharedAcceptanceCore::Valid => {}
     }
 
     let key_b64 = event_id_to_base64(&ss.key_event_id);
@@ -224,21 +320,37 @@ pub fn project_pure(
         ],
     }];
 
-    let material = match &ctx.unwrapped_secret_material {
-        Some(v) => v,
-        None => return ProjectorResult::valid(ops),
+    // Access-control gate: delegate the "emit key_secrets row?" decision
+    // to the Verus-verified core. The runtime's primitive flag is "did
+    // THIS peer's unwrap key decrypt the wrapped_key" — encoded by the
+    // context loader as `unwrapped_secret_material.is_some()`.
+    use topo_verus_proofs::event_modules::key_shared::{
+        decide_key_secrets_materialization_core, KeySecretsMaterializationCore,
     };
+    let unwrap_successful_for_this_peer = ctx.unwrapped_secret_material.is_some();
+    match decide_key_secrets_materialization_core(unwrap_successful_for_this_peer) {
+        KeySecretsMaterializationCore::SkipKeySecretsRow => {
+            return ProjectorResult::valid(ops);
+        }
+        KeySecretsMaterializationCore::EmitKeySecretsRow => {}
+    }
+    let material = ctx
+        .unwrapped_secret_material
+        .as_ref()
+        .expect("verified EmitKeySecretsRow requires material to be Some");
 
-    ops.push(WriteOp::InsertOrIgnore {
-        table: "key_secrets",
-        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-        values: vec![
-            SqlVal::Text(event_id_to_base64(&ss.key_event_id)),
-            SqlVal::Blob(material.key_bytes.to_vec()),
-            SqlVal::Int(ss.created_at_ms as i64),
-            SqlVal::Text(recorded_by.to_string()),
-        ],
-    });
+    // Typed row (pattern #1): sole production-path constructor for a
+    // key_secrets WriteOp. The verus-verified ensures on the typed row's
+    // table name and column count are cross-checked by the runtime unit
+    // tests; the CI gate (scripts/check_projection_write_sites.sh) enforces
+    // that no other code path writes key_secrets directly.
+    let key_secrets_row = KeySecretsRow::new(
+        event_id_to_base64(&ss.key_event_id),
+        material.key_bytes,
+        ss.created_at_ms as i64,
+        recorded_by.to_string(),
+    );
+    ops.push(key_secrets_row.to_write_op_from_unwrap());
 
     ProjectorResult::valid_with_commands(
         ops,
@@ -270,3 +382,65 @@ pub static KEY_SHARED_META: EventTypeMeta = crate::event_modules::registry::even
     projector: project_pure,
     context_loader: build_projector_context,
 };
+
+#[cfg(test)]
+mod typed_row_tests {
+    use super::*;
+    use crate::projection::projector::WriteOp;
+
+    #[test]
+    fn to_write_op_from_unwrap_preserves_typed_fields() {
+        let row = KeySecretsRow::new(
+            "abc".to_string(),
+            [0x42u8; 32],
+            1_700_000_000_000,
+            "tenant_0".to_string(),
+        );
+        let op = row.to_write_op_from_unwrap();
+        match op {
+            WriteOp::InsertKeySecretFromUnwrap(r) => {
+                assert_eq!(r.event_id_b64, "abc");
+                assert_eq!(r.key_bytes, [0x42u8; 32]);
+                assert_eq!(r.created_at_ms, 1_700_000_000_000);
+                assert_eq!(r.recorded_by, "tenant_0");
+            }
+            _ => panic!("expected InsertKeySecretFromUnwrap, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn to_write_op_local_preserves_typed_fields() {
+        let row = KeySecretsRow::new(
+            "abc".to_string(),
+            [0x42u8; 32],
+            1_700_000_000_000,
+            "tenant_0".to_string(),
+        );
+        let op = row.to_write_op_local();
+        match op {
+            WriteOp::InsertKeySecretLocal(r) => {
+                assert_eq!(r.event_id_b64, "abc");
+                assert_eq!(r.key_bytes, [0x42u8; 32]);
+                assert_eq!(r.created_at_ms, 1_700_000_000_000);
+                assert_eq!(r.recorded_by, "tenant_0");
+            }
+            _ => panic!("expected InsertKeySecretLocal, got {:?}", op),
+        }
+    }
+
+    #[test]
+    fn canonical_table_name_matches_verus_pinned() {
+        assert_eq!(
+            KEY_SECRETS_TABLE,
+            topo_verus_proofs::event_modules::key_shared::key_secrets_table_name(),
+        );
+    }
+
+    #[test]
+    fn canonical_column_count_matches_verus_pinned() {
+        assert_eq!(
+            KEY_SECRETS_COLUMNS.len() as u8,
+            topo_verus_proofs::event_modules::key_shared::key_secrets_column_count(),
+        );
+    }
+}

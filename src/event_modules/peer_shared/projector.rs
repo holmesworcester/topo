@@ -14,23 +14,45 @@ pub fn build_projector_context(
     event_id_b64: &str,
     parsed: &ParsedEvent,
 ) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    use topo_verus_proofs::event_modules::peer_shared::{
+        decide_peer_shared_acceptance_core, PeerSharedAcceptanceCore, PeerSharedAcceptanceFlags,
+    };
     let peer_shared = match parsed {
         ParsedEvent::PeerShared(peer_shared) => peer_shared,
         _ => return Err("peer_shared context loader called for non-peer_shared event".into()),
     };
 
     let ctx = queries.load_peer_shared_context(frame, recorded_by, event_id_b64, peer_shared)?;
-    if let Some(reason) = &ctx.peer_shared_user_mismatch_reason {
-        return Ok(ContextLoadResult::reject(reason.clone()));
-    }
-    if ctx.peer_shared_endpoint_id.is_none() {
-        return Ok(ContextLoadResult::reject(
-            ctx.peer_shared_endpoint_binding_reason
+
+    // Extract the two primitive flags (pattern #3) from the real loaded
+    // context. These flags are the ONLY facts that gate PeerShared
+    // acceptance at this seam.
+    let flags = PeerSharedAcceptanceFlags {
+        user_authority_ok: ctx.peer_shared_user_mismatch_reason.is_none(),
+        endpoint_binding_present: ctx.peer_shared_endpoint_id.is_some(),
+    };
+
+    // Delegate the accept/reject decision to the Verus-verified core.
+    match decide_peer_shared_acceptance_core(flags) {
+        PeerSharedAcceptanceCore::RejectUserAuthorityMismatch => {
+            // Flag was false only when reason was set; unwrap is safe.
+            let reason = ctx
+                .peer_shared_user_mismatch_reason
                 .clone()
-                .unwrap_or_else(|| "peer_shared missing endpoint_shared binding".to_string()),
-        ));
+                .expect("verified UserAuthorityMismatch requires reason to be present");
+            Ok(ContextLoadResult::reject(reason))
+        }
+        PeerSharedAcceptanceCore::RejectMissingEndpointBinding => {
+            Ok(ContextLoadResult::reject(
+                ctx.peer_shared_endpoint_binding_reason
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "peer_shared missing endpoint_shared binding".to_string()
+                    }),
+            ))
+        }
+        PeerSharedAcceptanceCore::Valid => Ok(ContextLoadResult::ready(ctx)),
     }
-    Ok(ContextLoadResult::ready(ctx))
 }
 
 /// Pure projector: PeerShared -> peers_shared table.
@@ -69,8 +91,12 @@ pub fn project_pure(
         ParsedEvent::PeerShared(p) => event_id_to_base64(&p.endpoint_shared_event_id),
         _ => unreachable!(),
     };
-    let ops = vec![WriteOp::InsertOrIgnore {
-        table: "peers_shared",
+    use topo_verus_proofs::event_modules::peer_shared::{
+        required_valid_column_count, required_valid_table_name,
+        required_valid_write_op_count, PeerSharedAcceptanceCore,
+    };
+    let peer_shared_write = WriteOp::InsertOrIgnore {
+        table: required_valid_table_name(),
         columns: vec![
             "recorded_by",
             "event_id",
@@ -91,7 +117,19 @@ pub fn project_pure(
             SqlVal::Text(user_event_id_b64),
             SqlVal::Text(device_name.to_string()),
         ],
-    }];
+    };
+    debug_assert_eq!(
+        write_op_column_len(&peer_shared_write) as u8,
+        required_valid_column_count(),
+        "peers_shared: column count drift (expected {} columns)",
+        required_valid_column_count(),
+    );
+    let ops = vec![peer_shared_write];
+    debug_assert_eq!(
+        ops.len() as u8,
+        required_valid_write_op_count(PeerSharedAcceptanceCore::Valid),
+        "peer_shared Valid must emit exactly 1 write op",
+    );
 
     let mut commands = Vec::new();
     if let Some(workspace_id) = ctx.accepted_workspace_id.clone() {
@@ -102,6 +140,13 @@ pub fn project_pure(
     }
 
     ProjectorResult::valid_with_commands(ops, commands)
+}
+
+fn write_op_column_len(op: &WriteOp) -> usize {
+    match op {
+        WriteOp::InsertOrIgnore { columns, .. } => columns.len(),
+        _ => 0,
+    }
 }
 
 #[cfg(test)]

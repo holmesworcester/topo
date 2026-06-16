@@ -25,12 +25,22 @@ verus! {
 pub enum WriteOpKind {
     InsertOrIgnore,
     Delete,
+    /// Dedicated typed variant for unwrap-gated key_secrets writes
+    /// (produced by KeyShared, KeyRotation, KeyHistory projectors).
+    /// The unwrap-based access-control theorem applies.
+    InsertKeySecretFromUnwrap,
+    /// Dedicated typed variant for local peer's own key plant (produced
+    /// only by the KeySecret projector). The unwrap theorem does NOT
+    /// apply; this is the peer writing its own key material.
+    InsertKeySecretLocal,
 }
 
 pub open spec fn kind_is_idempotent_spec(kind: WriteOpKind) -> bool {
     match kind {
         WriteOpKind::InsertOrIgnore => true,
         WriteOpKind::Delete => true,
+        WriteOpKind::InsertKeySecretFromUnwrap => true,
+        WriteOpKind::InsertKeySecretLocal => true,
     }
 }
 
@@ -40,6 +50,8 @@ pub fn is_idempotent_writeop(kind: WriteOpKind) -> (ok: bool)
     match kind {
         WriteOpKind::InsertOrIgnore => true,
         WriteOpKind::Delete => true,
+        WriteOpKind::InsertKeySecretFromUnwrap => true,
+        WriteOpKind::InsertKeySecretLocal => true,
     }
 }
 

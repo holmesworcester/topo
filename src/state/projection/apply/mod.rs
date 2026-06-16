@@ -5,14 +5,14 @@
 //! [`dispatch`] (projector lookup), [`stages`] (pipeline stages), and [`write_exec`]
 //! (`WriteOp` → rusqlite) for testability.
 
-mod backend;
+pub(crate) mod backend;
 mod cascade;
 mod dispatch;
 pub(crate) mod project_one;
 mod stages;
 mod write_exec;
 
-pub(crate) use backend::{ProjectionApplyResult, ProjectionBackend};
+pub(crate) use backend::{ProjectionApplyResult, ProjectionBackend, WriteCapability};
 pub use project_one::project_one;
 pub(crate) use stages::run_dep_and_projection_stages;
 

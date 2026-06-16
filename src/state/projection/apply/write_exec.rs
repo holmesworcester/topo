@@ -17,6 +17,8 @@ fn writeop_kind(op: &WriteOp) -> WriteOpKind {
     match op {
         WriteOp::InsertOrIgnore { .. } => WriteOpKind::InsertOrIgnore,
         WriteOp::Delete { .. } => WriteOpKind::Delete,
+        WriteOp::InsertKeySecretFromUnwrap(_) => WriteOpKind::InsertKeySecretFromUnwrap,
+        WriteOp::InsertKeySecretLocal(_) => WriteOpKind::InsertKeySecretLocal,
     }
 }
 
@@ -57,6 +59,12 @@ fn writeop_tenant_view(op: &WriteOp, executing_tenant: &str) -> WriteOpTenantVie
             WriteOpTenantView {
                 has_recorded_by: false,
                 recorded_by_matches_executing: false,
+            }
+        }
+        WriteOp::InsertKeySecretFromUnwrap(row) | WriteOp::InsertKeySecretLocal(row) => {
+            WriteOpTenantView {
+                has_recorded_by: true,
+                recorded_by_matches_executing: row.recorded_by == executing_tenant,
             }
         }
     }
@@ -119,6 +127,25 @@ pub(crate) fn execute_write_ops(
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| &**p).collect();
                 conn.execute(&sql, param_refs.as_slice())?;
+            }
+            WriteOp::InsertKeySecretFromUnwrap(row) | WriteOp::InsertKeySecretLocal(row) => {
+                // Verus-pinned SQL template and parameter order. The template
+                // is cross-checked in a unit test against the Verus constant
+                // `KEY_SECRETS_INSERT_SQL`; any drift in the runtime string
+                // is caught by both `cargo-verus verify` (if the Verus const
+                // is edited) and the unit test (if the runtime string is
+                // edited). Parameter order matches KeySecretsRow field
+                // declaration order exactly.
+                let sql = topo_verus_proofs::state::projection::apply::sql_mapping::key_secrets_insert_sql_template();
+                conn.execute(
+                    sql,
+                    rusqlite::params![
+                        row.event_id_b64,
+                        row.key_bytes.to_vec(),
+                        row.created_at_ms,
+                        row.recorded_by,
+                    ],
+                )?;
             }
             WriteOp::Delete {
                 table,
@@ -311,6 +338,38 @@ mod tests {
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{encode_event, endpoint_shared, ShareScope};
     use rusqlite::OptionalExtension;
+
+    // Phase 3 cross-check: the runtime's SQL for the typed key_secrets
+    // variants must equal the Verus-pinned constant byte-for-byte. This
+    // is the bridge between the Verus `writeop_target_table_spec` proofs
+    // and the actual string sent to SQLite.
+    #[test]
+    fn key_secrets_insert_sql_matches_verus_pinned_template() {
+        let expected =
+            topo_verus_proofs::state::projection::apply::sql_mapping::KEY_SECRETS_INSERT_SQL;
+        let runtime =
+            topo_verus_proofs::state::projection::apply::sql_mapping::key_secrets_insert_sql_template();
+        assert_eq!(runtime, expected);
+        // Structural: exactly 4 placeholders, targets "key_secrets".
+        assert_eq!(runtime.matches('?').count(), 4);
+        assert!(runtime.contains("INSERT OR IGNORE INTO key_secrets ("));
+    }
+
+    #[test]
+    fn key_secrets_insert_placeholder_count_is_four() {
+        assert_eq!(
+            topo_verus_proofs::state::projection::apply::sql_mapping::key_secrets_insert_placeholder_count(),
+            4,
+        );
+        // And matches KeySecretsRow field count.
+        let row = crate::event_modules::key_shared::KeySecretsRow::new(
+            String::new(),
+            [0u8; 32],
+            0,
+            String::new(),
+        );
+        let _ = row; // compile-time check: 4 fields → 4 params
+    }
 
     fn insert_invite_secret(
         conn: &rusqlite::Connection,

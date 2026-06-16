@@ -116,16 +116,16 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a key_secret event".to_string()),
     };
 
-    let ops = vec![WriteOp::InsertOrIgnore {
-        table: "key_secrets",
-        columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-        values: vec![
-            SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Blob(sk.key_bytes.to_vec()),
-            SqlVal::Int(sk.created_at_ms as i64),
-            SqlVal::Text(recorded_by.to_string()),
-        ],
-    }];
+    // Local key_secret: the peer plants its own key. Uses the LOCAL
+    // variant — the unwrap-based access-control theorem does NOT apply
+    // here. The peer is writing its own key material for its own use.
+    let ops = vec![super::key_shared::KeySecretsRow::new(
+        event_id_b64.to_string(),
+        sk.key_bytes,
+        sk.created_at_ms as i64,
+        recorded_by.to_string(),
+    )
+    .to_write_op_local()];
     ProjectorResult::valid(ops)
 }
 

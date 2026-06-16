@@ -256,16 +256,19 @@ pub fn project_pure(
     }];
 
     if let Some(material) = &ctx.unwrapped_secret_material {
-        ops.push(WriteOp::InsertOrIgnore {
-            table: "key_secrets",
-            columns: vec!["event_id", "key_bytes", "created_at", "recorded_by"],
-            values: vec![
-                SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Blob(material.key_bytes.to_vec()),
-                SqlVal::Int(rotation.created_at_ms as i64),
-                SqlVal::Text(recorded_by.to_string()),
-            ],
-        });
+        // Unwrap-gated (same access-control gate as KeyShared): only emit
+        // the key_secrets row when THIS peer successfully unwrapped the
+        // rotation wrapper. Routed through the typed row constructor so the
+        // "KeySecretsRow is the sole production path" invariant holds.
+        ops.push(
+            super::key_shared::KeySecretsRow::new(
+                event_id_b64.to_string(),
+                material.key_bytes,
+                rotation.created_at_ms as i64,
+                recorded_by.to_string(),
+            )
+            .to_write_op_from_unwrap(),
+        );
         return ProjectorResult::valid_with_commands(
             ops,
             vec![EmitCommand::RetryBlockedEncryptedByKey {
