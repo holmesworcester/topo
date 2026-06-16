@@ -17,3 +17,29 @@ pub fn spki_fingerprint_from_ed25519_pubkey(pubkey: &[u8; 32]) -> [u8; 32] {
 
     *blake3::hash(&spki).as_bytes()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::spki_fingerprint_from_ed25519_pubkey;
+    use ed25519_dalek::SigningKey;
+    use std::collections::HashSet;
+
+    #[test]
+    fn spki_fingerprints_are_unique_for_distinct_generated_keys() {
+        // Exercises AXIOM_SPKI_COLLISION_RESISTANCE by checking that
+        // generated Ed25519 keys produce distinct SPKI fingerprints.
+        let mut rng = rand::thread_rng();
+        let mut fingerprints = HashSet::with_capacity(1000);
+
+        for _ in 0..1000 {
+            let signing_key = SigningKey::generate(&mut rng);
+            let fp = spki_fingerprint_from_ed25519_pubkey(&signing_key.verifying_key().to_bytes());
+            assert!(
+                fingerprints.insert(fp),
+                "duplicate SPKI fingerprint observed during 1000-key generation run"
+            );
+        }
+
+        assert_eq!(fingerprints.len(), 1000);
+    }
+}
