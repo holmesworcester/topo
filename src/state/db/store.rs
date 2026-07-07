@@ -14,6 +14,29 @@ pub const SQL_INSERT_RECORDED_EVENT: &str =
     "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
      VALUES (?1, ?2, ?3, ?4)";
 
+pub const SHARED_PRIORITY_LANE_AUTH: &str = "auth";
+pub const SHARED_PRIORITY_LANE_KEY: &str = "key";
+
+fn classify_shared_priority_lane(semantic_type_code: Option<u8>) -> Option<&'static str> {
+    match semantic_type_code {
+        Some(
+            crate::event_modules::EVENT_TYPE_WORKSPACE
+            | crate::event_modules::EVENT_TYPE_USER_INVITE
+            | crate::event_modules::EVENT_TYPE_DEVICE_INVITE
+            | crate::event_modules::EVENT_TYPE_USER
+            | crate::event_modules::EVENT_TYPE_PEER_SHARED
+            | crate::event_modules::EVENT_TYPE_ADMIN
+            | crate::event_modules::EVENT_TYPE_REMOVAL
+            | crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
+        ) => Some(SHARED_PRIORITY_LANE_AUTH),
+        Some(
+            crate::event_modules::EVENT_TYPE_KEY_SHARED
+            | crate::event_modules::EVENT_TYPE_KEY_ROTATION,
+        ) => Some(SHARED_PRIORITY_LANE_KEY),
+        _ => None,
+    }
+}
+
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
         "
@@ -41,6 +64,14 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             ts INTEGER NOT NULL,
             id BLOB NOT NULL,
             PRIMARY KEY (workspace_id, ts, id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS shared_priority_event_index (
+            workspace_id TEXT NOT NULL,
+            lane TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            id BLOB NOT NULL,
+            PRIMARY KEY (workspace_id, lane, ts, id)
         ) WITHOUT ROWID;
         ",
     )?;
@@ -85,12 +116,22 @@ pub fn insert_shared_event_index_entry_if_shared(
     created_at_ms: i64,
     event_id: &EventId,
     workspace_id: &str,
+    blob: &[u8],
 ) -> SqliteResult<()> {
     if share_scope == ShareScope::Shared {
         conn.execute(
             SQL_INSERT_SHARED_EVENT_INDEX_ENTRY,
             params![workspace_id, created_at_ms, event_id.as_slice()],
         )?;
+        if let Some(lane) =
+            classify_shared_priority_lane(crate::event_modules::outer_semantic_type_code(blob))
+        {
+            conn.execute(
+                "INSERT OR IGNORE INTO shared_priority_event_index (workspace_id, lane, ts, id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![workspace_id, lane, created_at_ms, event_id.as_slice()],
+            )?;
+        }
     }
     Ok(())
 }
@@ -219,6 +260,35 @@ impl<'a> Store<'a> {
             let blob: Vec<u8> = row.get(1)?;
             if let Some(event_id) = event_id_from_base64(&id_str) {
                 map.insert(event_id, blob);
+            }
+        }
+        Ok(map)
+    }
+
+    pub fn get_shared_created_at_batch(
+        &self,
+        ids: &[EventId],
+    ) -> SqliteResult<HashMap<EventId, i64>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT event_id, created_at
+             FROM events
+             WHERE event_id IN ({})
+               AND share_scope = 'shared'",
+            placeholders
+        );
+        let id_strs: Vec<String> = ids.iter().map(event_id_to_base64).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut map = HashMap::with_capacity(ids.len());
+        let mut rows = stmt.query(rusqlite::params_from_iter(id_strs.iter()))?;
+        while let Some(row) = rows.next()? {
+            let id_str: String = row.get(0)?;
+            let created_at: i64 = row.get(1)?;
+            if let Some(event_id) = event_id_from_base64(&id_str) {
+                map.insert(event_id, created_at);
             }
         }
         Ok(map)

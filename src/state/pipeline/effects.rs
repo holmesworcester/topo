@@ -192,9 +192,7 @@ mod tests {
     fn event_pipeline_effects_fan_out_shared_events_to_same_workspace_siblings_only() {
         use crate::crypto::{event_id_to_base64, hash_event};
         use crate::db::{open_connection, schema::create_tables, store::insert_event};
-        use crate::event_modules::{
-            encode_event, EncryptedEvent, MessageEvent, ParsedEvent, EVENT_TYPE_MESSAGE,
-        };
+        use crate::event_modules::{EncryptedEvent, MessageEvent, ParsedEvent, EVENT_TYPE_MESSAGE};
         use crate::projection::encrypted::encrypt_event_blob;
         use crate::testutil::SharedDbNode;
 
@@ -269,6 +267,7 @@ mod tests {
             42,
             &event_id,
             &event_id_to_base64(&origin.workspace_id),
+            &blob,
         )
         .unwrap();
         conn.execute(

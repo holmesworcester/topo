@@ -39,15 +39,15 @@ fn index_endpoint_shared_for_workspace(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let endpoint_shared_event_id_b64 = event_id_to_base64(endpoint_shared_event_id);
     let workspace_id_b64 = event_id_to_base64(workspace_id);
-    let created_at_ms: i64 = db.query_row(
-        "SELECT created_at
+    let (created_at_ms, endpoint_blob): (i64, Vec<u8>) = db.query_row(
+        "SELECT created_at, blob
          FROM events
          WHERE event_id = ?1
            AND event_type = 'endpoint_shared'
            AND share_scope = 'shared'
          LIMIT 1",
         rusqlite::params![&endpoint_shared_event_id_b64],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     crate::db::store::insert_shared_event_index_entry_if_shared(
         db,
@@ -55,6 +55,7 @@ fn index_endpoint_shared_for_workspace(
         created_at_ms,
         endpoint_shared_event_id,
         &workspace_id_b64,
+        &endpoint_blob,
     )?;
     crate::state::shared_workspace_fanout::fanout_shared_event_immediate(
         db,

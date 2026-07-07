@@ -105,6 +105,7 @@ fn emit_deterministic_blob_in_tx(
                 created_at_ms,
                 &event_id,
                 &ws_id,
+                blob,
             )?;
         } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared
             && meta.type_name != "endpoint_shared"

@@ -9,8 +9,8 @@ use crate::db::{
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
     KeyRequestEvent, KeySecretEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent,
-    ParsedEvent, ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
-    EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
+    ParsedEvent, ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
+    EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
@@ -211,6 +211,7 @@ pub(super) fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]
         ts as i64,
         &event_id,
         "",
+        &blob,
     )
     .unwrap();
     insert_recorded_event(conn, recorded_by, &event_id, ts as i64, "test").unwrap();
