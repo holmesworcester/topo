@@ -1367,6 +1367,27 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
 
+        RpcMethod::Metrics {
+            since_ms,
+            message_created_after_ms,
+            include_message_ids,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match service::svc_sync_metrics(
+                    &db,
+                    &recorded_by,
+                    since_ms,
+                    message_created_after_ms,
+                    include_message_ids,
+                ) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
         RpcMethod::Replay { pass } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {

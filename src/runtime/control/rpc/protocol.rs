@@ -201,6 +201,15 @@ pub enum RpcMethod {
 
     /// Return all projection table counts for the active tenant.
     Stats,
+    /// Return sync/message attribution metrics for the active tenant.
+    Metrics {
+        #[serde(default)]
+        since_ms: Option<i64>,
+        #[serde(default)]
+        message_created_after_ms: Option<i64>,
+        #[serde(default)]
+        include_message_ids: bool,
+    },
     /// Run a replay pass (forward/idempotent/reverse/shuffle) and return the fingerprint.
     Replay {
         pass: String,

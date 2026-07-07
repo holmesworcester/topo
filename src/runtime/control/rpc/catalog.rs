@@ -378,6 +378,16 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Stats"}"#,
     },
     MethodInfo {
+        name: "Metrics",
+        purpose: "Return sync/message attribution metrics for the active tenant",
+        params: params![
+            "since_ms", "i64", false, None;
+            "message_created_after_ms", "i64", false, None;
+            "include_message_ids", "bool", false, Some("false")
+        ],
+        example_json: r#"{"type":"Metrics","since_ms":1712592000000,"message_created_after_ms":1712592000000,"include_message_ids":true}"#,
+    },
+    MethodInfo {
         name: "Replay",
         purpose: "Run a replay pass and return the projection fingerprint",
         params: params!["pass", "string", true, None],

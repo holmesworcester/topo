@@ -84,6 +84,32 @@ pub fn response_send_quantum_bytes() -> usize {
 }
 
 // -- Sync sessions --
+pub fn live_suppression_mode() -> bool {
+    read_bool_env("TOPO_ENABLE_LIVE_SUPPRESSION")
+}
+
+pub fn live_suppression_event_id_cap() -> usize {
+    if let Some(v) = read_usize_env("TOPO_LIVE_SUPPRESSION_EVENT_ID_CAP") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        1024
+    } else {
+        16_384
+    }
+}
+
+pub fn live_suppression_send_batch_size() -> usize {
+    if let Some(v) = read_usize_env("TOPO_LIVE_SUPPRESSION_SEND_BATCH_SIZE") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        4
+    } else {
+        8
+    }
+}
+
 pub fn session_ingest_cap() -> usize {
     if low_mem_mode() {
         8

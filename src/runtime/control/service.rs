@@ -3,6 +3,8 @@
 //! event modules (message/commands, reaction/commands, user/commands,
 //! workspace/commands, workspace/queries).
 
+use std::collections::BTreeMap;
+
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
@@ -120,6 +122,43 @@ pub struct NodeTenantItem {
     pub workspace_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncMetricsRangeTiming {
+    pub count: i64,
+    pub first_stored_at_ms: Option<i64>,
+    pub projected_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncMetricsPeerCount {
+    pub peer_id: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncMetricsSourceCount {
+    pub source: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncMetricsResponse {
+    pub recorded_by: String,
+    pub since_ms: Option<i64>,
+    pub message_created_after_ms: Option<i64>,
+    pub message_count: i64,
+    pub message_range: SyncMetricsRangeTiming,
+    pub message_ids: Vec<String>,
+    pub changed_sync_run_count: i64,
+    pub received_event_frames_total: i64,
+    pub received_event_frames_by_peer: Vec<SyncMetricsPeerCount>,
+    pub unique_sync_received_event_count: i64,
+    pub recorded_events_by_source_tag: Vec<SyncMetricsSourceCount>,
+    pub recorded_events_by_transport_peer: Vec<SyncMetricsPeerCount>,
+    pub live_endpoint_observation_count: i64,
+    pub live_endpoint_observations_by_peer: Vec<SyncMetricsPeerCount>,
+}
+
 // ---------------------------------------------------------------------------
 // Re-exports for backward compat
 // ---------------------------------------------------------------------------
@@ -179,6 +218,168 @@ pub fn svc_node_status(db_path: &str) -> ServiceResult<Vec<NodeTenantItem>> {
             workspace_id: t.workspace_id,
         })
         .collect())
+}
+
+fn quic_recv_transport_peer_id(source: &str) -> Option<&str> {
+    let source = source.strip_prefix("quic_recv:")?;
+    let (peer_id, _) = source.split_once('@')?;
+    (!peer_id.is_empty()).then_some(peer_id)
+}
+
+pub fn svc_sync_metrics(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    since_ms: Option<i64>,
+    message_created_after_ms: Option<i64>,
+    include_message_ids: bool,
+) -> ServiceResult<SyncMetricsResponse> {
+    let message_count = crate::event_modules::message::count(db, recorded_by)?;
+
+    let message_range = db.query_row(
+        "SELECT COUNT(*), MAX(t.first_stored_at), MAX(t.projected_at)
+         FROM messages m
+         LEFT JOIN event_timeline t ON t.event_id = m.message_id
+         WHERE m.recorded_by = ?1
+           AND (?2 IS NULL OR m.created_at >= ?2)",
+        rusqlite::params![recorded_by, message_created_after_ms],
+        |row| {
+            Ok(SyncMetricsRangeTiming {
+                count: row.get(0)?,
+                first_stored_at_ms: row.get(1)?,
+                projected_at_ms: row.get(2)?,
+            })
+        },
+    )?;
+
+    let message_ids = if include_message_ids {
+        let mut stmt = db.prepare(
+            "SELECT message_id
+             FROM messages
+             WHERE recorded_by = ?1
+               AND (?2 IS NULL OR created_at >= ?2)
+             ORDER BY created_at ASC, message_id ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![recorded_by, message_created_after_ms],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+
+    let mut stmt = db.prepare(
+        "SELECT peer_id, COALESCE(SUM(events_received), 0)
+         FROM sync_runs
+         WHERE tenant_id = ?1
+           AND events_received > 0
+           AND (?2 IS NULL OR started_at_ms >= ?2)
+         GROUP BY peer_id
+         ORDER BY peer_id ASC",
+    )?;
+    let received_event_frames_by_peer = stmt
+        .query_map(rusqlite::params![recorded_by, since_ms], |row| {
+            Ok(SyncMetricsPeerCount {
+                peer_id: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let received_event_frames_total = received_event_frames_by_peer
+        .iter()
+        .map(|item| item.count)
+        .sum();
+
+    let changed_sync_run_count = db.query_row(
+        "SELECT COUNT(*)
+         FROM sync_runs
+         WHERE tenant_id = ?1
+           AND (rounds > 0 OR events_sent > 0 OR events_received > 0)
+           AND (?2 IS NULL OR started_at_ms >= ?2)",
+        rusqlite::params![recorded_by, since_ms],
+        |row| row.get(0),
+    )?;
+
+    let unique_sync_received_event_count = db.query_row(
+        "SELECT COUNT(DISTINCT event_id)
+         FROM recorded_events
+         WHERE peer_id = ?1
+           AND source LIKE 'quic_recv:%'
+           AND (?2 IS NULL OR recorded_at >= ?2)",
+        rusqlite::params![recorded_by, since_ms],
+        |row| row.get(0),
+    )?;
+
+    let mut stmt = db.prepare(
+        "SELECT source, COUNT(*)
+         FROM recorded_events
+         WHERE peer_id = ?1
+           AND source LIKE 'quic_recv:%'
+           AND (?2 IS NULL OR recorded_at >= ?2)
+         GROUP BY source
+         ORDER BY source ASC",
+    )?;
+    let recorded_events_by_source_tag = stmt
+        .query_map(rusqlite::params![recorded_by, since_ms], |row| {
+            Ok(SyncMetricsSourceCount {
+                source: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut by_transport_peer = BTreeMap::<String, i64>::new();
+    for item in &recorded_events_by_source_tag {
+        if let Some(peer_id) = quic_recv_transport_peer_id(&item.source) {
+            *by_transport_peer.entry(peer_id.to_string()).or_default() += item.count;
+        }
+    }
+    let recorded_events_by_transport_peer = by_transport_peer
+        .into_iter()
+        .map(|(peer_id, count)| SyncMetricsPeerCount { peer_id, count })
+        .collect();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let mut stmt = db.prepare(
+        "SELECT via_peer_id, COUNT(*)
+         FROM peer_endpoint_observations
+         WHERE recorded_by = ?1
+           AND expires_at > ?2
+         GROUP BY via_peer_id
+         ORDER BY via_peer_id ASC",
+    )?;
+    let live_endpoint_observations_by_peer = stmt
+        .query_map(rusqlite::params![recorded_by, now_ms], |row| {
+            Ok(SyncMetricsPeerCount {
+                peer_id: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let live_endpoint_observation_count = live_endpoint_observations_by_peer
+        .iter()
+        .map(|item| item.count)
+        .sum();
+
+    Ok(SyncMetricsResponse {
+        recorded_by: recorded_by.to_string(),
+        since_ms,
+        message_created_after_ms,
+        message_count,
+        message_range,
+        message_ids,
+        changed_sync_run_count,
+        received_event_frames_total,
+        received_event_frames_by_peer,
+        unique_sync_received_event_count,
+        recorded_events_by_source_tag,
+        recorded_events_by_transport_peer,
+        live_endpoint_observation_count,
+        live_endpoint_observations_by_peer,
+    })
 }
 
 // ---------------------------------------------------------------------------

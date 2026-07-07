@@ -7,6 +7,7 @@
 //! - bootstrap refresher
 //! - known-peer refresher
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,11 +16,12 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::bootstrap_auth::GREEDY_KNOWN_PEER_TARGET_FLOOR;
 use super::target_dispatch::{run_target_dispatcher, TargetIngressEvent, TargetIngressSource};
 use super::target_planner::{collect_all_bootstrap_targets, collect_all_known_peer_targets};
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::db::transport_creds::TenantInfo;
-use crate::peering::loops::accept_loop_until_cancel;
+use crate::peering::loops::{accept_loop_until_cancel, live_session_peer_ids};
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::TransportEndpoint;
 
@@ -47,6 +49,9 @@ enum WorkerKind {
 enum WorkerFailurePolicy {
     FailRuntime,
 }
+
+const KNOWN_PEER_REFRESH_IDLE_DELAY: Duration = Duration::from_millis(1000);
+const KNOWN_PEER_REFRESH_GREEDY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct WorkerExit {
@@ -383,13 +388,18 @@ async fn run_known_peer_refresher(
             break;
         }
 
+        let mut refresh_delay = KNOWN_PEER_REFRESH_IDLE_DELAY;
         match collect_all_known_peer_targets(&db_path) {
             Ok(targets) => {
                 warning_gate.clear();
+                let mut dispatchable_target_counts: HashMap<String, usize> = HashMap::new();
                 for (tenant_id, peer_id, remote) in targets {
                     if discovery_disabled && remote.is_none() {
                         continue;
                     }
+                    *dispatchable_target_counts
+                        .entry(tenant_id.clone())
+                        .or_insert(0) += 1;
                     if ingress_tx
                         .send(TargetIngressEvent {
                             tenant_id,
@@ -402,6 +412,7 @@ async fn run_known_peer_refresher(
                         return Ok(());
                     }
                 }
+                refresh_delay = known_peer_refresh_delay(&db_path, &dispatchable_target_counts);
             }
             Err(e) => {
                 let message = format!("KNOWN PEER REFRESH failed: {}", e);
@@ -415,16 +426,40 @@ async fn run_known_peer_refresher(
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+            _ = tokio::time::sleep(refresh_delay) => {}
         }
     }
 
     Ok(())
 }
 
+fn known_peer_refresh_delay(
+    db_path: &str,
+    dispatchable_target_counts: &HashMap<String, usize>,
+) -> Duration {
+    if should_greedily_refresh_known_peers(db_path, dispatchable_target_counts) {
+        KNOWN_PEER_REFRESH_GREEDY_DELAY
+    } else {
+        KNOWN_PEER_REFRESH_IDLE_DELAY
+    }
+}
+
+fn should_greedily_refresh_known_peers(
+    db_path: &str,
+    dispatchable_target_counts: &HashMap<String, usize>,
+) -> bool {
+    dispatchable_target_counts
+        .iter()
+        .any(|(tenant_id, dispatchable_targets)| {
+            let live_sessions = live_session_peer_ids(db_path, tenant_id).len();
+            live_sessions < GREEDY_KNOWN_PEER_TARGET_FLOOR && live_sessions < *dispatchable_targets
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peering::loops::claim_live_session_peer;
 
     #[test]
     fn transition_to_active_when_tenants_present() {
@@ -451,5 +486,49 @@ mod tests {
             worker_failure_policy(WorkerKind::KnownPeerRefresher),
             WorkerFailurePolicy::FailRuntime
         );
+    }
+
+    #[test]
+    fn known_peer_refresher_goes_greedy_when_tenant_has_more_targets_than_live_sessions() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("known-peer-refresh-greedy.db");
+        let db_path = db_path.to_str().unwrap();
+        let leases: Vec<_> = (0..2)
+            .map(|idx| claim_live_session_peer(db_path, "tenant-a", &format!("{idx:064x}")))
+            .collect();
+        let target_counts = HashMap::from([
+            ("tenant-a".to_string(), GREEDY_KNOWN_PEER_TARGET_FLOOR),
+            ("tenant-b".to_string(), 1usize),
+        ]);
+
+        assert!(should_greedily_refresh_known_peers(db_path, &target_counts));
+        assert_eq!(
+            known_peer_refresh_delay(db_path, &target_counts),
+            KNOWN_PEER_REFRESH_GREEDY_DELAY
+        );
+
+        drop(leases);
+    }
+
+    #[test]
+    fn known_peer_refresher_stays_idle_when_live_sessions_cover_dispatchable_targets() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("known-peer-refresh-idle.db");
+        let db_path = db_path.to_str().unwrap();
+        let leases: Vec<_> = (0..GREEDY_KNOWN_PEER_TARGET_FLOOR)
+            .map(|idx| claim_live_session_peer(db_path, "tenant-a", &format!("{idx:064x}")))
+            .collect();
+        let target_counts = HashMap::from([("tenant-a".to_string(), 3usize)]);
+
+        assert!(!should_greedily_refresh_known_peers(
+            db_path,
+            &target_counts
+        ));
+        assert_eq!(
+            known_peer_refresh_delay(db_path, &target_counts),
+            KNOWN_PEER_REFRESH_IDLE_DELAY
+        );
+
+        drop(leases);
     }
 }

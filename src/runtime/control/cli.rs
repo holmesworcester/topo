@@ -230,6 +230,22 @@ pub(crate) enum Commands {
         json: bool,
     },
 
+    /// Show sync/message attribution metrics for the active tenant
+    Metrics {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Restrict sync-attribution counters to runs/events observed since this wall-clock timestamp
+        #[arg(long)]
+        since_ms: Option<i64>,
+        /// Restrict message/timeline counters to messages created at or after this wall-clock timestamp
+        #[arg(long)]
+        message_created_after_ms: Option<i64>,
+        /// Include matching message IDs in the JSON payload
+        #[arg(long)]
+        include_message_ids: bool,
+    },
+
     /// Run a replay pass: clear projections, reproject, return fingerprint
     Replay {
         /// Pass type: forward, idempotent, reverse, shuffle

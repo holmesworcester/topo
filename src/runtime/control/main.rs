@@ -931,6 +931,76 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        Commands::Metrics {
+            json,
+            since_ms,
+            message_created_after_ms,
+            include_message_ids,
+        } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::Metrics {
+                    since_ms,
+                    message_created_after_ms,
+                    include_message_ids,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else {
+                let message_range = &data["message_range"];
+                println!("METRICS ({}):", db);
+                println!(
+                    "  Messages total:         {}",
+                    data["message_count"].as_i64().unwrap_or_default()
+                );
+                println!(
+                    "  Message range count:    {}",
+                    message_range["count"].as_i64().unwrap_or_default()
+                );
+                println!(
+                    "  First stored at ms:     {}",
+                    message_range["first_stored_at_ms"]
+                        .as_i64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                );
+                println!(
+                    "  Projected at ms:        {}",
+                    message_range["projected_at_ms"]
+                        .as_i64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                );
+                println!(
+                    "  Sync runs changed:      {}",
+                    data["changed_sync_run_count"].as_i64().unwrap_or_default()
+                );
+                println!(
+                    "  Received event frames:  {}",
+                    data["received_event_frames_total"]
+                        .as_i64()
+                        .unwrap_or_default()
+                );
+                println!(
+                    "  Unique rx events:       {}",
+                    data["unique_sync_received_event_count"]
+                        .as_i64()
+                        .unwrap_or_default()
+                );
+                println!(
+                    "  Live endpoint rows:     {}",
+                    data["live_endpoint_observation_count"]
+                        .as_i64()
+                        .unwrap_or_default()
+                );
+            }
+        }
+
         Commands::Replay { pass, json } => {
             let data = rpc_require_daemon(
                 db,

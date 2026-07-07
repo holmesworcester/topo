@@ -703,17 +703,18 @@ async fn read_inbound_session_auth_inner(
             let claimed_peer_matches_key = auth.source_peer_id == derived_source_peer_id;
             let invite_event_id_b64 = event_id_to_base64(&auth.target_invite_event_id);
             let remote_peer_id = hex::encode(auth.source_peer_id);
-            let (tenant_resolution, tenant_resolution_error) = match resolve_bootstrap_session_tenant(
-                &db,
-                &invite_event_id_b64,
-                &actual_remote_daemon_peer_id_raw,
-            ) {
-                Ok(tenant_id) => (BootstrapSessionTenantDecision::Accept { tenant_id }, None),
-                Err(err) => (
-                    BootstrapSessionTenantDecision::RejectMissing,
-                    Some(err.to_string()),
-                ),
-            };
+            let (tenant_resolution, tenant_resolution_error) =
+                match resolve_bootstrap_session_tenant(
+                    &db,
+                    &invite_event_id_b64,
+                    &actual_remote_daemon_peer_id_raw,
+                ) {
+                    Ok(tenant_id) => (BootstrapSessionTenantDecision::Accept { tenant_id }, None),
+                    Err(err) => (
+                        BootstrapSessionTenantDecision::RejectMissing,
+                        Some(err.to_string()),
+                    ),
+                };
             let invite_public_key = load_invite_public_key(&db, &invite_event_id_b64)?;
             let signing_bytes = encode_invite_signing_bytes(&auth);
             let invite_signature_valid =

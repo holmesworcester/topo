@@ -103,6 +103,20 @@ pub fn query_field(
         "message_count" => {
             message::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
         }
+        other if other.starts_with("message_count_since:") => {
+            let cutoff_ms = other["message_count_since:".len()..]
+                .parse::<i64>()
+                .map_err(|e| format!("invalid message_count_since cutoff '{}': {}", other, e))?;
+            db.query_row(
+                "SELECT COUNT(*)
+                 FROM messages
+                 WHERE recorded_by = ?1
+                   AND created_at >= ?2",
+                rusqlite::params![recorded_by, cutoff_ms],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e))
+        }
         "reaction_count" => {
             reaction::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
         }

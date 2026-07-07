@@ -2877,6 +2877,35 @@ pub fn stats_json(db: &str) -> serde_json::Value {
     serde_json::from_str(stdout.trim()).expect("failed to parse stats JSON")
 }
 
+/// Run `topo metrics --json` with optional filters and parse the result.
+pub fn metrics_json(
+    db: &str,
+    since_ms: Option<i64>,
+    message_created_after_ms: Option<i64>,
+    include_message_ids: bool,
+) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--db").arg(db).arg("metrics").arg("--json");
+    if let Some(since_ms) = since_ms {
+        cmd.arg("--since-ms").arg(since_ms.to_string());
+    }
+    if let Some(message_created_after_ms) = message_created_after_ms {
+        cmd.arg("--message-created-after-ms")
+            .arg(message_created_after_ms.to_string());
+    }
+    if include_message_ids {
+        cmd.arg("--include-message-ids");
+    }
+    let out = cmd.output().expect("failed to run topo metrics --json");
+    assert!(
+        out.status.success(),
+        "topo metrics --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).expect("failed to parse metrics JSON")
+}
+
 /// Run all 4 replay passes and assert fingerprints match.
 /// Returns the shared fingerprint string.
 pub fn assert_replay_pass(db: &str) -> String {

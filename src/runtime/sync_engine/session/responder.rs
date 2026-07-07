@@ -8,7 +8,8 @@ use crate::runtime::sync_engine::session::admission::resolve_sync_admission;
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
-    load_shared_event_index_slice, send_have_events, spawn_receive_log_task,
+    load_shared_event_index_slice, open_live_suppression_session, send_have_events,
+    spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
@@ -154,6 +155,13 @@ where
     if hot_receive {
         note_hot_receive_started(db_path);
     }
+    let (mut live_suppression, receive_live_suppression) = if let Some((session, receive_state)) =
+        open_live_suppression_session(db_path, recorded_by, range, session_id)
+    {
+        (Some(session), Some(receive_state))
+    } else {
+        (None, None)
+    };
     let receive_task = spawn_receive_log_task(
         data_recv,
         db_path.to_string(),
@@ -162,11 +170,18 @@ where
         ingress_source_tag.to_string(),
         activity_timeout,
         rx_capture,
+        receive_live_suppression,
     );
 
     let store = Store::new(&db);
-    let (events_sent, bytes_sent) =
-        send_have_events(&store, &mut data_send, &have_ids, range).await?;
+    let (events_sent, bytes_sent) = send_have_events(
+        &store,
+        &mut data_send,
+        &have_ids,
+        range,
+        live_suppression.as_mut(),
+    )
+    .await?;
     drop(data_send);
 
     let received = match receive_task.await {

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::tuning::low_mem_mode;
+use crate::tuning::{live_suppression_mode, low_mem_mode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncWindowKind {
     Full = 0,
     LastDay = 1,
@@ -29,7 +29,7 @@ pub fn decode_sync_window_kind(kind: u8) -> Result<SyncWindowKind, String> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyncWindow {
     pub kind: SyncWindowKind,
     pub ts_min_inclusive_ms: Option<i64>,
@@ -256,7 +256,7 @@ pub fn select_outbound_window(
     now_ms: i64,
 ) -> SyncWindow {
     let live_peers = normalized_live_peers(peer_id, live_peer_ids);
-    if live_peers.len() <= 1 {
+    if live_peers.len() <= 1 || live_suppression_mode() {
         return select_single_peer_window(db_path, recorded_by, peer_id, now_ms);
     }
 
@@ -549,13 +549,28 @@ mod tests {
 
     struct EnvGuard {
         prev_low_mem_ios: Option<String>,
+        prev_live_suppression: Option<String>,
     }
 
     impl EnvGuard {
         fn enable_low_mem_ios() -> Self {
             let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
+            let prev_live_suppression = std::env::var("TOPO_ENABLE_LIVE_SUPPRESSION").ok();
             std::env::set_var("LOW_MEM_IOS", "1");
-            Self { prev_low_mem_ios }
+            Self {
+                prev_low_mem_ios,
+                prev_live_suppression,
+            }
+        }
+
+        fn enable_live_suppression() -> Self {
+            let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
+            let prev_live_suppression = std::env::var("TOPO_ENABLE_LIVE_SUPPRESSION").ok();
+            std::env::set_var("TOPO_ENABLE_LIVE_SUPPRESSION", "1");
+            Self {
+                prev_low_mem_ios,
+                prev_live_suppression,
+            }
         }
     }
 
@@ -564,6 +579,10 @@ mod tests {
             match &self.prev_low_mem_ios {
                 Some(v) => std::env::set_var("LOW_MEM_IOS", v),
                 None => std::env::remove_var("LOW_MEM_IOS"),
+            }
+            match &self.prev_live_suppression {
+                Some(v) => std::env::set_var("TOPO_ENABLE_LIVE_SUPPRESSION", v),
+                None => std::env::remove_var("TOPO_ENABLE_LIVE_SUPPRESSION"),
             }
         }
     }
@@ -814,6 +833,46 @@ mod tests {
         assert_eq!(split_week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
         assert_eq!(single_week.ts_min(), Some(1_000_000 - WEEK_MS));
         assert_eq!(single_week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
+    }
+
+    #[test]
+    fn live_suppression_mode_keeps_multi_peer_windows_identical() {
+        let _env = EnvGuard::enable_live_suppression();
+        let db_path = "/tmp/window-live-suppression";
+        let recorded_by = "tenant-a";
+        let peer_a = "peer-a";
+        let peer_b = "peer-b";
+        let live_peers = vec![peer_a.to_string(), peer_b.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_a);
+        reset_outbound_window_state(db_path, recorded_by, peer_b);
+
+        let auth_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let auth_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        assert_eq!(auth_a, auth_b);
+        assert_eq!(auth_a.kind, SyncWindowKind::AuthGraph);
+
+        mark_outbound_window_completed(db_path, recorded_by, peer_a, auth_a);
+        mark_outbound_window_completed(db_path, recorded_by, peer_b, auth_b);
+        let key_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let key_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        assert_eq!(key_a, key_b);
+        assert_eq!(key_a.kind, SyncWindowKind::KeyGraph);
+
+        mark_outbound_window_completed(db_path, recorded_by, peer_a, key_a);
+        mark_outbound_window_completed(db_path, recorded_by, peer_b, key_b);
+        let day_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let day_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        assert_eq!(day_a, day_b);
+        assert_eq!(day_a.kind, SyncWindowKind::LastDay);
+
+        mark_outbound_window_completed(db_path, recorded_by, peer_a, day_a);
+        mark_outbound_window_completed(db_path, recorded_by, peer_b, day_b);
+        let cold_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let cold_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        assert_eq!(cold_a, cold_b);
+        assert_eq!(cold_a.kind, SyncWindowKind::LastWeek);
+        assert_eq!(cold_a.ts_min(), Some(1_000_000 - WEEK_MS));
+        assert_eq!(cold_a.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
     }
 
     #[test]
