@@ -57,11 +57,13 @@ pub fn encode_endpoint_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         ParsedEvent::EndpointSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
-        EVENT_TYPE_ENDPOINT_SECRET,
-        e.created_at_ms,
-        &e.private_key_bytes,
-    ))
+    Ok(
+        topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
+            EVENT_TYPE_ENDPOINT_SECRET,
+            e.created_at_ms,
+            &e.private_key_bytes,
+        ),
+    )
 }
 
 pub fn deterministic_endpoint_secret_created_at_ms(private_key_bytes: &[u8; 32]) -> u64 {

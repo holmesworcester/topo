@@ -92,20 +92,10 @@ fn test_cli_key_request_heals_partitioned_removal_for_unknown_joiner() {
         .to_str()
         .unwrap()
         .to_string();
-    let carol_db = tmpdir
-        .path()
-        .join("carol.db")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let carol_db = tmpdir.path().join("carol.db").to_str().unwrap().to_string();
     let content = "partitioned-removal/key-repair-marker";
 
-    create_workspace_with_details(
-        &bob_db,
-        "partitioned-removal",
-        "bob",
-        "bob-root",
-    );
+    create_workspace_with_details(&bob_db, "partitioned-removal", "bob", "bob-root");
     let bob = start_daemon(&bob_db);
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(30));
     let invite_addr = daemon_listen_addr(&bob_db);
@@ -201,15 +191,13 @@ fn test_cli_key_request_heals_partitioned_removal_for_unknown_joiner() {
         timeout,
         Duration::from_millis(300),
         "Carol emits a real daemon key_request after receiving Alice's message without a key",
-        || {
-            RepairObservation {
-                key_request_count: count_event_type(&carol_db, "key_request"),
-                key_history_count: count_event_type(&carol_db, "key_history"),
-                key_rotation_count: count_event_type(&carol_db, "key_rotation"),
-                removal_count: count_event_type(&carol_db, "removal"),
-                key_shared_count: count_event_type(&carol_db, "key_shared"),
-                message_visible: message_visible(&carol_db, content),
-            }
+        || RepairObservation {
+            key_request_count: count_event_type(&carol_db, "key_request"),
+            key_history_count: count_event_type(&carol_db, "key_history"),
+            key_rotation_count: count_event_type(&carol_db, "key_rotation"),
+            removal_count: count_event_type(&carol_db, "removal"),
+            key_shared_count: count_event_type(&carol_db, "key_shared"),
+            message_visible: message_visible(&carol_db, content),
         },
         |state| state.key_request_count >= 1,
     );

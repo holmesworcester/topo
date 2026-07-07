@@ -386,15 +386,10 @@ pub fn resolve_peer_number(
             rows.len()
         ));
     };
-    event_id_from_base64(&row.peer_id)
-        .ok_or_else(|| format!("invalid event ID for peer {}", num))
+    event_id_from_base64(&row.peer_id).ok_or_else(|| format!("invalid event ID for peer {}", num))
 }
 
-pub fn resolve_peer(
-    db: &Connection,
-    recorded_by: &str,
-    selector: &str,
-) -> Result<EventId, String> {
+pub fn resolve_peer(db: &Connection, recorded_by: &str, selector: &str) -> Result<EventId, String> {
     let stripped = selector.strip_prefix('#').unwrap_or(selector);
     if let Ok(num) = stripped.parse::<usize>() {
         return resolve_peer_number(db, recorded_by, num);

@@ -177,12 +177,9 @@ pub fn build_projector_context(
         ParsedEvent::KeyRotation(rotation) => rotation,
         _ => return Err("key_rotation context loader called for non-key_rotation event".into()),
     };
-    Ok(ContextLoadResult::ready(queries.load_key_rotation_context(
-        frame,
-        recorded_by,
-        event_id_b64,
-        rotation,
-    )?))
+    Ok(ContextLoadResult::ready(
+        queries.load_key_rotation_context(frame, recorded_by, event_id_b64, rotation)?,
+    ))
 }
 
 pub fn project_pure(
@@ -196,10 +193,14 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a key_rotation event".to_string()),
     };
     if rotation.recipient_slots.len() != KEY_ROTATION_CAP {
-        return ProjectorResult::reject("recipient_slots len does not match key rotation cap".to_string());
+        return ProjectorResult::reject(
+            "recipient_slots len does not match key rotation cap".to_string(),
+        );
     }
     if rotation.wrapped_keys.len() != KEY_ROTATION_CAP {
-        return ProjectorResult::reject("wrapped_keys len does not match key rotation cap".to_string());
+        return ProjectorResult::reject(
+            "wrapped_keys len does not match key rotation cap".to_string(),
+        );
     }
     let Some(current_signer) = ctx.current_signer.as_ref() else {
         return ProjectorResult::reject("key_rotation missing current signer envelope".to_string());
@@ -273,9 +274,8 @@ pub fn project_pure(
         // Emit the deterministic KeySecret blob through the normal event
         // pipeline. The KeySecret projector writes `key_secrets` and the
         // encrypted wrapper dep resolves on the KeySecret event_id.
-        let sk_event = crate::event_modules::key_secret::deterministic_key_secret_event(
-            material.key_bytes,
-        );
+        let sk_event =
+            crate::event_modules::key_secret::deterministic_key_secret_event(material.key_bytes);
         let sk_blob = match crate::event_modules::encode_event(&sk_event) {
             Ok(blob) => blob,
             Err(err) => {

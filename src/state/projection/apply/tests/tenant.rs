@@ -344,7 +344,10 @@ fn test_two_tenant_contexts_single_db() {
     let (_rxn, rxn_blob) = make_reaction(&conn, tenant_b, &msg_a_eid, "\u{1f44d}");
     let rxn_eid = insert_event_raw(&conn, tenant_b, &rxn_blob);
     let r_rxn = project_one(&conn, tenant_b, &rxn_eid).unwrap();
-    assert!(matches!(r_rxn, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        r_rxn,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     // Now record and project tenant_a's message for tenant_b.
     // The message's signed_by references tenant_a's signer, so tenant_b also needs

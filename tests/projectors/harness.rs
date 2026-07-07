@@ -10,13 +10,13 @@ pub mod fixtures {
         KeyRequestEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent,
         ReactionEvent, UserInviteEvent, WorkspaceEvent,
     };
-    use topo::projection::projector::{
-        BootstrapDecisionContext, CurrentSignerInfo, EmitCommand, FileDescriptorInfo,
-        ProjectorDecisionContext, ProjectorResult, WriteOp,
-    };
     use topo::projection::decision::ProjectionDecision;
     use topo::projection::decision_context::{
         ContextLoadResult, DepLoadResult, ProjectionFrameContext, ProjectionQueries,
+    };
+    use topo::projection::projector::{
+        BootstrapDecisionContext, CurrentSignerInfo, EmitCommand, FileDescriptorInfo,
+        ProjectorDecisionContext, ProjectorResult, WriteOp,
     };
 
     #[derive(Clone)]
@@ -260,7 +260,10 @@ pub mod fixtures {
 
     pub fn assert_block(result: &ProjectorResult) {
         assert!(
-            matches!(result.decision, ProjectionDecision::BlockOnMissingDeps { .. }),
+            matches!(
+                result.decision,
+                ProjectionDecision::BlockOnMissingDeps { .. }
+            ),
             "expected Block, got {:?}",
             result.decision
         );

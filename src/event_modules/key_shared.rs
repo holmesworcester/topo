@@ -98,10 +98,10 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 }
 
 use crate::crypto::event_id_to_base64;
+use crate::projection::decision_context::{ProjectionFrameContext, ProjectionQueries};
 use crate::projection::projector::{
     EmitCommand, ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
 };
-use crate::projection::decision_context::{ProjectionFrameContext, ProjectionQueries};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -139,9 +139,11 @@ pub fn build_projector_context(
         _ => return Err("key_shared context loader called for non-key_shared event".into()),
     };
 
-    Ok(crate::projection::decision_context::ContextLoadResult::ready(
-        queries.load_key_shared_context(frame, recorded_by, event_id_b64, ss)?,
-    ))
+    Ok(
+        crate::projection::decision_context::ContextLoadResult::ready(
+            queries.load_key_shared_context(frame, recorded_by, event_id_b64, ss)?,
+        ),
+    )
 }
 
 pub fn project_pure(
@@ -232,9 +234,8 @@ pub fn project_pure(
     // Emit the deterministic KeySecret blob through the normal event
     // pipeline. The KeySecret projector writes `key_secrets` and the
     // encrypted wrapper dep resolves on the KeySecret event_id.
-    let sk_event = crate::event_modules::key_secret::deterministic_key_secret_event(
-        material.key_bytes,
-    );
+    let sk_event =
+        crate::event_modules::key_secret::deterministic_key_secret_event(material.key_bytes);
     let sk_blob = match crate::event_modules::encode_event(&sk_event) {
         Ok(blob) => blob,
         Err(err) => {

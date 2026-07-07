@@ -25,8 +25,7 @@ pub fn outer_payload(blob: &[u8]) -> Option<&[u8]> {
     if !topo_verus_proofs::event_modules::signed::is_well_formed_signed_prefix(blob) {
         return None;
     }
-    let (start, end) =
-        topo_verus_proofs::event_modules::signed::signed_body_range(blob.len());
+    let (start, end) = topo_verus_proofs::event_modules::signed::signed_body_range(blob.len());
     Some(&blob[start..end])
 }
 

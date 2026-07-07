@@ -751,7 +751,10 @@ fn test_project_unblock_cascade() {
 
     // Project reaction — should block
     let result = project_one(&conn, recorded_by, &rxn_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     // Now insert and project the message
     let msg_eid2 = insert_event_raw(&conn, recorded_by, &msg_blob);
@@ -831,7 +834,10 @@ fn test_duplicate_dep_ids_unblock_correctly() {
     insert_event_raw(&conn, recorded_by, &root_blob);
     insert_event_raw(&conn, recorded_by, &dup_blob);
     let result = project_one(&conn, recorded_by, &dup_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     // deps_remaining must be 1 (unique), not 2 (raw)
     let dup_b64 = event_id_to_base64(&dup_eid);

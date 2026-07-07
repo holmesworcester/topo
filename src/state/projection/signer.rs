@@ -142,7 +142,7 @@ fn signer_identity_from_parsed(
                 "signer event type_code={} is not a supported signer identity type",
                 other.event_type_code()
             )
-            .into())
+            .into());
         }
     };
     Ok(identity)

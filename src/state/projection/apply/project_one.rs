@@ -123,7 +123,13 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
     // `dep_facts::decide_key_shared`. No per-event finalization
     // bridge is required here.
 
-    backend.finalize_valid_projection(&cap, recorded_by, &event_id_b64, sub_event, suppress_sharing)?;
+    backend.finalize_valid_projection(
+        &cap,
+        recorded_by,
+        &event_id_b64,
+        sub_event,
+        suppress_sharing,
+    )?;
 
     Ok((ProjectionDecision::Valid, Some(parsed)))
 }

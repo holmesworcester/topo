@@ -117,7 +117,10 @@ pub fn frontier_refs_from_slots(
 
 pub fn parse_removal(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     if let Some((ts, removed_member_ref, parent_count, p1, p2, p3, p4, fh, rb, admin)) =
-        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id7(EVENT_TYPE_REMOVAL, blob)
+        topo_verus_proofs::event_modules::layout::shapes::parse_ts_id_u8_id7(
+            EVENT_TYPE_REMOVAL,
+            blob,
+        )
     {
         return Ok(ParsedEvent::Removal(RemovalEvent {
             created_at_ms: ts,
@@ -171,9 +174,7 @@ pub fn encode_removal(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 use crate::crypto::event_id_to_base64;
 use crate::projection::decision_context::define_query_context_loader;
-use crate::projection::projector::{
-    ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp,
-};
+use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -283,7 +284,12 @@ pub fn project_pure(
     ])
 }
 
-define_query_context_loader!(build_projector_context, Removal, load_removal_context, "removal");
+define_query_context_loader!(
+    build_projector_context,
+    Removal,
+    load_removal_context,
+    "removal"
+);
 
 pub static REMOVAL_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_REMOVAL,

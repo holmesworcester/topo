@@ -2,8 +2,10 @@ use super::super::ParsedEvent;
 use super::wire::{unpack_bao_payload, FILE_SLICE_CIPHERTEXT_BYTES};
 use crate::crypto::bao_verify;
 use crate::crypto::event_id_to_base64;
+use crate::projection::decision_context::{
+    ContextLoadResult, ProjectionFrameContext, ProjectionQueries,
+};
 use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::decision_context::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,

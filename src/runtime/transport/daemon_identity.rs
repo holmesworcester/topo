@@ -92,8 +92,7 @@ fn ensure_endpoint_secret_row(
             private_key_bytes,
         );
 
-        create_event(conn, &endpoint_id, &event)
-            .map_err(|e| sqlite_other(e.to_string()))?;
+        create_event(conn, &endpoint_id, &event).map_err(|e| sqlite_other(e.to_string()))?;
 
         crate::event_modules::endpoint_secret::load_local_endpoint_secret(conn)
             .map_err(|e| sqlite_other(e.to_string()))?

@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use rusqlite::OptionalExtension;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,7 +14,6 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use rusqlite::OptionalExtension;
 use topo::testutil::DaemonGuard;
 
 static DAEMON_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1804,14 +1804,13 @@ fn wait_for_tenant_inviter_route_ready_debug(
                     continue;
                 };
 
-                let inviter_peer_id =
-                    topo::transport::resolve_bootstrap_inviter_peer_id(
-                        &conn,
-                        tenant_peer_id,
-                        &invite_event_id,
-                    )
-                    .ok()
-                    .flatten();
+                let inviter_peer_id = topo::transport::resolve_bootstrap_inviter_peer_id(
+                    &conn,
+                    tenant_peer_id,
+                    &invite_event_id,
+                )
+                .ok()
+                .flatten();
                 let Some(inviter_peer_id) = inviter_peer_id else {
                     last = format!(
                         "tenant_peer_id={} invite_event_id={} inviter peer not projected yet",

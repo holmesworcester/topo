@@ -51,12 +51,12 @@ pub const fn encrypted_wire_size(inner_wire_size: usize) -> usize {
 pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     use super::super::admin::ADMIN_WIRE_SIZE;
     use super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
+    use super::super::device_invite::DEVICE_INVITE_WIRE_SIZE;
     use super::super::file::FILE_WIRE_SIZE;
     use super::super::file_slice::FILE_SLICE_WIRE_SIZE;
     use super::super::key_shared::KEY_SHARED_WIRE_SIZE;
     use super::super::message::wire::MESSAGE_WIRE_SIZE;
     use super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
-    use super::super::device_invite::DEVICE_INVITE_WIRE_SIZE;
     use super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
     use super::super::reaction::REACTION_WIRE_SIZE;
     use super::super::user::USER_WIRE_SIZE;
@@ -232,6 +232,7 @@ mod tests {
     fn test_per_event_wire_sizes() {
         use super::super::super::admin::ADMIN_WIRE_SIZE;
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
+        use super::super::super::device_invite::DEVICE_INVITE_WIRE_SIZE;
         use super::super::super::file::FILE_WIRE_SIZE;
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
@@ -243,7 +244,6 @@ mod tests {
         use super::super::super::key_shared::KEY_SHARED_WIRE_SIZE;
         use super::super::super::message::MESSAGE_WIRE_SIZE;
         use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
-        use super::super::super::device_invite::DEVICE_INVITE_WIRE_SIZE;
         use super::super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
         use super::super::super::tenant::TENANT_WIRE_SIZE;

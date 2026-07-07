@@ -2,7 +2,9 @@ use super::super::layout::field_spec::{
     decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
-use super::super::{EventError, ParsedEvent, EVENT_TYPE_FILE, EVENT_TYPE_KEY_SECRET, EVENT_TYPE_MESSAGE};
+use super::super::{
+    EventError, ParsedEvent, EVENT_TYPE_FILE, EVENT_TYPE_KEY_SECRET, EVENT_TYPE_MESSAGE,
+};
 
 // ─── Layout (owned by this module) ───
 
@@ -166,19 +168,21 @@ pub fn encode_file(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let mut mime_slot: [u8; FILE_MIME_BYTES] = [0u8; FILE_MIME_BYTES];
     crate::event_modules::layout::common::write_text_slot(&att.mime_type, &mut mime_slot)
         .map_err(EventError::TextSlot)?;
-    Ok(topo_verus_proofs::event_modules::layout::shapes::encode_file_v1(
-        EVENT_TYPE_FILE,
-        att.created_at_ms,
-        &att.message_id,
-        &att.file_id,
-        att.blob_bytes,
-        att.total_slices,
-        att.slice_bytes,
-        &att.root_hash,
-        &att.key_event_id,
-        &filename_slot,
-        &mime_slot,
-    ))
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_file_v1(
+            EVENT_TYPE_FILE,
+            att.created_at_ms,
+            &att.message_id,
+            &att.file_id,
+            att.blob_bytes,
+            att.total_slices,
+            att.slice_bytes,
+            &att.root_hash,
+            &att.key_event_id,
+            &filename_slot,
+            &mime_slot,
+        ),
+    )
 }
 
 pub static FILE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

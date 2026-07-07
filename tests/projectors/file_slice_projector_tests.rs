@@ -12,8 +12,8 @@ mod tests {
     use topo::event_modules::file_slice::FileSliceEvent;
     use topo::event_modules::file_slice::{build_projector_context, project_pure};
     use topo::event_modules::{ParsedEvent, EVENT_TYPE_FILE_SLICE};
-    use topo::projection::projector::FileDescriptorInfo;
     use topo::projection::decision_context::ProjectionFrameContext;
+    use topo::projection::projector::FileDescriptorInfo;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "fs_event_1";

@@ -62,8 +62,18 @@ fn test_cli_unlink_admin_rotates_and_removed_device_cannot_decrypt() {
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout = Duration::from_secs(60);
     let timeout_ms = timeout.as_millis() as u64;
-    let phone_db = tmpdir.path().join("alice-phone.db").to_str().unwrap().to_string();
-    let laptop_db = tmpdir.path().join("alice-laptop.db").to_str().unwrap().to_string();
+    let phone_db = tmpdir
+        .path()
+        .join("alice-phone.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let laptop_db = tmpdir
+        .path()
+        .join("alice-laptop.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let content = "unlink/live-removed-device-cannot-decrypt";
 
     create_workspace_with_details(&phone_db, "unlink-live", "alice", "alice-phone");

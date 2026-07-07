@@ -158,17 +158,21 @@ pub(super) fn decide_target_dispatch_plan(
         dispatch_action: core_action,
     };
     match v::decide_target_dispatch_core_plan(&core_ctx) {
-        v::TargetDispatchCorePlan::Skip(v::TargetDispatchCoreSkipReason::SourceNotInitiated) =>
-            TargetDispatchPlan::Skip(TargetDispatchSkipReason::SourceNotInitiated),
-        v::TargetDispatchCorePlan::Skip(v::TargetDispatchCoreSkipReason::LowerPrecedenceThanActiveWorker) =>
-            TargetDispatchPlan::Skip(TargetDispatchSkipReason::LowerPrecedenceThanActiveWorker),
-        v::TargetDispatchCorePlan::Skip(v::TargetDispatchCoreSkipReason::DispatcherNoop) =>
-            TargetDispatchPlan::Skip(TargetDispatchSkipReason::DispatcherNoop),
-        v::TargetDispatchCorePlan::Spawn(spawn) =>
+        v::TargetDispatchCorePlan::Skip(v::TargetDispatchCoreSkipReason::SourceNotInitiated) => {
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::SourceNotInitiated)
+        }
+        v::TargetDispatchCorePlan::Skip(
+            v::TargetDispatchCoreSkipReason::LowerPrecedenceThanActiveWorker,
+        ) => TargetDispatchPlan::Skip(TargetDispatchSkipReason::LowerPrecedenceThanActiveWorker),
+        v::TargetDispatchCorePlan::Skip(v::TargetDispatchCoreSkipReason::DispatcherNoop) => {
+            TargetDispatchPlan::Skip(TargetDispatchSkipReason::DispatcherNoop)
+        }
+        v::TargetDispatchCorePlan::Spawn(spawn) => {
             TargetDispatchPlan::Spawn(TargetDispatchSpawnPlan {
                 cancel_existing_dispatch_key: spawn.cancel_existing_dispatch_key,
                 cancel_bootstrap_prefix: spawn.cancel_bootstrap_prefix,
-            }),
+            })
+        }
     }
 }
 

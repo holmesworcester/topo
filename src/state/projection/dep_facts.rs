@@ -283,16 +283,12 @@ pub fn decide_peer_shared(
             signer_event_id: signer_event_id.clone(),
             reason: reason.clone(),
         },
-        SignerResolution::PeerShared { .. } => {
-            PeerSharedDecision::RejectUnsupportedSignerType {
-                semantic_type_code: crate::event_modules::EVENT_TYPE_PEER_SHARED,
-            }
-        }
-        SignerResolution::Workspace { .. } => {
-            PeerSharedDecision::RejectUnsupportedSignerType {
-                semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
-            }
-        }
+        SignerResolution::PeerShared { .. } => PeerSharedDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_PEER_SHARED,
+        },
+        SignerResolution::Workspace { .. } => PeerSharedDecision::RejectUnsupportedSignerType {
+            semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
+        },
         SignerResolution::Admin { .. } => PeerSharedDecision::RejectUnsupportedSignerType {
             semantic_type_code: crate::event_modules::EVENT_TYPE_ADMIN,
         },
@@ -317,7 +313,6 @@ pub fn decide_peer_shared(
         }
     }
 }
-
 
 /// Narrow current-state / local-only / runtime-only constraints.
 ///
@@ -528,8 +523,7 @@ impl RemovalDecision {
                 Some("removal signer must be peer_shared".to_string())
             }
             Self::RejectMalformedSigner { reason, .. } => Some(reason.clone()),
-            Self::RejectAdminUserMismatch { .. }
-            | Self::RejectAdminAuthorityWrongKind { .. } => {
+            Self::RejectAdminUserMismatch { .. } | Self::RejectAdminAuthorityWrongKind { .. } => {
                 Some("removal signer must be an admin peer_shared identity".to_string())
             }
         }
@@ -747,9 +741,9 @@ impl AdminDecision {
             Self::RejectBootstrapAuthorityMismatch => {
                 Some("bootstrap admin must use workspace as signer and authority".to_string())
             }
-            Self::RejectPeerSignerAuthorityMismatch => Some(
-                "peer-signed admin authority does not match signer admin identity".to_string(),
-            ),
+            Self::RejectPeerSignerAuthorityMismatch => {
+                Some("peer-signed admin authority does not match signer admin identity".to_string())
+            }
             Self::RejectMissingUser { user_event_id_b64 } => Some(format!(
                 "no users row for user_event_id {}",
                 user_event_id_b64
@@ -841,8 +835,7 @@ pub fn decide_admin(
     // 2. User-row normalization (malformed / missing / ambiguous).
     //    Precedence matters: in the old pipeline these fire BEFORE
     //    authority-match rejects.
-    if guards.malformed
-        || crate::crypto::event_id_from_base64(&guards.user_event_id_b64).is_none()
+    if guards.malformed || crate::crypto::event_id_from_base64(&guards.user_event_id_b64).is_none()
     {
         return AdminDecision::RejectMalformedUserKey {
             user_event_id_b64: guards.user_event_id_b64.clone(),
@@ -978,11 +971,17 @@ pub enum MessageDecision {
         reason: String,
     },
     /// Materialized rollup missing (no `peers_shared` row for signer).
-    RejectNoPeersSharedRow { signer_event_id: String },
+    RejectNoPeersSharedRow {
+        signer_event_id: String,
+    },
     /// Materialized rollup carries >1 distinct user_event_id.
-    RejectAmbiguousPeersSharedRow { signer_event_id: String },
+    RejectAmbiguousPeersSharedRow {
+        signer_event_id: String,
+    },
     /// Materialized rollup user_event_id is not a valid base64 EventId.
-    RejectMalformedPeersSharedRow { signer_event_id: String },
+    RejectMalformedPeersSharedRow {
+        signer_event_id: String,
+    },
     /// Signer's peers_shared user_event_id differs from claimed author.
     RejectAuthorMismatch {
         signer_event_id: String,
@@ -998,9 +997,7 @@ impl MessageDecision {
     pub fn signer_user_mismatch_reason(&self) -> Option<String> {
         match self {
             Self::Ready => None,
-            Self::RejectMissingCurrentSigner => {
-                Some("missing current signer envelope".to_string())
-            }
+            Self::RejectMissingCurrentSigner => Some("missing current signer envelope".to_string()),
             Self::RejectUnsupportedSignerType { semantic_type_code } => Some(format!(
                 "content signer must be peer_shared, got semantic type {}",
                 semantic_type_code
@@ -1014,7 +1011,9 @@ impl MessageDecision {
                 "ambiguous peers_shared user binding for signer {}",
                 signer_event_id
             )),
-            Self::RejectMalformedSigner { signer_event_id, .. }
+            Self::RejectMalformedSigner {
+                signer_event_id, ..
+            }
             | Self::RejectMalformedPeersSharedRow { signer_event_id } => Some(format!(
                 "malformed peers_shared user binding for signer {}",
                 signer_event_id
@@ -1106,7 +1105,9 @@ pub fn decide_message(
         SignerResolution::Workspace { .. } => MessageDecision::RejectUnsupportedSignerType {
             semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
         },
-        SignerResolution::PeerShared { signer_event_id, .. } => {
+        SignerResolution::PeerShared {
+            signer_event_id, ..
+        } => {
             let author_b64 = crate::crypto::event_id_to_base64(&event.author_id);
             match resolve_peers_shared_rollup(signer_event_id, &guards.signer_rollup) {
                 Err(PeersSharedRollupError::Missing) => MessageDecision::RejectNoPeersSharedRow {
@@ -1170,9 +1171,15 @@ pub enum ReactionDecision {
         signer_event_id: String,
         reason: String,
     },
-    RejectNoPeersSharedRow { signer_event_id: String },
-    RejectAmbiguousPeersSharedRow { signer_event_id: String },
-    RejectMalformedPeersSharedRow { signer_event_id: String },
+    RejectNoPeersSharedRow {
+        signer_event_id: String,
+    },
+    RejectAmbiguousPeersSharedRow {
+        signer_event_id: String,
+    },
+    RejectMalformedPeersSharedRow {
+        signer_event_id: String,
+    },
     RejectAuthorMismatch {
         signer_event_id: String,
         signer_user_id: String,
@@ -1184,9 +1191,7 @@ impl ReactionDecision {
     pub fn signer_user_mismatch_reason(&self) -> Option<String> {
         match self {
             Self::Ready => None,
-            Self::RejectMissingCurrentSigner => {
-                Some("missing current signer envelope".to_string())
-            }
+            Self::RejectMissingCurrentSigner => Some("missing current signer envelope".to_string()),
             Self::RejectUnsupportedSignerType { semantic_type_code } => Some(format!(
                 "content signer must be peer_shared, got semantic type {}",
                 semantic_type_code
@@ -1200,7 +1205,9 @@ impl ReactionDecision {
                 "ambiguous peers_shared user binding for signer {}",
                 signer_event_id
             )),
-            Self::RejectMalformedSigner { signer_event_id, .. }
+            Self::RejectMalformedSigner {
+                signer_event_id, ..
+            }
             | Self::RejectMalformedPeersSharedRow { signer_event_id } => Some(format!(
                 "malformed peers_shared user binding for signer {}",
                 signer_event_id
@@ -1250,14 +1257,14 @@ pub fn decide_reaction(
         SignerResolution::Workspace { .. } => ReactionDecision::RejectUnsupportedSignerType {
             semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
         },
-        SignerResolution::PeerShared { signer_event_id, .. } => {
+        SignerResolution::PeerShared {
+            signer_event_id, ..
+        } => {
             let author_b64 = crate::crypto::event_id_to_base64(&event.author_id);
             match resolve_peers_shared_rollup(signer_event_id, &guards.signer_rollup) {
-                Err(PeersSharedRollupError::Missing) => {
-                    ReactionDecision::RejectNoPeersSharedRow {
-                        signer_event_id: signer_event_id.clone(),
-                    }
-                }
+                Err(PeersSharedRollupError::Missing) => ReactionDecision::RejectNoPeersSharedRow {
+                    signer_event_id: signer_event_id.clone(),
+                },
                 Err(PeersSharedRollupError::Ambiguous) => {
                     ReactionDecision::RejectAmbiguousPeersSharedRow {
                         signer_event_id: signer_event_id.clone(),
@@ -1324,7 +1331,9 @@ pub enum MessageDeletionDecision {
     /// Admin signer: authorized for any message.
     ReadyAdmin,
     /// PeerShared signer: deletion carries the signer's user_event_id.
-    ReadyPeerSharedUser { signer_user_id: String },
+    ReadyPeerSharedUser {
+        signer_user_id: String,
+    },
     RejectMissingCurrentSigner,
     RejectUnsupportedSignerType {
         semantic_type_code: u8,
@@ -1336,9 +1345,15 @@ pub enum MessageDeletionDecision {
         signer_event_id: String,
         reason: String,
     },
-    RejectNoPeersSharedRow { signer_event_id: String },
-    RejectAmbiguousPeersSharedRow { signer_event_id: String },
-    RejectMalformedPeersSharedRow { signer_event_id: String },
+    RejectNoPeersSharedRow {
+        signer_event_id: String,
+    },
+    RejectAmbiguousPeersSharedRow {
+        signer_event_id: String,
+    },
+    RejectMalformedPeersSharedRow {
+        signer_event_id: String,
+    },
 }
 
 impl MessageDeletionDecision {
@@ -1436,28 +1451,26 @@ pub fn decide_message_deletion(
                 semantic_type_code: crate::event_modules::EVENT_TYPE_WORKSPACE,
             }
         }
-        SignerResolution::PeerShared { signer_event_id, .. } => {
-            match resolve_peers_shared_rollup(signer_event_id, &guards.signer_rollup) {
-                Err(PeersSharedRollupError::Missing) => {
-                    MessageDeletionDecision::RejectNoPeersSharedRow {
-                        signer_event_id: signer_event_id.clone(),
-                    }
-                }
-                Err(PeersSharedRollupError::Ambiguous) => {
-                    MessageDeletionDecision::RejectAmbiguousPeersSharedRow {
-                        signer_event_id: signer_event_id.clone(),
-                    }
-                }
-                Err(PeersSharedRollupError::Malformed) => {
-                    MessageDeletionDecision::RejectMalformedPeersSharedRow {
-                        signer_event_id: signer_event_id.clone(),
-                    }
-                }
-                Ok(signer_user_id) => {
-                    MessageDeletionDecision::ReadyPeerSharedUser { signer_user_id }
+        SignerResolution::PeerShared {
+            signer_event_id, ..
+        } => match resolve_peers_shared_rollup(signer_event_id, &guards.signer_rollup) {
+            Err(PeersSharedRollupError::Missing) => {
+                MessageDeletionDecision::RejectNoPeersSharedRow {
+                    signer_event_id: signer_event_id.clone(),
                 }
             }
-        }
+            Err(PeersSharedRollupError::Ambiguous) => {
+                MessageDeletionDecision::RejectAmbiguousPeersSharedRow {
+                    signer_event_id: signer_event_id.clone(),
+                }
+            }
+            Err(PeersSharedRollupError::Malformed) => {
+                MessageDeletionDecision::RejectMalformedPeersSharedRow {
+                    signer_event_id: signer_event_id.clone(),
+                }
+            }
+            Ok(signer_user_id) => MessageDeletionDecision::ReadyPeerSharedUser { signer_user_id },
+        },
     }
 }
 
@@ -1751,9 +1764,7 @@ pub enum KeyRotationDecision {
     /// In all cases: emit no unwrapped material.
     NoUnwrap,
     /// Unwrapped key material for our slot, ready to install.
-    Ready {
-        unwrapped_key: [u8; 32],
-    },
+    Ready { unwrapped_key: [u8; 32] },
 }
 
 impl KeyRotationDecision {
@@ -1869,11 +1880,11 @@ pub fn decide_key_history(
         Ok(p) => p,
         Err(_) => return KeyHistoryDecision::NoUnwrap,
     };
-    let entries =
-        match crate::event_modules::key_history::decode_key_history_plaintext(&plaintext) {
-            Ok(e) => e,
-            Err(_) => return KeyHistoryDecision::NoUnwrap,
-        };
+    let entries = match crate::event_modules::key_history::decode_key_history_plaintext(&plaintext)
+    {
+        Ok(e) => e,
+        Err(_) => return KeyHistoryDecision::NoUnwrap,
+    };
     KeyHistoryDecision::Ready {
         entries: entries
             .into_iter()
@@ -1999,8 +2010,7 @@ impl KeySharedDecision {
                 Some("delivery_target_id does not match key_shared target".to_string())
             }
             Self::RejectRecipientPeerSharedInvalid => Some(
-                "key_shared recipient_event_id does not resolve to a Valid peer_shared"
-                    .to_string(),
+                "key_shared recipient_event_id does not resolve to a Valid peer_shared".to_string(),
             ),
         }
     }
@@ -2098,7 +2108,11 @@ mod tests {
 
     fn ev(invite_eq_workspace: bool) -> InviteAcceptedEvent {
         let invite = [7u8; 32];
-        let workspace = if invite_eq_workspace { invite } else { [9u8; 32] };
+        let workspace = if invite_eq_workspace {
+            invite
+        } else {
+            [9u8; 32]
+        };
         InviteAcceptedEvent {
             created_at_ms: 0,
             tenant_event_id: [1u8; 32],
@@ -2127,7 +2141,10 @@ mod tests {
     fn reject_when_no_local_binding_and_not_self_create() {
         let event = ev(false);
         let d = decide_invite_accepted(&event, &DepFacts::default(), &GuardFacts::default());
-        assert!(matches!(d, InviteAcceptedDecision::RejectMissingLinkBinding));
+        assert!(matches!(
+            d,
+            InviteAcceptedDecision::RejectMissingLinkBinding
+        ));
         assert!(d.reject_reason().is_some());
     }
 
@@ -2196,7 +2213,9 @@ mod tests {
             endpoint_shared_endpoint_id: Some("endpoint-1".into()),
         };
         let d = decide_peer_shared(&event, &deps, &PeerSharedGuardFacts::default());
-        assert!(matches!(d, PeerSharedDecision::Ready { ref endpoint_id } if endpoint_id == "endpoint-1"));
+        assert!(
+            matches!(d, PeerSharedDecision::Ready { ref endpoint_id } if endpoint_id == "endpoint-1")
+        );
         assert!(d.user_mismatch_reason().is_none());
         assert!(d.endpoint_binding_reason().is_none());
     }
@@ -2520,9 +2539,7 @@ mod tests {
         let user_id = [5u8; 32];
         let deps = AdminDepFacts {
             signer: workspace_signer_res("other-workspace-id"),
-            authority: admin_authority_workspace(&crate::crypto::event_id_to_base64(
-                &workspace_id,
-            )),
+            authority: admin_authority_workspace(&crate::crypto::event_id_to_base64(&workspace_id)),
             peer_signer_admin_match: false,
         };
         let guards = admin_user_key_guard(user_id, vec![Some(admin_public.to_vec())]);
@@ -2580,7 +2597,10 @@ mod tests {
             &deps,
             &guards,
         );
-        assert!(matches!(d, AdminDecision::RejectPeerSignerAuthorityMismatch));
+        assert!(matches!(
+            d,
+            AdminDecision::RejectPeerSignerAuthorityMismatch
+        ));
         assert_eq!(
             d.mismatch_reason().as_deref(),
             Some("peer-signed admin authority does not match signer admin identity"),
@@ -2737,8 +2757,7 @@ mod tests {
             authority: admin_authority_workspace(&authority_b64),
             peer_signer_admin_match: false,
         };
-        let guards =
-            admin_user_key_guard(user_id, vec![Some(vec![1u8; 32]), Some(vec![2u8; 32])]);
+        let guards = admin_user_key_guard(user_id, vec![Some(vec![1u8; 32]), Some(vec![2u8; 32])]);
         let d = decide_admin(
             &admin_event_for(admin_public, workspace_id, user_id),
             &deps,
@@ -3066,7 +3085,10 @@ mod tests {
             d,
             MessageDecision::RejectMalformedPeersSharedRow { .. }
         ));
-        assert!(d.signer_user_mismatch_reason().unwrap().contains("malformed"));
+        assert!(d
+            .signer_user_mismatch_reason()
+            .unwrap()
+            .contains("malformed"));
     }
 
     // ── Reaction pilot ────────────────────────────────────────
@@ -3144,11 +3166,7 @@ mod tests {
         let deps = MessageDeletionDepFacts {
             signer: admin_signer([1u8; 32]),
         };
-        let d = decide_message_deletion(
-            &del_event(),
-            &deps,
-            &MessageDeletionGuardFacts::default(),
-        );
+        let d = decide_message_deletion(&del_event(), &deps, &MessageDeletionGuardFacts::default());
         assert!(matches!(d, MessageDeletionDecision::ReadyAdmin));
         let (user, is_admin, reject) = d.context_fields();
         assert!(user.is_none());
@@ -3212,11 +3230,7 @@ mod tests {
         let deps = MessageDeletionDepFacts {
             signer: SignerResolution::Missing,
         };
-        let d = decide_message_deletion(
-            &del_event(),
-            &deps,
-            &MessageDeletionGuardFacts::default(),
-        );
+        let d = decide_message_deletion(&del_event(), &deps, &MessageDeletionGuardFacts::default());
         assert!(matches!(
             d,
             MessageDeletionDecision::RejectMissingCurrentSigner
@@ -3240,11 +3254,7 @@ mod tests {
                 },
             },
         };
-        let d = decide_message_deletion(
-            &del_event(),
-            &deps,
-            &MessageDeletionGuardFacts::default(),
-        );
+        let d = decide_message_deletion(&del_event(), &deps, &MessageDeletionGuardFacts::default());
         assert!(matches!(
             d,
             MessageDeletionDecision::RejectUnsupportedSignerType { .. }
@@ -3297,7 +3307,11 @@ mod tests {
 
     #[test]
     fn file_ready_always() {
-        let d = decide_file(&file_event(), &FileDepFacts::default(), &FileGuardFacts::default());
+        let d = decide_file(
+            &file_event(),
+            &FileDepFacts::default(),
+            &FileGuardFacts::default(),
+        );
         assert!(matches!(d, FileDecision::Ready));
     }
 

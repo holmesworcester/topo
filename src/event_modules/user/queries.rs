@@ -77,8 +77,7 @@ pub fn resolve_number(db: &Connection, recorded_by: &str, num: usize) -> Result<
             rows.len()
         ));
     };
-    event_id_from_base64(&row.event_id)
-        .ok_or_else(|| format!("invalid event ID for user {}", num))
+    event_id_from_base64(&row.event_id).ok_or_else(|| format!("invalid event ID for user {}", num))
 }
 
 pub fn resolve(db: &Connection, recorded_by: &str, selector: &str) -> Result<EventId, String> {

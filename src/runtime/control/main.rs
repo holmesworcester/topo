@@ -860,7 +860,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Admin { action } => match action {
-            AdminAction::Add { target, target_flag } => {
+            AdminAction::Add {
+                target,
+                target_flag,
+            } => {
                 let target = resolve_target_selector(target, target_flag, "admin add", None)?;
                 let method = RpcMethod::GrantAdmin {
                     target: target.clone(),
@@ -879,9 +882,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         resp.data.unwrap_or(serde_json::Value::Null)
                     }
                     Err(RpcClientError::DaemonNotRunning(_)) => serde_json::to_value(
-                        topo::event_modules::workspace::commands::grant_admin_for_db(
-                            db, &target,
-                        )?,
+                        topo::event_modules::workspace::commands::grant_admin_for_db(db, &target)?,
                     )?,
                     Err(e) => return Err(e.to_string().into()),
                 };
@@ -896,7 +897,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         },
 
-        Commands::Ban { target, target_flag } => {
+        Commands::Ban {
+            target,
+            target_flag,
+        } => {
             let target = resolve_target_selector(target, target_flag, "ban", None)?;
             let method = RpcMethod::BanUser {
                 target: target.clone(),
@@ -914,11 +918,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     resp.data.unwrap_or(serde_json::Value::Null)
                 }
-                Err(RpcClientError::DaemonNotRunning(_)) => {
-                    serde_json::to_value(topo::event_modules::workspace::commands::ban_user_for_db(
-                        db, &target,
-                    )?)?
-                }
+                Err(RpcClientError::DaemonNotRunning(_)) => serde_json::to_value(
+                    topo::event_modules::workspace::commands::ban_user_for_db(db, &target)?,
+                )?,
                 Err(e) => return Err(e.to_string().into()),
             };
             println!(
@@ -1027,10 +1029,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Err(_) => {
                     let (recorded_by, replay_db) =
                         service::open_db_load(db).map_err(|err| err.to_string())?;
-                    let replay = topo::testutil::run_replay_pass(&replay_db, &recorded_by, &pass)
-                        .map_err(|err| {
-                            std::io::Error::new(std::io::ErrorKind::Other, err)
-                        })?;
+                    let replay =
+                        topo::testutil::run_replay_pass(&replay_db, &recorded_by, &pass)
+                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
                     serde_json::to_value(replay).unwrap_or_default()
                 }
             };
@@ -1129,7 +1130,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::Unlink { target, target_flag } => {
+        Commands::Unlink {
+            target,
+            target_flag,
+        } => {
             let target = resolve_target_selector(target, target_flag, "unlink", None)?;
             let method = RpcMethod::UnlinkDevice {
                 target: target.clone(),

@@ -12,12 +12,12 @@ use crate::event_modules::workspace::identity_ops::create_key_rotation_event_wit
 use crate::event_modules::workspace::load_local_authoring_context;
 use crate::event_modules::ParsedEvent;
 use crate::projection::create::{create_encrypted_event, create_signed_event};
-pub(crate) use crate::runtime::key_repair::{
-    key_shared_target, response_rank, slotted_frontier_refs, RepairTarget,
-};
 pub use crate::runtime::key_repair::{
     emit_key_requests_for_dbs, emit_key_requests_for_peers, emit_key_shared_responses_for_dbs,
     emit_key_shared_responses_for_peers, KeyRepairEmitStats, KeyResponsePolicy,
+};
+pub(crate) use crate::runtime::key_repair::{
+    key_shared_target, response_rank, slotted_frontier_refs, RepairTarget,
 };
 
 type SimResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -63,11 +63,8 @@ pub fn seed_deterministic_key_secret(
 ) -> SimResult<EventId> {
     let conn = open_connection(db_path)?;
     crate::db::schema::create_tables(&conn)?;
-    let local_recipient_event_id = crate::event_modules::peer_shared::load_local_peer_signer_required(
-        &conn,
-        recorded_by,
-    )?
-    .0;
+    let local_recipient_event_id =
+        crate::event_modules::peer_shared::load_local_peer_signer_required(&conn, recorded_by)?.0;
     let _rotation_event_id = seed_key_rotation_for_recipients(
         db_path,
         recorded_by,
@@ -79,16 +76,13 @@ pub fn seed_deterministic_key_secret(
     // dep resolves in valid_events.
     let conn = open_connection(db_path)?;
     let sk_event = crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes);
-    let expected =
-        crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
+    let expected = crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
     let created = crate::projection::create::event_id_or_blocked(
         crate::projection::create::create_event(&conn, recorded_by, &sk_event),
     )
     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
     if created != expected {
-        return Err(
-            "seed_deterministic_key_secret: key_secret event_id mismatch".into(),
-        );
+        return Err("seed_deterministic_key_secret: key_secret event_id mismatch".into());
     }
     Ok(created)
 }
@@ -157,7 +151,8 @@ pub fn create_removal(
     crate::db::schema::create_tables(&conn)?;
     let authoring = load_local_authoring_context(&conn, recorded_by)?;
     let slots = slotted_frontier_refs(parent_refs)?;
-    let admin_authority_event_id = sim_resolve_admin_authority(&conn, recorded_by, &authoring.author_id)?;
+    let admin_authority_event_id =
+        sim_resolve_admin_authority(&conn, recorded_by, &authoring.author_id)?;
     let event = ParsedEvent::Removal(RemovalEvent {
         created_at_ms: crate::state::db::queue::current_timestamp_ms_u64(),
         removed_member_ref: *removed_member_ref,
@@ -247,7 +242,12 @@ fn load_recipient_keys(
     }
     Ok(recipient_event_ids
         .iter()
-        .filter_map(|event_id| found.get(event_id).copied().map(|public_key| (*event_id, public_key)))
+        .filter_map(|event_id| {
+            found
+                .get(event_id)
+                .copied()
+                .map(|public_key| (*event_id, public_key))
+        })
         .collect())
 }
 

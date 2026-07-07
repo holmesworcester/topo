@@ -76,12 +76,12 @@ fn decide_hard_purge_plan(context: &HardPurgeDecisionContext) -> HardPurgePlan {
         topo_verus_proofs::state::projection::purge::HardPurgePlanCore::RejectMissingTombstone => {
             HardPurgePlan::RejectMissingTombstone
         }
-        topo_verus_proofs::state::projection::purge::HardPurgePlanCore::ExecuteManifest { .. } => {
-            HardPurgePlan::ExecuteManifest {
-                event_ids: context.manifest.event_ids.clone(),
-                file_ids: context.manifest.file_ids.clone(),
-            }
-        }
+        topo_verus_proofs::state::projection::purge::HardPurgePlanCore::ExecuteManifest {
+            ..
+        } => HardPurgePlan::ExecuteManifest {
+            event_ids: context.manifest.event_ids.clone(),
+            file_ids: context.manifest.file_ids.clone(),
+        },
     }
 }
 

@@ -14,8 +14,8 @@
 //! The verified `encode` / `parse` pair below is parameterized over the type byte
 //! and proves full round-trip: `parse(encode(ts, bytes), type_byte) == Some((ts, bytes))`.
 
-use vstd::prelude::*;
 use vstd::bytes::{u64_from_le_bytes, u64_to_le_bytes};
+use vstd::prelude::*;
 
 verus! {
 

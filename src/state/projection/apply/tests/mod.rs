@@ -16,15 +16,14 @@ use crate::db::{
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
     KeyRequestEvent, KeyRotationEvent, KeySecretEvent, KeySharedEvent, MessageDeletionEvent,
-    MessageEvent, PeerSecretEvent,
-    ParsedEvent, ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
-    EVENT_TYPE_REACTION,
+    MessageEvent, ParsedEvent, PeerSecretEvent, ReactionEvent, WorkspaceEvent,
+    EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE, EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::state::projection::create::{
-    create_event_staged, create_event, create_signed_event,
-    encode_signed_wrapper_blob, project_event, store_event_only,
+    create_event, create_event_staged, create_signed_event, encode_signed_wrapper_blob,
+    project_event, store_event_only,
 };
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -436,8 +435,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
     };
     let uib_event = ParsedEvent::UserInvite(uib);
     let uib_eid =
-        create_signed_event(conn, recorded_by, &net_eid, &uib_event, &workspace_key)
-            .unwrap();
+        create_signed_event(conn, recorded_by, &net_eid, &uib_event, &workspace_key).unwrap();
 
     // 5. User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
@@ -448,9 +446,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         username: "user".to_string(),
     };
     let ub_event = ParsedEvent::User(ub);
-    let ub_eid =
-        create_signed_event(conn, recorded_by, &uib_eid, &ub_event, &invite_key)
-            .unwrap();
+    let ub_eid = create_signed_event(conn, recorded_by, &uib_eid, &ub_event, &invite_key).unwrap();
 
     // 6. DeviceInvite (signed by user key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -462,8 +458,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
-    let dif_eid =
-        create_signed_event(conn, recorded_by, &ub_eid, &dif_event, &user_key).unwrap();
+    let dif_eid = create_signed_event(conn, recorded_by, &ub_eid, &dif_event, &user_key).unwrap();
 
     // 7. EndpointShared (self-signed, endpoint-scoped)
     let endpoint_key = SigningKey::generate(&mut rng);
@@ -471,8 +466,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         endpoint_key.to_bytes(),
     );
     let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
-    let endpoint_shared_event_id =
-        create_event(conn, &endpoint_id, &endpoint_event).unwrap();
+    let endpoint_shared_event_id = create_event(conn, &endpoint_id, &endpoint_event).unwrap();
 
     // 8. PeerShared (signed by device_invite key)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -485,14 +479,8 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         device_name: "device".to_string(),
     };
     let psf_event = ParsedEvent::PeerShared(psf);
-    let psf_eid = create_signed_event(
-        conn,
-        recorded_by,
-        &dif_eid,
-        &psf_event,
-        &device_invite_key,
-    )
-    .unwrap();
+    let psf_eid =
+        create_signed_event(conn, recorded_by, &dif_eid, &psf_event, &device_invite_key).unwrap();
     let peer_secret_event = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: now_ms(),
         signer_event_id: psf_eid,
@@ -625,7 +613,11 @@ pub(super) fn build_identity_chain_deferred(
         (_recorded_by.to_string(), dif_eid, dif_blob),
         (endpoint_recorded_by, endpoint_eid, endpoint_blob),
         (_recorded_by.to_string(), psf_eid, psf_blob),
-        (_recorded_by.to_string(), hash_event(&peer_secret_blob), peer_secret_blob),
+        (
+            _recorded_by.to_string(),
+            hash_event(&peer_secret_blob),
+            peer_secret_blob,
+        ),
     ];
 
     (psf_eid, peer_shared_key, chain_blobs)
@@ -798,10 +790,8 @@ pub(super) fn make_self_key_rotation_blob(
     key_bytes: [u8; 32],
 ) -> (ParsedEvent, Vec<u8>) {
     let _ = conn;
-    let mut recipient_slots =
-        vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
-    let mut wrapped_keys =
-        vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
+    let mut recipient_slots = vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
+    let mut wrapped_keys = vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
     recipient_slots[0] = *signer_event_id;
     wrapped_keys[0] = crate::projection::encrypted::wrap_key_for_recipient(
         signing_key,
@@ -879,10 +869,8 @@ pub(super) fn make_key_rotation_blob_for_recipient(
     signing_key: &SigningKey,
     recipient_event_id: &EventId,
 ) -> (ParsedEvent, Vec<u8>) {
-    let mut recipient_slots =
-        vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
-    let mut wrapped_keys =
-        vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
+    let mut recipient_slots = vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
+    let mut wrapped_keys = vec![[0u8; 32]; crate::event_modules::key_rotation::KEY_ROTATION_CAP];
     recipient_slots[0] = *recipient_event_id;
     wrapped_keys[0] = [0xAB; 32];
     let event = ParsedEvent::KeyRotation(KeyRotationEvent {

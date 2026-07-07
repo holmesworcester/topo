@@ -303,16 +303,19 @@ fn ban_user_for_recorded_by(
     target: &str,
 ) -> Result<RemoveMemberResponse, Box<dyn std::error::Error + Send + Sync>> {
     let authoring = super::load_local_authoring_context(db, recorded_by)?;
-    let target_event_id =
-        crate::event_modules::user::resolve(db, recorded_by, target).map_err(
-            |err| -> Box<dyn std::error::Error + Send + Sync> { err.into() },
-        )?;
+    let target_event_id = crate::event_modules::user::resolve(db, recorded_by, target)
+        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
     let is_admin = signer_is_admin(db, recorded_by, &authoring.signer_event_id)?;
     let plan = super::command_plans::decide_remove_member_plan(
         &super::command_plans::RemoveMemberDecisionContext {
             actor_is_admin: is_admin,
             targets_self: target_event_id == authoring.author_id,
-            already_removed: removal_target_already_removed(db, recorded_by, &target_event_id, "user")?,
+            already_removed: removal_target_already_removed(
+                db,
+                recorded_by,
+                &target_event_id,
+                "user",
+            )?,
             target_kind: super::command_plans::RemoveMemberTargetKind::User,
         },
     );
@@ -336,10 +339,8 @@ fn grant_admin_for_recorded_by(
     target: &str,
 ) -> Result<GrantAdminResponse, Box<dyn std::error::Error + Send + Sync>> {
     let authoring = super::load_local_authoring_context(db, recorded_by)?;
-    let target_event_id =
-        crate::event_modules::user::resolve(db, recorded_by, target).map_err(
-            |err| -> Box<dyn std::error::Error + Send + Sync> { err.into() },
-        )?;
+    let target_event_id = crate::event_modules::user::resolve(db, recorded_by, target)
+        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
     let is_admin = signer_is_admin(db, recorded_by, &authoring.signer_event_id)?;
     let plan = super::command_plans::decide_grant_admin_plan(
         &super::command_plans::GrantAdminDecisionContext {
@@ -348,14 +349,12 @@ fn grant_admin_for_recorded_by(
         },
     );
     super::command_plans::resolve_grant_admin_plan(plan)?;
-    let authority_admin_event_id = resolve_admin_event_for_signer(
-        db,
-        recorded_by,
-        &authoring.signer_event_id,
-    )?
-    .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-        "Could not resolve admin event for local peer signer.".into()
-    })?;
+    let authority_admin_event_id =
+        resolve_admin_event_for_signer(db, recorded_by, &authoring.signer_event_id)?.ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
+                "Could not resolve admin event for local peer signer.".into()
+            },
+        )?;
     let result = grant_admin(
         db,
         recorded_by,
@@ -376,16 +375,19 @@ fn unlink_device_for_recorded_by(
     target: &str,
 ) -> Result<RemoveMemberResponse, Box<dyn std::error::Error + Send + Sync>> {
     let authoring = super::load_local_authoring_context(db, recorded_by)?;
-    let target_event_id =
-        crate::event_modules::peer_shared::resolve_peer(db, recorded_by, target).map_err(
-            |err| -> Box<dyn std::error::Error + Send + Sync> { err.into() },
-        )?;
+    let target_event_id = crate::event_modules::peer_shared::resolve_peer(db, recorded_by, target)
+        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
     let is_admin = signer_is_admin(db, recorded_by, &authoring.signer_event_id)?;
     let plan = super::command_plans::decide_remove_member_plan(
         &super::command_plans::RemoveMemberDecisionContext {
             actor_is_admin: is_admin,
             targets_self: target_event_id == authoring.signer_event_id,
-            already_removed: removal_target_already_removed(db, recorded_by, &target_event_id, "peer")?,
+            already_removed: removal_target_already_removed(
+                db,
+                recorded_by,
+                &target_event_id,
+                "peer",
+            )?,
             target_kind: super::command_plans::RemoveMemberTargetKind::Peer,
         },
     );

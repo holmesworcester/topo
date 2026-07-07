@@ -9,8 +9,8 @@
 //! counterexample into a positive invariant proof (an exec-fn `ensures` clause in
 //! the relevant seam) and remove it here. A shrinking `bug_hunt.rs` is progress.
 
-use vstd::prelude::*;
 use crate::state::projection::decision::*;
+use vstd::prelude::*;
 
 verus! {
 

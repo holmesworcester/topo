@@ -2,7 +2,9 @@ use super::layout::common::{
     encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_AUTH_TAG_BYTES,
 };
 use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_KEY_SECRET, EVENT_TYPE_MESSAGE};
+use super::{
+    EventError, ParsedEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_KEY_SECRET, EVENT_TYPE_MESSAGE,
+};
 
 // ─── Layout (owned by this module) ───
 

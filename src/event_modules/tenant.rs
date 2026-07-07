@@ -58,11 +58,13 @@ pub fn encode_tenant(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
     // Verus-verified encoder; output is SMT-proven to round-trip through `parse_ts_id`.
-    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
-        EVENT_TYPE_TENANT,
-        e.created_at_ms,
-        &e.public_key,
-    ))
+    Ok(
+        topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
+            EVENT_TYPE_TENANT,
+            e.created_at_ms,
+            &e.public_key,
+        ),
+    )
 }
 
 use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};

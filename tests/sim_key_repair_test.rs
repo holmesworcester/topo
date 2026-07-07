@@ -2,14 +2,13 @@ use std::collections::BTreeSet;
 
 use topo::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use topo::db::open_connection;
+use topo::projection::apply::project_one;
 use topo::rpc::protocol::RpcMethod;
 use topo::sim::{
     create_encrypted_message_with_key, create_key_rotation, create_removal,
-    emit_key_requests_for_dbs, emit_key_shared_responses_for_dbs,
-    seed_key_rotation_for_recipients, FakeTopologyPreference, KeyResponsePolicy, PlannerMode,
-    PlannerSimulation, VirtualDaemon,
+    emit_key_requests_for_dbs, emit_key_shared_responses_for_dbs, seed_key_rotation_for_recipients,
+    FakeTopologyPreference, KeyResponsePolicy, PlannerMode, PlannerSimulation, VirtualDaemon,
 };
-use topo::projection::apply::project_one;
 use topo::state::db::queue::current_timestamp_ms;
 use topo::state::pipeline::{drain_project_queue, ingest_now};
 
@@ -626,10 +625,9 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
     let key_event_id_b64 = event_id_to_base64(&alice_key);
 
     let mut delivery_rounds = 0usize;
-    while ![&bob, &carol, &dave, &erin]
-        .into_iter()
-        .all(|daemon| has_event(daemon, &encrypted_event_id_b64) && has_event(daemon, &key_event_id_b64))
-    {
+    while ![&bob, &carol, &dave, &erin].into_iter().all(|daemon| {
+        has_event(daemon, &encrypted_event_id_b64) && has_event(daemon, &key_event_id_b64)
+    }) {
         let report = run_fake_star_round(&fake_star_db_paths, "message propagation round");
         assert_eq!(report.rounds[0].unique_pairs, 4);
         delivery_rounds = delivery_rounds.saturating_add(1);
@@ -859,13 +857,9 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
     let rotation_event_id_b64 = event_id_to_base64(&rotation_event_id);
 
     let mut propagation_rounds = 0usize;
-    while ![&bob, &carol, &dave]
-        .into_iter()
-        .all(|daemon| {
-            has_event(daemon, &encrypted_event_id_b64)
-                && has_event(daemon, &rotation_event_id_b64)
-        })
-    {
+    while ![&bob, &carol, &dave].into_iter().all(|daemon| {
+        has_event(daemon, &encrypted_event_id_b64) && has_event(daemon, &rotation_event_id_b64)
+    }) {
         let report = run_fake_star_round(
             &fake_star_db_paths,
             &format!("frontier propagation round {}", propagation_rounds + 1),

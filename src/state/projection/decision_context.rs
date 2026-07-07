@@ -3,15 +3,14 @@ use crate::event_modules::{
     endpoint_shared::load_endpoint_shared_by_event_id, parse_event, AdminEvent, DeviceInviteEvent,
     FileEvent, FileSliceEvent, InviteAcceptedEvent, KeyHistoryEvent, KeyRequestEvent,
     KeyRotationEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
-    RemovalEvent,
-    PeerSharedEvent, ReactionEvent, UserInviteEvent, WorkspaceEvent, EVENT_TYPE_ADMIN,
-    EVENT_TYPE_DEVICE_INVITE, EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
+    PeerSharedEvent, ReactionEvent, RemovalEvent, UserInviteEvent, WorkspaceEvent,
+    EVENT_TYPE_ADMIN, EVENT_TYPE_DEVICE_INVITE, EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
 };
+use crate::projection::encrypted::unwrap_key_from_sender;
 use crate::projection::projector::{
     BootstrapDecisionContext, CurrentSignerInfo, DeletionIntentInfo, FileDescriptorInfo,
     ProjectorDecisionContext, RemovalTargetKind, UnwrappedSecretMaterial,
 };
-use crate::projection::encrypted::unwrap_key_from_sender;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use crate::state::db::transport_creds::{peer_has_creds_with_source, CRED_SOURCE_PEER_SHARED};
 use crate::state::db::transport_trust::read_bootstrap_context;
@@ -1216,7 +1215,10 @@ macro_rules! define_query_context_loader {
             recorded_by: &str,
             event_id_b64: &str,
             parsed: &$crate::event_modules::ParsedEvent,
-        ) -> Result<$crate::projection::decision_context::ContextLoadResult, Box<dyn std::error::Error>> {
+        ) -> Result<
+            $crate::projection::decision_context::ContextLoadResult,
+            Box<dyn std::error::Error>,
+        > {
             let event = match parsed {
                 $crate::event_modules::ParsedEvent::$variant(event) => event,
                 _ => {
@@ -1226,9 +1228,11 @@ macro_rules! define_query_context_loader {
                 }
             };
 
-            Ok($crate::projection::decision_context::ContextLoadResult::ready(
-                queries.$query_method(frame, recorded_by, event_id_b64, event)?,
-            ))
+            Ok(
+                $crate::projection::decision_context::ContextLoadResult::ready(
+                    queries.$query_method(frame, recorded_by, event_id_b64, event)?,
+                ),
+            )
         }
     };
 }
@@ -1402,19 +1406,18 @@ fn load_removal_dep_facts(
     // event exists in valid_events; we parse it here to surface the
     // AdminEvent fields to `decide_removal`.
     let admin_event_id_b64 = event_id_to_base64(&removal.admin_authority_event_id);
-    let admin_authority =
-        match load_valid_event_blob(conn, recorded_by, &admin_event_id_b64)? {
-            None => {
-                // Dep-resolution upstream should have blocked this; if
-                // somehow we got here without the blob, surface it as
-                // a wrong-kind reject so the runtime doesn't panic.
-                AdminResolution::WrongKind {
-                    event_id: removal.admin_authority_event_id,
-                    semantic_type_code: 0,
-                }
+    let admin_authority = match load_valid_event_blob(conn, recorded_by, &admin_event_id_b64)? {
+        None => {
+            // Dep-resolution upstream should have blocked this; if
+            // somehow we got here without the blob, surface it as
+            // a wrong-kind reject so the runtime doesn't panic.
+            AdminResolution::WrongKind {
+                event_id: removal.admin_authority_event_id,
+                semantic_type_code: 0,
             }
-            Some(blob) => resolve_admin_authority(&removal.admin_authority_event_id, &blob),
-        };
+        }
+        Some(blob) => resolve_admin_authority(&removal.admin_authority_event_id, &blob),
+    };
 
     Ok(RemovalDepFacts {
         signer,
@@ -1504,24 +1507,23 @@ fn load_file_slice_guard_facts(
     // Owner-deleted guard: treats `frame.current_owner_event_id`
     // like ambient signer-resolution state — consulted once, surfaced
     // verbatim. Not yet a true dep.
-    let purge_owner_event_id = if let Some(owner_event_id_b64) =
-        frame.current_owner_event_id.as_deref()
-    {
-        let owner_deleted: bool = conn.query_row(
-            "SELECT COUNT(*) > 0
+    let purge_owner_event_id =
+        if let Some(owner_event_id_b64) = frame.current_owner_event_id.as_deref() {
+            let owner_deleted: bool = conn.query_row(
+                "SELECT COUNT(*) > 0
              FROM deleted_messages
              WHERE recorded_by = ?1 AND message_id = ?2",
-            rusqlite::params![recorded_by, owner_event_id_b64],
-            |row| row.get(0),
-        )?;
-        if owner_deleted {
-            Some(owner_event_id_b64.to_string())
+                rusqlite::params![recorded_by, owner_event_id_b64],
+                |row| row.get(0),
+            )?;
+            if owner_deleted {
+                Some(owner_event_id_b64.to_string())
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
     let mut desc_stmt = conn.prepare(
         "SELECT event_id, message_id, signer_event_id, key_event_id, root_hash, blob_bytes, slice_bytes
@@ -1848,18 +1850,16 @@ fn load_key_rotation_guard_facts(
 ) -> ProjectionQueryResult<crate::projection::dep_facts::KeyRotationGuardFacts> {
     use crate::projection::dep_facts::{KeyRotationGuardFacts, LocalPeerSigner};
 
-    let local_peer_signer = match crate::event_modules::peer_shared::load_local_peer_signer(
-        conn,
-        recorded_by,
-    )
-    .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?
-    {
-        Some((recipient_event_id, signing_key)) => Some(LocalPeerSigner {
-            recipient_event_id,
-            signing_key,
-        }),
-        None => None,
-    };
+    let local_peer_signer =
+        match crate::event_modules::peer_shared::load_local_peer_signer(conn, recorded_by)
+            .map_err(|err| -> Box<dyn std::error::Error> { err.to_string().into() })?
+        {
+            Some((recipient_event_id, signing_key)) => Some(LocalPeerSigner {
+                recipient_event_id,
+                signing_key,
+            }),
+            None => None,
+        };
 
     let sender_verifying_key = load_sender_verifying_key_from_frame(conn, frame, recorded_by)?;
 
@@ -1889,8 +1889,11 @@ fn load_key_history_guard_facts(
     recorded_by: &str,
     key_history: &KeyHistoryEvent,
 ) -> ProjectionQueryResult<crate::projection::dep_facts::KeyHistoryGuardFacts> {
-    let local_recipient_signing_key =
-        load_matching_invite_secret_signing_key(conn, recorded_by, &key_history.recipient_public_key)?;
+    let local_recipient_signing_key = load_matching_invite_secret_signing_key(
+        conn,
+        recorded_by,
+        &key_history.recipient_public_key,
+    )?;
     let sender_verifying_key = load_sender_verifying_key_from_frame(conn, frame, recorded_by)?;
     Ok(crate::projection::dep_facts::KeyHistoryGuardFacts {
         local_recipient_signing_key,
@@ -1942,8 +1945,7 @@ fn load_peer_shared_dep_facts(
         SignerKindExpectation::Exactly(EVENT_TYPE_DEVICE_INVITE),
     )?;
 
-    let endpoint_shared_event_id_b64 =
-        event_id_to_base64(&peer_shared.endpoint_shared_event_id);
+    let endpoint_shared_event_id_b64 = event_id_to_base64(&peer_shared.endpoint_shared_event_id);
     let endpoint_shared_endpoint_id =
         load_endpoint_shared_by_event_id(conn, &endpoint_shared_event_id_b64)
             .map_err(|e| -> Box<dyn std::error::Error> { e })?
@@ -2101,9 +2103,10 @@ fn load_user_invite_dep_facts(
         SignerResolution::PeerShared { .. } => {
             let authority_b64 = event_id_to_base64(&user_invite.authority_event_id);
             match load_valid_event_blob(conn, recorded_by, &authority_b64)? {
-                Some(blob) => {
-                    Some(resolve_admin_authority(&user_invite.authority_event_id, &blob))
-                }
+                Some(blob) => Some(resolve_admin_authority(
+                    &user_invite.authority_event_id,
+                    &blob,
+                )),
                 None => None,
             }
         }
@@ -2748,9 +2751,9 @@ fn load_admin_authority_raw_rows(
                 malformed,
             })
         }
-        semantic_type_code => Ok(AdminAuthorityRawRows::UnsupportedSignerType {
-            semantic_type_code,
-        }),
+        semantic_type_code => {
+            Ok(AdminAuthorityRawRows::UnsupportedSignerType { semantic_type_code })
+        }
     }
 }
 
@@ -3038,8 +3041,7 @@ impl ProjectionQueries for Connection {
         use crate::projection::dep_facts::decide_message_deletion;
 
         let deps = load_message_deletion_dep_facts(self, frame, recorded_by)?;
-        let guards =
-            load_message_deletion_guard_facts(self, frame, recorded_by, message_deletion)?;
+        let guards = load_message_deletion_guard_facts(self, frame, recorded_by, message_deletion)?;
         let decision = decide_message_deletion(message_deletion, &deps, &guards);
 
         let (deletion_signer_user_id, deletion_signer_is_admin, deletion_signer_reject_reason) =
@@ -3149,12 +3151,10 @@ impl ProjectionQueries for Connection {
                 ctx.has_local_invite_secret = guards.has_local_invite_secret;
                 ctx.peer_shared_transport_identity_active =
                     guards.peer_shared_transport_identity_active;
-                ctx.bootstrap_spki_already_peer_shared =
-                    guards.bootstrap_spki_already_peer_shared;
+                ctx.bootstrap_spki_already_peer_shared = guards.bootstrap_spki_already_peer_shared;
                 ctx.bootstrap_context = guards.bootstrap_context.clone();
-                ctx.invite_accepted_link_workspace_mismatch_reason = reject
-                    .reject_reason()
-                    .map(|s| s.to_string());
+                ctx.invite_accepted_link_workspace_mismatch_reason =
+                    reject.reject_reason().map(|s| s.to_string());
             }
         }
         Ok(ctx)

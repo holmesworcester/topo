@@ -206,7 +206,10 @@ fn normalize_bootstrap_session_tenant_decision_context(
         }
         VerifiedTenantCtx::UniqueTenantBinding => {
             BootstrapSessionTenantDecisionContext::UniqueTenantBinding {
-                tenant_id: tenant_ids.into_iter().next().expect("unique row has tenant"),
+                tenant_id: tenant_ids
+                    .into_iter()
+                    .next()
+                    .expect("unique row has tenant"),
             }
         }
         VerifiedTenantCtx::AmbiguousTenantBinding => {
@@ -407,8 +410,7 @@ fn plan_for_outbound_session_auth_decision(
     use topo_verus_proofs::runtime::transport::outbound_session_auth::{
         plan_for_outbound_session_auth_decision as verified_plan_for,
         OutboundSessionAuthDecision as VerifiedDecision,
-        RequestedSessionAuthPlan as VerifiedRequested,
-        ResolvedSessionAuthPlan as VerifiedResolved,
+        RequestedSessionAuthPlan as VerifiedRequested, ResolvedSessionAuthPlan as VerifiedResolved,
     };
     let requested = match &context.requested_plan {
         OutboundSessionAuthPlan::PeerShared { .. } => VerifiedRequested::PeerShared,
@@ -438,10 +440,9 @@ fn normalize_inbound_route_auth_decision_context(
         normalize_inbound_route_auth_decision_context as verified_normalize_route,
         InboundRouteAuthRawRows as VerifiedRouteRows,
     };
-    let verified =
-        verified_normalize_route(VerifiedRouteRows {
-            route_authorized: raw_rows.route_authorized,
-        });
+    let verified = verified_normalize_route(VerifiedRouteRows {
+        route_authorized: raw_rows.route_authorized,
+    });
     InboundRouteAuthDecisionContext {
         route_authorized: verified.route_authorized,
     }
@@ -1101,7 +1102,8 @@ async fn read_inbound_session_auth_inner(
                 );
                 let spec_accepts = matches!(spec_outcome, AuthResultExec::Accepted { .. });
                 debug_assert_eq!(
-                    runtime_accepts, spec_accepts,
+                    runtime_accepts,
+                    spec_accepts,
                     "protocol-level invite_bootstrap_auth_decide disagrees with runtime \
                      InboundBootstrapAuthDecision: expiry_valid={} daemon_binding_valid={} \
                      peer_id_matches_pubkey={} tenant_resolved={} signature_valid={}",

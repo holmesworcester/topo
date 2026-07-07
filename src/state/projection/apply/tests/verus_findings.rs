@@ -109,7 +109,10 @@ fn finding_3_reblock_via_project_one_retry_preserves_stale_deps_remaining() {
 
     // First projection: blocks on both A and B
     let result = project_one(&conn, recorded_by, &bench_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     let deps_remaining: i64 = conn
         .query_row(
@@ -136,7 +139,10 @@ fn finding_3_reblock_via_project_one_retry_preserves_stale_deps_remaining() {
     // Call project_one directly for E (simulating a retry command).
     // B is still missing. record_block_rows will INSERT OR IGNORE.
     let retry_result = project_one(&conn, recorded_by, &bench_eid).unwrap();
-    assert!(matches!(retry_result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        retry_result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     // Check: deps_remaining should match actual unique missing dep edge count.
     // Before fix: deps_remaining=1 but edge_count=2 (stale A edge + B edge).

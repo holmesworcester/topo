@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod bench_dep;
+pub mod device_invite;
 pub mod encrypted;
 pub mod endpoint_secret;
 pub mod endpoint_shared;
@@ -20,7 +21,6 @@ pub mod key_shared;
 pub mod layout;
 pub mod message;
 pub mod message_deletion;
-pub mod device_invite;
 pub mod peer_secret;
 pub mod peer_shared;
 pub mod reaction;
@@ -61,6 +61,7 @@ pub fn trunc_hex(bytes: &[u8], max_hex_chars: usize) -> String {
 
 pub use admin::AdminEvent;
 pub use bench_dep::BenchDepEvent;
+pub use device_invite::DeviceInviteEvent;
 pub use encrypted::EncryptedEvent;
 pub use endpoint_secret::EndpointSecretEvent;
 pub use endpoint_shared::EndpointSharedEvent;
@@ -75,7 +76,6 @@ pub use key_secret::KeySecretEvent;
 pub use key_shared::KeySharedEvent;
 pub use message::MessageEvent;
 pub use message_deletion::MessageDeletionEvent;
-pub use device_invite::DeviceInviteEvent;
 pub use peer_secret::PeerSecretEvent;
 pub use peer_shared::PeerSharedEvent;
 pub use reaction::ReactionEvent;
@@ -247,15 +247,15 @@ impl ParsedEvent {
                 let mut deps = vec![("removed_member_ref", r.removed_member_ref)];
                 deps.extend(
                     removal::frontier_refs_from_slots(r.parent_count, &slots)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, id)| match idx {
-                        0 => ("parent_1", id),
-                        1 => ("parent_2", id),
-                        2 => ("parent_3", id),
-                        _ => ("parent_4", id),
-                    }),
+                        .unwrap_or_default()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, id)| match idx {
+                            0 => ("parent_1", id),
+                            1 => ("parent_2", id),
+                            2 => ("parent_3", id),
+                            _ => ("parent_4", id),
+                        }),
                 );
                 deps
             }
@@ -282,9 +282,7 @@ impl ParsedEvent {
             // `key_event_id` is the identifier of the key being
             // requested, not a dep (the requester by definition does
             // not have the KeySecret yet). See KEY_REQUEST_META.
-            ParsedEvent::KeyRequest(k) => vec![
-                ("recipient_event_id", k.recipient_event_id),
-            ],
+            ParsedEvent::KeyRequest(k) => vec![("recipient_event_id", k.recipient_event_id)],
             ParsedEvent::KeyHistory(_) => vec![],
             ParsedEvent::UserInvite(u) => {
                 let mut deps = vec![("authority_event_id", u.authority_event_id)];
@@ -322,9 +320,7 @@ impl ParsedEvent {
                 // the recipient derives it locally by unwrapping the
                 // `wrapped_key`, so it can't be a dep (would be
                 // circular). See KEY_SHARED_META.
-                let mut deps = vec![
-                    ("recipient_event_id", s.recipient_event_id),
-                ];
+                let mut deps = vec![("recipient_event_id", s.recipient_event_id)];
                 deps.extend(
                     removal::frontier_refs_from_slots(s.frontier_count, &slots)
                         .unwrap_or_default()

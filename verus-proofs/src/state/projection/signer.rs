@@ -15,8 +15,8 @@
 //! set is rejected via the predicate without reaching the runtime's match arms,
 //! preserving a single source of truth about which types are signers.
 
-use vstd::prelude::*;
 use crate::event_modules::registry::EventTypeCode;
+use vstd::prelude::*;
 
 verus! {
 

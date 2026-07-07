@@ -32,7 +32,8 @@ fn writeop_tenant_view(op: &WriteOp, executing_tenant: &str) -> WriteOpTenantVie
         } => {
             for (idx, col) in columns.iter().enumerate() {
                 if *col == "recorded_by" {
-                    let matches = matches!(values.get(idx), Some(SqlVal::Text(s)) if s == executing_tenant);
+                    let matches =
+                        matches!(values.get(idx), Some(SqlVal::Text(s)) if s == executing_tenant);
                     return WriteOpTenantView {
                         has_recorded_by: true,
                         recorded_by_matches_executing: matches,
@@ -215,7 +216,8 @@ pub(crate) fn execute_emit_commands(
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
             EmitCommand::EmitDeterministicBlob { blob } => {
-                let _ = crate::projection::create::emit_deterministic_blob(conn, recorded_by, blob)?;
+                let _ =
+                    crate::projection::create::emit_deterministic_blob(conn, recorded_by, blob)?;
             }
             EmitCommand::IndexEndpointSharedForWorkspace {
                 workspace_id,
@@ -380,8 +382,7 @@ mod tests {
         create_tables(&conn).unwrap();
 
         let workspace_id = crate::crypto::event_id_to_base64(&[0x41; 32]);
-        let endpoint_event =
-            endpoint_shared::deterministic_endpoint_shared_event([0x55; 32]);
+        let endpoint_event = endpoint_shared::deterministic_endpoint_shared_event([0x55; 32]);
         let endpoint_blob = encode_event(&endpoint_event).unwrap();
         let endpoint_event_id = crate::crypto::hash_event(&endpoint_blob);
         let endpoint_event_id_b64 = crate::crypto::event_id_to_base64(&endpoint_event_id);
@@ -421,6 +422,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(indexed, "endpoint_shared should be indexed for the workspace");
+        assert!(
+            indexed,
+            "endpoint_shared should be indexed for the workspace"
+        );
     }
 }

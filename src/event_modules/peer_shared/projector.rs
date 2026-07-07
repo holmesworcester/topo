@@ -112,9 +112,9 @@ mod projector_tests {
     use crate::event_modules::EVENT_TYPE_DEVICE_INVITE;
     use crate::event_modules::{encode_event, DeviceInviteEvent};
     use crate::event_modules::{ParsedEvent, PeerSharedEvent, WorkspaceEvent};
-    use crate::projection::projector::CurrentSignerInfo;
     use crate::projection::decision_context::ContextLoadResult;
     use crate::projection::decision_context::ProjectionFrameContext;
+    use crate::projection::projector::CurrentSignerInfo;
 
     fn peer_shared_event() -> ParsedEvent {
         ParsedEvent::PeerShared(PeerSharedEvent {

@@ -106,8 +106,14 @@ fn test_removal_projects_and_rejects_bad_frontier_hash() {
         .unwrap();
     assert!(projected, "valid removal should project");
 
-    let (_bad_removal, bad_blob) =
-        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_eid, &[], Some([0x99; 32]));
+    let (_bad_removal, bad_blob) = make_signed_removal(
+        &signing_key,
+        &signer_eid,
+        &admin_eid,
+        signer_eid,
+        &[],
+        Some([0x99; 32]),
+    );
     let bad_eid = insert_event_raw(&conn, recorded_by, &bad_blob);
     let result = project_one(&conn, recorded_by, &bad_eid).unwrap();
     match result {
@@ -129,7 +135,8 @@ fn test_removal_blocks_on_missing_removed_member_ref() {
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
     let admin_eid = seed_admin_for_signer(&conn, recorded_by, &signer_eid);
 
-    let (_removal, blob) = make_signed_removal(&signing_key, &signer_eid, &admin_eid, [0x44; 32], &[], None);
+    let (_removal, blob) =
+        make_signed_removal(&signing_key, &signer_eid, &admin_eid, [0x44; 32], &[], None);
     let event_id = insert_event_raw(&conn, recorded_by, &blob);
     let result = project_one(&conn, recorded_by, &event_id).unwrap();
     match result {
@@ -160,8 +167,14 @@ fn test_removal_projects_removed_entities_for_user_target() {
         .unwrap();
     let removed_user_eid = event_id_from_base64(&removed_user_b64).expect("user event id");
 
-    let (_removal, blob) =
-        make_signed_removal(&signing_key, &signer_eid, &admin_eid, removed_user_eid, &[], None);
+    let (_removal, blob) = make_signed_removal(
+        &signing_key,
+        &signer_eid,
+        &admin_eid,
+        removed_user_eid,
+        &[],
+        None,
+    );
     let event_id = insert_event_raw(&conn, recorded_by, &blob);
     assert_eq!(
         project_one(&conn, recorded_by, &event_id).unwrap(),
@@ -269,12 +282,8 @@ fn test_key_rotation_blocks_on_missing_frontier_then_projects_and_rejects_bad_ha
         "rotation should auto-project once frontier arrives"
     );
 
-    let (_bad_rotation, bad_blob) = make_signed_key_rotation(
-        &signing_key,
-        &signer_eid,
-        &[frontier_eid],
-        Some([0xAB; 32]),
-    );
+    let (_bad_rotation, bad_blob) =
+        make_signed_key_rotation(&signing_key, &signer_eid, &[frontier_eid], Some([0xAB; 32]));
     let bad_eid = insert_event_raw(&conn, recorded_by, &bad_blob);
     let result = project_one(&conn, recorded_by, &bad_eid).unwrap();
     match result {
@@ -305,8 +314,14 @@ fn test_concurrent_multi_parent_frontier_hash_converges_despite_parent_order() {
         ProjectionDecision::Valid
     );
 
-    let (_right_parent, right_blob) =
-        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_user_eid, &[], None);
+    let (_right_parent, right_blob) = make_signed_removal(
+        &signing_key,
+        &signer_eid,
+        &admin_eid,
+        signer_user_eid,
+        &[],
+        None,
+    );
     let right_eid = insert_event_raw(&conn, recorded_by, &right_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &right_eid).unwrap(),
@@ -384,8 +399,14 @@ fn test_key_rotation_multi_parent_frontier_blocks_until_all_frontier_deps_arrive
         make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_eid, &[], None);
     let left_eid = canonical_test_event_id(&conn, recorded_by, &left_blob);
 
-    let (_right_parent, right_blob) =
-        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_user_eid, &[], None);
+    let (_right_parent, right_blob) = make_signed_removal(
+        &signing_key,
+        &signer_eid,
+        &admin_eid,
+        signer_user_eid,
+        &[],
+        None,
+    );
     let right_eid = canonical_test_event_id(&conn, recorded_by, &right_blob);
 
     let canonical_frontier = if left_eid <= right_eid {
@@ -394,12 +415,8 @@ fn test_key_rotation_multi_parent_frontier_blocks_until_all_frontier_deps_arrive
         vec![right_eid, left_eid]
     };
 
-    let (_rotation, rotation_blob) = make_signed_key_rotation(
-        &signing_key,
-        &signer_eid,
-        &canonical_frontier,
-        None,
-    );
+    let (_rotation, rotation_blob) =
+        make_signed_key_rotation(&signing_key, &signer_eid, &canonical_frontier, None);
     let rotation_eid = insert_event_raw(&conn, recorded_by, &rotation_blob);
 
     match project_one(&conn, recorded_by, &rotation_eid).unwrap() {
@@ -488,8 +505,14 @@ fn test_key_rotation_rejects_unsorted_multi_parent_frontier_even_when_hash_match
         ProjectionDecision::Valid
     );
 
-    let (_right_parent, right_blob) =
-        make_signed_removal(&signing_key, &signer_eid, &admin_eid, signer_user_eid, &[], None);
+    let (_right_parent, right_blob) = make_signed_removal(
+        &signing_key,
+        &signer_eid,
+        &admin_eid,
+        signer_user_eid,
+        &[],
+        None,
+    );
     let right_eid = insert_event_raw(&conn, recorded_by, &right_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &right_eid).unwrap(),

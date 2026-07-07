@@ -51,7 +51,10 @@ fn test_file_slice_blocks_on_missing_signer() {
     let (_fs, fs_blob) = make_file_slice(&signing_key, &fake_signer, file_id, 0, b"data");
     let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
     let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 }
 
 #[test]
@@ -70,7 +73,10 @@ fn test_file_slice_unblocks_when_signer_arrives() {
 
     // Should block on missing signer dep
     let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     // Insert and project the full identity chain — signer dep resolves,
     // but file_slice still blocks on the missing file descriptor.
@@ -281,7 +287,10 @@ fn test_attachment_blocks_on_missing_message() {
     let (_att, att_blob) = make_file(&conn, recorded_by, &fake_msg_id, &sk_eid);
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
     let result = project_one(&conn, recorded_by, &att_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 }
 
 #[test]
@@ -302,7 +311,10 @@ fn test_attachment_blocks_on_missing_key() {
         make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &fake_key_id);
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
     let result = project_one(&conn, recorded_by, &att_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 }
 
 #[test]
@@ -352,7 +364,10 @@ fn test_attachment_cascade_unblock() {
     let (_att, att_blob) = make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &sk_eid);
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
     let result = project_one(&conn, recorded_by, &att_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     // Insert message dep — still blocked (key missing)
     let msg_eid2 = insert_event_raw(&conn, recorded_by, &msg_blob);

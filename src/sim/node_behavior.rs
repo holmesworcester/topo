@@ -11,10 +11,6 @@ use crate::projection::apply::{
     project_one::project_one_step_with_backend, ProjectionApplyResult, ProjectionBackend,
     WriteCapability,
 };
-use crate::projection::projector::{
-    CurrentSignerInfo, DeletionIntentInfo, EmitCommand, FileDescriptorInfo,
-    ProjectorDecisionContext, SqlVal, WriteOp,
-};
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::decision_context::{
     admin_authority_plan_to_mismatch_reason, build_workspace_projector_decision_context,
@@ -26,6 +22,10 @@ use crate::projection::decision_context::{
     DeletionSignerRawRows, DepLoadResult, PeerSharedAuthorityRawRows, ProjectionFrameContext,
     ProjectionQueries, ProjectionQueryResult, SemanticTypeRawRows, WorkspaceAcceptedRawRows,
     WorkspaceDecisionContext,
+};
+use crate::projection::projector::{
+    CurrentSignerInfo, DeletionIntentInfo, EmitCommand, FileDescriptorInfo,
+    ProjectorDecisionContext, SqlVal, WriteOp,
 };
 use crate::projection::signer::{ResolvedSigner, SignerResolution};
 use crate::sim::query_snapshot::ImportedPeerState;
@@ -628,7 +628,9 @@ impl NodeBehaviorEngine {
             let parsed = events::parse_event(&blob)?;
             if matches!(
                 semantic_event_owned(&parsed),
-                ParsedEvent::KeyHistory(_) | ParsedEvent::KeyRotation(_) | ParsedEvent::KeyShared(_)
+                ParsedEvent::KeyHistory(_)
+                    | ParsedEvent::KeyRotation(_)
+                    | ParsedEvent::KeyShared(_)
             ) {
                 self.state
                     .borrow_mut()
@@ -823,9 +825,10 @@ fn insert_or_ignore_key_matches(table: &str, left: &BehaviorRow, right: &Behavio
         _ => return left == right,
     };
     key_columns.iter().all(|column| {
-        left.values.get(*column).zip(right.values.get(*column)).is_some_and(
-            |(left_value, right_value)| left_value == right_value,
-        )
+        left.values
+            .get(*column)
+            .zip(right.values.get(*column))
+            .is_some_and(|(left_value, right_value)| left_value == right_value)
     })
 }
 
@@ -1229,8 +1232,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
                                         .any(|row| {
                                             row_text(row, "event_id")
                                                 == Some(&authority_event_id_b64)
-                                                && row_blob(row, "public_key")
-                                                    .is_some_and(|admin_key| admin_key == public_key)
+                                                && row_blob(row, "public_key").is_some_and(
+                                                    |admin_key| admin_key == public_key,
+                                                )
                                         })
                                 })
                         });
@@ -1699,9 +1703,11 @@ impl ProjectionQueries for NodeBehaviorEngine {
             &key_shared.wrapped_key,
         );
         Ok(ProjectorDecisionContext {
-            unwrapped_secret_material: Some(crate::projection::projector::UnwrappedSecretMaterial {
-                key_bytes: plaintext_key,
-            }),
+            unwrapped_secret_material: Some(
+                crate::projection::projector::UnwrappedSecretMaterial {
+                    key_bytes: plaintext_key,
+                },
+            ),
             ..ProjectorDecisionContext::default()
         })
     }
@@ -1770,9 +1776,11 @@ impl ProjectionQueries for NodeBehaviorEngine {
             &key_rotation.wrapped_keys[slot_index],
         );
         Ok(ProjectorDecisionContext {
-            unwrapped_secret_material: Some(crate::projection::projector::UnwrappedSecretMaterial {
-                key_bytes: plaintext_key,
-            }),
+            unwrapped_secret_material: Some(
+                crate::projection::projector::UnwrappedSecretMaterial {
+                    key_bytes: plaintext_key,
+                },
+            ),
             ..ProjectorDecisionContext::default()
         })
     }
@@ -1836,19 +1844,21 @@ impl ProjectionQueries for NodeBehaviorEngine {
             Ok(plaintext) => plaintext,
             Err(_) => return Ok(ProjectorDecisionContext::default()),
         };
-        let entries = match crate::event_modules::key_history::decode_key_history_plaintext(&plaintext)
-        {
-            Ok(entries) => entries,
-            Err(_) => return Ok(ProjectorDecisionContext::default()),
-        };
+        let entries =
+            match crate::event_modules::key_history::decode_key_history_plaintext(&plaintext) {
+                Ok(entries) => entries,
+                Err(_) => return Ok(ProjectorDecisionContext::default()),
+            };
 
         Ok(ProjectorDecisionContext {
             unwrapped_key_history_material: entries
                 .into_iter()
-                .map(|entry| crate::projection::projector::HistoricalKeyMaterial {
-                    key_event_id: entry.key_event_id,
-                    key_bytes: entry.key_bytes,
-                })
+                .map(
+                    |entry| crate::projection::projector::HistoricalKeyMaterial {
+                        key_event_id: entry.key_event_id,
+                        key_bytes: entry.key_bytes,
+                    },
+                )
                 .collect(),
             ..ProjectorDecisionContext::default()
         })
@@ -2073,7 +2083,10 @@ impl ProjectionBackend for NodeBehaviorEngine {
                     );
                     let row = BehaviorRow { values: row_values };
                     let mut state = self.state.borrow_mut();
-                    let rows = state.tables.entry("shared_event_index".to_string()).or_default();
+                    let rows = state
+                        .tables
+                        .entry("shared_event_index".to_string())
+                        .or_default();
                     if !rows.contains(&row) {
                         rows.push(row);
                         rows.sort();
@@ -2292,8 +2305,8 @@ mod tests {
         table: &str,
         drop_columns: &[&str],
     ) {
-        let drop_created_at_for_key_secrets = table == "key_secrets"
-            && !drop_columns.iter().any(|column| *column == "created_at");
+        let drop_created_at_for_key_secrets =
+            table == "key_secrets" && !drop_columns.iter().any(|column| *column == "created_at");
         let drop_columns = if drop_created_at_for_key_secrets {
             let mut columns = drop_columns.to_vec();
             columns.push("created_at");

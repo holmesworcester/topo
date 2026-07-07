@@ -10,9 +10,7 @@ use crate::crypto::EventId;
 use crate::event_modules::file_slice::{
     BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES, MAX_FILE_BYTES,
 };
-use crate::projection::create::{
-    create_encrypted_event, create_encrypted_event_with_owner,
-};
+use crate::projection::create::{create_encrypted_event, create_encrypted_event_with_owner};
 use crate::service::open_db_for_peer;
 use crate::state::db::queue::current_timestamp_ms_u64;
 use ed25519_dalek::SigningKey;

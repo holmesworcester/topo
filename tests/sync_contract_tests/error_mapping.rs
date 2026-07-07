@@ -488,8 +488,7 @@ async fn fragmented_data_frames_handler_completes() {
         // The responder may treat the truncated tail as a clean close or a
         // connection-close race, but it must terminate promptly.
         assert!(
-            result.is_ok()
-                || matches!(result, Err(ref err) if err.contains("Connection closed")),
+            result.is_ok() || matches!(result, Err(ref err) if err.contains("Connection closed")),
             "handler should terminate promptly on fragmented data frames, got: {:?}",
             result
         );

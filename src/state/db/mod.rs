@@ -19,11 +19,11 @@ pub mod schema;
 pub mod sql_types;
 pub mod store;
 pub mod sync_log;
-pub mod txn_guard;
 pub mod timeline;
 pub mod topo_log;
 pub mod transport_creds;
 pub mod transport_trust;
+pub mod txn_guard;
 
 use rusqlite::{Connection, OpenFlags, Result as SqliteResult};
 use std::path::Path;

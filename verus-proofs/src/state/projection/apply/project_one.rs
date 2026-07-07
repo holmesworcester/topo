@@ -5,8 +5,8 @@
 //! Postconditions (`ensures`) are SMT-checked against the function body by
 //! `cargo-verus verify`.
 
-use vstd::prelude::*;
 use crate::state::projection::decision::*;
+use vstd::prelude::*;
 
 verus! {
 

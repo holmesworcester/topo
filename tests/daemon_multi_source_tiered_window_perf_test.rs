@@ -20,8 +20,8 @@ use cli_harness::{
     create_workspace_with_details, daemon_listen_addr, daemon_transport_fingerprint,
     ensure_active_peer, generate_messages, hold_network_test_lock_for_binary, send_message,
     start_daemon_with_options, stop_daemon, sync_log_json, topo_assert_eventually, topo_cmd,
-    topo_create_invite_retry, wait_for_active_tenant_ready, wait_for_daemon_stopped,
-    DaemonOptions, HarnessDaemon,
+    topo_create_invite_retry, wait_for_active_tenant_ready, wait_for_daemon_stopped, DaemonOptions,
+    HarnessDaemon,
 };
 use daemon_perf_harness::write_summary;
 

@@ -34,7 +34,10 @@ mod tests {
         })
     }
 
-    fn removal_ctx(signer: [u8; 32], target_kind: RemovalTargetKind) -> topo::projection::projector::ProjectorDecisionContext {
+    fn removal_ctx(
+        signer: [u8; 32],
+        target_kind: RemovalTargetKind,
+    ) -> topo::projection::projector::ProjectorDecisionContext {
         let mut ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_REMOVAL);
         ctx.removal_target_kind = Some(target_kind);
         ctx

@@ -144,7 +144,9 @@ pub(crate) fn decide_invite_bootstrap_endpoint_plan(
     let core_ctx = InviteBootstrapEndpointDecisionContextCore {
         explicit_endpoint: match context.explicit_endpoint {
             ExplicitBootstrapEndpointState::Absent => ExplicitBootstrapEndpointStateCore::Absent,
-            ExplicitBootstrapEndpointState::Present(_) => ExplicitBootstrapEndpointStateCore::Present,
+            ExplicitBootstrapEndpointState::Present(_) => {
+                ExplicitBootstrapEndpointStateCore::Present
+            }
             ExplicitBootstrapEndpointState::Invalid => ExplicitBootstrapEndpointStateCore::Invalid,
         },
         local_daemon_endpoint: match context.local_daemon_endpoint {
@@ -164,7 +166,9 @@ pub(crate) fn decide_invite_bootstrap_endpoint_plan(
             LocalDaemonEndpointState::Present(endpoint_id) => {
                 InviteBootstrapEndpointPlan::UseLocalDaemon(endpoint_id)
             }
-            _ => unreachable!("core returned UseLocalDaemon but local daemon endpoint was not Present"),
+            _ => unreachable!(
+                "core returned UseLocalDaemon but local daemon endpoint was not Present"
+            ),
         },
         InviteBootstrapEndpointPlanCore::RejectInvalidExplicit => {
             InviteBootstrapEndpointPlan::RejectInvalidExplicit
@@ -249,7 +253,9 @@ pub(crate) fn decide_local_endpoint_shared_plan(
             LocalEndpointSharedState::Present(event_id) => {
                 LocalEndpointSharedPlan::UseLocalEndpointShared(event_id)
             }
-            _ => unreachable!("core returned UseLocalEndpointShared but local_endpoint_shared was not Present"),
+            _ => unreachable!(
+                "core returned UseLocalEndpointShared but local_endpoint_shared was not Present"
+            ),
         },
         LocalEndpointSharedPlanCore::RejectMissingLocalDaemonIdentity => {
             LocalEndpointSharedPlan::RejectMissingLocalDaemonIdentity
@@ -274,9 +280,7 @@ pub(crate) fn resolve_local_endpoint_shared_plan(
     }
 }
 
-pub(crate) fn decide_remove_member_plan(
-    context: &RemoveMemberDecisionContext,
-) -> RemoveMemberPlan {
+pub(crate) fn decide_remove_member_plan(context: &RemoveMemberDecisionContext) -> RemoveMemberPlan {
     use topo_verus_proofs::event_modules::workspace::command_plans::{
         decide_remove_member_plan_core, RemoveMemberDecisionContextCore, RemoveMemberPlanCore,
         RemoveMemberTargetKindCore,
@@ -322,9 +326,7 @@ pub(crate) fn resolve_remove_member_plan(
     }
 }
 
-pub(crate) fn decide_grant_admin_plan(
-    context: &GrantAdminDecisionContext,
-) -> GrantAdminPlan {
+pub(crate) fn decide_grant_admin_plan(context: &GrantAdminDecisionContext) -> GrantAdminPlan {
     use topo_verus_proofs::event_modules::workspace::command_plans::{
         decide_grant_admin_plan_core, GrantAdminDecisionContextCore, GrantAdminPlanCore,
     };
@@ -443,8 +445,7 @@ mod tests {
             target_already_admin: true,
         });
         assert_eq!(plan, GrantAdminPlan::RejectNotAdmin);
-        let err = resolve_grant_admin_plan(plan)
-            .expect_err("non-admin grant should reject");
+        let err = resolve_grant_admin_plan(plan).expect_err("non-admin grant should reject");
         assert_eq!(
             err.to_string(),
             "Local peer signer is not admin for this workspace."
@@ -458,8 +459,7 @@ mod tests {
             target_already_admin: true,
         });
         assert_eq!(plan, GrantAdminPlan::RejectAlreadyAdmin);
-        let err = resolve_grant_admin_plan(plan)
-            .expect_err("already-admin target must reject");
+        let err = resolve_grant_admin_plan(plan).expect_err("already-admin target must reject");
         assert_eq!(err.to_string(), "user is already admin");
     }
 }

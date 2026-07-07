@@ -56,12 +56,14 @@ pub fn encode_peer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::PeerSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
-        EVENT_TYPE_PEER_SECRET,
-        e.created_at_ms,
-        &e.signer_event_id,
-        &e.private_key_bytes,
-    ))
+    Ok(
+        topo_verus_proofs::event_modules::layout::ts_id2::encode_ts_id2(
+            EVENT_TYPE_PEER_SECRET,
+            e.created_at_ms,
+            &e.signer_event_id,
+            &e.private_key_bytes,
+        ),
+    )
 }
 
 // === Projector (event-module locality) ===

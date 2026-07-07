@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use super::{EventError, ParsedEvent};
+use crate::projection::decision_context::{
+    ContextLoadResult, ProjectionFrameContext, ProjectionQueries,
+};
 use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult};
-use crate::projection::decision_context::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareScope {

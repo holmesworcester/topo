@@ -198,7 +198,9 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a key_history event".to_string()),
     };
     if history.ciphertext.len() != KEY_HISTORY_BUNDLE_BYTES {
-        return ProjectorResult::reject("ciphertext size does not match key history cap".to_string());
+        return ProjectorResult::reject(
+            "ciphertext size does not match key history cap".to_string(),
+        );
     }
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "key_histories",

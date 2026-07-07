@@ -669,10 +669,12 @@ fn test_source_isomorphism_reverse_order_replay() {
     let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b);
     let del_eid_b = insert_event_raw(&conn_b, recorded_by, &del_blob_b);
 
-    let (tenant_recorded_by, tenant_eid, _tenant_blob) =
-        chain_b.first().expect("identity chain includes tenant root");
-    let (invite_recorded_by, invite_eid, _invite_blob) =
-        chain_b.get(1).expect("identity chain includes invite_accepted");
+    let (tenant_recorded_by, tenant_eid, _tenant_blob) = chain_b
+        .first()
+        .expect("identity chain includes tenant root");
+    let (invite_recorded_by, invite_eid, _invite_blob) = chain_b
+        .get(1)
+        .expect("identity chain includes invite_accepted");
     let (workspace_recorded_by, workspace_eid, _workspace_blob) =
         chain_b.get(2).expect("identity chain includes workspace");
     let (peer_secret_recorded_by, peer_secret_eid, _peer_secret_blob) =

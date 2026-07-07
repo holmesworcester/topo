@@ -442,14 +442,7 @@ pub fn create_encrypted_event(
     inner_event: &ParsedEvent,
     signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
-    create_encrypted_event_with_owner(
-        conn,
-        recorded_by,
-        key_event_id,
-        None,
-        inner_event,
-        signer,
-    )
+    create_encrypted_event_with_owner(conn, recorded_by, key_event_id, None, inner_event, signer)
 }
 
 /// Create an encrypted event with optional outer owner linkage for convergent
@@ -522,13 +515,9 @@ pub fn create_encrypted_event_with_owner(
 
     // 5. Store either the plaintext encrypted wrapper or Signed(Encrypted(inner)).
     match signer {
-        Some((signer_event_id, signing_key)) => create_signed_event(
-            conn,
-            recorded_by,
-            signer_event_id,
-            &wrapper,
-            signing_key,
-        ),
+        Some((signer_event_id, signing_key)) => {
+            create_signed_event(conn, recorded_by, signer_event_id, &wrapper, signing_key)
+        }
         None => create_event(conn, recorded_by, &wrapper),
     }
 }
@@ -803,8 +792,7 @@ mod tests {
             key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
         let uib_eid =
-            create_signed_event(conn, recorded_by, &net_eid, &uib, &workspace_key)
-                .unwrap();
+            create_signed_event(conn, recorded_by, &net_eid, &uib, &workspace_key).unwrap();
 
         let user_key = SigningKey::generate(&mut rng);
         let ub = ParsedEvent::User(UserEvent {
@@ -812,8 +800,7 @@ mod tests {
             public_key: user_key.verifying_key().to_bytes(),
             username: "test-user".to_string(),
         });
-        let ub_eid =
-            create_signed_event(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
+        let ub_eid = create_signed_event(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
 
         let device_invite_key = SigningKey::generate(&mut rng);
         let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
@@ -822,8 +809,7 @@ mod tests {
             authority_event_id: ub_eid,
             key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
         });
-        let dif_eid =
-            create_signed_event(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
+        let dif_eid = create_signed_event(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
 
         let endpoint_key = SigningKey::generate(&mut rng);
         let endpoint_event =
@@ -831,8 +817,7 @@ mod tests {
                 endpoint_key.to_bytes(),
             );
         let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
-        let endpoint_shared_event_id =
-            create_event(conn, &endpoint_id, &endpoint_event).unwrap();
+        let endpoint_shared_event_id = create_event(conn, &endpoint_id, &endpoint_event).unwrap();
 
         let peer_shared_key = SigningKey::generate(&mut rng);
         let psf = ParsedEvent::PeerShared(PeerSharedEvent {
@@ -843,8 +828,7 @@ mod tests {
             device_name: "test-device".to_string(),
         });
         let psf_eid =
-            create_signed_event(conn, recorded_by, &dif_eid, &psf, &device_invite_key)
-                .unwrap();
+            create_signed_event(conn, recorded_by, &dif_eid, &psf, &device_invite_key).unwrap();
         conn.execute(
             "INSERT INTO peer_secrets
              (recorded_by, event_id, signer_event_id, private_key, created_at)
@@ -1066,9 +1050,8 @@ mod tests {
             content: "signed content".to_string(),
         });
 
-        let err =
-            create_signed_event(&conn, recorded_by, &signer_eid, &msg, &signing_key)
-                .expect_err("plaintext content should be rejected");
+        let err = create_signed_event(&conn, recorded_by, &signer_eid, &msg, &signing_key)
+            .expect_err("plaintext content should be rejected");
         match err {
             CreateEventError::Rejected { reason, .. } => {
                 assert!(reason.contains("must be carried inside encrypted wrappers"));

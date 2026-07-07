@@ -243,4 +243,4 @@ pub fn plan_for_outbound_session_auth_decision(
 }
 
 } // verus!
-// Mirror maintenance: synced with current transport/session auth runtime changes in this branch.
+  // Mirror maintenance: synced with current transport/session auth runtime changes in this branch.

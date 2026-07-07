@@ -24,8 +24,7 @@ use crate::event_modules::{
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
-    create_event_staged, create_event, create_signed_event,
-    event_id_or_blocked, project_event,
+    create_event, create_event_staged, create_signed_event, event_id_or_blocked, project_event,
 };
 use crate::state::db::queue::current_timestamp_ms_u64;
 
@@ -509,8 +508,7 @@ fn create_workspace_inner(
         authority_event_id: ws_eid,
         key_history_event_id: crate::event_modules::key_history::NO_KEY_HISTORY_EVENT_ID,
     });
-    let uib_eid =
-        create_signed_event(db, &derived_peer_id, &ws_eid, &uib, &workspace_key)?;
+    let uib_eid = create_signed_event(db, &derived_peer_id, &ws_eid, &uib, &workspace_key)?;
 
     // 7. User (signed by invite_key)
     let user_key = SigningKey::generate(&mut rng);
@@ -549,8 +547,7 @@ fn create_workspace_inner(
         endpoint_shared_event_id,
         device_name: device_name.to_string(),
     });
-    let psf_eid =
-        create_signed_event(db, &derived_peer_id, &dif_eid, &psf, &device_invite_key)?;
+    let psf_eid = create_signed_event(db, &derived_peer_id, &dif_eid, &psf, &device_invite_key)?;
     index_endpoint_shared_for_workspace(db, &derived_peer_id, &ws_eid, &endpoint_shared_event_id)?;
 
     // 11. Emit peer_secret for peer_shared signer key only.
@@ -654,7 +651,8 @@ fn join_workspace_inner(
     peer_shared_key: SigningKey,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
-    let endpoint_shared_event_id = resolve_or_materialize_local_endpoint_shared_event_id_for_accept(db)?;
+    let endpoint_shared_event_id =
+        resolve_or_materialize_local_endpoint_shared_event_id_for_accept(db)?;
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_secret material. This is the key event
@@ -785,7 +783,8 @@ pub fn add_device_to_workspace(
     device_name: &str,
     peer_shared_key: SigningKey,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
-    let endpoint_shared_event_id = resolve_or_materialize_local_endpoint_shared_event_id_for_accept(db)?;
+    let endpoint_shared_event_id =
+        resolve_or_materialize_local_endpoint_shared_event_id_for_accept(db)?;
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_secret material so invite_accepted projection
@@ -982,8 +981,9 @@ fn resolve_admin_authority_for_user(
     user_event_id: &EventId,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let user_b64 = event_id_to_base64(user_event_id);
-    let admin_b64: String = db.query_row(
-        "SELECT a.event_id
+    let admin_b64: String = db
+        .query_row(
+            "SELECT a.event_id
          FROM admins a
          JOIN users u
            ON u.recorded_by = a.recorded_by
@@ -992,19 +992,19 @@ fn resolve_admin_authority_for_user(
            AND u.event_id = ?2
          ORDER BY a.event_id
          LIMIT 1",
-        rusqlite::params![recorded_by, &user_b64],
-        |row| crate::db::sql_types::get_text(row, 0),
-    ).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        match e {
-            rusqlite::Error::QueryReturnedNoRows => {
-                "no admin grant found for signer user — signer is not authorized to remove"
-                    .into()
+            rusqlite::params![recorded_by, &user_b64],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    "no admin grant found for signer user — signer is not authorized to remove"
+                        .into()
+                }
+                other => Box::new(other),
             }
-            other => Box::new(other),
-        }
-    })?;
-    event_id_from_base64(&admin_b64)
-        .ok_or_else(|| "admins.event_id is not valid base64".into())
+        })?;
+    event_id_from_base64(&admin_b64).ok_or_else(|| "admins.event_id is not valid base64".into())
 }
 
 pub fn remove_member(
@@ -1024,8 +1024,7 @@ pub fn remove_member(
         )
         .into());
     }
-    let mut parent_slots =
-        [[0u8; 32]; crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS];
+    let mut parent_slots = [[0u8; 32]; crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS];
     for (slot, parent_ref) in parent_slots.iter_mut().zip(parent_refs.iter()) {
         *slot = *parent_ref;
     }

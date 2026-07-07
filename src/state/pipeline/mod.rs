@@ -342,7 +342,6 @@ pub fn ingest_now_result(
         });
     }
 
-
     let db = open_connection(db_path).map_err(|e| format!("open ingest db: {e}"))?;
     let mut shared_event_index_stmt = db
         .prepare(SQL_INSERT_SHARED_EVENT_INDEX_ENTRY)

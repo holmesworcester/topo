@@ -2,8 +2,8 @@
 //!
 //! Covers: peer_secret, invite_secret, admin, peer_invite_shared (device_invite).
 
-use vstd::prelude::*;
 use vstd::bytes::{u64_from_le_bytes, u64_to_le_bytes};
+use vstd::prelude::*;
 
 verus! {
 

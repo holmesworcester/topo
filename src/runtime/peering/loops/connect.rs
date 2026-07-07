@@ -43,8 +43,8 @@ pub use topo_verus_proofs::runtime::peering::loops::connect::{
 };
 #[cfg(test)]
 use topo_verus_proofs::runtime::peering::loops::connect::{
-    should_warn_for_connect_failure, DialFailureDecisionContext,
-    SessionOpenFailureDecisionContext, SessionRetryDecisionContext, STALE_DIAL_FAILURE_THRESHOLD,
+    should_warn_for_connect_failure, DialFailureDecisionContext, SessionOpenFailureDecisionContext,
+    SessionRetryDecisionContext, STALE_DIAL_FAILURE_THRESHOLD,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,12 +109,13 @@ fn normalize_session_auth_failure_decision_context(
 fn decide_session_auth_failure_plan(
     context: SessionAuthFailureDecisionContext,
 ) -> SessionAuthFailurePlan {
-    let core = topo_verus_proofs::runtime::peering::loops::connect::decide_session_auth_failure_core_plan(
-        topo_verus_proofs::runtime::peering::loops::connect::SessionAuthFailureCoreContext {
-            connection_lost: context.connection_lost,
-            has_bootstrap_retry_invite: context.bootstrap_retry_invite.is_some(),
-        },
-    );
+    let core =
+        topo_verus_proofs::runtime::peering::loops::connect::decide_session_auth_failure_core_plan(
+            topo_verus_proofs::runtime::peering::loops::connect::SessionAuthFailureCoreContext {
+                connection_lost: context.connection_lost,
+                has_bootstrap_retry_invite: context.bootstrap_retry_invite.is_some(),
+            },
+        );
     let next_auth_plan_override = if core.next_auth_plan_override {
         context
             .bootstrap_retry_invite

@@ -519,6 +519,128 @@ fn join_workspace_replays_existing_same_workspace_shared_events_for_new_tenant()
 }
 
 #[test]
+fn joined_peer_reuses_inherited_root_frontier_key_for_first_send() {
+    let conn = open_in_memory().expect("open in-memory db");
+    create_tables(&conn).expect("create tables");
+    materialize_local_daemon_identity(&conn);
+
+    let workspace =
+        create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
+    let creator_peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
+    let creator_admin_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator admin event");
+
+    let root_key = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+        &conn,
+        &creator_peer_id,
+    )
+    .expect("root content key");
+
+    let invite = create_user_invite_raw(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_key,
+        &workspace.peer_shared_event_id,
+        &creator_admin_eid,
+        &workspace.workspace_id,
+    )
+    .expect("create invite");
+
+    let bob_key = SigningKey::from_bytes(&[7u8; 32]);
+    let bob_peer_id = peer_id_for_signing_key(&bob_key);
+    record_invite_link_workspace(
+        &conn,
+        &bob_peer_id,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+    );
+    let join = join_workspace_as_new_user(
+        &conn,
+        &bob_peer_id,
+        &invite.invite_key,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+        "bob",
+        "tablet",
+        bob_key,
+    )
+    .expect("join workspace");
+    persist_join_peer_secret(&conn, &bob_peer_id, &join).expect("persist peer secret");
+
+    let inherited_key_present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![&bob_peer_id, event_id_to_base64(&root_key)],
+            |row| row.get(0),
+        )
+        .expect("query inherited root key");
+    assert!(
+        inherited_key_present,
+        "joined peer should materialize the inherited root-frontier key"
+    );
+
+    let wrapper_event_id = crate::event_modules::message::commands::create(
+        &conn,
+        &bob_peer_id,
+        &join.peer_shared_event_id,
+        &join.peer_shared_key,
+        10_000,
+        crate::event_modules::message::commands::CreateMessageCmd {
+            workspace_id: workspace.workspace_id,
+            author_id: join.user_event_id,
+            content: "joined-peer-first-send".to_string(),
+        },
+    )
+    .expect("create message from joined peer");
+
+    assert_eq!(
+        encrypted_wrapper_key_event_id(&conn, &wrapper_event_id),
+        root_key,
+        "joined peer should reuse the inherited root-frontier key instead of rotating a fresh one"
+    );
+}
+
+#[test]
+fn rotate_content_key_returns_materialized_key_secret_id() {
+    let conn = open_in_memory().expect("open in-memory db");
+    create_tables(&conn).expect("create tables");
+    materialize_local_daemon_identity(&conn);
+
+    let workspace =
+        create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
+    let recorded_by = peer_id_for_signing_key(&workspace.peer_shared_key);
+
+    let rotated = crate::event_modules::workspace::identity_ops::rotate_content_key_for_peer(
+        &conn,
+        &recorded_by,
+    )
+    .expect("rotate content key");
+
+    let key_present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, event_id_to_base64(&rotated.key_event_id)],
+            |row| row.get(0),
+        )
+        .expect("query rotated key secret");
+    assert!(
+        key_present,
+        "rotate_content_key_for_peer should return the materialized KeySecret id"
+    );
+    assert_ne!(
+        rotated.key_event_id, rotated.rotation_event_id,
+        "rotation result should distinguish the KeySecret dep id from the rotation lineage id"
+    );
+}
+
+#[test]
 fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
@@ -678,6 +800,140 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
 }
 
 #[test]
+fn joined_peer_device_link_replays_inherited_key_history() {
+    let conn = open_in_memory().expect("open in-memory db");
+    create_tables(&conn).expect("create tables");
+    materialize_local_daemon_identity(&conn);
+
+    let workspace =
+        create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
+    let creator_peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
+    let creator_admin_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator admin event");
+    let creator_user_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| crate::db::sql_types::get_text(row, 0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator user event");
+
+    let root_key = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+        &conn,
+        &creator_peer_id,
+    )
+    .expect("root content key");
+    let seeded_message_id = crate::event_modules::message::commands::create(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        42,
+        crate::event_modules::message::commands::CreateMessageCmd {
+            workspace_id: workspace.workspace_id,
+            author_id: creator_user_eid,
+            content: "seeded-before-join".to_string(),
+        },
+    )
+    .expect("create seeded message");
+
+    let invite = create_user_invite_raw(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_key,
+        &workspace.peer_shared_event_id,
+        &creator_admin_eid,
+        &workspace.workspace_id,
+    )
+    .expect("create invite");
+
+    let bob_key = SigningKey::from_bytes(&[7u8; 32]);
+    let bob_peer_id = peer_id_for_signing_key(&bob_key);
+    record_invite_link_workspace(
+        &conn,
+        &bob_peer_id,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+    );
+    let join = join_workspace_as_new_user(
+        &conn,
+        &bob_peer_id,
+        &invite.invite_key,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+        "bob",
+        "tablet",
+        bob_key,
+    )
+    .expect("join workspace");
+    persist_join_peer_secret(&conn, &bob_peer_id, &join).expect("persist peer secret");
+
+    let link_invite = create_device_link_invite_raw(
+        &conn,
+        &bob_peer_id,
+        &join.peer_shared_key,
+        &join.peer_shared_event_id,
+        &join.user_event_id,
+        &workspace.workspace_id,
+    )
+    .expect("create device-link invite from joined peer");
+
+    let phone_key = SigningKey::from_bytes(&[8u8; 32]);
+    let phone_peer_id = peer_id_for_signing_key(&phone_key);
+    record_invite_link_workspace(
+        &conn,
+        &phone_peer_id,
+        &link_invite.invite_event_id,
+        workspace.workspace_id,
+    );
+    let link = add_device_to_workspace(
+        &conn,
+        &phone_peer_id,
+        &link_invite.invite_key,
+        &link_invite.invite_event_id,
+        workspace.workspace_id,
+        join.user_event_id,
+        "phone",
+        phone_key,
+    )
+    .expect("add linked device from joined peer");
+    persist_link_peer_secret(&conn, &phone_peer_id, &link).expect("persist linked peer secret");
+
+    let inherited_key_present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![&phone_peer_id, event_id_to_base64(&root_key)],
+            |row| row.get(0),
+        )
+        .expect("query inherited key on linked device");
+    assert!(
+        inherited_key_present,
+        "device link from joined peer should replay inherited key history"
+    );
+
+    let seeded_message_visible: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![&phone_peer_id, event_id_to_base64(&seeded_message_id)],
+            |row| row.get(0),
+        )
+        .expect("query seeded message on linked device");
+    assert!(
+        seeded_message_visible,
+        "linked device should decrypt preexisting history shared through the joined peer's inherited keys"
+    );
+}
+
+#[test]
 fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
@@ -720,12 +976,43 @@ fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
         "message before removal should use the existing root-frontier key"
     );
 
+    let link_invite = create_device_link_invite_raw(
+        &conn,
+        &recorded_by,
+        &workspace.peer_shared_key,
+        &workspace.peer_shared_event_id,
+        &author_id,
+        &workspace.workspace_id,
+    )
+    .expect("create removable device-link invite");
+    let phone_key = SigningKey::from_bytes(&[9u8; 32]);
+    let phone_peer_id = peer_id_for_signing_key(&phone_key);
+    record_invite_link_workspace(
+        &conn,
+        &phone_peer_id,
+        &link_invite.invite_event_id,
+        workspace.workspace_id,
+    );
+    let linked_device = add_device_to_workspace(
+        &conn,
+        &phone_peer_id,
+        &link_invite.invite_key,
+        &link_invite.invite_event_id,
+        workspace.workspace_id,
+        author_id,
+        "phone",
+        phone_key,
+    )
+    .expect("add removable linked device");
+    persist_link_peer_secret(&conn, &phone_peer_id, &linked_device)
+        .expect("persist removable linked device secret");
+
     let removal_event_id = create_local_removal(
         &conn,
         &recorded_by,
         &workspace.peer_shared_event_id,
         &workspace.peer_shared_key,
-        [0x55; 32],
+        linked_device.peer_shared_event_id,
         &[],
     );
 

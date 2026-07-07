@@ -32,8 +32,13 @@ fn test_encrypted_message_valid() {
 
     // Create identity chain for signing the inner message
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-    let sk_eid =
-        insert_and_project_self_key_rotation(&conn, recorded_by, &signer_eid, &signing_key, key_bytes);
+    let sk_eid = insert_and_project_self_key_rotation(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signing_key,
+        key_bytes,
+    );
 
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
@@ -71,8 +76,7 @@ fn test_encrypted_blocks_on_missing_key() {
     // Compute the deterministic KeySecret event_id for these key bytes, but
     // do NOT insert/project it — the encrypted wrapper must block on this
     // missing KeySecret dep.
-    let sk_eid =
-        crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
+    let sk_eid = crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
 
     // Create encrypted event referencing the missing key
     let msg = ParsedEvent::Message(MessageEvent {
@@ -110,8 +114,7 @@ fn test_encrypted_unblocks_when_key_arrives() {
         &crate::event_modules::key_secret::deterministic_key_secret_event(key_bytes),
     )
     .unwrap();
-    let sk_eid =
-        crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
+    let sk_eid = crate::event_modules::key_secret::deterministic_key_secret_event_id(&key_bytes);
 
     // Insert encrypted event first (before key)
     let msg = ParsedEvent::Message(MessageEvent {
@@ -126,7 +129,10 @@ fn test_encrypted_unblocks_when_key_arrives() {
 
     // Project → Block
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     // Now insert and project the secret key
     insert_event_raw(&conn, recorded_by, &sk_blob);
@@ -350,8 +356,13 @@ fn test_encrypted_inner_type_mismatch_rejects() {
     let recorded_by = "peer1";
     let key_bytes: [u8; 32] = rand::random();
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-    let sk_eid =
-        insert_and_project_self_key_rotation(&conn, recorded_by, &signer_eid, &signing_key, key_bytes);
+    let sk_eid = insert_and_project_self_key_rotation(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signing_key,
+        key_bytes,
+    );
 
     // Craft a reaction-sized blob whose first byte is MESSAGE type (1)
     // to trigger inner type mismatch at the pipeline level.
@@ -397,8 +408,13 @@ fn test_encrypted_nested_rejects() {
     let recorded_by = "peer1";
     let key_bytes: [u8; 32] = rand::random();
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-    let sk_eid =
-        insert_and_project_self_key_rotation(&conn, recorded_by, &signer_eid, &signing_key, key_bytes);
+    let sk_eid = insert_and_project_self_key_rotation(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signing_key,
+        key_bytes,
+    );
 
     // inner_type_code=5 (encrypted) is now rejected at parser level
     // (encrypted_inner_wire_size returns None). Construct raw blob manually.
@@ -439,8 +455,13 @@ fn test_encrypted_inner_dep_blocks() {
 
     // Create identity chain for signing the inner reaction
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-    let sk_eid =
-        insert_and_project_self_key_rotation(&conn, recorded_by, &signer_eid, &signing_key, key_bytes);
+    let sk_eid = insert_and_project_self_key_rotation(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signing_key,
+        key_bytes,
+    );
 
     // Create encrypted reaction with missing target
     let fake_target = [88u8; 32];
@@ -478,8 +499,13 @@ fn test_encrypted_inner_dep_unblocks() {
 
     // Create identity chain for signing inner events
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-    let sk_eid =
-        insert_and_project_self_key_rotation(&conn, recorded_by, &signer_eid, &signing_key, key_bytes);
+    let sk_eid = insert_and_project_self_key_rotation(
+        &conn,
+        recorded_by,
+        &signer_eid,
+        &signing_key,
+        key_bytes,
+    );
 
     // Create target message (pre-compute but don't insert yet)
     let msg = raw_message_event(&signer_eid, "target for encrypted rxn");
@@ -495,7 +521,10 @@ fn test_encrypted_inner_dep_unblocks() {
 
     // Project → Block on inner dep (message)
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
-    assert!(matches!(result, ProjectionDecision::BlockOnMissingDeps { .. }));
+    assert!(matches!(
+        result,
+        ProjectionDecision::BlockOnMissingDeps { .. }
+    ));
 
     // Now insert and project the message
     let inserted_msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);

@@ -1,8 +1,8 @@
 //! Verified round-trip codec for (Timestamp + 3 × EventId) events (105 bytes).
 //! Covers: invite_accepted, user_invite_shared (user_invite).
 
-use vstd::prelude::*;
 use vstd::bytes::{u64_from_le_bytes, u64_to_le_bytes};
+use vstd::prelude::*;
 
 verus! {
 

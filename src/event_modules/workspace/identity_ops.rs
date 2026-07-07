@@ -7,6 +7,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::BTreeSet;
 
 use crate::crypto::{
     encrypt_bundle_for_recipient, event_id_from_base64, event_id_to_base64, EventId,
@@ -22,8 +23,7 @@ use crate::event_modules::removal::{
 };
 use crate::event_modules::*;
 use crate::projection::create::{
-    create_event, create_signed_event, event_id_or_blocked,
-    store_signed_event_then_project,
+    create_event, create_signed_event, event_id_or_blocked, store_signed_event_then_project,
 };
 use crate::projection::encrypted::wrap_key_for_recipient;
 use crate::state::db::queue::current_timestamp_ms_u64;
@@ -41,9 +41,11 @@ struct InviteShareTarget {
 }
 
 #[derive(Debug, Clone)]
-struct KeyRotationSummary {
-    key_event_id: EventId,
+struct MaterializedContentKeySummary {
+    key_secret_event_id: EventId,
     frontier_refs: Vec<EventId>,
+    created_at_ms: i64,
+    source_rank: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -150,11 +152,10 @@ fn slotted_frontier_refs(
     Ok(slots)
 }
 
-fn recent_key_rotations_for_peer(
+fn materialized_content_keys_from_rotations(
     conn: &Connection,
     recorded_by: &str,
-    limit: usize,
-) -> Result<Vec<KeyRotationSummary>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<MaterializedContentKeySummary>, Box<dyn std::error::Error + Send + Sync>> {
     let mut stmt = conn.prepare(
         "SELECT kr.key_event_id,
                 kr.frontier_count,
@@ -170,10 +171,9 @@ fn recent_key_rotations_for_peer(
          JOIN events e
            ON e.event_id = kr.event_id
          WHERE kr.recorded_by = ?1
-         ORDER BY e.created_at DESC, kr.event_id DESC
-         LIMIT ?2",
+         ORDER BY e.created_at DESC, kr.event_id DESC",
     )?;
-    let rows = stmt.query_map(rusqlite::params![recorded_by, limit as i64], |row| {
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
             crate::db::sql_types::get_text(row, 0)?,
             row.get::<_, u8>(1)?,
@@ -187,21 +187,115 @@ fn recent_key_rotations_for_peer(
 
     let mut out = Vec::new();
     for row in rows {
-        let (key_b64, frontier_count, ref1_b64, ref2_b64, ref3_b64, ref4_b64, _created_at_ms) =
-            row?;
-        let key_event_id = parse_event_id_b64(&key_b64, "key_rotation.key_event_id")?;
+        let (key_b64, frontier_count, ref1_b64, ref2_b64, ref3_b64, ref4_b64, created_at_ms) = row?;
+        let key_secret_event_id = parse_event_id_b64(&key_b64, "key_rotation.key_event_id")?;
         let ref1 = parse_event_id_b64(&ref1_b64, "key_rotation.frontier_ref_1")?;
         let ref2 = parse_event_id_b64(&ref2_b64, "key_rotation.frontier_ref_2")?;
         let ref3 = parse_event_id_b64(&ref3_b64, "key_rotation.frontier_ref_3")?;
         let ref4 = parse_event_id_b64(&ref4_b64, "key_rotation.frontier_ref_4")?;
         let frontier_refs = frontier_refs_from_slots(frontier_count, &[ref1, ref2, ref3, ref4])
             .map_err(|reason| format!("invalid key_rotation frontier refs: {reason}"))?;
-        out.push(KeyRotationSummary {
-            key_event_id,
+        out.push(MaterializedContentKeySummary {
+            key_secret_event_id,
             frontier_refs,
+            created_at_ms,
+            source_rank: 0,
         });
     }
     Ok(out)
+}
+
+fn materialized_content_keys_from_shared(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<MaterializedContentKeySummary>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = conn.prepare(
+        "SELECT ks.event_id,
+                ksr.frontier_count,
+                ksr.frontier_ref_1,
+                ksr.frontier_ref_2,
+                ksr.frontier_ref_3,
+                ksr.frontier_ref_4,
+                e.created_at
+         FROM key_shared ksr
+         JOIN key_secrets ks
+           ON ks.recorded_by = ksr.recorded_by
+          AND ks.event_id = ksr.key_event_id
+         JOIN events e
+           ON e.event_id = ksr.event_id
+         WHERE ksr.recorded_by = ?1
+         ORDER BY e.created_at DESC, ksr.event_id DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((
+            crate::db::sql_types::get_text(row, 0)?,
+            row.get::<_, u8>(1)?,
+            crate::db::sql_types::get_text(row, 2)?,
+            crate::db::sql_types::get_text(row, 3)?,
+            crate::db::sql_types::get_text(row, 4)?,
+            crate::db::sql_types::get_text(row, 5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (key_b64, frontier_count, ref1_b64, ref2_b64, ref3_b64, ref4_b64, created_at_ms) = row?;
+        let key_secret_event_id = parse_event_id_b64(&key_b64, "key_shared.key_event_id")?;
+        let ref1 = parse_event_id_b64(&ref1_b64, "key_shared.frontier_ref_1")?;
+        let ref2 = parse_event_id_b64(&ref2_b64, "key_shared.frontier_ref_2")?;
+        let ref3 = parse_event_id_b64(&ref3_b64, "key_shared.frontier_ref_3")?;
+        let ref4 = parse_event_id_b64(&ref4_b64, "key_shared.frontier_ref_4")?;
+        let frontier_refs = frontier_refs_from_slots(frontier_count, &[ref1, ref2, ref3, ref4])
+            .map_err(|reason| format!("invalid key_shared frontier refs: {reason}"))?;
+        out.push(MaterializedContentKeySummary {
+            key_secret_event_id,
+            frontier_refs,
+            created_at_ms,
+            source_rank: 1,
+        });
+    }
+    Ok(out)
+}
+
+fn materialized_content_keys_for_peer(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<MaterializedContentKeySummary>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut entries = materialized_content_keys_from_rotations(conn, recorded_by)?;
+    entries.extend(materialized_content_keys_from_shared(conn, recorded_by)?);
+    entries.sort_by(|left, right| {
+        right
+            .created_at_ms
+            .cmp(&left.created_at_ms)
+            .then_with(|| left.source_rank.cmp(&right.source_rank))
+            .then_with(|| {
+                event_id_to_base64(&right.key_secret_event_id)
+                    .cmp(&event_id_to_base64(&left.key_secret_event_id))
+            })
+    });
+
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let frontier_hash = frontier_hash_from_refs(&entry.frontier_refs);
+        if seen.insert((frontier_hash, entry.key_secret_event_id)) {
+            deduped.push(entry);
+        }
+    }
+    Ok(deduped)
+}
+
+fn recent_materialized_content_keys_for_peer(
+    conn: &Connection,
+    recorded_by: &str,
+    limit: usize,
+) -> Result<Vec<MaterializedContentKeySummary>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut entries = materialized_content_keys_for_peer(conn, recorded_by)?;
+    if entries.len() > limit {
+        entries.truncate(limit);
+    }
+    Ok(entries)
 }
 
 pub(crate) fn current_removal_frontier_for_peer(
@@ -306,7 +400,8 @@ fn removed_member_refs_for_frontier(
         if !visited.insert(removal_event_id) {
             continue;
         }
-        let Some((removed_member_ref, parents)) = removal_row(conn, recorded_by, &removal_event_id)?
+        let Some((removed_member_ref, parents)) =
+            removal_row(conn, recorded_by, &removal_event_id)?
         else {
             continue;
         };
@@ -321,8 +416,7 @@ pub(crate) fn peer_shared_removal_refs(
     conn: &Connection,
     peer_shared_event_id: &EventId,
     user_event_id: Option<EventId>,
-) -> Result<Option<std::collections::BTreeSet<EventId>>, Box<dyn std::error::Error + Send + Sync>>
-{
+) -> Result<Option<std::collections::BTreeSet<EventId>>, Box<dyn std::error::Error + Send + Sync>> {
     let peer_shared_event_id_b64 = event_id_to_base64(peer_shared_event_id);
     let peer_shared_blob: Option<Vec<u8>> = conn
         .query_row(
@@ -430,7 +524,10 @@ fn active_rotation_recipients_for_frontier(
         else {
             continue;
         };
-        if removal_refs.iter().any(|removed_ref| removed.contains(removed_ref)) {
+        if removal_refs
+            .iter()
+            .any(|removed_ref| removed.contains(removed_ref))
+        {
             continue;
         }
         let public_key = parse_blob_event_id(public_key_blob, "peers_shared.public_key")?;
@@ -470,46 +567,13 @@ fn latest_content_key_for_frontier(
     recorded_by: &str,
     frontier_refs: &[EventId],
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
-    let slots = slotted_frontier_refs(frontier_refs)?;
-    let frontier_hash = frontier_hash_from_refs(frontier_refs);
-    // After migration, `key_rotations.key_event_id` points at the
-    // deterministic KeySecret event_id (type 6), and `key_secrets` is keyed
-    // by that same KeySecret event_id. Join on kr.key_event_id and return
-    // the KeySecret event_id so the caller can use it as the encrypted
-    // wrapper dep target.
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT ks.event_id
-             FROM key_rotations kr
-             JOIN key_secrets ks
-               ON ks.recorded_by = kr.recorded_by
-              AND ks.event_id = kr.key_event_id
-             JOIN events e
-               ON e.event_id = kr.event_id
-             WHERE kr.recorded_by = ?1
-               AND kr.frontier_hash = ?2
-               AND kr.frontier_count = ?3
-               AND kr.frontier_ref_1 = ?4
-               AND kr.frontier_ref_2 = ?5
-               AND kr.frontier_ref_3 = ?6
-               AND kr.frontier_ref_4 = ?7
-             ORDER BY e.created_at DESC, kr.event_id DESC
-             LIMIT 1",
-            rusqlite::params![
-                recorded_by,
-                event_id_to_base64(&frontier_hash),
-                frontier_refs.len() as i64,
-                event_id_to_base64(&slots[0]),
-                event_id_to_base64(&slots[1]),
-                event_id_to_base64(&slots[2]),
-                event_id_to_base64(&slots[3]),
-            ],
-            |row| crate::db::sql_types::get_text(row, 0),
-        )
-        .optional()?;
-    existing
-        .map(|eid_b64| parse_event_id_b64(&eid_b64, "key_secrets.event_id"))
-        .transpose()
+    let target_frontier = canonicalize_frontier_refs(frontier_refs)?;
+    for entry in materialized_content_keys_for_peer(conn, recorded_by)? {
+        if entry.frontier_refs == target_frontier {
+            return Ok(Some(entry.key_secret_event_id));
+        }
+    }
+    Ok(None)
 }
 
 fn recent_key_history_entries_for_peer(
@@ -517,19 +581,13 @@ fn recent_key_history_entries_for_peer(
     recorded_by: &str,
     limit: usize,
 ) -> Result<Vec<KeyHistoryEntry>, Box<dyn std::error::Error + Send + Sync>> {
-    // Post-migration: key_secrets.event_id = deterministic KeySecret id (type
-    // 6). Join key_rotations.key_event_id = key_secrets.event_id to resolve
-    // the KeySecret id for each rotation.
     let mut stmt = conn.prepare(
         "SELECT ks.event_id, ks.key_bytes
-         FROM key_rotations kr
-         JOIN key_secrets ks
-           ON ks.recorded_by = kr.recorded_by
-          AND ks.event_id = kr.key_event_id
+         FROM key_secrets ks
          JOIN events e
-           ON e.event_id = kr.event_id
-         WHERE kr.recorded_by = ?1
-         ORDER BY e.created_at DESC, kr.event_id DESC
+           ON e.event_id = ks.event_id
+         WHERE ks.recorded_by = ?1
+         ORDER BY e.created_at DESC, ks.event_id DESC
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by, limit as i64], |row| {
@@ -567,12 +625,10 @@ fn create_key_history_event_for_public_key(
         recorded_by,
         history_cap,
     )?)?;
-    let (nonce, ciphertext, auth_tag) = encrypt_bundle_for_recipient(
-        signer_key,
-        &recipient_vk,
-        &plaintext,
-    )
-    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.to_string().into() })?;
+    let (nonce, ciphertext, auth_tag) =
+        encrypt_bundle_for_recipient(signer_key, &recipient_vk, &plaintext).map_err(
+            |err| -> Box<dyn std::error::Error + Send + Sync> { err.to_string().into() },
+        )?;
     let event = ParsedEvent::KeyHistory(KeyHistoryEvent {
         created_at_ms,
         recipient_public_key: *recipient_public_key,
@@ -596,9 +652,8 @@ fn existing_rotation_for_frontier(
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
     let slots = slotted_frontier_refs(frontier_refs)?;
     let frontier_hash = frontier_hash_from_refs(frontier_refs);
-    conn
-        .query_row(
-            "SELECT event_id
+    conn.query_row(
+        "SELECT event_id
              FROM key_rotations
              WHERE recorded_by = ?1
                AND frontier_hash = ?2
@@ -609,20 +664,20 @@ fn existing_rotation_for_frontier(
                AND frontier_ref_4 = ?7
              ORDER BY rowid DESC
              LIMIT 1",
-            rusqlite::params![
-                recorded_by,
-                event_id_to_base64(&frontier_hash),
-                frontier_refs.len() as i64,
-                event_id_to_base64(&slots[0]),
-                event_id_to_base64(&slots[1]),
-                event_id_to_base64(&slots[2]),
-                event_id_to_base64(&slots[3]),
-            ],
-            |row| crate::db::sql_types::get_text(row, 0),
-        )
-        .optional()?
-        .map(|existing| parse_event_id_b64(&existing, "key_rotations.event_id"))
-        .transpose()
+        rusqlite::params![
+            recorded_by,
+            event_id_to_base64(&frontier_hash),
+            frontier_refs.len() as i64,
+            event_id_to_base64(&slots[0]),
+            event_id_to_base64(&slots[1]),
+            event_id_to_base64(&slots[2]),
+            event_id_to_base64(&slots[3]),
+        ],
+        |row| crate::db::sql_types::get_text(row, 0),
+    )
+    .optional()?
+    .map(|existing| parse_event_id_b64(&existing, "key_rotations.event_id"))
+    .transpose()
 }
 
 pub(crate) fn create_key_rotation_event_with_selected_recipients_at(
@@ -663,7 +718,10 @@ pub(crate) fn create_key_rotation_event_with_selected_recipients_at(
         let chaff_key = SigningKey::generate(&mut rng);
         let mut chaff_recipient_id = [0u8; 32];
         rng.fill_bytes(&mut chaff_recipient_id);
-        if recipient_slots.iter().any(|existing| *existing == chaff_recipient_id) {
+        if recipient_slots
+            .iter()
+            .any(|existing| *existing == chaff_recipient_id)
+        {
             continue;
         }
         let mut dummy_key = [0u8; 32];
@@ -904,14 +962,14 @@ fn emit_recent_key_history_for_invite(
     history_cap: usize,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut emitted = 0usize;
-    for rotation in recent_key_rotations_for_peer(conn, recorded_by, history_cap)? {
+    for key in recent_materialized_content_keys_for_peer(conn, recorded_by, history_cap)? {
         if emit_key_shared_for_invite_target(
             conn,
             recorded_by,
             sender_peer_shared_key,
             sender_peer_shared_event_id,
-            &rotation.key_event_id,
-            &rotation.frontier_refs,
+            &key.key_secret_event_id,
+            &key.frontier_refs,
             invite_event_id,
             unwrap_key_event_id,
             invite_public_key,
@@ -973,6 +1031,8 @@ pub(crate) fn rotate_content_key_for_peer_at(
     let mut rng = rand::thread_rng();
     let mut content_key_bytes = [0u8; 32];
     rng.fill_bytes(&mut content_key_bytes);
+    let key_event_id =
+        crate::event_modules::key_secret::deterministic_key_secret_event_id(&content_key_bytes);
 
     let rotation_event_id = create_key_rotation_event_with_key_bytes_at(
         conn,
@@ -983,7 +1043,7 @@ pub(crate) fn rotate_content_key_for_peer_at(
     )?;
 
     Ok(RotateContentKeyResult {
-        key_event_id: rotation_event_id,
+        key_event_id,
         rotation_event_id,
         proactive_share_count: 0,
     })
@@ -1069,8 +1129,7 @@ pub(crate) fn ensure_content_key_for_peer_at(
     // `latest_content_key_for_frontier` returns the deterministic KeySecret
     // event_id (type 6) which is the canonical dep target for encrypted
     // wrappers.
-    if let Some(existing) = latest_content_key_for_frontier(conn, recorded_by, &frontier_refs)?
-    {
+    if let Some(existing) = latest_content_key_for_frontier(conn, recorded_by, &frontier_refs)? {
         return Ok(existing);
     }
     if frontier_refs.is_empty() {

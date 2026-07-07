@@ -1,7 +1,9 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
+use crate::projection::decision_context::{
+    ContextLoadResult, ProjectionFrameContext, ProjectionQueries,
+};
 use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::decision_context::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,

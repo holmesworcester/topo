@@ -3,8 +3,8 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::ParsedEvent;
-use crate::projection::projector::{EmitCommand, WriteOp};
 use crate::projection::decision_context::ProjectionQueries;
+use crate::projection::projector::{EmitCommand, WriteOp};
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use rusqlite::{Connection, OptionalExtension};
 
@@ -568,9 +568,9 @@ mod tests {
         encode_event, EncryptedEvent, ParsedEvent, TenantEvent, EVENT_TYPE_FILE_SLICE,
     };
     use crate::projection::apply::stages::apply_projection_with_backend;
-    use crate::projection::projector::{EmitCommand, ProjectorDecisionContext, WriteOp};
     use crate::projection::decision::ProjectionDecision;
     use crate::projection::decision_context::{DepLoadResult, ProjectionQueryResult};
+    use crate::projection::projector::{EmitCommand, ProjectorDecisionContext, WriteOp};
 
     use super::*;
     use crate::projection::apply::project_one::project_one_step_with_backend;
@@ -750,7 +750,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _workspace: &crate::event_modules::WorkspaceEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -760,7 +761,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _admin: &crate::event_modules::AdminEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -770,7 +772,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _peer_shared: &crate::event_modules::PeerSharedEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -780,7 +783,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _user_invite: &crate::event_modules::UserInviteEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -790,7 +794,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _device_invite: &crate::event_modules::DeviceInviteEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -800,7 +805,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _message: &crate::event_modules::MessageEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -810,7 +816,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _message_deletion: &crate::event_modules::MessageDeletionEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -820,7 +827,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _reaction: &crate::event_modules::ReactionEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -830,7 +838,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _file: &crate::event_modules::FileEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -840,7 +849,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _file_slice: &crate::event_modules::FileSliceEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -850,7 +860,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _invite_accepted: &crate::event_modules::InviteAcceptedEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -860,7 +871,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _key_request: &crate::event_modules::KeyRequestEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
 
@@ -870,7 +882,8 @@ mod tests {
             _recorded_by: &str,
             _event_id_b64: &str,
             _key_shared: &crate::event_modules::KeySharedEvent,
-        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext> {
+        ) -> crate::projection::decision_context::ProjectionQueryResult<ProjectorDecisionContext>
+        {
             Ok(ProjectorDecisionContext::default())
         }
     }

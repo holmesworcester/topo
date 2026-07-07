@@ -6,11 +6,11 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
-use crate::projection::projector::EmitCommand;
 use crate::projection::decision_context::{
     decide_semantic_type_plan, normalize_semantic_type, ContextLoadResult, DepLoadResult,
     ProjectionFrameContext, SemanticTypePlan,
 };
+use crate::projection::projector::EmitCommand;
 use rusqlite::Connection;
 
 use super::dispatch::dispatch_pure_projector;
@@ -281,10 +281,18 @@ fn decide_context_load_disposition(
         ContextLoadDispositionPlanCore,
     };
     let core_plan = decide_context_load_disposition_core(match context {
-        ContextLoadDispositionDecisionContext::Ready => ContextLoadDispositionDecisionContextCore::Ready,
-        ContextLoadDispositionDecisionContext::Block { .. } => ContextLoadDispositionDecisionContextCore::Block,
-        ContextLoadDispositionDecisionContext::Reject { .. } => ContextLoadDispositionDecisionContextCore::Reject,
-        ContextLoadDispositionDecisionContext::Purge { .. } => ContextLoadDispositionDecisionContextCore::Purge,
+        ContextLoadDispositionDecisionContext::Ready => {
+            ContextLoadDispositionDecisionContextCore::Ready
+        }
+        ContextLoadDispositionDecisionContext::Block { .. } => {
+            ContextLoadDispositionDecisionContextCore::Block
+        }
+        ContextLoadDispositionDecisionContext::Reject { .. } => {
+            ContextLoadDispositionDecisionContextCore::Reject
+        }
+        ContextLoadDispositionDecisionContext::Purge { .. } => {
+            ContextLoadDispositionDecisionContextCore::Purge
+        }
     });
     match (core_plan, context) {
         (ContextLoadDispositionPlanCore::Continue, _) => ContextLoadDispositionPlan::Continue,
@@ -341,9 +349,7 @@ fn decide_projection_decision_effect_plan(
         ) => ProjectionDecisionEffectPlan::EmitCommandsOnly {
             missing: missing.clone(),
         },
-        (ProjectionDecisionEffectPlanCore::NoEffects, _) => {
-            ProjectionDecisionEffectPlan::NoEffects
-        }
+        (ProjectionDecisionEffectPlanCore::NoEffects, _) => ProjectionDecisionEffectPlan::NoEffects,
         _ => unreachable!("verified core dispatch is tag-preserving"),
     }
 }
@@ -353,9 +359,11 @@ fn load_projection_decision_effect_raw_rows(
 ) -> ProjectionDecisionEffectRawRows {
     match decision {
         ProjectionDecision::Valid => ProjectionDecisionEffectRawRows::Valid,
-        ProjectionDecision::BlockOnMissingDeps { missing } => ProjectionDecisionEffectRawRows::Block {
-            missing: missing.clone(),
-        },
+        ProjectionDecision::BlockOnMissingDeps { missing } => {
+            ProjectionDecisionEffectRawRows::Block {
+                missing: missing.clone(),
+            }
+        }
         ProjectionDecision::Reject { .. } => ProjectionDecisionEffectRawRows::Reject,
         ProjectionDecision::AlreadyProcessed => ProjectionDecisionEffectRawRows::AlreadyProcessed,
     }
@@ -494,7 +502,11 @@ fn apply_projection_frame<B: ProjectionBackend>(
             if !missing.is_empty() {
                 backend.record_block(cap, recorded_by, event_id_b64, &missing)?;
             }
-            return Ok((ProjectionDecision::BlockOnMissingDeps { missing }, None, false));
+            return Ok((
+                ProjectionDecision::BlockOnMissingDeps { missing },
+                None,
+                false,
+            ));
         }
         ContextLoadDispositionPlan::Reject { reason } => {
             return Ok((ProjectionDecision::Reject { reason }, None, false));

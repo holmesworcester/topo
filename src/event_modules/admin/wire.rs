@@ -1,6 +1,4 @@
-use super::super::layout::field_spec::{
-    decode_fields, wire_size_for_fields, FieldSpec,
-};
+use super::super::layout::field_spec::{decode_fields, wire_size_for_fields, FieldSpec};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN};
 
@@ -54,13 +52,15 @@ pub fn encode_admin(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::Admin(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::event_modules::layout::ts_id3::encode_ts_id3(
-        EVENT_TYPE_ADMIN,
-        e.created_at_ms,
-        &e.public_key,
-        &e.authority_event_id,
-        &e.user_event_id,
-    ))
+    Ok(
+        topo_verus_proofs::event_modules::layout::ts_id3::encode_ts_id3(
+            EVENT_TYPE_ADMIN,
+            e.created_at_ms,
+            &e.public_key,
+            &e.authority_event_id,
+            &e.user_event_id,
+        ),
+    )
 }
 
 pub static ADMIN_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

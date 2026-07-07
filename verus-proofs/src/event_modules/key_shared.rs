@@ -27,8 +27,8 @@
 //! DepFacts/GuardFacts migration (follow-up once LocalKeySecret lands
 //! — see `docs/planning/LOCAL_KEY_SECRET_MIGRATION.md`).
 
-use vstd::prelude::*;
 use crate::state::projection::decision_context::PeerSharedAuthorityPlanCore;
+use vstd::prelude::*;
 
 verus! {
 

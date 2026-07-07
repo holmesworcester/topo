@@ -1,8 +1,10 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::event_modules::{EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE};
+use crate::projection::decision_context::{
+    ContextLoadResult, ProjectionFrameContext, ProjectionQueries,
+};
 use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::decision_context::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
@@ -64,7 +66,12 @@ pub fn project_pure(
 
     let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "user_invites",
-        columns: vec!["recorded_by", "event_id", "public_key", "key_history_event_id"],
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "public_key",
+            "key_history_event_id",
+        ],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
@@ -110,11 +117,11 @@ mod user_invite_projector_tests {
     use crate::crypto::event_id_to_base64;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{ParsedEvent, UserInviteEvent, WorkspaceEvent};
+    use crate::projection::decision::ProjectionDecision;
+    use crate::projection::decision_context::ProjectionFrameContext;
     use crate::projection::projector::{
         BootstrapDecisionContext, CurrentSignerInfo, ProjectorDecisionContext, WriteOp,
     };
-    use crate::projection::decision::ProjectionDecision;
-    use crate::projection::decision_context::ProjectionFrameContext;
 
     fn bootstrap_user_invite() -> ParsedEvent {
         ParsedEvent::UserInvite(UserInviteEvent {

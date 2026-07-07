@@ -55,9 +55,8 @@ pub(crate) use crate::event_modules::{
 use crate::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
 use crate::projection::apply::project_one;
 use crate::projection::create::{
-    create_encrypted_event_staged, create_encrypted_event, create_event_staged,
-    create_event, create_signed_event_staged, create_signed_event,
-    event_id_or_blocked, CreateEventError,
+    create_encrypted_event, create_encrypted_event_staged, create_event, create_event_staged,
+    create_signed_event, create_signed_event_staged, event_id_or_blocked, CreateEventError,
 };
 pub(crate) use crate::state::db::queue::current_timestamp_ms_u64;
 pub(crate) use crate::state::db::queue::SQLITE_BUSY_RETRY_ATTEMPTS;
@@ -1509,8 +1508,7 @@ impl Peer {
             invite_event_id: *invite_event_id,
             workspace_id,
         });
-        create_event(&db, &self.identity, &ia)
-            .expect("failed to create invite_accepted")
+        create_event(&db, &self.identity, &ia).expect("failed to create invite_accepted")
     }
 
     /// Try to create an InviteAccepted event. Returns Result to allow handling rejection.
@@ -1725,14 +1723,8 @@ impl Peer {
             unwrap_key_event_id: *unwrap_key_event_id,
             wrapped_key,
         });
-        create_signed_event(
-            &db,
-            &self.identity,
-            peer_shared_event_id,
-            &evt,
-            signing_key,
-        )
-        .expect("failed to create key_shared")
+        create_signed_event(&db, &self.identity, peer_shared_event_id, &evt, signing_key)
+            .expect("failed to create key_shared")
     }
 
     /// Create multiple messages. Uses a transaction for speed at scale.

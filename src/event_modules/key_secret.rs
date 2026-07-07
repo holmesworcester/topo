@@ -52,11 +52,13 @@ pub fn encode_key_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::KeySecret(s) => s,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
-        EVENT_TYPE_KEY_SECRET,
-        sk.created_at_ms,
-        &sk.key_bytes,
-    ))
+    Ok(
+        topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
+            EVENT_TYPE_KEY_SECRET,
+            sk.created_at_ms,
+            &sk.key_bytes,
+        ),
+    )
 }
 
 /// Deterministic timestamp derivation for key materialized Secret events.

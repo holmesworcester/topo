@@ -13,8 +13,8 @@ mod tests {
     use topo::event_modules::message_deletion::MessageDeletionEvent;
     use topo::event_modules::message_deletion::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::projector::{EmitCommand, ProjectorDecisionContext};
     use topo::projection::decision_context::ProjectionFrameContext;
+    use topo::projection::projector::{EmitCommand, ProjectorDecisionContext};
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "del_event_1";

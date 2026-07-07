@@ -54,12 +54,14 @@ fn decide_bootstrap_session_fallback_plan(
 ) -> BootstrapSessionFallbackPlan {
     use topo_verus_proofs::runtime::peering::engine::bootstrap_auth as v;
     let (core_ctx, payload) = match context {
-        BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase => {
-            (v::BootstrapSessionFallbackCoreContext::RejectRequiresLocalBootstrapPhase, None)
-        }
-        BootstrapSessionFallbackDecisionContext::MissingCandidate => {
-            (v::BootstrapSessionFallbackCoreContext::MissingCandidate, None)
-        }
+        BootstrapSessionFallbackDecisionContext::RejectRequiresLocalBootstrapPhase => (
+            v::BootstrapSessionFallbackCoreContext::RejectRequiresLocalBootstrapPhase,
+            None,
+        ),
+        BootstrapSessionFallbackDecisionContext::MissingCandidate => (
+            v::BootstrapSessionFallbackCoreContext::MissingCandidate,
+            None,
+        ),
         BootstrapSessionFallbackDecisionContext::UniqueCandidate {
             fallback,
             workspace_already_local_before_candidate,
@@ -69,23 +71,29 @@ fn decide_bootstrap_session_fallback_plan(
             },
             Some(fallback.clone()),
         ),
-        BootstrapSessionFallbackDecisionContext::AmbiguousCandidate => {
-            (v::BootstrapSessionFallbackCoreContext::AmbiguousCandidate, None)
-        }
+        BootstrapSessionFallbackDecisionContext::AmbiguousCandidate => (
+            v::BootstrapSessionFallbackCoreContext::AmbiguousCandidate,
+            None,
+        ),
     };
     match v::decide_bootstrap_session_fallback_core_plan(core_ctx) {
-        v::BootstrapSessionFallbackCorePlan::RejectRequiresLocalBootstrapPhase =>
-            BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase,
-        v::BootstrapSessionFallbackCorePlan::RejectMissingCandidate =>
-            BootstrapSessionFallbackPlan::RejectMissingCandidate,
-        v::BootstrapSessionFallbackCorePlan::UseFallback =>
+        v::BootstrapSessionFallbackCorePlan::RejectRequiresLocalBootstrapPhase => {
+            BootstrapSessionFallbackPlan::RejectRequiresLocalBootstrapPhase
+        }
+        v::BootstrapSessionFallbackCorePlan::RejectMissingCandidate => {
+            BootstrapSessionFallbackPlan::RejectMissingCandidate
+        }
+        v::BootstrapSessionFallbackCorePlan::UseFallback => {
             BootstrapSessionFallbackPlan::UseFallback(
                 payload.expect("core said UseFallback but payload is missing"),
-            ),
-        v::BootstrapSessionFallbackCorePlan::RejectAmbiguousCandidate =>
-            BootstrapSessionFallbackPlan::RejectAmbiguousCandidate,
-        v::BootstrapSessionFallbackCorePlan::RejectAlreadyLocalWorkspaceCandidate =>
-            BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate,
+            )
+        }
+        v::BootstrapSessionFallbackCorePlan::RejectAmbiguousCandidate => {
+            BootstrapSessionFallbackPlan::RejectAmbiguousCandidate
+        }
+        v::BootstrapSessionFallbackCorePlan::RejectAlreadyLocalWorkspaceCandidate => {
+            BootstrapSessionFallbackPlan::RejectAlreadyLocalWorkspaceCandidate
+        }
     }
 }
 

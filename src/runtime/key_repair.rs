@@ -422,12 +422,13 @@ fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> KeyRepairResu
         // local rotation rows still carry the legacy fallback key_event_id),
         // emit a request for every known rotation frontier so the sender can
         // answer with the matching key_shared.
-        let frontiers =
-            if let Some(frontier) = rotation_frontier_by_key_event_id(&conn, recorded_by, &key_event_id)? {
-                vec![frontier]
-            } else {
-                all_local_rotation_frontiers(&conn, recorded_by)?
-            };
+        let frontiers = if let Some(frontier) =
+            rotation_frontier_by_key_event_id(&conn, recorded_by, &key_event_id)?
+        {
+            vec![frontier]
+        } else {
+            all_local_rotation_frontiers(&conn, recorded_by)?
+        };
         if frontiers.is_empty() {
             continue;
         }
@@ -503,8 +504,8 @@ fn all_local_rotation_frontiers(
                 decode_frontier_slot(&ref4)?,
             ],
         )?;
-        let frontier_hash = event_id_from_base64(&frontier_hash_b64)
-            .ok_or("invalid key_rotation.frontier_hash")?;
+        let frontier_hash =
+            event_id_from_base64(&frontier_hash_b64).ok_or("invalid key_rotation.frontier_hash")?;
         out.push(RotationFrontier {
             frontier_hash,
             frontier_refs,
@@ -957,11 +958,13 @@ fn repair_target_is_removed(
     let Some(user_event_id) = event_id_from_base64(&user_event_id_b64) else {
         return Ok(false);
     };
-    let Some(removal_refs) = crate::event_modules::workspace::identity_ops::peer_shared_removal_refs(
-        conn,
-        recipient_event_id,
-        Some(user_event_id),
-    )? else {
+    let Some(removal_refs) =
+        crate::event_modules::workspace::identity_ops::peer_shared_removal_refs(
+            conn,
+            recipient_event_id,
+            Some(user_event_id),
+        )?
+    else {
         return Ok(true);
     };
     Ok(removal_refs

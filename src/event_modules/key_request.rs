@@ -111,21 +111,25 @@ pub fn encode_key_request(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::KeyRequest(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::event_modules::layout::shapes::encode_ts_id6(
-        EVENT_TYPE_KEY_REQUEST,
-        kr.created_at_ms,
-        &kr.blocked_event_id,
-        &kr.key_event_id,
-        &kr.frontier_hash,
-        &kr.delivery_target_id,
-        &kr.recipient_event_id,
-        &kr.unwrap_key_event_id,
-    ))
+    Ok(
+        topo_verus_proofs::event_modules::layout::shapes::encode_ts_id6(
+            EVENT_TYPE_KEY_REQUEST,
+            kr.created_at_ms,
+            &kr.blocked_event_id,
+            &kr.key_event_id,
+            &kr.frontier_hash,
+            &kr.delivery_target_id,
+            &kr.recipient_event_id,
+            &kr.unwrap_key_event_id,
+        ),
+    )
 }
 
 use crate::crypto::event_id_to_base64;
+use crate::projection::decision_context::{
+    ContextLoadResult, ProjectionFrameContext, ProjectionQueries,
+};
 use crate::projection::projector::{ProjectorDecisionContext, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::decision_context::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {

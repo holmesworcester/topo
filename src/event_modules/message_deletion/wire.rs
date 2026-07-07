@@ -52,11 +52,13 @@ pub fn encode_message_deletion(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
         ParsedEvent::MessageDeletion(d) => d,
         _ => return Err(EventError::WrongVariant),
     };
-    Ok(topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
-        EVENT_TYPE_MESSAGE_DELETION,
-        del.created_at_ms,
-        &del.target_event_id,
-    ))
+    Ok(
+        topo_verus_proofs::event_modules::layout::ts_id::encode_ts_id(
+            EVENT_TYPE_MESSAGE_DELETION,
+            del.created_at_ms,
+            &del.target_event_id,
+        ),
+    )
 }
 
 pub static MESSAGE_DELETION_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {

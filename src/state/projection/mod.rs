@@ -6,11 +6,11 @@
 //! [`signer`] resolves and verifies signer chains; [`purge`] performs tombstone cascades.
 
 pub mod apply;
-pub mod projector;
 pub mod create;
 pub mod decision;
+pub mod decision_context;
 pub mod dep_facts;
 pub mod encrypted;
+pub mod projector;
 pub mod purge;
-pub mod decision_context;
 pub mod signer;

@@ -1,8 +1,8 @@
 //! Verified codecs for additional primitive-only wire shapes.
 //! Each codec covers one or more runtime event modules with the same layout.
 
-use vstd::prelude::*;
 use vstd::bytes::{u64_from_le_bytes, u64_to_le_bytes};
+use vstd::prelude::*;
 
 verus! {
 
