@@ -38,7 +38,6 @@ fn test_sync_round_all_subcommand_syntax() {
         "'sync round all' should be a valid subcommand, not an unexpected argument:\n{}",
         stderr
     );
-
 }
 
 // ---------------------------------------------------------------------------
