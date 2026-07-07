@@ -870,11 +870,13 @@ fn test_encrypted_parity_deletion_intent_only() {
 
     // Verify deletion_intent was written
     let target_b64 = event_id_to_base64(&fake_target);
-    let intent_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM deletion_intents WHERE recorded_by = ?1 AND target_id = ?2",
-        rusqlite::params![recorded_by, &target_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let intent_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deletion_intents WHERE recorded_by = ?1 AND target_id = ?2",
+            rusqlite::params![recorded_by, &target_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(
         intent_count, 1,
         "deletion_intent must be written through encrypted layer"

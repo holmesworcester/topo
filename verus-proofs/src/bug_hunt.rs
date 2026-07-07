@@ -334,4 +334,78 @@ proof fn finding_bootstrap_cache_outlives_db_ttl()
 {
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// BUG 8: Forged Invite Link Workspace Can Drive Raw Cross-Workspace Exfil
+// ═══════════════════════════════════════════════════════════════════
+//
+// Current runtime shape:
+// 1. The invite link carries a plaintext WORKSPACE field.
+// 2. prepare_invite_acceptance records that link workspace into local bootstrap
+//    context before the canonical invite event is checked.
+// 3. accept_invite emits InviteAccepted using that accepted workspace.
+// 4. same_workspace_seed replay uses InviteAccepted.workspace_id to copy
+//    existing shared events from sibling tenants in the same local DB.
+// 5. outbound sync also uses the tenant's accepted workspace binding to choose
+//    the shared_event_index slice to send.
+//
+// If an attacker changes only WORKSPACE in the link to a victim's existing
+// local workspace, the accept path can replay that victim workspace locally and
+// then sync the raw event blobs outward, even though the canonical invite event
+// belongs to a different workspace.
+//
+// This proof is intentionally expected to FAIL under the current modeled
+// behavior. Once the accept binding is repaired to come from the canonical
+// invite event workspace instead of the link field, the proof should pass.
+
+/// Current buggy binding model: the accepted workspace comes from the link.
+pub open spec fn invite_accept_binding_workspace(
+    canonical_invite_workspace: nat,
+    link_workspace: nat,
+) -> nat {
+    link_workspace
+}
+
+/// same_workspace_seed replay occurs when the accepted workspace matches an
+/// existing local workspace that already has shared history.
+pub open spec fn local_same_workspace_seed_occurs(
+    existing_local_workspace: nat,
+    accepted_workspace: nat,
+) -> bool {
+    existing_local_workspace == accepted_workspace
+}
+
+/// Outbound sync chooses which shared events to send by the accepted workspace.
+pub open spec fn outbound_sync_selects_workspace(
+    event_workspace: nat,
+    accepted_workspace: nat,
+) -> bool {
+    event_workspace == accepted_workspace
+}
+
+/// Full raw-exfil path: a forged link binds to the victim's local workspace,
+/// replays sibling shared history locally, and selects that victim workspace
+/// again for outbound sync.
+pub open spec fn raw_exfil_path_exists(
+    canonical_invite_workspace: nat,
+    forged_link_workspace: nat,
+) -> bool {
+    let accepted_workspace =
+        invite_accept_binding_workspace(canonical_invite_workspace, forged_link_workspace);
+    local_same_workspace_seed_occurs(forged_link_workspace, accepted_workspace)
+        && outbound_sync_selects_workspace(forged_link_workspace, accepted_workspace)
+}
+
+/// SECURITY GOAL: forging the link workspace must never create a raw exfil path.
+///
+/// This is currently false because invite_accept_binding_workspace() models the
+/// vulnerable runtime behavior by returning the forged link workspace.
+proof fn finding_forged_link_cannot_exfiltrate_raw_victim_workspace(
+    canonical_invite_workspace: nat,
+    victim_existing_workspace: nat,
+)
+    requires canonical_invite_workspace != victim_existing_workspace
+    ensures !raw_exfil_path_exists(canonical_invite_workspace, victim_existing_workspace),
+{
+}
+
 } // verus!

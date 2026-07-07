@@ -9,8 +9,8 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::file_slice::{build_projector_context, project_pure};
     use topo::event_modules::file_slice::FileSliceEvent;
+    use topo::event_modules::file_slice::{build_projector_context, project_pure};
     use topo::event_modules::{ParsedEvent, EVENT_TYPE_FILE_SLICE};
     use topo::projection::contract::FileDescriptorInfo;
     use topo::projection::queries::ProjectionFrameContext;
