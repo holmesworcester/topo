@@ -63,7 +63,9 @@ pub fn project_pure(
     } else if let Some(user_id) = signer_user_b64 {
         (user_id.to_string(), 0i64)
     } else {
-        return ProjectorResult::reject("message_deletion signer authorization missing".to_string());
+        return ProjectorResult::reject(
+            "message_deletion signer authorization missing".to_string(),
+        );
     };
 
     // Type validation: reject if target is a known non-message event.

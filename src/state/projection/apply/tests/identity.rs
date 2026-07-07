@@ -1415,8 +1415,7 @@ fn test_post_tombstone_wrong_author_deletion_rejects() {
 
     // Second deletion from a different peer_shared signer
     let (wrong_signer_eid, wrong_signing_key) = make_identity_chain(&conn, recorded_by);
-    let (_del2, del2_blob) =
-        make_deletion_signed(&wrong_signing_key, &wrong_signer_eid, &msg_eid);
+    let (_del2, del2_blob) = make_deletion_signed(&wrong_signing_key, &wrong_signer_eid, &msg_eid);
     let del2_eid = insert_event_raw(&conn, recorded_by, &del2_blob);
     let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
 
@@ -1516,7 +1515,10 @@ fn test_admin_signer_can_delete_other_users_message() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(admin_intent_count, 1, "admin delete should record wildcard intent");
+    assert_eq!(
+        admin_intent_count, 1,
+        "admin delete should record wildcard intent"
+    );
 }
 
 #[test]
