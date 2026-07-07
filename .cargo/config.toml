@@ -9,6 +9,12 @@ perf-topo-all = "test --release --test topo_cascade_test -- --nocapture --includ
 perf-lowmem = "test --release --test low_mem_test -- --nocapture"
 perf-lowmem-all = "test --release --test low_mem_test -- --nocapture --include-ignored"
 
+[build]
+# Keep workspace-wide test/build sweeps from spawning an unbounded rustc/rust-lld
+# fanout that trips systemd-oomd in tmux-backed sessions. Callers can still
+# override this explicitly with `cargo -j <n> ...` when they intend to.
+jobs = 4
+
 [env]
 # Default each cargo test invocation to one harness thread. Separate workstreams
 # can still run distinct cargo test commands in parallel, and callers can
