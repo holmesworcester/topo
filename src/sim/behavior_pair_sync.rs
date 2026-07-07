@@ -422,6 +422,8 @@ mod tests {
                 workspace_name: "sim".into(),
                 username: "alice".into(),
                 device_name: "laptop".into(),
+                message_count: 0,
+                network_age: None,
             })
             .expect("create workspace");
         creator
@@ -516,6 +518,8 @@ mod tests {
                 workspace_name: "sim".into(),
                 username: "alice".into(),
                 device_name: "laptop".into(),
+                message_count: 0,
+                network_age: None,
             })
             .expect("create workspace");
         let invite: CreateInviteResponse = creator

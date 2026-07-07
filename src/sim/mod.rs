@@ -1,3 +1,5 @@
+pub mod behavior_planner;
+mod behavior_pair_sync;
 pub mod clock;
 pub mod hash_graph;
 pub mod key_repair;
@@ -29,6 +31,10 @@ pub use large_graph_sample::{
 pub use node_behavior::{
     sqlite_behavior_summary, BehaviorRow, BehaviorValue, EventProjectionFilter, NodeBehaviorEngine,
     NodeBehaviorSummary,
+};
+pub use behavior_planner::{
+    BehaviorPlannerConfig, BehaviorPlannerIntent, BehaviorPlannerReport,
+    BehaviorPlannerRoundReport, BehaviorPlannerSimulation,
 };
 pub use pair_sync::{
     plan_pair_sync_intents, run_pair_sync_session, PairSyncDirectionStats, PairSyncIntent,

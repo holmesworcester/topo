@@ -317,7 +317,6 @@ fn pair_intent_source(intent: &PairSyncIntent) -> Option<TargetIngressSource> {
         }),
         "observed" | "discovery" => Some(TargetIngressSource::KnownPeer {
             peer_id: intent.target_transport_peer_id.clone(),
-            daemon_peer_id: intent.target_transport_peer_id.clone(),
         }),
         _ => None,
     }

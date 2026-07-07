@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::net::SocketAddr;
 
 use rusqlite::types::ValueRef;
 use serde::Serialize;
@@ -20,6 +21,7 @@ use crate::projection::queries::{
 };
 use crate::projection::signer::{ResolvedSigner, SignerResolution};
 use crate::sim::query_snapshot::ImportedPeerState;
+use crate::sync::session::windowing::SyncTask;
 
 const SUMMARY_TABLES: &[&str] = &[
     "admins",
@@ -39,8 +41,10 @@ const SUMMARY_TABLES: &[&str] = &[
     "key_secrets",
     "key_shared",
     "messages",
+    "peer_endpoint_observations",
     "peer_secrets",
     "peers_shared",
+    "peer_transport_bindings",
     "pending_invite_bootstrap_trust",
     "reactions",
     "removals",
@@ -91,9 +95,25 @@ struct StoredRecordedEvent {
     source: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BehaviorEventDepRow {
+    pub dep_event_id: String,
+    pub dep_field_name: String,
+    pub dep_mode: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BehaviorSharedIndexRow {
+    pub workspace_id: String,
+    pub created_at_ms: i64,
+    pub shard_u8: i64,
+    pub event_id: String,
+}
+
 #[derive(Clone, Debug, Default)]
 struct NodeBehaviorData {
     recorded_by: String,
+    workspace_id: Option<String>,
     local_transport_peer_id: Option<String>,
     local_transport_source: Option<String>,
     events: BTreeMap<String, StoredEvent>,
@@ -102,6 +122,8 @@ struct NodeBehaviorData {
     rejected_events: BTreeMap<String, String>,
     blocked_events: BTreeMap<String, i64>,
     blocked_event_deps: BTreeMap<String, BTreeSet<String>>,
+    event_deps: BTreeMap<String, Vec<BehaviorEventDepRow>>,
+    shared_event_index: BTreeMap<String, BehaviorSharedIndexRow>,
     tables: BTreeMap<String, Vec<BehaviorRow>>,
 }
 
@@ -164,6 +186,7 @@ impl NodeBehaviorEngine {
         let engine = Self::with_filter(&imported.recorded_by, filter);
         {
             let mut state = engine.state.borrow_mut();
+            state.workspace_id = imported.workspace_id.clone();
             state.local_transport_peer_id = imported.local_transport_peer_id.clone();
             state.local_transport_source = imported.local_transport_source.clone();
             for row in &imported.bootstrap_context_rows {
@@ -269,6 +292,7 @@ impl NodeBehaviorEngine {
         let engine = Self::with_filter(&imported.recorded_by, filter);
         {
             let mut state = engine.state.borrow_mut();
+            state.workspace_id = imported.workspace_id.clone();
             state.local_transport_peer_id = imported.local_transport_peer_id.clone();
             state.local_transport_source = imported.local_transport_source.clone();
             for ambient in &imported.ambient_shared_events {
@@ -294,6 +318,7 @@ impl NodeBehaviorEngine {
                     });
             }
             seed_state_from_summary(&mut state, summary)?;
+            index_existing_recorded_events_in_state(&mut state)?;
         }
         Ok(engine)
     }
@@ -425,6 +450,298 @@ impl NodeBehaviorEngine {
             .unwrap_or_else(|| state.recorded_by.clone())
     }
 
+    pub(crate) fn workspace_id(&self) -> Option<String> {
+        let mut state = self.state.borrow_mut();
+        refresh_workspace_id_cache(&mut state);
+        state.workspace_id.clone()
+    }
+
+    pub(crate) fn load_shared_event_index_slice(&self, workspace_id: &str, task: SyncTask) -> Vec<(i64, EventId)> {
+        let state = self.state.borrow();
+        let mut entries = state
+            .shared_event_index
+            .values()
+            .filter(|row| row.workspace_id == workspace_id)
+            .filter(|row| task.window.ts_min().is_none_or(|min| row.created_at_ms >= min))
+            .filter(|row| task.window.ts_max_exclusive().is_none_or(|max| row.created_at_ms < max))
+            .filter(|row| row.shard_u8 >= task.shard_min_inclusive as i64 && row.shard_u8 < task.shard_max_exclusive as i64)
+            .filter_map(|row| event_id_from_base64(&row.event_id).map(|event_id| (row.created_at_ms, event_id)))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        entries
+    }
+
+    pub(crate) fn expand_transitive_shared_deps(&self, seed_ids: &[EventId]) -> Vec<(i64, EventId)> {
+        if seed_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let state = self.state.borrow();
+        let mut discovered = Vec::new();
+        let mut visited: HashSet<EventId> = seed_ids.iter().copied().collect();
+        let mut frontier = seed_ids.to_vec();
+
+        while let Some(event_id) = frontier.pop() {
+            let event_id_b64 = event_id_to_base64(&event_id);
+            if let Some(deps) = state.event_deps.get(&event_id_b64) {
+                for dep in deps {
+                    let Some(dep_id) = event_id_from_base64(&dep.dep_event_id) else {
+                        continue;
+                    };
+                    let Some(dep_blob) = state.events.get(&dep.dep_event_id).map(|event| &event.blob) else {
+                        continue;
+                    };
+                    if !is_shared_non_endpoint_blob(dep_blob) {
+                        continue;
+                    }
+                    let created_at_ms = events::extract_created_at_ms(dep_blob).unwrap_or(0) as i64;
+                    if visited.insert(dep_id) {
+                        frontier.push(dep_id);
+                        discovered.push((created_at_ms, dep_id));
+                    }
+                }
+            }
+
+            if let Some(carriers) = key_shared_carriers_for_key_event(&state, &event_id_b64) {
+                for (carrier_id_b64, created_at_ms) in carriers {
+                    let Some(carrier_id) = event_id_from_base64(&carrier_id_b64) else {
+                        continue;
+                    };
+                    if visited.insert(carrier_id) {
+                        frontier.push(carrier_id);
+                        discovered.push((created_at_ms, carrier_id));
+                    }
+                }
+            }
+        }
+
+        discovered.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        discovered
+    }
+
+    pub(crate) fn get_shared_batch(&self, ids: &[EventId]) -> HashMap<EventId, Vec<u8>> {
+        let state = self.state.borrow();
+        let mut out = HashMap::new();
+        for event_id in ids {
+            let event_id_b64 = event_id_to_base64(event_id);
+            let Some(blob) = state.events.get(&event_id_b64).map(|event| event.blob.clone()) else {
+                continue;
+            };
+            if !is_shared_blob(&blob) {
+                continue;
+            }
+            out.insert(*event_id, blob);
+        }
+        out
+    }
+
+    pub(crate) fn get_shared_created_at_batch(&self, ids: &[EventId]) -> HashMap<EventId, i64> {
+        let state = self.state.borrow();
+        let mut out = HashMap::new();
+        for event_id in ids {
+            let event_id_b64 = event_id_to_base64(event_id);
+            let Some(blob) = state.events.get(&event_id_b64).map(|event| &event.blob) else {
+                continue;
+            };
+            if !is_shared_blob(blob) {
+                continue;
+            }
+            out.insert(*event_id, events::extract_created_at_ms(blob).unwrap_or(0) as i64);
+        }
+        out
+    }
+
+    pub(crate) fn get_shared_dep_edges_batch(&self, ids: &[EventId]) -> HashMap<EventId, Vec<EventId>> {
+        let state = self.state.borrow();
+        let mut out = HashMap::<EventId, Vec<EventId>>::new();
+        for event_id in ids {
+            let event_id_b64 = event_id_to_base64(event_id);
+            if let Some(rows) = state.event_deps.get(&event_id_b64) {
+                for row in rows {
+                    let Some(dep_id) = event_id_from_base64(&row.dep_event_id) else {
+                        continue;
+                    };
+                    let Some(blob) = state.events.get(&row.dep_event_id).map(|event| &event.blob) else {
+                        continue;
+                    };
+                    if !is_shared_blob(blob) {
+                        continue;
+                    }
+                    out.entry(*event_id).or_default().push(dep_id);
+                }
+            }
+            if let Some(carriers) = key_shared_carriers_for_key_event(&state, &event_id_b64) {
+                let deps = out.entry(*event_id).or_default();
+                for (carrier_id_b64, _created_at_ms) in carriers {
+                    let Some(carrier_id) = event_id_from_base64(&carrier_id_b64) else {
+                        continue;
+                    };
+                    if !deps.contains(&carrier_id) {
+                        deps.push(carrier_id);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn current_connect_targets(
+        &self,
+        now_ms: i64,
+        discovery_disabled: bool,
+    ) -> Vec<crate::sim::query_snapshot::ImportedConnectTarget> {
+        let state = self.state.borrow();
+        let recorded_by = state.recorded_by.clone();
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        if let Some(rows) = state.tables.get("invite_bootstrap_trust") {
+            for row in rows {
+                if row_text(row, "recorded_by") != Some(recorded_by.as_str()) {
+                    continue;
+                }
+                if row_int(row, "expires_at").is_some_and(|expires_at| expires_at <= now_ms) {
+                    continue;
+                }
+                let Some(fingerprint) = row_blob(row, "bootstrap_spki_fingerprint") else {
+                    continue;
+                };
+                if fingerprint.len() != 32 {
+                    continue;
+                }
+                let transport_peer_id = hex::encode(fingerprint);
+                let bootstrap_addr = row_text(row, "bootstrap_addr").unwrap_or_default().to_string();
+                let remote = if bootstrap_addr.trim().is_empty() {
+                    "lookup".to_string()
+                } else if bootstrap_addr.starts_with("http://") || bootstrap_addr.starts_with("https://") {
+                    format!("relay:{bootstrap_addr}")
+                } else {
+                    bootstrap_addr.clone()
+                };
+                let key = ("bootstrap".to_string(), transport_peer_id.clone(), remote.clone());
+                if seen.insert(key) {
+                    out.push(crate::sim::query_snapshot::ImportedConnectTarget {
+                        source: "bootstrap".to_string(),
+                        transport_peer_id,
+                        remote,
+                        invite_event_id: row_text(row, "invite_event_id").map(ToOwned::to_owned),
+                    });
+                }
+            }
+        }
+
+        if let Some(rows) = state.tables.get("peers_shared") {
+            for row in rows {
+                if row_text(row, "recorded_by") != Some(recorded_by.as_str()) {
+                    continue;
+                }
+                let Some(fingerprint) = row_blob(row, "transport_fingerprint") else {
+                    continue;
+                };
+                if fingerprint.len() != 32 {
+                    continue;
+                }
+                let peer_id = hex::encode(fingerprint);
+                if state.local_transport_peer_id.as_deref() == Some(peer_id.as_str()) {
+                    continue;
+                }
+                let daemon_peer_id = row_text(row, "endpoint_id").map(ToOwned::to_owned).or_else(|| {
+                    latest_bound_daemon_peer_id(&state, &recorded_by, &peer_id)
+                });
+                let Some(transport_peer_id) = daemon_peer_id else {
+                    continue;
+                };
+                let remote = latest_observed_remote(&state, &recorded_by, &peer_id, now_ms);
+                if remote.is_none() && discovery_disabled {
+                    continue;
+                }
+                let remote_label = remote.map(|remote| remote.to_string()).unwrap_or_else(|| "lookup".to_string());
+                let source = if remote.is_some() { "observed" } else { "discovery" };
+                let key = (source.to_string(), transport_peer_id.clone(), remote_label.clone());
+                if seen.insert(key) {
+                    out.push(crate::sim::query_snapshot::ImportedConnectTarget {
+                        source: source.to_string(),
+                        transport_peer_id,
+                        remote: remote_label,
+                        invite_event_id: None,
+                    });
+                }
+            }
+        }
+
+        out.sort_by(|left, right| (&left.source, &left.transport_peer_id, &left.remote, &left.invite_event_id).cmp(&(&right.source, &right.transport_peer_id, &right.remote, &right.invite_event_id)));
+        out
+    }
+
+    pub(crate) fn should_initiate_connect_for_source(
+        &self,
+        now_ms: i64,
+        source: &crate::runtime::peering::engine::target_dispatch::TargetIngressSource,
+    ) -> bool {
+        match source {
+            crate::runtime::peering::engine::target_dispatch::TargetIngressSource::Bootstrap { .. } => true,
+            crate::runtime::peering::engine::target_dispatch::TargetIngressSource::KnownPeer { .. } => {
+                self.has_active_bootstrap_session_fallback(now_ms)
+                    || crate::runtime::peering::engine::target_dispatch::should_initiate_connect_for_source(&self.recorded_by(), source)
+            }
+        }
+    }
+
+    pub(crate) fn record_successful_session(
+        &self,
+        remote_session_peer_id: &str,
+        remote_daemon_peer_id: &str,
+        remote: Option<SocketAddr>,
+        observed_at_ms: i64,
+        endpoint_ttl_ms: i64,
+    ) {
+        let mut state = self.state.borrow_mut();
+        let recorded_by = state.recorded_by.clone();
+        if let Ok(blob) = hex::decode(remote_daemon_peer_id) {
+            if blob.len() == 32 {
+                let mut values = BTreeMap::new();
+                values.insert("recorded_by".to_string(), BehaviorValue::Text(recorded_by.clone()));
+                values.insert("peer_id".to_string(), BehaviorValue::Text(remote_session_peer_id.to_string()));
+                values.insert("spki_fingerprint".to_string(), BehaviorValue::Blob(blob));
+                values.insert("bound_at".to_string(), BehaviorValue::Int(observed_at_ms));
+                let row = BehaviorRow { values };
+                let rows = state.tables.entry("peer_transport_bindings".to_string()).or_default();
+                if !rows.contains(&row) {
+                    rows.push(row);
+                    rows.sort();
+                }
+            }
+        }
+        if let Some(remote) = remote {
+            let mut values = BTreeMap::new();
+            values.insert("recorded_by".to_string(), BehaviorValue::Text(recorded_by));
+            values.insert("via_peer_id".to_string(), BehaviorValue::Text(remote_session_peer_id.to_string()));
+            values.insert("origin_ip".to_string(), BehaviorValue::Text(remote.ip().to_string()));
+            values.insert("origin_port".to_string(), BehaviorValue::Int(i64::from(remote.port())));
+            values.insert("observed_at".to_string(), BehaviorValue::Int(observed_at_ms));
+            values.insert("expires_at".to_string(), BehaviorValue::Int(observed_at_ms.saturating_add(endpoint_ttl_ms)));
+            let row = BehaviorRow { values };
+            let rows = state.tables.entry("peer_endpoint_observations".to_string()).or_default();
+            if !rows.contains(&row) {
+                rows.push(row);
+                rows.sort();
+            }
+        }
+    }
+
+    fn has_active_bootstrap_session_fallback(&self, now_ms: i64) -> bool {
+        let state = self.state.borrow();
+        let recorded_by = state.recorded_by.clone();
+        let local_bootstrap_phase = state.local_transport_source.as_deref() == Some("bootstrap");
+        if !local_bootstrap_phase {
+            return false;
+        }
+        state.tables.get("invite_bootstrap_trust").into_iter().flat_map(|rows| rows.iter()).any(|row| {
+            row_text(row, "recorded_by") == Some(recorded_by.as_str())
+                && row_int(row, "expires_at").is_none_or(|expires_at| expires_at > now_ms)
+        })
+    }
+
     pub fn recorded_event_ids(&self) -> BTreeSet<String> {
         self.state
             .borrow()
@@ -532,6 +849,8 @@ impl NodeBehaviorEngine {
             .or_insert_with(|| StoredRecordedEvent {
                 source: source.to_string(),
             });
+        index_event_deps_in_state(&mut state, event_id, &parsed);
+        index_shared_event_in_state(&mut state, event_id, &parsed);
         Ok(())
     }
 
@@ -1801,6 +2120,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
                 }
             }
         }
+        refresh_workspace_id_cache(&mut state);
         Ok(())
     }
 
@@ -1860,15 +2180,189 @@ impl ProjectionBackend for NodeBehaviorEngine {
         if self.state.borrow().recorded_by != recorded_by {
             return Ok(());
         }
-        self.state.borrow_mut().valid_events.insert(
+        let mut state = self.state.borrow_mut();
+        state.valid_events.insert(
             event_id_b64.to_string(),
             Some(i64::from(match sub_event {
                 ParsedEvent::Encrypted(enc) => enc.inner_type_code,
                 _ => sub_event.event_type_code(),
             })),
         );
+        refresh_workspace_id_cache(&mut state);
         Ok(())
     }
+}
+
+fn current_workspace_id(state: &NodeBehaviorData) -> Option<String> {
+    state.workspace_id.clone().or_else(|| {
+        table_rows_for_recorded(state, "invites_accepted", &state.recorded_by)
+            .into_iter()
+            .filter_map(|row| {
+                Some((
+                    row_int(row, "created_at").unwrap_or(i64::MAX),
+                    row_text(row, "event_id")?.to_string(),
+                    row_text(row, "workspace_id")?.to_string(),
+                ))
+            })
+            .min_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)))
+            .map(|(_, _, workspace_id)| workspace_id)
+            .or_else(|| {
+                table_rows_for_recorded(state, "workspaces", &state.recorded_by)
+                    .into_iter()
+                    .find_map(|row| row_text(row, "event_id").map(ToOwned::to_owned))
+            })
+    })
+}
+
+fn refresh_workspace_id_cache(state: &mut NodeBehaviorData) {
+    if state.workspace_id.is_none() {
+        state.workspace_id = current_workspace_id(state);
+    }
+}
+
+fn is_shared_blob(blob: &[u8]) -> bool {
+    events::parse_event(blob)
+        .ok()
+        .and_then(|parsed| events::registry().lookup(parsed.event_type_code()).map(|meta| meta.share_scope))
+        == Some(events::ShareScope::Shared)
+}
+
+fn is_shared_non_endpoint_blob(blob: &[u8]) -> bool {
+    match events::parse_event(blob)
+        .ok()
+        .and_then(|parsed| {
+            events::registry()
+                .lookup(parsed.event_type_code())
+                .map(|meta| (meta.share_scope, meta.type_name))
+        }) {
+        Some((events::ShareScope::Shared, "endpoint_shared")) => false,
+        Some((events::ShareScope::Shared, _)) => true,
+        _ => false,
+    }
+}
+
+fn index_event_deps_in_state(state: &mut NodeBehaviorData, event_id: &EventId, parsed: &ParsedEvent) {
+    let event_id_b64 = event_id_to_base64(event_id);
+    let mut rows = parsed
+        .outer_sync_dep_refs_recursive()
+        .into_iter()
+        .map(|dep| BehaviorEventDepRow {
+            dep_event_id: event_id_to_base64(&dep.event_id),
+            dep_field_name: dep.field_name.to_string(),
+            dep_mode: match dep.mode {
+                events::EventDepMode::Blocking => "blocking".to_string(),
+                events::EventDepMode::SyncOnly => "sync_only".to_string(),
+            },
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| (&left.dep_field_name, &left.dep_event_id, &left.dep_mode).cmp(&(&right.dep_field_name, &right.dep_event_id, &right.dep_mode)));
+    rows.dedup();
+    if !rows.is_empty() {
+        state.event_deps.entry(event_id_b64).or_insert(rows);
+    }
+}
+
+fn index_shared_event_in_state(state: &mut NodeBehaviorData, event_id: &EventId, parsed: &ParsedEvent) {
+    let Some(meta) = events::registry().lookup(parsed.event_type_code()) else {
+        return;
+    };
+    if meta.share_scope != events::ShareScope::Shared || meta.type_name == "endpoint_shared" {
+        return;
+    }
+    let event_id_b64 = event_id_to_base64(event_id);
+    let workspace_id = if meta.type_name == "workspace" {
+        Some(event_id_b64.clone())
+    } else {
+        current_workspace_id(state)
+    };
+    let Some(workspace_id) = workspace_id else {
+        return;
+    };
+    let created_at_ms = state
+        .events
+        .get(&event_id_b64)
+        .and_then(|event| events::extract_created_at_ms(&event.blob))
+        .unwrap_or(0) as i64;
+    state.workspace_id.get_or_insert_with(|| workspace_id.clone());
+    state.shared_event_index.entry(event_id_b64.clone()).or_insert_with(|| BehaviorSharedIndexRow {
+        workspace_id,
+        created_at_ms,
+        shard_u8: crate::db::store::shared_event_shard_u8(event_id),
+        event_id: event_id_b64,
+    });
+}
+
+fn index_existing_recorded_events_in_state(state: &mut NodeBehaviorData) -> Result<(), Box<dyn std::error::Error>> {
+    let event_ids = state.events.keys().cloned().collect::<Vec<_>>();
+    for event_id_b64 in event_ids {
+        let Some(event_id) = event_id_from_base64(&event_id_b64) else {
+            continue;
+        };
+        let Some(blob) = state.events.get(&event_id_b64).map(|event| event.blob.clone()) else {
+            continue;
+        };
+        let parsed = events::parse_event(&blob)?;
+        index_event_deps_in_state(state, &event_id, &parsed);
+        index_shared_event_in_state(state, &event_id, &parsed);
+    }
+    refresh_workspace_id_cache(state);
+    Ok(())
+}
+
+fn latest_bound_daemon_peer_id(state: &NodeBehaviorData, recorded_by: &str, peer_id: &str) -> Option<String> {
+    table_rows_for_recorded(state, "peer_transport_bindings", recorded_by)
+        .into_iter()
+        .filter(|row| row_text(row, "peer_id") == Some(peer_id))
+        .filter_map(|row| {
+            let fingerprint = row_blob(row, "spki_fingerprint")?;
+            if fingerprint.len() != 32 {
+                return None;
+            }
+            Some((row_int(row, "bound_at").unwrap_or(i64::MIN), hex::encode(fingerprint)))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, daemon_peer_id)| daemon_peer_id)
+}
+
+fn latest_observed_remote(state: &NodeBehaviorData, recorded_by: &str, via_peer_id: &str, now_ms: i64) -> Option<SocketAddr> {
+    table_rows_for_recorded(state, "peer_endpoint_observations", recorded_by)
+        .into_iter()
+        .filter(|row| row_text(row, "via_peer_id") == Some(via_peer_id))
+        .filter(|row| row_int(row, "expires_at").is_none_or(|expires_at| expires_at > now_ms))
+        .filter_map(|row| {
+            Some((
+                row_int(row, "observed_at").unwrap_or(i64::MIN),
+                row_text(row, "origin_ip")?.to_string(),
+                row_int(row, "origin_port")?,
+            ))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .and_then(|(_, origin_ip, origin_port)| {
+            let ip: std::net::IpAddr = origin_ip.parse().ok()?;
+            let port = u16::try_from(origin_port).ok()?;
+            Some(SocketAddr::new(ip, port))
+        })
+}
+
+fn key_shared_carriers_for_key_event(state: &NodeBehaviorData, key_event_id_b64: &str) -> Option<Vec<(String, i64)>> {
+    let mut carriers = state
+        .tables
+        .get("key_shared")
+        .into_iter()
+        .flat_map(|rows| rows.iter())
+        .filter(|row| row_text(row, "key_event_id") == Some(key_event_id_b64))
+        .filter_map(|row| {
+            let event_id = row_text(row, "event_id")?.to_string();
+            let blob = state.events.get(&event_id)?.blob.clone();
+            if !is_shared_blob(&blob) {
+                return None;
+            }
+            Some((event_id, events::extract_created_at_ms(&blob).unwrap_or(0) as i64))
+        })
+        .collect::<Vec<_>>();
+    carriers.sort();
+    carriers.dedup();
+    (!carriers.is_empty()).then_some(carriers)
 }
 
 fn key_secret_bytes(
