@@ -1,4 +1,6 @@
 /target
+_apalache-out/
+node_modules/
 *.db
 *.db*
 *.jar

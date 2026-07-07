@@ -1,0 +1,14 @@
+{
+  "name": "quint-forward-secrecy-model",
+  "private": true,
+  "scripts": {
+    "quint": "quint",
+    "quint:fs:typecheck": "quint typecheck docs/quint/forward_secrecy_repair.qnt",
+    "quint:fs:test": "quint test docs/quint/forward_secrecy_repair.qnt --max-samples=200",
+    "quint:fs:run": "quint run docs/quint/forward_secrecy_repair.qnt --invariants=typeOk requestSafety responseSafety responseEventSafety responseProjectionMatchesEvents learnedMaterialSafety removedPeerNeverLearnsPostRemovalMaterial --max-samples=2000 --max-steps=20 --verbosity=1",
+    "quint:fs:verify": "quint verify docs/quint/forward_secrecy_repair.qnt --invariants=typeOk requestSafety responseSafety responseEventSafety responseProjectionMatchesEvents learnedMaterialSafety removedPeerNeverLearnsPostRemovalMaterial --max-steps=8 --verbosity=1"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.32.0"
+  }
+}
