@@ -11,10 +11,12 @@ use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
+use crate::db::transport_creds::{resolve_tenant_transport_target, CRED_SOURCE_BOOTSTRAP};
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::SyncConnectionHandler;
+use crate::tuning::{sync_mode, SyncMode};
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{
     dial_daemon_connection_target, load_daemon_identity_from_db,
@@ -29,7 +31,9 @@ use super::supervisor::{
 use super::{
     claim_live_daemon_connection_slot, claim_live_session_peer, current_timestamp_ms,
     evict_live_daemon_connection, live_daemon_connection, peer_fingerprint_from_hex,
-    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
+    preferred_connection_direction, try_claim_active_sync_run, CONNECT_RETRY_DELAY,
+    ENDPOINT_TTL_MS,
+    SYNC_SESSION_TIMEOUT_SECS,
 };
 
 pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -140,6 +144,48 @@ fn should_evict_closed_daemon_connection(
 ) -> bool {
     let _ = daemon_connection;
     is_connection_lost_message(message)
+}
+
+fn should_open_outbound_sync_sessions_for_mode(
+    mode: SyncMode,
+    local_bootstrap_phase: bool,
+    local_daemon_peer_id: &str,
+    remote_daemon_peer_id: &str,
+) -> bool {
+    if !matches!(mode, SyncMode::RatelessSpray) {
+        return true;
+    }
+    if local_bootstrap_phase {
+        return true;
+    }
+    preferred_connection_direction(local_daemon_peer_id, remote_daemon_peer_id)
+        .map(|direction| direction == SessionDirection::Outbound)
+        .unwrap_or(true)
+}
+
+fn local_transport_in_bootstrap_phase(db_path: &str, recorded_by: &str) -> bool {
+    let Ok(db) = open_connection(db_path) else {
+        return false;
+    };
+    resolve_tenant_transport_target(&db, recorded_by)
+        .ok()
+        .flatten()
+        .map(|target| target.source == CRED_SOURCE_BOOTSTRAP)
+        .unwrap_or(false)
+}
+
+fn should_open_outbound_sync_sessions(
+    db_path: &str,
+    recorded_by: &str,
+    local_daemon_peer_id: &str,
+    remote_daemon_peer_id: &str,
+) -> bool {
+    should_open_outbound_sync_sessions_for_mode(
+        sync_mode(),
+        local_transport_in_bootstrap_phase(db_path, recorded_by),
+        local_daemon_peer_id,
+        remote_daemon_peer_id,
+    )
 }
 
 fn normalize_dial_failure_decision_context(
@@ -447,6 +493,25 @@ async fn connect_loop_inner(
             SyncConnectionHandler::outbound(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS)
                 .with_sync_control(sync_control.clone());
 
+        if !should_open_outbound_sync_sessions(
+            db_path,
+            recorded_by,
+            local_daemon_peer_id,
+            daemon_connection.remote_daemon_peer_id(),
+        ) {
+            let connection = daemon_connection.connection().clone();
+            debug!(
+                target: "topo::connection",
+                "connect_loop leaving daemon={} inbound-only for rateless logical sessions",
+                super::short_peer_id(daemon_connection.remote_daemon_peer_id()),
+            );
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = connection.inner.closed() => {}
+            }
+            continue;
+        }
+
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -592,6 +657,23 @@ async fn connect_loop_inner(
                     );
                     break;
                 }
+            };
+
+            let Some(_active_sync_run_lease) =
+                try_claim_active_sync_run(db_path, recorded_by, &peer_id)
+            else {
+                debug!(
+                    target: "topo::connection",
+                    "connect_loop suppressing duplicate outbound session tenant={} peer={} daemon={}",
+                    super::short_peer_id(recorded_by),
+                    super::short_peer_id(&peer_id),
+                    super::short_peer_id(daemon_connection.remote_daemon_peer_id()),
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
+                }
+                continue;
             };
 
             let should_refresh_live_peer_registration = live_session_peer_registration
@@ -985,6 +1067,38 @@ mod tests {
                 evict_live_connection: false,
             }
         );
+    }
+
+    #[test]
+    fn rateless_only_opens_outbound_sessions_on_preferred_side() {
+        let local_lower = "0000000000000000000000000000000000000000000000000000000000000001";
+        let remote_higher =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        assert!(should_open_outbound_sync_sessions_for_mode(
+            SyncMode::Negentropy,
+            false,
+            remote_higher,
+            local_lower,
+        ));
+        assert!(should_open_outbound_sync_sessions_for_mode(
+            SyncMode::RatelessSpray,
+            true,
+            remote_higher,
+            local_lower,
+        ));
+        assert!(should_open_outbound_sync_sessions_for_mode(
+            SyncMode::RatelessSpray,
+            false,
+            local_lower,
+            remote_higher,
+        ));
+        assert!(!should_open_outbound_sync_sessions_for_mode(
+            SyncMode::RatelessSpray,
+            false,
+            remote_higher,
+            local_lower,
+        ));
     }
 
     #[test]

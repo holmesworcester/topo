@@ -373,6 +373,49 @@ pub fn load_shared_send_batch(
     Ok(ordered)
 }
 
+fn append_blob_record_bytes(payload: &mut Vec<u8>, blob: &[u8]) -> Result<(), String> {
+    let blob_len = u32::try_from(blob.len())
+        .map_err(|_| format!("range event too large: {} bytes", blob.len()))?;
+    payload.extend_from_slice(&blob_len.to_le_bytes());
+    payload.extend_from_slice(blob);
+    Ok(())
+}
+
+pub fn build_shared_snapshot_bytes(
+    conn: &Connection,
+    db_path: &str,
+    store: &Store<'_>,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> Result<(Vec<u8>, u64), String> {
+    let requested_ids = load_shared_sync_entries_with_pending(conn, db_path, workspace_id, range)?
+        .into_iter()
+        .map(|(_, event_id)| event_id)
+        .collect::<Vec<_>>();
+    build_shared_snapshot_bytes_for_roots(conn, store, workspace_id, range, &requested_ids)
+}
+
+pub fn build_shared_snapshot_bytes_for_roots(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    range: SyncWindow,
+    requested_ids: &[EventId],
+) -> Result<(Vec<u8>, u64), String> {
+    let ordered_ids =
+        order_snapshot_ids_for_send(conn, store, workspace_id, range, requested_ids, None)?;
+    let mut payload = Vec::new();
+    let mut events = 0u64;
+    for chunk in ordered_ids.chunks(64) {
+        let ordered = load_shared_send_batch(store, chunk)?;
+        for (_event_id, blob) in ordered {
+            append_blob_record_bytes(&mut payload, &blob)?;
+            events += 1;
+        }
+    }
+    Ok((payload, events))
+}
+
 fn load_workspace_index_membership(
     conn: &Connection,
     workspace_id: &str,
@@ -998,6 +1041,129 @@ fn order_requested_ids_for_send(
     Ok(ordered)
 }
 
+fn load_snapshot_direct_deps(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    event_id: &EventId,
+    created_at_by_id: &mut HashMap<EventId, i64>,
+    dep_cache: &mut HashMap<EventId, Vec<EventId>>,
+) -> Result<Vec<EventId>, String> {
+    if let Some(dep_ids) = dep_cache.get(event_id) {
+        return Ok(dep_ids.clone());
+    }
+
+    let mut dep_ids = crate::db::dep_index::list_shared_event_deps(conn, workspace_id, event_id)
+        .map_err(|e| format!("load snapshot event deps: {e}"))?;
+    if dep_ids.is_empty() {
+        dep_cache.insert(*event_id, Vec::new());
+        return Ok(Vec::new());
+    }
+
+    let dep_created_at = store
+        .get_shared_created_at_batch(&dep_ids)
+        .map_err(|e| format!("load snapshot dep created_at batch: {e}"))?;
+    dep_ids.retain(|dep_id| dep_created_at.contains_key(dep_id));
+    for (dep_id, created_at_ms) in dep_created_at {
+        created_at_by_id.entry(dep_id).or_insert(created_at_ms);
+    }
+    dep_ids.sort_by(|left, right| {
+        let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
+        let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
+        left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
+    });
+    dep_cache.insert(*event_id, dep_ids.clone());
+    Ok(dep_ids)
+}
+
+fn visit_snapshot_send_order(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    event_id: EventId,
+    created_at_by_id: &mut HashMap<EventId, i64>,
+    dep_cache: &mut HashMap<EventId, Vec<EventId>>,
+    emitted: &mut HashSet<EventId>,
+    visiting: &mut HashSet<EventId>,
+    ordered: &mut Vec<EventId>,
+) -> Result<(), String> {
+    if emitted.contains(&event_id) {
+        return Ok(());
+    }
+    if !visiting.insert(event_id) {
+        return Ok(());
+    }
+
+    for dep_id in load_snapshot_direct_deps(
+        conn,
+        store,
+        workspace_id,
+        &event_id,
+        created_at_by_id,
+        dep_cache,
+    )? {
+        visit_snapshot_send_order(
+            conn,
+            store,
+            workspace_id,
+            dep_id,
+            created_at_by_id,
+            dep_cache,
+            emitted,
+            visiting,
+            ordered,
+        )?;
+    }
+
+    visiting.remove(&event_id);
+    emitted.insert(event_id);
+    ordered.push(event_id);
+    Ok(())
+}
+
+fn order_snapshot_ids_for_send(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    range: SyncWindow,
+    requested_ids: &[EventId],
+    live_suppression_seed: Option<&str>,
+) -> Result<Vec<EventId>, String> {
+    if requested_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (eligible_roots, mut created_at_by_id) =
+        eligible_shared_send_root_ids(conn, store, workspace_id, range, requested_ids)?;
+    let ordered_roots = prioritize_send_order_with_created_at(
+        range,
+        &eligible_roots,
+        live_suppression_seed,
+        &created_at_by_id,
+    );
+
+    let mut ordered = Vec::new();
+    let mut emitted = HashSet::new();
+    let mut visiting = HashSet::new();
+    let mut dep_cache = HashMap::new();
+
+    for event_id in ordered_roots {
+        visit_snapshot_send_order(
+            conn,
+            store,
+            workspace_id,
+            event_id,
+            &mut created_at_by_id,
+            &mut dep_cache,
+            &mut emitted,
+            &mut visiting,
+            &mut ordered,
+        )?;
+    }
+
+    Ok(ordered)
+}
+
 async fn send_have_events_live<S>(
     conn: &Connection,
     store: &Store<'_>,
@@ -1242,10 +1408,7 @@ where
         let ordered = load_shared_send_batch(store, chunk)?;
         let mut payload = Vec::new();
         for (_event_id, blob) in ordered {
-            let blob_len = u32::try_from(blob.len())
-                .map_err(|_| format!("range event too large: {} bytes", blob.len()))?;
-            payload.extend_from_slice(&blob_len.to_le_bytes());
-            payload.extend_from_slice(&blob);
+            append_blob_record_bytes(&mut payload, &blob)?;
             events_sent += 1;
             bytes_sent += blob.len() as u64;
         }

@@ -7,6 +7,7 @@ use crate::crypto::{
     verify_ed25519_signature,
 };
 use crate::db::open_connection;
+use crate::db::transport_creds::{resolve_tenant_transport_target, CRED_SOURCE_BOOTSTRAP};
 use crate::db::transport_trust::is_authorized_for_tenant;
 use crate::event_modules::{parse_event, ParsedEvent};
 use crate::protocol::{
@@ -111,6 +112,7 @@ enum BootstrapFallbackInvitePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutboundSessionAuthRawRows {
     bootstrap_auth_still_valid: bool,
+    local_bootstrap_phase: bool,
     bound_daemon_peer_id: Option<String>,
     remote_session_peer_authorized: bool,
 }
@@ -120,6 +122,7 @@ struct OutboundSessionAuthDecisionContext {
     requested_plan: OutboundSessionAuthPlan,
     remote_session_peer_id: String,
     bootstrap_auth_still_valid: bool,
+    local_bootstrap_phase: bool,
     daemon_connection_admits_route: bool,
     bound_daemon_matches_remote: bool,
     remote_session_peer_authorized: bool,
@@ -129,7 +132,6 @@ struct OutboundSessionAuthDecisionContext {
 enum OutboundSessionAuthDecision {
     KeepRequested,
     UpgradeToPeerSharedAfterRouteAdmission,
-    UpgradeToPeerSharedAfterBootstrapLapse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +274,7 @@ fn normalize_outbound_session_auth_decision_context(
         requested_plan: requested_plan.clone(),
         remote_session_peer_id: remote_session_peer_id.to_string(),
         bootstrap_auth_still_valid: raw_rows.bootstrap_auth_still_valid,
+        local_bootstrap_phase: raw_rows.local_bootstrap_phase,
         daemon_connection_admits_route,
         bound_daemon_matches_remote: raw_rows
             .bound_daemon_peer_id
@@ -288,18 +291,8 @@ fn decide_outbound_session_auth_decision(
     match &context.requested_plan {
         OutboundSessionAuthPlan::PeerShared { .. } => OutboundSessionAuthDecision::KeepRequested,
         OutboundSessionAuthPlan::InviteBootstrap { .. } => {
-            if context.bootstrap_auth_still_valid {
-                if context.remote_session_peer_authorized
-                    && (context.bound_daemon_matches_remote
-                        || context.daemon_connection_admits_route)
-                {
-                    return OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission;
-                }
-                return OutboundSessionAuthDecision::KeepRequested;
-            }
-
-            if context.bound_daemon_matches_remote && context.remote_session_peer_authorized {
-                return OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse;
+            if context.daemon_connection_admits_route && context.remote_session_peer_authorized {
+                return OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission;
             }
 
             OutboundSessionAuthDecision::KeepRequested
@@ -313,8 +306,7 @@ fn plan_for_outbound_session_auth_decision(
 ) -> OutboundSessionAuthPlan {
     match decision {
         OutboundSessionAuthDecision::KeepRequested => context.requested_plan.clone(),
-        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
-        | OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
+        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission => {
             OutboundSessionAuthPlan::PeerShared {
                 target_peer_id: context.remote_session_peer_id.clone(),
             }
@@ -1177,6 +1169,9 @@ fn load_outbound_session_auth_raw_rows(
         }
         OutboundSessionAuthPlan::PeerShared { .. } => false,
     };
+    let local_bootstrap_phase = resolve_tenant_transport_target(conn, recorded_by)?
+        .map(|target| target.source == CRED_SOURCE_BOOTSTRAP)
+        .unwrap_or(false);
     let bound_daemon_peer_id =
         resolve_bound_daemon_peer_id(conn, recorded_by, remote_session_peer_id)?;
 
@@ -1190,6 +1185,7 @@ fn load_outbound_session_auth_raw_rows(
 
     Ok(OutboundSessionAuthRawRows {
         bootstrap_auth_still_valid,
+        local_bootstrap_phase,
         bound_daemon_peer_id,
         remote_session_peer_authorized,
     })
@@ -1232,22 +1228,6 @@ pub fn resolve_outbound_session_auth_plan(
             if should_emit_globally(key) {
                 debug!(
                     "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because the steady-state route is authorized",
-                    short_value(recorded_by),
-                    short_value(remote_session_peer_id),
-                    short_value(actual_remote_daemon_peer_id),
-                    describe_outbound_session_auth_plan(requested_plan),
-                    describe_outbound_session_auth_plan(&resolved_plan)
-                );
-            }
-        }
-        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
-            let key = format!(
-                "outbound-auth-upgrade:{}:{}:{}",
-                recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
-            );
-            if should_emit_globally(key) {
-                debug!(
-                    "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because the steady-state daemon binding is now authorized",
                     short_value(recorded_by),
                     short_value(remote_session_peer_id),
                     short_value(actual_remote_daemon_peer_id),
@@ -1356,6 +1336,9 @@ mod tests {
 
     use crate::crypto::{event_id_to_base64, spki_fingerprint_from_ed25519_pubkey};
     use crate::db::open_connection;
+    use crate::db::transport_creds::{
+        set_local_transport_target, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
+    };
     use crate::db::transport_trust::{
         record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust,
         record_transport_binding,
@@ -1738,6 +1721,7 @@ mod tests {
         let decision_context = normalize_outbound_session_auth_decision_context(
             &OutboundSessionAuthRawRows {
                 bootstrap_auth_still_valid: true,
+                local_bootstrap_phase: true,
                 bound_daemon_peer_id: Some("daemon-1".to_string()),
                 remote_session_peer_authorized: true,
             },
@@ -1756,6 +1740,7 @@ mod tests {
                 },
                 remote_session_peer_id: "peer-1".to_string(),
                 bootstrap_auth_still_valid: true,
+                local_bootstrap_phase: true,
                 daemon_connection_admits_route: false,
                 bound_daemon_matches_remote: true,
                 remote_session_peer_authorized: true,
@@ -1764,41 +1749,18 @@ mod tests {
     }
 
     #[test]
-    fn outbound_session_auth_planner_upgrades_active_bootstrap_when_route_is_authorized() {
+    fn outbound_session_auth_planner_keeps_active_bootstrap_without_route_admission_even_for_steady_state_tenant(
+    ) {
         let decision_context = OutboundSessionAuthDecisionContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
             remote_session_peer_id: "peer-1".to_string(),
             bootstrap_auth_still_valid: true,
+            local_bootstrap_phase: false,
             daemon_connection_admits_route: false,
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
-        };
-        let decision = decide_outbound_session_auth_decision(&decision_context);
-        assert_eq!(
-            decision,
-            OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
-        );
-        assert_eq!(
-            plan_for_outbound_session_auth_decision(&decision_context, &decision),
-            OutboundSessionAuthPlan::PeerShared {
-                target_peer_id: "peer-1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn outbound_session_auth_planner_keeps_active_bootstrap_for_known_daemon_without_peer_route() {
-        let decision_context = OutboundSessionAuthDecisionContext {
-            requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
-                invite_event_id: "invite-1".to_string(),
-            },
-            remote_session_peer_id: "peer-1".to_string(),
-            bootstrap_auth_still_valid: true,
-            daemon_connection_admits_route: false,
-            bound_daemon_matches_remote: true,
-            remote_session_peer_authorized: false,
         };
         let decision = decide_outbound_session_auth_decision(&decision_context);
         assert_eq!(decision, OutboundSessionAuthDecision::KeepRequested);
@@ -1811,26 +1773,49 @@ mod tests {
     }
 
     #[test]
-    fn outbound_session_auth_planner_upgrades_only_when_binding_and_auth_hold() {
+    fn outbound_session_auth_planner_keeps_active_bootstrap_during_local_bootstrap_phase_without_route_admission(
+    ) {
+        let decision_context = OutboundSessionAuthDecisionContext {
+            requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite-1".to_string(),
+            },
+            remote_session_peer_id: "peer-1".to_string(),
+            bootstrap_auth_still_valid: true,
+            local_bootstrap_phase: true,
+            daemon_connection_admits_route: false,
+            bound_daemon_matches_remote: true,
+            remote_session_peer_authorized: true,
+        };
+        let decision = decide_outbound_session_auth_decision(&decision_context);
+        assert_eq!(decision, OutboundSessionAuthDecision::KeepRequested);
+        assert_eq!(
+            plan_for_outbound_session_auth_decision(&decision_context, &decision),
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn outbound_session_auth_planner_keeps_bootstrap_without_route_admission_after_binding_or_bootstrap_lapse(
+    ) {
         let decision_context = OutboundSessionAuthDecisionContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
             remote_session_peer_id: "peer-1".to_string(),
             bootstrap_auth_still_valid: false,
+            local_bootstrap_phase: false,
             daemon_connection_admits_route: false,
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
         };
         let decision = decide_outbound_session_auth_decision(&decision_context);
-        assert_eq!(
-            decision,
-            OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse
-        );
+        assert_eq!(decision, OutboundSessionAuthDecision::KeepRequested);
         assert_eq!(
             plan_for_outbound_session_auth_decision(&decision_context, &decision),
-            OutboundSessionAuthPlan::PeerShared {
-                target_peer_id: "peer-1".to_string(),
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite-1".to_string(),
             }
         );
 
@@ -1840,8 +1825,9 @@ mod tests {
             },
             remote_session_peer_id: "peer-1".to_string(),
             bootstrap_auth_still_valid: false,
+            local_bootstrap_phase: true,
             daemon_connection_admits_route: false,
-            bound_daemon_matches_remote: false,
+            bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
         };
         let no_upgrade = decide_outbound_session_auth_decision(&no_upgrade_context);
@@ -1862,6 +1848,7 @@ mod tests {
             },
             remote_session_peer_id: "peer-1".to_string(),
             bootstrap_auth_still_valid: true,
+            local_bootstrap_phase: true,
             daemon_connection_admits_route: true,
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
@@ -2064,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_outbound_session_auth_plan_upgrades_after_binding_auth_exists() {
+    fn resolve_outbound_session_auth_plan_keeps_bootstrap_without_connection_route_admission() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("client.sqlite3");
         let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
@@ -2072,6 +2059,7 @@ mod tests {
         let recorded_by = hex::encode([0x44; 32]);
         let remote_session_peer_id = hex::encode([0x66; 32]);
         let remote_daemon_peer_id = hex::encode([0x77; 32]);
+        let steady_state_transport_peer_id = hex::encode([0x78; 32]);
 
         insert_authorized_peer_shared(
             db_path.to_str().unwrap(),
@@ -2083,6 +2071,13 @@ mod tests {
 
         let db = open_connection(db_path.to_str().unwrap()).unwrap();
         record_transport_binding(&db, &recorded_by, &remote_session_peer_id, &[0x77; 32]).unwrap();
+        set_local_transport_target(
+            &db,
+            &recorded_by,
+            &steady_state_transport_peer_id,
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
 
         let plan = resolve_outbound_session_auth_plan(
             &db,
@@ -2098,8 +2093,58 @@ mod tests {
 
         assert_eq!(
             plan,
-            OutboundSessionAuthPlan::PeerShared {
-                target_peer_id: remote_session_peer_id,
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_outbound_session_auth_plan_keeps_bootstrap_when_binding_auth_exists_but_local_bootstrap_phase_is_active(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
+
+        let recorded_by = hex::encode([0x54; 32]);
+        let remote_session_peer_id = hex::encode([0x56; 32]);
+        let remote_daemon_peer_id = hex::encode([0x57; 32]);
+        let local_bootstrap_transport_peer_id = hex::encode([0x58; 32]);
+
+        insert_authorized_peer_shared(
+            db_path.to_str().unwrap(),
+            &recorded_by,
+            &[0x59; 32],
+            &[0x5A; 32],
+            &[0x56; 32],
+        );
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        record_transport_binding(&db, &recorded_by, &remote_session_peer_id, &[0x57; 32]).unwrap();
+        set_local_transport_target(
+            &db,
+            &recorded_by,
+            &local_bootstrap_transport_peer_id,
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap();
+
+        let plan = resolve_outbound_session_auth_plan(
+            &db,
+            None,
+            &recorded_by,
+            &remote_session_peer_id,
+            &remote_daemon_peer_id,
+            &OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
             }
         );
     }
@@ -2143,6 +2188,13 @@ mod tests {
             "ws-1",
             "127.0.0.1:1",
             &server_daemon_peer_id_raw,
+        )
+        .unwrap();
+        set_local_transport_target(
+            &client_db,
+            &recorded_by,
+            &hex::encode([0xA8; 32]),
+            CRED_SOURCE_BOOTSTRAP,
         )
         .unwrap();
         drop(client_db);

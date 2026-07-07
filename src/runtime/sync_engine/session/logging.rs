@@ -56,6 +56,30 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
         Frame::NegOpen { msg } | Frame::NegMsg { msg } => {
             serde_json::to_string(&parse_neg_payload(msg, capture_full_ids)).ok()
         }
+        Frame::RatelessOpen { msg } => serde_json::to_string(&json!({ "window_bytes": msg.len() })).ok(),
+        Frame::RatelessHeader {
+            chunk_size,
+            source_symbols,
+            symbols_sent,
+            total_bytes,
+            total_events,
+            ..
+        } => serde_json::to_string(&json!({
+            "chunk_size": chunk_size,
+            "source_symbols": source_symbols,
+            "symbols_sent": symbols_sent,
+            "total_bytes": total_bytes,
+            "total_events": total_events
+        }))
+        .ok(),
+        Frame::RatelessSymbol {
+            symbol_index,
+            payload,
+        } => serde_json::to_string(&json!({
+            "symbol_index": symbol_index,
+            "payload_len": payload.len()
+        }))
+        .ok(),
         Frame::RangePolicyReject {
             rejected_window_kind,
             oldest_allowed_window_kind,
@@ -84,6 +108,9 @@ fn frame_type(frame: &Frame) -> &'static str {
     match frame {
         Frame::NegOpen { .. } => "NegOpen",
         Frame::NegMsg { .. } => "NegMsg",
+        Frame::RatelessOpen { .. } => "RatelessOpen",
+        Frame::RatelessHeader { .. } => "RatelessHeader",
+        Frame::RatelessSymbol { .. } => "RatelessSymbol",
         Frame::RangePolicyReject { .. } => "RangePolicyReject",
         Frame::Event { .. } => "Event",
         Frame::SuppressIds { .. } => "SuppressIds",

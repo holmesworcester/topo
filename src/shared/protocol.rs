@@ -10,6 +10,9 @@ pub fn neg_id_to_event_id(id: &Id) -> EventId {
 /// Sync message types
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
+pub const MSG_TYPE_RATELESS_OPEN: u8 = 0x12; // Initial rateless snapshot message
+pub const MSG_TYPE_RATELESS_HEADER: u8 = 0x13; // Rateless snapshot metadata
+pub const MSG_TYPE_RATELESS_SYMBOL: u8 = 0x14; // Rateless coded symbol
 pub const MSG_TYPE_RANGE_POLICY_REJECT: u8 = 0x15; // Peer explicitly rejects a sync window policy
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_RANGE_SUPPRESS_IDS: u8 = 0x04; // Suppress queued event ids on the active data session
@@ -58,6 +61,24 @@ pub enum Frame {
     NegMsg {
         msg: Vec<u8>,
     },
+    /// Initial rateless snapshot/spray message
+    RatelessOpen {
+        msg: Vec<u8>,
+    },
+    /// Rateless snapshot metadata for one spray generation
+    RatelessHeader {
+        chunk_size: u32,
+        source_symbols: u32,
+        symbols_sent: u32,
+        total_bytes: u64,
+        total_events: u32,
+        seed: [u8; 32],
+    },
+    /// One coded rateless symbol for the current snapshot generation
+    RatelessSymbol {
+        symbol_index: u32,
+        payload: Vec<u8>,
+    },
     /// Peer explicitly rejected the requested sync window and advertises the
     /// oldest window kind it is willing to accept.
     RangePolicyReject {
@@ -94,7 +115,7 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
     let msg_type = input[0];
 
     match msg_type {
-        MSG_TYPE_NEG_OPEN | MSG_TYPE_NEG_MSG => {
+        MSG_TYPE_NEG_OPEN | MSG_TYPE_NEG_MSG | MSG_TYPE_RATELESS_OPEN => {
             // Variable length: type(1) + len(4) + data(len)
             if input.len() < 5 {
                 return Err(ParseError::InsufficientData);
@@ -108,12 +129,59 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 return Err(ParseError::InsufficientData);
             }
             let msg = input[5..total_size].to_vec();
-            let sync_msg = if msg_type == MSG_TYPE_NEG_OPEN {
-                Frame::NegOpen { msg }
-            } else {
-                Frame::NegMsg { msg }
+            let sync_msg = match msg_type {
+                MSG_TYPE_NEG_OPEN => Frame::NegOpen { msg },
+                MSG_TYPE_NEG_MSG => Frame::NegMsg { msg },
+                MSG_TYPE_RATELESS_OPEN => Frame::RatelessOpen { msg },
+                _ => unreachable!("unexpected control message type"),
             };
             Ok((sync_msg, total_size))
+        }
+        MSG_TYPE_RATELESS_HEADER => {
+            const HEADER_SIZE: usize = 1 + 4 + 4 + 4 + 8 + 4 + 32;
+            if input.len() < HEADER_SIZE {
+                return Err(ParseError::InsufficientData);
+            }
+            let chunk_size = u32::from_le_bytes(input[1..5].try_into().unwrap());
+            let source_symbols = u32::from_le_bytes(input[5..9].try_into().unwrap());
+            let symbols_sent = u32::from_le_bytes(input[9..13].try_into().unwrap());
+            let total_bytes = u64::from_le_bytes(input[13..21].try_into().unwrap());
+            let total_events = u32::from_le_bytes(input[21..25].try_into().unwrap());
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&input[25..57]);
+            Ok((
+                Frame::RatelessHeader {
+                    chunk_size,
+                    source_symbols,
+                    symbols_sent,
+                    total_bytes,
+                    total_events,
+                    seed,
+                },
+                HEADER_SIZE,
+            ))
+        }
+        MSG_TYPE_RATELESS_SYMBOL => {
+            if input.len() < 9 {
+                return Err(ParseError::InsufficientData);
+            }
+            let symbol_index = u32::from_le_bytes(input[1..5].try_into().unwrap());
+            let len = u32::from_le_bytes(input[5..9].try_into().unwrap()) as usize;
+            if len > MAX_NEG_MSG_BYTES {
+                return Err(ParseError::NegMessageTooLarge(len));
+            }
+            let total_size = 9 + len;
+            if input.len() < total_size {
+                return Err(ParseError::InsufficientData);
+            }
+            let payload = input[9..total_size].to_vec();
+            Ok((
+                Frame::RatelessSymbol {
+                    symbol_index,
+                    payload,
+                },
+                total_size,
+            ))
         }
         MSG_TYPE_RANGE_POLICY_REJECT => {
             const RANGE_POLICY_REJECT_SIZE: usize = 3;
@@ -263,6 +331,42 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             buf.extend_from_slice(data);
             buf
         }
+        Frame::RatelessOpen { msg: data } => {
+            let mut buf = Vec::with_capacity(5 + data.len());
+            buf.push(MSG_TYPE_RATELESS_OPEN);
+            buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(data);
+            buf
+        }
+        Frame::RatelessHeader {
+            chunk_size,
+            source_symbols,
+            symbols_sent,
+            total_bytes,
+            total_events,
+            seed,
+        } => {
+            let mut buf = Vec::with_capacity(1 + 4 + 4 + 4 + 8 + 4 + 32);
+            buf.push(MSG_TYPE_RATELESS_HEADER);
+            buf.extend_from_slice(&chunk_size.to_le_bytes());
+            buf.extend_from_slice(&source_symbols.to_le_bytes());
+            buf.extend_from_slice(&symbols_sent.to_le_bytes());
+            buf.extend_from_slice(&total_bytes.to_le_bytes());
+            buf.extend_from_slice(&total_events.to_le_bytes());
+            buf.extend_from_slice(seed);
+            buf
+        }
+        Frame::RatelessSymbol {
+            symbol_index,
+            payload,
+        } => {
+            let mut buf = Vec::with_capacity(9 + payload.len());
+            buf.push(MSG_TYPE_RATELESS_SYMBOL);
+            buf.extend_from_slice(&symbol_index.to_le_bytes());
+            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(payload);
+            buf
+        }
         Frame::RangePolicyReject {
             rejected_window_kind,
             oldest_allowed_window_kind,
@@ -371,6 +475,45 @@ mod tests {
 
         let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, 8);
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_rateless_open_roundtrip() {
+        let msg = Frame::RatelessOpen {
+            msg: vec![4, 5, 6],
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_rateless_header_roundtrip() {
+        let msg = Frame::RatelessHeader {
+            chunk_size: 32 * 1024,
+            source_symbols: 7,
+            symbols_sent: 11,
+            total_bytes: 123_456,
+            total_events: 9,
+            seed: [0x55; 32],
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_rateless_symbol_roundtrip() {
+        let msg = Frame::RatelessSymbol {
+            symbol_index: 42,
+            payload: vec![0xAA; 2048],
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
         assert_eq!(parsed, msg);
     }
 

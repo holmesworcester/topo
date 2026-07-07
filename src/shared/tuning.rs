@@ -4,12 +4,29 @@
 //! byte-credit watermarks, and low-memory toggles. All values are determined by
 //! the LOW_MEM_IOS environment variable at runtime.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    Negentropy,
+    RatelessSpray,
+}
+
 pub fn low_mem_mode() -> bool {
     read_bool_env("LOW_MEM_IOS")
 }
 
 pub fn sync_last_day_only_mode() -> bool {
     read_bool_env("TOPO_SYNC_LAST_DAY_ONLY")
+}
+
+pub fn sync_mode() -> SyncMode {
+    match std::env::var("TOPO_SYNC_MODE") {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "" | "negentropy" => SyncMode::Negentropy,
+            "rateless-spray" | "rateless_spray" | "rateless" => SyncMode::RatelessSpray,
+            _ => SyncMode::Negentropy,
+        },
+        Err(_) => SyncMode::Negentropy,
+    }
 }
 
 /// Enables periodic low-memory runtime queue/vector instrumentation logs.
@@ -85,6 +102,35 @@ pub fn response_send_quantum_bytes() -> usize {
     } else {
         1024 * 1024
     }
+}
+
+pub fn rateless_chunk_bytes() -> usize {
+    if let Some(v) = read_usize_env("TOPO_RATELESS_CHUNK_BYTES") {
+        return v.max(1024);
+    }
+    if low_mem_mode() {
+        8 * 1024
+    } else {
+        32 * 1024
+    }
+}
+
+pub fn rateless_min_extra_symbols() -> usize {
+    if let Some(v) = read_usize_env("TOPO_RATELESS_MIN_EXTRA_SYMBOLS") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        4
+    } else {
+        8
+    }
+}
+
+pub fn rateless_symbol_count(source_symbols: usize) -> usize {
+    if source_symbols == 0 {
+        return 0;
+    }
+    source_symbols.saturating_add(rateless_min_extra_symbols())
 }
 
 // -- Sync sessions --

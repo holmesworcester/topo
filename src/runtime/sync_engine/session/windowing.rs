@@ -289,6 +289,7 @@ pub fn mark_outbound_window_completed(
     recorded_by: &str,
     peer_id: &str,
     window: SyncWindow,
+    received_events: u64,
 ) {
     if sync_last_day_only_mode() {
         return;
@@ -300,7 +301,15 @@ pub fn mark_outbound_window_completed(
         let planner = state_for(&mut state, db_path, recorded_by, peer_id);
         match window.kind {
             SyncWindowKind::LastDay => {
-                planner.single_peer_phase = SinglePeerPhase::Cold;
+                if received_events > 0 {
+                    // Keep sweeping the hot window until it goes quiet. This
+                    // avoids advancing into cold tiers while recent backlog is
+                    // still being projected on the remote side.
+                    planner.single_peer_phase = SinglePeerPhase::LastDay;
+                    planner.cycle_anchor_now_ms = None;
+                } else {
+                    planner.single_peer_phase = SinglePeerPhase::Cold;
+                }
             }
             SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks | SyncWindowKind::Full => {
                 let tier_order = cold_tier_order(planner);
@@ -669,7 +678,7 @@ mod tests {
                 let window =
                     select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
                 let kind = window.kind;
-                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
+                mark_outbound_window_completed(db_path, recorded_by, peer_id, window, 0);
                 kind
             })
             .collect();
@@ -690,7 +699,7 @@ mod tests {
                 let window =
                     select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
                 let kind = window.kind;
-                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
+                mark_outbound_window_completed(db_path, recorded_by, peer_id, window, 0);
                 kind
             })
             .collect();
@@ -728,7 +737,7 @@ mod tests {
                 let window =
                     select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
                 let kind = window.kind;
-                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
+                mark_outbound_window_completed(db_path, recorded_by, peer_id, window, 0);
                 kind
             })
             .collect();
@@ -762,7 +771,7 @@ mod tests {
                 let window =
                     select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
                 let kind = window.kind;
-                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
+                mark_outbound_window_completed(db_path, recorded_by, peer_id, window, 0);
                 kind
             })
             .collect();
@@ -819,7 +828,7 @@ mod tests {
         reset_outbound_window_state(db_path, recorded_by, peer_id);
 
         let day = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
-        mark_outbound_window_completed(db_path, recorded_by, peer_id, day);
+        mark_outbound_window_completed(db_path, recorded_by, peer_id, day, 0);
         let week = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 2_000_000);
 
         assert_eq!(day.kind, SyncWindowKind::LastDay);
@@ -843,7 +852,7 @@ mod tests {
         assert_eq!(day_a.kind, SyncWindowKind::LastDay);
         assert_eq!(day_b.kind, SyncWindowKind::LastDay);
 
-        mark_outbound_window_completed(db_path, recorded_by, peer_a, day_a);
+        mark_outbound_window_completed(db_path, recorded_by, peer_a, day_a, 0);
         let week_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
         let still_day_b =
             select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
@@ -851,6 +860,30 @@ mod tests {
         assert_eq!(week_a.ts_min(), Some(1_000_000 - WEEK_MS));
         assert_eq!(week_a.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
         assert_eq!(still_day_b.kind, SyncWindowKind::LastDay);
+    }
+
+    #[test]
+    fn last_day_window_repeats_until_recent_receives_go_quiet() {
+        let db_path = "/tmp/window-repeat-hot";
+        let recorded_by = "tenant-a";
+        let peer_id = "peer-a";
+        let live_peers = vec![peer_id.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_id);
+
+        let first_day =
+            select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
+        assert_eq!(first_day.kind, SyncWindowKind::LastDay);
+        mark_outbound_window_completed(db_path, recorded_by, peer_id, first_day, 42);
+
+        let repeated_day =
+            select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 2_000_000);
+        assert_eq!(repeated_day.kind, SyncWindowKind::LastDay);
+        assert_eq!(repeated_day.ts_max_exclusive(), Some(2_000_000));
+        mark_outbound_window_completed(db_path, recorded_by, peer_id, repeated_day, 0);
+
+        let week = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 3_000_000);
+        assert_eq!(week.kind, SyncWindowKind::LastWeek);
+        assert_eq!(week.ts_max_exclusive(), Some(2_000_000 - DAY_MS));
     }
 
     #[test]

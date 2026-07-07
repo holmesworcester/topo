@@ -156,9 +156,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Start {
             bind,
             last_day_only_sync,
+            sync_mode,
         } => {
             if last_day_only_sync {
                 std::env::set_var("TOPO_SYNC_LAST_DAY_ONLY", "1");
+            }
+            if let Some(sync_mode) = sync_mode.as_deref() {
+                std::env::set_var("TOPO_SYNC_MODE", sync_mode);
             }
             let socket_path = socket_override
                 .as_ref()

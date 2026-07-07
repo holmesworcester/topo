@@ -7,4 +7,5 @@ mod cancellation_semantics;
 mod error_mapping;
 mod fake_session_io;
 mod initiator_protocol_ordering;
+mod rateless_protocol_ordering;
 mod responder_protocol_ordering;

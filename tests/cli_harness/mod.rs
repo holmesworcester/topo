@@ -553,6 +553,20 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
             "RUST_BACKTRACE",
             "SSL_CERT_FILE",
             "SSL_CERT_DIR",
+            "TOPO_SYNC_MODE",
+            "TOPO_RESPONSE_SEND_QUANTUM_BYTES",
+            "TOPO_EGRESS_SEND_QUANTUM_BYTES",
+            "TOPO_RATELESS_CHUNK_BYTES",
+            "TOPO_RATELESS_MIN_EXTRA_SYMBOLS",
+            "TOPO_LIVE_SUPPRESSION_EVENT_ID_CAP",
+            "TOPO_LIVE_SUPPRESSION_SEND_BATCH_SIZE",
+            "TOPO_LIVE_SUPPRESSION_BATCH_SETTLE_MS",
+            "LOW_MEM_MAX_RECV_BUFFER",
+            "LOW_MEM_WAL_CAP_MIB",
+            "LOW_MEM_MALLOC_ARENA_MAX",
+            "LOW_MEM_MALLOC_TRIM_THRESHOLD",
+            "LOW_MEM_MALLOC_MMAP_THRESHOLD",
+            "LOW_MEM_MALLOC_TOP_PAD",
         ] {
             if let Some(value) = std::env::var_os(key) {
                 cmd.env(key, value);

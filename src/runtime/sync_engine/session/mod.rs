@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod initiator;
 pub mod logging;
+pub mod rateless;
 pub mod range_session;
 pub mod receive_log;
 pub mod responder;

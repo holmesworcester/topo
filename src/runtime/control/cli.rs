@@ -28,6 +28,9 @@ pub(crate) enum Commands {
         /// Restrict sync planning to the hot LastDay window only.
         #[arg(long)]
         last_day_only_sync: bool,
+        /// Sync protocol to use for range sessions (`negentropy` or `rateless-spray`).
+        #[arg(long)]
+        sync_mode: Option<String>,
     },
 
     /// Stop a running daemon

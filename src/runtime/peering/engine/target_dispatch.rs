@@ -177,6 +177,7 @@ fn known_peer_id(source: &TargetIngressSource) -> Option<&str> {
 fn select_outbound_session_auth_plan(
     source: &TargetIngressSource,
     bootstrap_session_fallback: Option<&BootstrapSessionFallback>,
+    bootstrap_phase: bool,
 ) -> OutboundSessionAuthPlan {
     match source {
         TargetIngressSource::Bootstrap { .. } => {
@@ -186,9 +187,21 @@ fn select_outbound_session_auth_plan(
                 invite_event_id: fallback.invite_event_id.clone(),
             }
         }
-        TargetIngressSource::KnownPeer { peer_id } => OutboundSessionAuthPlan::PeerShared {
-            target_peer_id: peer_id.clone(),
-        },
+        TargetIngressSource::KnownPeer { peer_id } => {
+            if bootstrap_phase {
+                bootstrap_session_fallback
+                    .map(|fallback| OutboundSessionAuthPlan::InviteBootstrap {
+                        invite_event_id: fallback.invite_event_id.clone(),
+                    })
+                    .unwrap_or_else(|| OutboundSessionAuthPlan::PeerShared {
+                        target_peer_id: peer_id.clone(),
+                    })
+            } else {
+                OutboundSessionAuthPlan::PeerShared {
+                    target_peer_id: peer_id.clone(),
+                }
+            }
+        }
     }
 }
 
@@ -439,7 +452,7 @@ pub(super) async fn run_target_dispatcher(
                 invite_event_id: invite_event_id.clone(),
             }),
             TargetIngressSource::KnownPeer { .. } => {
-                resolve_active_bootstrap_session_fallback(&db_path, &event.tenant_id, false)
+                resolve_active_bootstrap_session_fallback(&db_path, &event.tenant_id, true)
             }
         };
 
@@ -467,8 +480,11 @@ pub(super) async fn run_target_dispatcher(
             continue;
         };
 
-        let auth_plan =
-            select_outbound_session_auth_plan(&event.source, bootstrap_session_fallback.as_ref());
+        let auth_plan = select_outbound_session_auth_plan(
+            &event.source,
+            bootstrap_session_fallback.as_ref(),
+            bootstrap_phase,
+        );
         let worker_cancel = shutdown.child_token();
         let target_label = format_target(
             event.remote,
@@ -478,7 +494,6 @@ pub(super) async fn run_target_dispatcher(
 
         if matches!(event.source, TargetIngressSource::KnownPeer { .. }) {
             if let Some(fallback) = bootstrap_session_fallback.as_ref() {
-                let bootstrap_phase = is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id);
                 let key = format!(
                     "known-peer-bootstrap-fallback:{}:{}:{}:{}",
                     event.tenant_id,
@@ -814,6 +829,7 @@ mod tests {
                 invite_event_id: "invite".to_string(),
             },
             Some(&fallback),
+            true,
         );
         assert_eq!(
             plan,
@@ -824,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn known_peer_requests_peer_shared_even_with_bootstrap_fallback() {
+    fn known_peer_uses_invite_bootstrap_when_bootstrap_fallback_exists_during_bootstrap_phase() {
         let fallback = BootstrapSessionFallback {
             daemon_peer_id: "daemon".to_string(),
             invite_event_id: "invite".to_string(),
@@ -834,6 +850,45 @@ mod tests {
                 peer_id: "peer".to_string(),
             },
             Some(&fallback),
+            true,
+        );
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn known_peer_uses_peer_shared_without_bootstrap_fallback() {
+        let plan = select_outbound_session_auth_plan(
+            &TargetIngressSource::KnownPeer {
+                peer_id: "peer".to_string(),
+            },
+            None,
+            true,
+        );
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: "peer".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn known_peer_ignores_bootstrap_fallback_outside_bootstrap_phase() {
+        let fallback = BootstrapSessionFallback {
+            daemon_peer_id: "daemon".to_string(),
+            invite_event_id: "invite".to_string(),
+        };
+        let plan = select_outbound_session_auth_plan(
+            &TargetIngressSource::KnownPeer {
+                peer_id: "peer".to_string(),
+            },
+            Some(&fallback),
+            false,
         );
         assert_eq!(
             plan,

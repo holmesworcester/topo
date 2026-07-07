@@ -18,13 +18,14 @@ use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, enqueue_receive_log_ingest_with_pending_overlay,
     note_hot_receive_finished, note_hot_receive_started,
 };
+use crate::sync::session::rateless::run_rateless_sync_responder;
 use crate::sync::session::windowing::{
     decode_initial_neg_open, encode_sync_window_kind, is_low_mem_allowed_window,
     is_priority_ingest_window, SyncWindowKind,
 };
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
-use crate::tuning::low_mem_mode;
+use crate::tuning::{low_mem_mode, sync_mode, SyncMode};
 use negentropy::{Id, Negentropy};
 
 type ManualRoundReply =
@@ -71,6 +72,55 @@ fn reply_manual_rounds(
 /// Run sync as the responder for one requested range.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sync_responder<C, S, R>(
+    conn: DualConnection<C, S, R>,
+    session_id: u64,
+    db_path: &str,
+    timeout_secs: u64,
+    peer_id: &str,
+    recorded_by: &str,
+    ingress_source_tag: &str,
+    rx_capture: Option<SyncRunRxCapture>,
+    command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: StreamConn,
+    S: StreamSend,
+    R: StreamRecv + Send + 'static,
+{
+    match sync_mode() {
+        SyncMode::Negentropy => {
+            run_negentropy_sync_responder(
+                conn,
+                session_id,
+                db_path,
+                timeout_secs,
+                peer_id,
+                recorded_by,
+                ingress_source_tag,
+                rx_capture,
+                command_rx,
+            )
+            .await
+        }
+        SyncMode::RatelessSpray => {
+            run_rateless_sync_responder(
+                conn,
+                session_id,
+                db_path,
+                timeout_secs,
+                peer_id,
+                recorded_by,
+                ingress_source_tag,
+                rx_capture,
+                command_rx,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_negentropy_sync_responder<C, S, R>(
     conn: DualConnection<C, S, R>,
     session_id: u64,
     db_path: &str,

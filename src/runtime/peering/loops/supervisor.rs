@@ -26,8 +26,9 @@ use crate::transport::{
 };
 
 use super::{
-    claim_live_session_peer, current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex,
-    run_session, short_peer_id, ENDPOINT_TTL_MS,
+    claim_live_session_peer, current_timestamp_ms, drain_batch_size,
+    peer_fingerprint_from_hex, run_session, short_peer_id, try_claim_active_sync_run,
+    ENDPOINT_TTL_MS,
 };
 
 const FIRST_SESSION_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -293,6 +294,11 @@ pub(super) async fn supervise_inbound_daemon_connection(
                 continue;
             }
         };
+        let Some(_active_sync_run_lease) =
+            try_claim_active_sync_run(db_path, &auth_context.tenant_id, &auth_context.remote_peer_id)
+        else {
+            continue;
+        };
         live_session_peer_registrations
             .entry((
                 auth_context.tenant_id.clone(),
@@ -348,6 +354,7 @@ pub(super) async fn supervise_inbound_daemon_connection(
         let session_start = std::time::Instant::now();
         let connection_id = connection.stable_id();
         tokio::task::spawn_local(async move {
+            let _active_sync_run_lease = _active_sync_run_lease;
             let session_stats = run_session(
                 &handler,
                 session.session_id,

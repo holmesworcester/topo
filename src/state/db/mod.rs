@@ -19,6 +19,7 @@ pub mod transport_creds;
 pub mod transport_trust;
 
 use rusqlite::{Connection, Result as SqliteResult};
+use std::time::Duration;
 use std::path::Path;
 
 /// Open database connection with WAL mode and performance pragmas
@@ -73,10 +74,23 @@ pub fn open_in_memory() -> SqliteResult<Connection> {
 }
 
 fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
+    let busy_timeout = Duration::from_millis(
+        std::env::var("TOPO_DB_BUSY_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(30_000),
+    );
+    conn.busy_timeout(busy_timeout)?;
+
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if journal_mode != "wal" && journal_mode != "memory" {
+        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+    }
+
     if low_mem_mode() {
         conn.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -256;
             PRAGMA cache_spill = ON;
@@ -85,17 +99,14 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
             PRAGMA wal_autocheckpoint = 64;
             PRAGMA journal_size_limit = 262144;
             PRAGMA soft_heap_limit = 2097152;
-            PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = OFF;
             ",
         )?;
     } else {
         conn.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;
-            PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = OFF;
             PRAGMA temp_store = MEMORY;
             ",
@@ -140,5 +151,20 @@ mod tests {
             .unwrap();
         // In-memory databases may report "memory" instead of "wal"
         assert!(journal_mode == "wal" || journal_mode == "memory");
+    }
+
+    #[test]
+    fn open_connection_succeeds_while_another_connection_holds_immediate_tx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("busy.sqlite3");
+
+        let writer = open_connection(&db_path).unwrap();
+        writer.execute("BEGIN IMMEDIATE", []).unwrap();
+
+        let reader = open_connection(&db_path).unwrap();
+        let journal_mode: String = reader
+            .query_row("PRAGMA journal_mode", [], |row| get_text(row, 0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
     }
 }

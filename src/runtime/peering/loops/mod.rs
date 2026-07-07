@@ -103,6 +103,13 @@ struct LiveSessionPeerKey {
     remote_session_peer_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ActiveSyncRunKey {
+    db_path: String,
+    tenant_id: String,
+    remote_session_peer_id: String,
+}
+
 struct LiveDaemonConnectionSlot {
     claim_id: u64,
     direction: SessionDirection,
@@ -139,6 +146,12 @@ fn live_session_peer_counts() -> &'static Mutex<HashMap<LiveSessionPeerKey, usiz
     LIVE_SESSION_PEER_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn active_sync_run_counts() -> &'static Mutex<HashMap<ActiveSyncRunKey, usize>> {
+    static ACTIVE_SYNC_RUN_COUNTS: OnceLock<Mutex<HashMap<ActiveSyncRunKey, usize>>> =
+        OnceLock::new();
+    ACTIVE_SYNC_RUN_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub(crate) struct LiveDaemonConnectionLease {
     key: LiveDaemonConnectionKey,
     claim_id: u64,
@@ -146,6 +159,10 @@ pub(crate) struct LiveDaemonConnectionLease {
 
 pub(crate) struct LiveSessionPeerLease {
     key: LiveSessionPeerKey,
+}
+
+pub(crate) struct ActiveSyncRunLease {
+    key: ActiveSyncRunKey,
 }
 
 impl Drop for LiveDaemonConnectionLease {
@@ -173,6 +190,25 @@ impl Drop for LiveDaemonConnectionLease {
 impl Drop for LiveSessionPeerLease {
     fn drop(&mut self) {
         let mut counts = live_session_peer_counts()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let remove = match counts.get_mut(&self.key) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if remove {
+            counts.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for ActiveSyncRunLease {
+    fn drop(&mut self) {
+        let mut counts = active_sync_run_counts()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let remove = match counts.get_mut(&self.key) {
@@ -435,6 +471,26 @@ pub(crate) fn live_session_peer_ids(db_path: &str, tenant_id: &str) -> Vec<Strin
     remote_session_peer_ids
 }
 
+pub(crate) fn try_claim_active_sync_run(
+    db_path: &str,
+    tenant_id: &str,
+    remote_session_peer_id: &str,
+) -> Option<ActiveSyncRunLease> {
+    let key = ActiveSyncRunKey {
+        db_path: db_path.to_string(),
+        tenant_id: tenant_id.to_string(),
+        remote_session_peer_id: remote_session_peer_id.to_string(),
+    };
+    let mut counts = active_sync_run_counts()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if counts.contains_key(&key) {
+        return None;
+    }
+    counts.insert(key.clone(), 1);
+    Some(ActiveSyncRunLease { key })
+}
+
 // ---------------------------------------------------------------------------
 // Transport↔peering session seam
 // ---------------------------------------------------------------------------
@@ -504,8 +560,8 @@ mod tests {
 
     use super::{
         claim_live_daemon_connection_slot, claim_live_session_peer, live_daemon_connection,
-        live_session_peer_ids, preferred_connection_direction, LiveDaemonConnectionClaim,
-        SessionDirection,
+        live_session_peer_ids, preferred_connection_direction, try_claim_active_sync_run,
+        LiveDaemonConnectionClaim, SessionDirection,
     };
     use crate::db::schema::create_tables;
     use crate::transport::{
@@ -573,6 +629,25 @@ mod tests {
         drop(lease_a2);
         assert!(live_session_peer_ids(db_path, &tenant_a).is_empty());
         assert_eq!(live_session_peer_ids(db_path, &tenant_b), vec![peer]);
+    }
+
+    #[test]
+    fn try_claim_active_sync_run_suppresses_only_concurrent_runs() {
+        let db_path = "/tmp/active-sync-run-presence.db";
+        let tenant = format!("{:064x}", 4);
+        let peer = format!("{:064x}", 5);
+
+        let lease = try_claim_active_sync_run(db_path, &tenant, &peer)
+            .expect("first active sync run claim should succeed");
+        assert!(
+            try_claim_active_sync_run(db_path, &tenant, &peer).is_none(),
+            "duplicate active sync run should be suppressed while first claim is live"
+        );
+        drop(lease);
+        assert!(
+            try_claim_active_sync_run(db_path, &tenant, &peer).is_some(),
+            "claim should succeed again once the prior run lease is dropped"
+        );
     }
 
     #[tokio::test]
