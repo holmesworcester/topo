@@ -59,7 +59,7 @@ pub(super) struct ActiveConnectWorker {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TargetIngressSourceKind {
+pub(crate) enum TargetIngressSourceKind {
     Bootstrap,
     KnownPeer,
 }
@@ -74,29 +74,29 @@ impl TargetIngressSource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TargetDispatchContext {
-    pub(super) incoming_source: TargetIngressSourceKind,
-    pub(super) should_initiate_connect: bool,
-    pub(super) bootstrap_phase: bool,
-    pub(super) has_active_higher_precedence_worker: bool,
-    pub(super) dispatch_action: DispatchAction,
+pub(crate) struct TargetDispatchContext {
+    pub(crate) incoming_source: TargetIngressSourceKind,
+    pub(crate) should_initiate_connect: bool,
+    pub(crate) bootstrap_phase: bool,
+    pub(crate) has_active_higher_precedence_worker: bool,
+    pub(crate) dispatch_action: DispatchAction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum TargetDispatchSkipReason {
+pub(crate) enum TargetDispatchSkipReason {
     NonPreferredSource,
     LowerPrecedenceThanActiveWorker,
     DispatcherNoop,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TargetDispatchSpawnPlan {
-    pub(super) cancel_existing_dispatch_key: bool,
-    pub(super) cancel_bootstrap_prefix: bool,
+pub(crate) struct TargetDispatchSpawnPlan {
+    pub(crate) cancel_existing_dispatch_key: bool,
+    pub(crate) cancel_bootstrap_prefix: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum TargetDispatchPlan {
+pub(crate) enum TargetDispatchPlan {
     Skip(TargetDispatchSkipReason),
     Spawn(TargetDispatchSpawnPlan),
 }
@@ -115,7 +115,7 @@ pub(super) fn should_ignore_target_event(
     source_precedence(existing) > source_precedence(incoming)
 }
 
-pub(super) fn decide_target_dispatch_plan(context: &TargetDispatchContext) -> TargetDispatchPlan {
+pub(crate) fn decide_target_dispatch_plan(context: &TargetDispatchContext) -> TargetDispatchPlan {
     if !context.should_initiate_connect {
         return TargetDispatchPlan::Skip(TargetDispatchSkipReason::NonPreferredSource);
     }
@@ -171,7 +171,7 @@ fn select_outbound_session_auth_plan(
     }
 }
 
-pub(super) fn should_initiate_connect_for_source(
+pub(crate) fn should_initiate_connect_for_source(
     tenant_id: &str,
     source: &TargetIngressSource,
 ) -> bool {
