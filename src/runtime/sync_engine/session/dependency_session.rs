@@ -17,7 +17,7 @@ use crate::runtime::transport::{
     send_outbound_session_auth,
 };
 use crate::state::{dependency_fetch, pipeline::ingest_now};
-use crate::sync::session::range_session::load_shared_send_batch_with_endpoint_deps;
+use crate::sync::session::range_session::load_shared_send_batch;
 use crate::transport::{DaemonConnection, OutboundSessionAuthPlan};
 
 const DEPENDENCY_BATCH_CAP: usize = 16;
@@ -148,7 +148,7 @@ async fn run_dependency_response_sender(
         ids.sort_unstable();
         ids.dedup();
         for chunk in ids.chunks(REQUEST_BATCH_CAP) {
-            let ordered = load_shared_send_batch_with_endpoint_deps(&store, chunk)?;
+            let ordered = load_shared_send_batch(&store, chunk)?;
             for (_event_id, blob) in ordered {
                 data_send
                     .send(&encode_frame(&Frame::Event { blob: blob.clone() }))

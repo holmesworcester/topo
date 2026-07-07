@@ -11,8 +11,7 @@ use crate::event_modules::{
 };
 use crate::projection::contract::EmitCommand;
 use crate::projection::queries::{ContextLoadResult, DepLoadResult, ProjectionFrameContext};
-use crate::state::live_hints::source_peer_id_from_source_tag;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use super::dispatch::dispatch_pure_projector;
 
@@ -61,24 +60,6 @@ fn check_transport_privacy(
         )),
         _ => Ok(()),
     }
-}
-
-pub(crate) fn load_recorded_source_peer_id(
-    conn: &Connection,
-    recorded_by: &str,
-    event_id_b64: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let source_tag: Option<String> = conn
-        .query_row(
-            "SELECT source
-             FROM recorded_events
-             WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(source_tag.and_then(|source_tag| source_peer_id_from_source_tag(&source_tag)))
 }
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
@@ -556,7 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_quic_event_emits_dependency_fetch_for_source_peer() {
+    async fn blocked_quic_event_does_not_emit_dependency_fetch_when_disabled() {
         let (_dir, db_path, conn) = setup_file_db();
         let blocked = event_id(1);
         let missing = event_id(2);
@@ -571,7 +552,11 @@ mod tests {
         let (mut rx, _guard): (tokio::sync::mpsc::UnboundedReceiver<Vec<EventId>>, _) =
             dependency_fetch::register(&db_path, "tenant-a", "peer-z");
         ProjectionBackend::record_block(&conn, "tenant-a", &blocked_b64, &[missing]).unwrap();
-        assert_eq!(rx.recv().await, Some(vec![missing]));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
